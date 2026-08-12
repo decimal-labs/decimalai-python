@@ -51,13 +51,20 @@ Browsing without an account? Explore the [public skill registry](https://app.dec
 ```python
 import decimalai
 
-decimalai.init(langchain=True)  # That's it — all LLM calls auto-traced
+decimalai.init(langchain=True)  # That's it — chains, graphs and agents auto-traced
 
 # Use LangChain as normal — nothing else changes
 from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(model="gpt-4o")
-result = llm.invoke("Hello!")  # ← Auto-captured by DecimalAI
+from langchain_core.prompts import ChatPromptTemplate
+
+chain = ChatPromptTemplate.from_template("Tell me about {topic}") | ChatOpenAI(model="gpt-4o")
+result = chain.invoke({"topic": "otters"})  # ← one trace, sent when the chain completes
 ```
+
+A trace is sent when a **chain, agent, or graph run completes**. A bare `llm.invoke("Hello!")`
+with no surrounding chain never reaches that boundary, so it sends nothing — wrap the call, or
+see [manual tracing](https://docs.decimal.ai/sdk/python/frameworks/langchain) for the per-call
+handler.
 
 ### OpenAI Agents SDK
 

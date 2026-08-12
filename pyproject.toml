@@ -197,9 +197,12 @@ providers-tests = [
 decimalai = "decimalai.cli.main:cli"
 
 [project.urls]
-Homepage = "https://github.com/decimal-labs/decimalai-python"
+# Every link here must resolve for a signed-out stranger — PyPI renders them as
+# the project page's links, which is the route someone takes to check that a
+# package is real. Verify with a HEAD request before adding one.
+Homepage = "https://decimal.ai"
 Documentation = "https://docs.decimal.ai"
-Repository = "https://github.com/decimal-labs/decimalai-python"
+Changelog = "https://docs.decimal.ai/changelog"
 
 [tool.hatch.build.targets.wheel]
 packages = ["decimalai"]
