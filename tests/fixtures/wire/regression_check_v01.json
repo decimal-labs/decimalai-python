@@ -1,0 +1,15 @@
+{
+  "id": "rc_v01_a",
+  "agent_name": "support-agent",
+  "baseline_manifest_id": "mfst_baseline_v01",
+  "candidate_manifest_id": "mfst_candidate_v01",
+  "status": "completed",
+  "verdict": "high_risk",
+  "verdict_message": "247 traces will break.",
+  "high_risk_count": 247,
+  "medium_risk_count": 89,
+  "low_risk_count": 1666,
+  "total_traces_analyzed": 2002,
+  "diff_summary": null,
+  "created_at": "2026-01-15T12:00:00Z"
+}

@@ -1,0 +1,27 @@
+{
+  "id": "rc_v02_b",
+  "agent_name": "support-agent",
+  "baseline_manifest_id": "mfst_baseline_v02",
+  "candidate_manifest_id": "mfst_candidate_v02",
+  "status": "completed",
+  "verdict": "medium_risk",
+  "verdict_message": "89 traces may behave differently.",
+  "high_risk_count": 0,
+  "medium_risk_count": 89,
+  "low_risk_count": 1666,
+  "total_traces_analyzed": 1755,
+  "diff_summary": {
+    "total_changes": 2,
+    "changes": [
+      {"type": "tool_removed", "name": "deprecated_lookup", "severity": "medium"},
+      {"type": "prompt_section_rewritten", "name": "refund_policy", "severity": "medium"}
+    ]
+  },
+  "pr_context": {
+    "repo": "acme/support-bot",
+    "pr_number": 42,
+    "branch": "fix/refund-prompt",
+    "commit_sha": "abc123def456"
+  },
+  "created_at": "2026-03-12T15:30:00Z"
+}

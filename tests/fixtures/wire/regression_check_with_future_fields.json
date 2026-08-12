@@ -1,0 +1,21 @@
+{
+  "id": "rc_future_d",
+  "agent_name": "support-agent",
+  "baseline_manifest_id": "mfst_baseline_fut",
+  "candidate_manifest_id": "mfst_candidate_fut",
+  "status": "completed",
+  "verdict": "medium_risk",
+  "verdict_message": "Some impact.",
+  "high_risk_count": 10,
+  "medium_risk_count": 40,
+  "low_risk_count": 1000,
+  "total_traces_analyzed": 1050,
+  "diff_summary": null,
+  "pr_context": null,
+  "impacts": [],
+  "created_at": "2026-05-14T01:00:00Z",
+  "future_field_a": "this field does not exist in v0.x",
+  "future_field_b": {"nested": "value"},
+  "future_field_c": [1, 2, 3],
+  "auto_replay_budget_remaining_cents": 999
+}

@@ -1,0 +1,1615 @@
+"""HTTP client for communicating with the Decimal platform."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional, cast
+from uuid import UUID
+
+import httpx
+
+from ._responses import (
+    AgentListResponse,
+    IngestionResult,
+    IngestionSkipped,
+    ManifestDiffResponse,
+    ManifestListResponse,
+    ManifestRegistrationResponse,
+    RegressionCheckListResponse,
+    RegressionCheckResponse,
+    TraceDetailResponse,
+    TraceListResponse,
+    VerifyAuthResponse,
+)
+from .schema.trace import RunTrace
+
+logger = logging.getLogger("decimalai")
+
+_MAX_RETRIES = 3
+_DEFAULT_RETRY_DELAY = 1.0  # seconds
+
+
+def _parse_retry_after(value: Optional[str]) -> float:
+    """Parse a 429 ``Retry-After`` header into delta-seconds.
+
+    Per RFC 7231 the value may be delta-seconds ("5")
+    OR an HTTP-date ("Wed, 21 Oct 2025 07:28:00 GMT") — many proxies/CDNs/LBs
+    (Cloudflare, nginx, GCP LB) emit the date form on 429. The old ``float(value)``
+    raised an uncaught ValueError on the date form, defeating retry/backoff on
+    every write path. Returns 0.0 on absent/unparseable (caller falls back to
+    exponential backoff).
+    """
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return 0.0
+
+# Warn-once latch. ``init(verify=True)`` caches the backend's
+# ``require_manifest_on_ingest`` flag onto the global config; honoring the
+# init() docstring, we surface an actionable warning at the source when a
+# manual ingest omits ``manifest_id`` against a strict backend — instead of
+# letting the caller hit a bare 400. Latched to once-per-process so a stream
+# of mis-shaped traces can't spam the log.
+_STRICT_MANIFEST_WARNED = False
+
+
+def _warn_if_strict_manifest_missing(payload_has_manifest: bool) -> None:
+    """Emit a one-time warning when the backend requires manifest_id and it's absent.
+
+    No-op unless ``init(verify=True)`` cached ``require_manifest_on_ingest=True``
+    (the default for prod backends is unset/False, so this stays silent there).
+    """
+    global _STRICT_MANIFEST_WARNED
+    if payload_has_manifest or _STRICT_MANIFEST_WARNED:
+        return
+    from ._config import _config as _global_config
+
+    if _global_config is None or not _global_config.backend_require_manifest_on_ingest:
+        return
+    _STRICT_MANIFEST_WARNED = True
+    logger.warning(
+        "Ingesting a trace without a manifest_id, but this backend requires one "
+        "(require_manifest_on_ingest=True) — the server will reject it with a 400 "
+        "'manifest_id is required'. Register a manifest first "
+        "(decimalai.register_manifest(...)) and attach its id to the trace, or use "
+        "a framework integration / the generic tracer, which register one "
+        "automatically."
+    )
+
+
+def _scrub_surrogates(value: Any) -> Any:
+    """Make a serialized payload safe to UTF-8 encode for upload.
+
+    A lone UTF-16 surrogate (e.g. ``"\\ud800"``) is a valid Python ``str`` but
+    cannot be encoded to UTF-8, so httpx's ``json=`` encoder
+    (``ensure_ascii=False``) raises ``UnicodeEncodeError`` and crashes
+    ``ingest_trace`` / ``ingest_traces_batch`` / ``register_manifest`` in the
+    caller's process *before any request is sent*. A compliant client cannot put
+    a lone surrogate on the wire, so we scrub the serialized copy — replacing
+    un-encodable code points with the UTF-8 ``replace`` substitute — and proceed,
+    rather than failing the whole upload. Operates on the serialized dict/list (never the caller's
+    model), recurses into nested containers, and is a no-op for clean strings.
+    Pairs with the server-side global backstop.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+            return value
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {_scrub_surrogates(k): _scrub_surrogates(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_surrogates(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_surrogates(v) for v in value)
+    return value
+
+
+class DecimalRateLimitError(Exception):
+    """Raised when the Decimal platform returns 429 after all retries are exhausted."""
+
+    def __init__(self, retry_after: float = 0, message: str = ""):
+        self.retry_after = retry_after
+        super().__init__(message or f"Rate limit exceeded. Retry after {retry_after}s")
+
+
+class DecimalQuotaExceededError(Exception):
+    """Raised immediately when a plan quota is exhausted — never retried.
+
+    A quota 429 and a rate-limit 429 share a status code but nothing else: a rate limit
+    clears in seconds, a quota does not clear until the billing period rolls over. Retrying
+    it cannot succeed, so the old behaviour (3 attempts with backoff, then a rate-limit
+    error) burned wall-clock and then DROPPED the payload with a misleading message.
+
+    The server marks the difference with an ``X-Quota-Exceeded`` header naming the
+    dimension; ``resets_in_seconds`` on the body says when capacity returns. Deliberately
+    NOT a subclass of DecimalRateLimitError — code that catches a rate limit to sleep and
+    retry must not swallow this one.
+    """
+
+    def __init__(self, dimension: str = "", resets_in_seconds: int = 0,
+                 plan: str = "", message: str = ""):
+        self.dimension = dimension
+        self.resets_in_seconds = resets_in_seconds
+        self.plan = plan
+        super().__init__(message or (
+            f"Plan quota exhausted for {dimension!r}"
+            + (f" on the {plan!r} plan" if plan else "")
+            + (f"; resets in {resets_in_seconds}s" if resets_in_seconds else "")
+            + ". Retrying will not help — upgrade the plan or wait for the period to roll over."
+        ))
+
+
+class DecimalAPIError(httpx.HTTPStatusError):
+    """An HTTP error from the Decimal platform, enriched with the server's message.
+
+    ``httpx.Response.raise_for_status()`` produces a generic message
+    like ``"Client error '400 Bad Request' for url ..."`` and throws away the
+    JSON body the server sent — so callers never see *why* a request failed
+    (e.g. ``"manifest_id is required"``). This subclass extracts the server's
+    ``detail`` / ``message`` and ``request_id`` and folds them into the error
+    text, while remaining a :class:`httpx.HTTPStatusError` so existing
+    ``except httpx.HTTPStatusError`` handlers keep working unchanged.
+    """
+
+    def __init__(self, response: "httpx.Response") -> None:
+        self.status_code: int = response.status_code
+        self.server_detail: Optional[str] = None
+        self.server_code: Optional[str] = None
+        self.request_id: Optional[str] = None
+
+        # Pull a human message out of the JSON body, tolerating non-JSON
+        # bodies (HTML error pages, plain text, empty) without masking the
+        # original failure.
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+
+        if isinstance(body, dict):
+            detail = body.get("detail")
+            # FastAPI 422 detail is a list of validation errors — keep it readable.
+            if isinstance(detail, (list, dict)):
+                detail = json.dumps(detail)
+            self.server_detail = (
+                detail
+                or body.get("message")
+                or body.get("error")
+            )
+            # Server error envelope is {detail, code, request_id}: `code` is a
+            # machine-readable error code (e.g. "validation_error"), NOT a
+            # request id. Keep them in separate fields — folding `code` into
+            # `request_id` (the old bug) mislabels the error code as a trace.
+            self.server_code = body.get("code")
+            self.request_id = body.get("request_id")
+
+        # request_id is also exposed as a response header on this backend.
+        if not self.request_id:
+            self.request_id = response.headers.get("x-request-id")
+
+        reason = (response.reason_phrase or "").strip()
+        parts = [f"HTTP {self.status_code}"]
+        if reason:
+            parts[0] += f" {reason}"
+        if self.server_detail:
+            parts.append(str(self.server_detail))
+        else:
+            # Fall back to the response text so something is always surfaced.
+            text = (response.text or "").strip()
+            if text:
+                parts.append(text[:500])
+        message = ": ".join(parts)
+        suffix = []
+        if self.server_code:
+            suffix.append(f"code={self.server_code}")
+        if self.request_id:
+            suffix.append(f"request_id={self.request_id}")
+        if suffix:
+            message += f" ({', '.join(suffix)})"
+
+        super().__init__(message, request=response.request, response=response)
+
+
+def _raise_for_status(resp: "httpx.Response") -> None:
+    """Like ``resp.raise_for_status()`` but surfaces the server's message.
+
+    On a 4xx/5xx, re-raises a :class:`DecimalAPIError` (a subclass of
+    ``httpx.HTTPStatusError``) carrying the server's ``detail``/``message`` and
+    ``request_id``. Success responses pass through untouched.
+    """
+    if resp.is_success:
+        return
+    raise DecimalAPIError(resp)
+
+
+class DecimalAIClient:
+    """Client for the Decimal platform API.
+
+    Handles authentication, trace ingestion, and manifest registration.
+    Can be used standalone or created automatically via ``decimalai.init()``.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://api.decimal.ai",
+        project: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.project = project
+
+        # DEPRECATED (0.10.0): `project` no longer emits an `X-Decimal-Project`
+        # header — the platform never read it. See DecimalConfig.api_headers.
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        self._http = httpx.Client(
+            base_url=self.base_url,
+            headers=headers,
+            timeout=timeout,
+        )
+        self._trace_buffer: List[RunTrace] = []
+
+    # ── Auth ────────────────────────────────────────────────────
+
+    def verify_auth(self) -> VerifyAuthResponse:
+        """Verify the API key and return project configuration."""
+        resp = self._http.get("/api/v1/auth/verify")
+        _raise_for_status(resp)
+        return cast(VerifyAuthResponse, resp.json())
+
+    # ── Retry logic ────────────────────────────────────────────
+
+    def _request_with_retry(
+        self, method: str, url: str, **kwargs: Any
+    ) -> httpx.Response:
+        """Make an HTTP request with retry-on-429.
+
+        Retries up to ``_MAX_RETRIES`` times when the server responds with
+        HTTP 429. Uses the ``Retry-After`` header if present, otherwise
+        falls back to exponential backoff (1s, 2s, 4s).
+        """
+        last_exc: Optional[httpx.HTTPStatusError] = None
+
+        for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2, 3
+            resp = self._http.request(method, url, **kwargs)
+
+            if resp.status_code != 429:
+                _raise_for_status(resp)
+                return resp
+
+            # A plan quota is TERMINAL — it does not clear until the billing period rolls
+            # over, so the retry loop below can only burn wall-clock and then drop the
+            # payload. Measured on prod 2026-08-08: orgs pinned against their storage cap
+            # 429'd every single trace post, and each one cost 3 attempts before being
+            # discarded. Bail immediately with an error that says what is actually wrong.
+            quota_dimension = resp.headers.get("X-Quota-Exceeded")
+            if quota_dimension:
+                body = {}
+                try:
+                    parsed = resp.json()
+                    detail = parsed.get("detail") if isinstance(parsed, dict) else None
+                    body = detail if isinstance(detail, dict) else {}
+                except Exception:  # noqa: BLE001 — a malformed body must not mask the quota
+                    body = {}
+                raise DecimalQuotaExceededError(
+                    dimension=quota_dimension,
+                    resets_in_seconds=int(body.get("resets_in_seconds") or 0),
+                    plan=str(body.get("plan") or resp.headers.get("X-RateLimit-Plan") or ""),
+                )
+
+            # 429 — parse Retry-After (delta-seconds OR HTTP-date) and maybe retry
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+
+            last_exc = httpx.HTTPStatusError(
+                "429 Too Many Requests",
+                request=resp.request,
+                response=resp,
+            )
+
+            if attempt < _MAX_RETRIES:
+                logger.warning(
+                    "Rate limited (429). Retrying in %.1fs (attempt %d/%d)",
+                    delay, attempt + 1, _MAX_RETRIES,
+                )
+                time.sleep(delay)
+            else:
+                raise DecimalRateLimitError(
+                    retry_after=retry_after,
+                    message=(
+                        f"Rate limit exceeded after {_MAX_RETRIES} retries. "
+                        f"Server says retry after {retry_after}s."
+                    ),
+                )
+
+        # Should never reach here, but satisfy type checker
+        raise last_exc  # type: ignore[misc]
+
+    # ── Trace ingestion ────────────────────────────────────────
+    #
+    # All trace ingestion methods consult `_should_send_traces()` first.
+    # When the SDK is in `manifest_only` mode (DECIMALAI_MODE=manifest_only),
+    # they no-op. This is the bouncer that makes the mode actually mean
+    # something — framework integrations (LangChain/OpenAI Agents/etc.) can
+    # fire callbacks freely without polluting the production trace store
+    # with CI/test data.
+    #
+    # In short: manifest_only mode registers manifests but sends no traces.
+
+    def _should_send_traces(self, method_name: str) -> bool:
+        """Return False (and log once) when the SDK is in manifest_only mode."""
+        from ._config import _is_manifest_only
+
+        if _is_manifest_only():
+            logger.debug(
+                "Skipping %s — SDK is in manifest_only mode (DECIMALAI_MODE=manifest_only). "
+                "Traces are deliberately not sent during CI manifest extraction.",
+                method_name,
+            )
+            return False
+        return True
+
+    def ingest_trace(self, trace: RunTrace) -> IngestionResult:
+        """Send a single trace to the platform.
+
+        No-op when the SDK is in manifest_only mode (returns
+        ``{"status": "skipped", ...}`` — see :class:`IngestionSkipped`).
+        """
+        if not self._should_send_traces("ingest_trace"):
+            skipped: IngestionSkipped = {"status": "skipped", "reason": "manifest_only_mode"}
+            return skipped
+        payload = _scrub_surrogates(trace.model_dump(mode="json"))
+        _warn_if_strict_manifest_missing(bool(payload.get("manifest_id")))
+        resp = self._request_with_retry("POST", "/api/v1/traces", json=payload)
+        logger.debug("Ingested trace %s", trace.id)
+        return cast(IngestionResult, resp.json())
+
+    def ingest_traces_batch(self, traces: List[RunTrace]) -> IngestionResult:
+        """Send a batch of traces to the platform.
+
+        No-op when the SDK is in manifest_only mode.
+        """
+        if not self._should_send_traces("ingest_traces_batch"):
+            skipped: IngestionSkipped = {
+                "status": "skipped",
+                "reason": "manifest_only_mode",
+                "skipped_count": len(traces),
+            }
+            return skipped
+        payload = [_scrub_surrogates(t.model_dump(mode="json")) for t in traces]
+        _warn_if_strict_manifest_missing(
+            all(p.get("manifest_id") for p in payload) if payload else True
+        )
+        resp = self._request_with_retry("POST", "/api/v1/traces/batch", json=payload)
+        logger.debug("Ingested %d traces", len(traces))
+        return cast(IngestionResult, resp.json())
+
+    def ingest_raw_trace(self, payload: Dict[str, Any]) -> IngestionResult:
+        """Send a raw trace dict directly to the platform.
+
+        No-op when the SDK is in manifest_only mode.
+
+        No Pydantic validation — the backend validates the payload.
+        Useful for custom pipelines, batch imports, and non-Python sources.
+        """
+        if not self._should_send_traces("ingest_raw_trace"):
+            skipped: IngestionSkipped = {"status": "skipped", "reason": "manifest_only_mode"}
+            return skipped
+        # Raw payloads come from custom pipelines / non-Python sources, exactly
+        # where lone UTF-16 surrogates are most likely — scrub them or httpx's
+        # JSON encoder raises UnicodeEncodeError before the request is built.
+        payload = _scrub_surrogates(payload)
+        _warn_if_strict_manifest_missing(bool(payload.get("manifest_id")))
+        resp = self._request_with_retry("POST", "/api/v1/traces", json=payload)
+        logger.debug("Ingested raw trace")
+        return cast(IngestionResult, resp.json())
+
+    def ingest_raw_traces_batch(
+        self, payloads: List[Dict[str, Any]]
+    ) -> IngestionResult:
+        """Send a batch of raw trace dicts to the platform.
+
+        No-op when the SDK is in manifest_only mode.
+        """
+        if not self._should_send_traces("ingest_raw_traces_batch"):
+            skipped: IngestionSkipped = {
+                "status": "skipped",
+                "reason": "manifest_only_mode",
+                "skipped_count": len(payloads),
+            }
+            return skipped
+        payloads = [_scrub_surrogates(p) for p in payloads]
+        _warn_if_strict_manifest_missing(
+            all(p.get("manifest_id") for p in payloads) if payloads else True
+        )
+        resp = self._request_with_retry(
+            "POST", "/api/v1/traces/batch", json=payloads
+        )
+        logger.debug("Ingested %d raw traces", len(payloads))
+        return cast(IngestionResult, resp.json())
+
+    def buffer_trace(self, trace: RunTrace) -> None:
+        """Buffer a trace for batched sending.
+
+        No-op when the SDK is in manifest_only mode. Buffered traces would
+        eventually be flushed, but in manifest_only mode we never want to
+        send — short-circuiting here also avoids unbounded buffer growth
+        from framework integrations that fire repeatedly during CI runs.
+        """
+        if not self._should_send_traces("buffer_trace"):
+            return
+        self._trace_buffer.append(trace)
+        if len(self._trace_buffer) >= 50:
+            self.flush()
+
+    def flush(self) -> None:
+        """Flush all buffered traces to the platform.
+
+        On rate limit errors (429), the buffer is **preserved** so that
+        traces are not lost — the next call to ``flush()`` will retry.
+        For all other errors the buffer is cleared.
+        """
+        if not self._trace_buffer:
+            return
+        try:
+            self.ingest_traces_batch(self._trace_buffer)
+            self._trace_buffer.clear()
+        except DecimalRateLimitError:
+            logger.warning(
+                "Rate limited — preserving %d buffered traces for later flush",
+                len(self._trace_buffer),
+            )
+        except Exception:
+            logger.exception("Failed to flush %d traces", len(self._trace_buffer))
+            self._trace_buffer.clear()
+
+    # ── Trace queries ──────────────────────────────────────────
+
+    def list_traces(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        status: Optional[str] = None,
+        agent_name: Optional[str] = None,
+    ) -> TraceListResponse:
+        """List traces for the current project."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if status:
+            params["status"] = status
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/traces", params=params)
+        _raise_for_status(resp)
+        return cast(TraceListResponse, resp.json())
+
+    def get_trace(self, trace_id: str | UUID) -> TraceDetailResponse:
+        """Get a single trace with its full span tree."""
+        resp = self._http.get(f"/api/v1/traces/{trace_id}")
+        _raise_for_status(resp)
+        return cast(TraceDetailResponse, resp.json())
+
+    # ── Agents ──────────────────────────────────────────────────
+
+    def list_agents(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> AgentListResponse:
+        """List all agents in the workspace."""
+        resp = self._http.get(
+            "/api/v1/agents", params={"limit": limit, "offset": offset}
+        )
+        _raise_for_status(resp)
+        return cast(AgentListResponse, resp.json())
+
+    # ── Manifest registration ─────────────────────────────────
+
+    def register_manifest(self, manifest: Any) -> ManifestRegistrationResponse:
+        """Register a manifest snapshot with the platform.
+
+        Args:
+            manifest: A ManifestSnapshot (from decimalai.schema.manifest).
+
+        Returns:
+            Registration response with manifest_id and compatibility info.
+        """
+        payload = _scrub_surrogates(manifest.model_dump(mode="json"))
+        resp = self._http.post("/api/v1/manifests", json=payload)
+        _raise_for_status(resp)
+        logger.debug("Registered manifest %s (hash=%s)", manifest.id, manifest.manifest_hash)
+        return cast(ManifestRegistrationResponse, resp.json())
+
+    def list_manifests(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        agent_name: Optional[str] = None,
+    ) -> ManifestListResponse:
+        """List manifests from the platform."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/manifests", params=params)
+        _raise_for_status(resp)
+        return cast(ManifestListResponse, resp.json())
+
+    def get_manifest(
+        self, manifest_id: str,
+    ) -> Dict[str, Any]:
+        """Get a single manifest with full component details."""
+        resp = self._http.get(f"/api/v1/manifests/{manifest_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def diff_manifest(
+        self, manifest_id: str,
+    ) -> ManifestDiffResponse:
+        """Get a diff between this manifest and its predecessor (parent).
+
+        Returns:
+            An envelope ``{"diff": <ManifestDiff | None>}``. The structural diff
+            lives under the ``"diff"`` key (with ``changed_surfaces`` and
+            ``summary``); ``diff`` is ``None`` with a ``"message"`` when there is
+            no parent to compare against, and ``None`` with
+            ``"verdict": "self_comparison"`` on a self-diff. Read
+            ``result["diff"]["changed_surfaces"]``, not ``result[...]`` directly.
+        """
+        resp = self._http.get(f"/api/v1/manifests/{manifest_id}/diff")
+        _raise_for_status(resp)
+        return cast(ManifestDiffResponse, resp.json())
+
+    # ── Regression Check ─────────────────────────────────────────
+
+    def run_regression_check(
+        self,
+        agent_name: str,
+        candidate_manifest_id: str,
+        pr_context: Optional[Dict[str, Any]] = None,
+        trace_window_days: int = 30,
+        dry_run: bool = False,
+        source: Optional[str] = None,
+    ) -> RegressionCheckResponse:
+        """Run a manifest impact analysis for a candidate manifest.
+
+        The backend computes the structural diff vs the agent's baseline
+        manifest and returns a severity-classified impact report (which
+        historical traces will break, may behave differently, or are
+        unaffected).
+
+        Args:
+            agent_name: Agent name (matches the value passed to decimalai.init()).
+            candidate_manifest_id: Manifest ID returned by flush_manifest_for_ci().
+            pr_context: Optional PR metadata dict (repo, pr_number, branch,
+                commit_sha). Persisted with the regression check for traceability.
+            trace_window_days: How far back to look for affected traces.
+
+        Returns:
+            Impact report dict with verdict, severity counts, and per-surface
+            impact entries. See `_serialize_regression_check` in the backend
+            for the full schema.
+        """
+        payload: Dict[str, Any] = {
+            "agent_name": agent_name,
+            "candidate_manifest_id": candidate_manifest_id,
+            "trace_window_days": trace_window_days,
+        }
+        if pr_context:
+            payload["pr_context"] = pr_context
+        # 048: explicit source attribution. The CLI passes source="cli";
+        # direct SDK callers can override, otherwise the backend defaults
+        # to "api" (or "github_action" when pr_context is set).
+        if source is not None:
+            payload["source"] = source
+
+        params: Dict[str, Any] = {}
+        if dry_run:
+            params["dry_run"] = "true"
+
+        resp = self._http.post("/api/v1/regression-check", json=payload, params=params)
+        _raise_for_status(resp)
+        return cast(RegressionCheckResponse, resp.json())
+
+    def get_regression_check(self, regression_check_id: str) -> RegressionCheckResponse:
+        """Fetch a previously-run regression check by ID."""
+        resp = self._http.get(f"/api/v1/regression-check/{regression_check_id}")
+        _raise_for_status(resp)
+        return cast(RegressionCheckResponse, resp.json())
+
+    def list_regression_checks(
+        self,
+        agent_name: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> RegressionCheckListResponse:
+        """List regression checks for an agent, most recent first."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/regression-check", params=params)
+        _raise_for_status(resp)
+        return cast(RegressionCheckListResponse, resp.json())
+
+    # ── Eval Scores ──────────────────────────────────────────────
+
+    def push_eval_scores(
+        self,
+        trace_id: str | UUID,
+        source: str,
+        scores: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Push external evaluation scores to a trace.
+
+        Args:
+            trace_id: The trace to attach scores to.
+            source: Origin of the scores (e.g., "deepeval", "langsmith", "custom").
+            scores: List of score dicts, each with at least "name" and "score".
+                    Optional fields: "passed", "reason", "category".
+            metadata: Optional source-specific metadata (e.g., a ``source_label``
+                display name, run_id, metric version). Forwarded to the backend
+                ``metadata`` field, which reads ``source_label`` to override the
+                source's display name.
+
+        Returns:
+            Ingestion response with stored score count.
+
+        Example::
+
+            client.push_eval_scores(
+                trace_id="abc123",
+                source="deepeval",
+                scores=[
+                    {"name": "correctness", "score": 0.92, "reason": "Accurate"},
+                    {"name": "faithfulness", "score": 0.85},
+                ],
+            )
+        """
+        payload: Dict[str, Any] = {"source": source, "scores": scores}
+        if metadata:
+            payload["metadata"] = metadata
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/traces/{trace_id}/eval-scores", json=payload,
+        )
+        logger.debug("Pushed %d eval scores to trace %s", len(scores), str(trace_id)[:8])
+        return resp.json()
+
+    def register_evals(
+        self,
+        evals: List[Any],
+        agent_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Register SDK-defined @eval functions with the platform.
+
+        Tells the backend "these named evaluators exist in user code" so the
+        UI can surface them in the evaluator list before any scores arrive.
+        Idempotent — safe to call repeatedly. Fail-open: returns an empty
+        result on transport errors instead of raising.
+
+        Args:
+            evals: List of DecimalEval (or compatible) instances. Each must
+                expose ``to_registration_dict(agent_name=...)``.
+            agent_name: Optional agent scope. If None, the registration is
+                org-wide (visible across all agents).
+
+        Returns:
+            The backend's registration response, or {"registered": [], "total": 0}
+            on failure.
+        """
+        items = []
+        for ev in evals:
+            try:
+                items.append(ev.to_registration_dict(agent_name=agent_name))
+            except AttributeError:
+                logger.debug(
+                    "register_evals: skipping %r — no to_registration_dict()",
+                    ev,
+                )
+
+        if not items:
+            return {"registered": [], "total": 0}
+
+        try:
+            resp = self._request_with_retry(
+                "POST",
+                "/api/v1/evaluators/register",
+                json={"evaluators": items},
+            )
+            logger.debug(
+                "Registered %d SDK evaluator(s) with platform", len(items),
+            )
+            return resp.json()
+        except Exception as e:
+            logger.warning(
+                "register_evals failed (%s: %s) — evals will still emit "
+                "scores but may not appear in UI until first trace lands",
+                type(e).__name__,
+                e,
+            )
+            return {"registered": [], "total": 0}
+
+    # ── Evaluator config (deterministic + LLM judge templates) ──
+
+    def list_evaluators(
+        self,
+        agent_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List configured evaluators (server-managed) for an agent or workspace.
+
+        Args:
+            agent_name: If provided, list only evaluators attached to this agent.
+
+        Returns:
+            ``{"evaluators": [...]}`` — each entry has id, name, eval_type,
+            category, enabled, etc.
+        """
+        params: Dict[str, Any] = {}
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/evaluators", params=params)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def list_evaluator_templates(self) -> Dict[str, Any]:
+        """List available evaluator templates (pre-built deterministic / LLM judges).
+
+        Returns:
+            ``{"templates": [...], "categories": {...}}``.
+        """
+        resp = self._http.get("/api/v1/evaluators/templates")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def add_evaluator(
+        self,
+        *,
+        agent_name: Optional[str] = None,
+        template_id: Optional[str] = None,
+        name: Optional[str] = None,
+        eval_type: Optional[str] = None,
+        category: Optional[str] = None,
+        prompt_template: Optional[str] = None,
+        threshold: Optional[float] = None,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Configure a new evaluator for an agent (or workspace-wide).
+
+        Two modes:
+
+        - **Template-based** — pass ``template_id`` (e.g. ``"skill_output_check"``
+          or ``"helpfulness_judge"``) to instantiate a pre-built evaluator.
+        - **Custom** — pass ``name``, ``eval_type`` (``"deterministic"`` |
+          ``"llm_judge"``), and for LLM judges, a ``prompt_template`` containing
+          ``{input}`` / ``{output}`` placeholders.
+
+        Args:
+            agent_name: Agent to attach this evaluator to. Omit for workspace-wide.
+            template_id: Pre-built template ID — overrides custom fields.
+            name: Evaluator name (required if no template_id).
+            eval_type: ``"deterministic"`` or ``"llm_judge"``.
+            category: ``"quality"``, ``"safety"``, ``"rag"``, ``"agentic"``, ``"custom"``.
+            prompt_template: Rubric prompt for LLM judges.
+            threshold: Pass threshold (default 0.5).
+            display_name: Human-readable name shown in the dashboard.
+            description: One-line explanation of what this evaluator checks.
+        """
+        payload: Dict[str, Any] = {}
+        if agent_name:
+            payload["agent_name"] = agent_name
+        if template_id:
+            payload["template_id"] = template_id
+        if name:
+            payload["name"] = name
+        if eval_type:
+            payload["eval_type"] = eval_type
+        if category:
+            payload["category"] = category
+        if prompt_template:
+            payload["prompt_template"] = prompt_template
+        if threshold is not None:
+            payload["threshold"] = threshold
+        if display_name:
+            payload["display_name"] = display_name
+        if description:
+            payload["description"] = description
+
+        resp = self._request_with_retry("POST", "/api/v1/evaluators", json=payload)
+        return resp.json()
+
+    def remove_evaluator(self, evaluator_id: str) -> Dict[str, Any]:
+        """Remove an evaluator by id."""
+        resp = self._http.delete(f"/api/v1/evaluators/{evaluator_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_eval_scores(self, trace_id: str | UUID) -> Dict[str, Any]:
+        """Get all evaluation scores (quality + compatibility) for a trace.
+
+        Returns:
+            Dict with quality_scores, compatibility_scores, and aggregates.
+        """
+        resp = self._http.get(f"/api/v1/traces/{trace_id}/eval-scores")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_eval_breakdown(self, trace_id: str | UUID) -> Dict[str, Any]:
+        """Get the full eval breakdown with provenance for a trace.
+
+        Returns scores grouped by source (Manifest Diff, DeepEval, LangSmith,
+        Custom, etc.) with icons, labels, badge colors, and decision reasons
+        explaining how the final verdict was computed.
+
+        Returns:
+            Dict with eval_verdict, quality_avg, compat_avg, source_groups,
+            and decision_reasons.
+
+        Example::
+
+            breakdown = client.get_eval_breakdown("trace-123")
+            print(breakdown["eval_verdict"])  # "keep" / "drop" / ...
+            for group in breakdown["source_groups"]:
+                print(f"{group['source_label']}: {group['source_avg']}")
+                for score in group["scores"]:
+                    print(f"  {score['name']}: {score['score']}")
+        """
+        resp = self._http.get(f"/api/v1/traces/{trace_id}/eval-breakdown")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_decision(self, trace_id: str | UUID) -> Dict[str, Any]:
+        """Compute and get the unified verdict for a trace.
+
+        Returns:
+            Dict with verdict (keep/repair/replay/drop), quality_avg,
+            compat_avg, and per-score breakdowns.
+        """
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/traces/{trace_id}/decision",
+        )
+        return resp.json()
+
+    def batch_decision(
+        self,
+        trace_ids: Optional[List[str]] = None,
+        manifest_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Batch compute unified verdicts for multiple traces.
+
+        Args:
+            trace_ids: Specific trace IDs to score.
+            manifest_id: Score all traces from this manifest (alternative to trace_ids).
+
+        Returns:
+            Dict with decisions list, total count, and verdict_counts breakdown.
+        """
+        payload: Dict[str, Any] = {}
+        if trace_ids:
+            payload["trace_ids"] = trace_ids
+        if manifest_id:
+            payload["manifest_id"] = manifest_id
+
+        resp = self._request_with_retry(
+            "POST", "/api/v1/traces/batch-decision", json=payload,
+        )
+        return resp.json()
+
+    def get_eval_stats(
+        self,
+        agent_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get aggregate evaluation statistics.
+
+        Returns:
+            Dict with total_evaluated, pass_rate, verdict_breakdown, avg_quality.
+        """
+        params: Dict[str, Any] = {}
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/traces/eval/stats", params=params)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def annotate_trace(
+        self,
+        trace_id: str | UUID,
+        notes: Optional[str] = None,
+        *,
+        label: Optional[str] = None,
+        rating: Optional[int] = None,
+        correctness: Optional[str] = None,
+        error_categories: Optional[List[str]] = None,
+        corrected_output: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        score: Optional[float] = None,
+        flagged_for_review: Optional[bool] = None,
+        add_to_dataset: Optional[bool] = None,
+        text: Optional[str] = None,
+        annotation_type: Optional[str] = None,
+        span_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a human annotation to a trace.
+
+        Mirrors the backend ``CreateAnnotationRequest``. Annotations are
+        trace-scoped. Provide at least one of: ``label``
+        (``thumbs_up``/``thumbs_down``/``needs_correction``), ``rating`` (1-5),
+        ``correctness`` (``correct``/``partial``/``incorrect``),
+        ``error_categories``, ``corrected_output``, ``tags``, ``notes``, or
+        ``score`` (0..1). ``flagged_for_review`` and ``add_to_dataset`` are
+        side-flags that don't count as content on their own.
+
+        Args:
+            trace_id: The trace to annotate.
+            notes: Free-text note (the old ``text`` argument maps here).
+            label, rating, correctness, error_categories, corrected_output,
+            tags, score, flagged_for_review, add_to_dataset: see above.
+
+        Returns:
+            The created annotation (id, timestamp, and the fields you set).
+        """
+        # Back-compat: the old signature was annotate_trace(trace_id, text, ...).
+        if text is not None and notes is None:
+            notes = text
+        # annotation_type/span_id were never accepted by the backend (the
+        # endpoint 422'd on them via extra="forbid"); accept-and-ignore for one
+        # release so old call sites don't TypeError, but warn.
+        if annotation_type is not None or span_id is not None:
+            import warnings
+
+            warnings.warn(
+                "annotate_trace(): 'annotation_type' and 'span_id' are no longer "
+                "supported (annotations are trace-scoped) and are ignored; they "
+                "will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        candidates: Dict[str, Any] = {
+            "label": label,
+            "rating": rating,
+            "correctness": correctness,
+            "error_categories": error_categories,
+            "corrected_output": corrected_output,
+            "tags": tags,
+            "notes": notes,
+            "score": score,
+            "flagged_for_review": flagged_for_review,
+            "add_to_dataset": add_to_dataset,
+        }
+        payload: Dict[str, Any] = {k: v for k, v in candidates.items() if v is not None}
+        # The backend requires at least one substantive field (the two flags
+        # don't count); fail locally with a clear error instead of a 422.
+        _substantive = {
+            "label", "rating", "correctness", "error_categories",
+            "corrected_output", "tags", "notes", "score",
+        }
+        if not (_substantive & payload.keys()):
+            raise ValueError(
+                "annotate_trace() needs at least one of: label, rating, "
+                "correctness, error_categories, corrected_output, tags, notes, score."
+            )
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/traces/{trace_id}/annotations", json=payload,
+        )
+        logger.debug("Annotated trace %s", str(trace_id)[:8])
+        return resp.json()
+
+    # ── Datasets ──────────────────────────────────────────────
+
+    def list_datasets(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List all datasets in the workspace."""
+        resp = self._http.get(
+            "/api/v1/datasets", params={"limit": limit, "offset": offset}
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_dataset(
+        self, dataset_id: str,
+    ) -> Dict[str, Any]:
+        """Get a dataset with its version history."""
+        resp = self._http.get(f"/api/v1/datasets/{dataset_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def resolve_version_id(
+        self,
+        dataset_id: str,
+        version: Optional[str] = None,
+    ) -> str:
+        """Resolve a version specifier to a concrete version ID.
+
+        Supports:
+            - ``None`` or ``"latest"`` → resolves to the current (latest) version
+            - ``"v3"`` or ``"3"`` → resolves by version number
+            - A full version UUID → returned as-is
+
+        Args:
+            dataset_id: The dataset to look up.
+            version: Version specifier (None, "latest", "v3", "3", or UUID).
+
+        Returns:
+            The resolved version ID string.
+
+        Raises:
+            ValueError: If the version specifier cannot be resolved.
+        """
+        # Full UUID — return as-is. Parse strictly so human-friendly labels
+        # that merely look UUID-ish (e.g. "release-1", "prod-2026") fall
+        # through to the "vN"/number resolution path instead of being sent to
+        # the backend verbatim (which would 404 opaquely).
+        if version:
+            try:
+                UUID(version)
+                return version
+            except (ValueError, AttributeError):
+                pass
+
+        ds = self.get_dataset(dataset_id)
+
+        # Latest / default
+        if not version or version.lower() == "latest":
+            current = ds.get("current_version_id")
+            if current:
+                return current
+            # Fallback: pick the highest version_number from versions list
+            versions = ds.get("versions", [])
+            if not versions:
+                raise ValueError(
+                    f"Dataset {dataset_id} has no versions. "
+                    f"Build one first with client.build_dataset()."
+                )
+            latest = max(versions, key=lambda v: v.get("version_number", 0))
+            return latest["id"]
+
+        # Version number: "v3" or "3"
+        version_num_str = version.lstrip("vV")
+        try:
+            version_num = int(version_num_str)
+        except ValueError:
+            raise ValueError(
+                f"Unrecognized version specifier: '{version}'. "
+                f"Use 'latest', 'v3', '3', or a full version UUID."
+            )
+
+        versions = ds.get("versions", [])
+        for v in versions:
+            if v.get("version_number") == version_num:
+                return v["id"]
+
+        available = sorted(v.get("version_number", 0) for v in versions)
+        raise ValueError(
+            f"Version v{version_num} not found for dataset {dataset_id}. "
+            f"Available versions: {', '.join(f'v{n}' for n in available)}"
+        )
+
+    def build_dataset(
+        self,
+        dataset_id: str,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build a new dataset version from traces.
+
+        Args:
+            dataset_id: The dataset to build.
+            filters: Optional trace filters (eval_verdict, agent_name, etc.).
+
+        Returns:
+            Build result with version_id and row_count.
+        """
+        payload: Dict[str, Any] = {}
+        if filters:
+            payload["filters"] = filters
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/datasets/{dataset_id}/build", json=payload,
+        )
+        logger.debug("Built dataset %s", dataset_id[:8])
+        return resp.json()
+
+    def export_dataset(
+        self,
+        dataset_id: str,
+        version_id: Optional[str] = None,
+        format: str = "jsonl",
+    ) -> Any:
+        """Export a dataset version in a training-ready format.
+
+        Args:
+            dataset_id: The dataset to export.
+            version_id: The version to export. Accepts ``None``/``"latest"``
+                for the most recent version, ``"v3"`` for version 3, or a
+                full version UUID. Defaults to the latest version.
+            format: Export format: ``"jsonl"`` (default) or ``"parquet"``.
+
+        Returns:
+            For JSONL: the response content as a string (newline-delimited JSON).
+            For Parquet: raw bytes of the Parquet file.
+            For other formats: parsed JSON response.
+        """
+        resolved = self.resolve_version_id(dataset_id, version_id)
+        resp = self._http.get(
+            f"/api/v1/datasets/{dataset_id}/versions/{resolved}/export",
+            params={"format": format},
+        )
+        _raise_for_status(resp)
+
+        content_type = resp.headers.get("content-type", "")
+        if "octet-stream" in content_type:
+            return resp.content  # raw bytes (Parquet)
+        if "jsonl" in content_type or "ndjson" in content_type:
+            return resp.text  # JSONL string
+        return resp.text  # default to text for JSONL
+
+    def pull_dataset(
+        self,
+        dataset_id: str,
+        path: str,
+        *,
+        version: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Download a dataset version to a local file.
+
+        This is the high-level convenience method for getting training data
+        onto disk. It resolves the version, downloads in the requested format,
+        and writes to the specified path.
+
+        Args:
+            dataset_id: The dataset to download.
+            path: Local file path to write to (e.g., ``"./data.jsonl"``).
+                  Parent directories are created automatically.
+            version: Version specifier: ``None``/``"latest"`` for the most
+                     recent version, ``"v3"`` for version 3, or a full UUID.
+            format: Export format: ``"jsonl"`` (default) or ``"parquet"``.
+                    If not specified, inferred from the file extension.
+
+        Returns:
+            Summary dict with ``row_count``, ``file_path``, ``bytes_written``,
+            ``format``, ``version_id``, and ``dataset_id``.
+
+        Example::
+
+            client = DecimalAIClient(api_key="dai_sk_...")
+
+            # Pull the latest version as JSONL
+            result = client.pull_dataset("ds_abc123", "./training_data.jsonl")
+
+            # Pull a specific version as Parquet
+            result = client.pull_dataset(
+                "ds_abc123", "./data.parquet", version="v2"
+            )
+        """
+        # Infer format from file extension if not specified
+        if format is None:
+            if path.endswith(".parquet") or path.endswith(".pq"):
+                format = "parquet"
+            else:
+                format = "jsonl"
+
+        # Resolve version
+        resolved_version = self.resolve_version_id(dataset_id, version)
+
+        # Download
+        data = self.export_dataset(dataset_id, resolved_version, format=format)
+
+        # Write to disk
+        if format == "parquet":
+            from .export.parquet import write_parquet
+            result = write_parquet(data, path)
+        else:
+            from .export.jsonl import write_jsonl
+            result = write_jsonl(data, path)
+
+        result["version_id"] = resolved_version
+        result["dataset_id"] = dataset_id
+        return result
+
+    # ── Replay ────────────────────────────────────────────────
+
+    def create_replay_batch(
+        self,
+        source_manifest_id: str,
+        target_manifest_id: str,
+        trace_ids: List[str],
+    ) -> Dict[str, Any]:
+        """Create a replay batch from traces.
+
+        Args:
+            source_manifest_id: Manifest the traces were recorded against.
+            target_manifest_id: New manifest version to replay against.
+            trace_ids: List of trace IDs to include in the batch.
+
+        Returns:
+            Batch details including batch_id, status, and task count.
+        """
+        payload = {
+            "source_manifest_id": source_manifest_id,
+            "target_manifest_id": target_manifest_id,
+            "trace_ids": trace_ids,
+        }
+        resp = self._request_with_retry("POST", "/api/v1/replay/batches", json=payload)
+        logger.debug("Created replay batch with %d traces", len(trace_ids))
+        return resp.json()
+
+    def get_replay_batch(self, batch_id: str) -> Dict[str, Any]:
+        """Get a replay batch with task details.
+
+        Returns:
+            Batch details including status, progress, and task list.
+        """
+        resp = self._http.get(f"/api/v1/replay/batches/{batch_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def list_replay_batches(self, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+        """List replay batches.
+
+        Returns:
+            Dict with batches list and total count.
+        """
+        resp = self._http.get("/api/v1/replay/batches", params={"limit": limit, "offset": offset})
+        _raise_for_status(resp)
+        return resp.json()
+
+    def submit_replay_result(
+        self,
+        task_id: str,
+        replayed_trace_id: Optional[str] = None,
+        eval_score: Optional[float] = None,
+        eval_verdict: Optional[str] = None,
+        status: str = "completed",
+    ) -> Dict[str, Any]:
+        """Submit the result of a replay task.
+
+        Args:
+            task_id: The replay task ID.
+            replayed_trace_id: ID of the new trace from the replay.
+            eval_score: Optional quality score (0.0 to 1.0).
+            eval_verdict: Optional verdict (pass/fail).
+            status: Task status (completed/failed/skipped).
+
+        Returns:
+            Updated task details.
+        """
+        payload: Dict[str, Any] = {"status": status}
+        if replayed_trace_id:
+            payload["replayed_trace_id"] = replayed_trace_id
+        if eval_score is not None:
+            payload["eval_score"] = eval_score
+        if eval_verdict is not None:
+            payload["eval_verdict"] = eval_verdict
+
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/replay/tasks/{task_id}/submit", json=payload,
+        )
+        logger.debug("Submitted replay result for task %s", task_id[:8])
+        return resp.json()
+
+    def get_replay_prompts(
+        self,
+        agent_name: str,
+        verdict: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Get stale prompts that need to be replayed.
+
+        Downloads prompts from traces classified as needing replay
+        based on the compatibility report. Users should re-run these
+        prompts through their agent and submit the results back.
+
+        Args:
+            agent_name: Agent name to get replay prompts for.
+            verdict: Filter by verdict (replay, drop, repair).
+                     Defaults to replay + drop.
+            limit: Maximum number of prompts (default 500, max 5000).
+
+        Returns:
+            Dict with agent_name, total count, and prompts list.
+            Each prompt has: trace_id, user_input, original_output,
+            verdict, agent_name, manifest_id, created_at.
+        """
+        params: Dict[str, Any] = {
+            "agent_name": agent_name,
+            "format": "json",
+            "limit": limit,
+        }
+        if verdict:
+            params["verdict"] = verdict
+
+        resp = self._http.get("/api/v1/replay/export", params=params)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_replay_task(self, task_id: str) -> Dict[str, Any]:
+        """Get a single replay task with its input for execution.
+
+        Args:
+            task_id: The replay task ID.
+
+        Returns:
+            Task details including task_input and replayability.
+        """
+        resp = self._http.get(f"/api/v1/replay/tasks/{task_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def link_replay(
+        self,
+        original_trace_id: str,
+        replayed_trace_id: str,
+    ) -> Dict[str, Any]:
+        """Link a replayed trace to its original and auto-score.
+
+        Creates a replay task connecting the two traces without requiring
+        an explicit batch. The backend auto-scores the comparison.
+
+        Args:
+            original_trace_id: ID of the original trace.
+            replayed_trace_id: ID of the replayed trace.
+
+        Returns:
+            Dict with task_id, eval_score, eval_verdict, batch_id.
+        """
+        payload = {
+            "original_trace_id": original_trace_id,
+            "replayed_trace_id": replayed_trace_id,
+        }
+        resp = self._request_with_retry("POST", "/api/v1/replay/link", json=payload)
+        logger.debug(
+            "Linked replay: %s → %s",
+            original_trace_id[:8], replayed_trace_id[:8],
+        )
+        return resp.json()
+
+    def get_replay_sessions(
+        self,
+        agent_name: str,
+        verdict: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Get session-grouped replay prompts for multi-turn replay.
+
+        Groups replay-eligible traces by session_id and includes all
+        turns in each session (including context-only turns) in
+        chronological order.
+
+        Args:
+            agent_name: Agent name to get replay sessions for.
+            verdict: Filter trigger turns by verdict.
+            limit: Maximum number of sessions (default 50, max 500).
+
+        Returns:
+            Dict with agent_name, total, and sessions list.
+            Each session has: session_id, turns[], verdict, agent_name.
+        """
+        params: Dict[str, Any] = {
+            "agent_name": agent_name,
+            "format": "json",
+            "limit": limit,
+        }
+        if verdict:
+            params["verdict"] = verdict
+
+        resp = self._http.get("/api/v1/replay/export/sessions", params=params)
+        _raise_for_status(resp)
+        return resp.json()
+
+
+    # ── Compatibility ──────────────────────────────────────────
+
+    def compat_check(
+        self,
+        agent_name: str,
+        recompute: bool = False,
+    ) -> Dict[str, Any]:
+        """Check training data compatibility for an agent's latest manifest transition.
+
+        Compares the two most recent manifests and returns how many traces
+        are affected (keep/repair/replay/drop). If a cached report exists
+        it is returned; pass ``recompute=True`` to force fresh analysis.
+
+        Args:
+            agent_name: Agent to check compatibility for.
+            recompute: Force a fresh analysis (ignore cached report).
+
+        Returns:
+            Dict with status, version info, verdict counts, and component impact.
+            If the agent has fewer than 2 manifests, returns status="no_transition".
+
+        Example::
+
+            result = client.compat_check("my-agent")
+            if result["status"] == "ok":
+                print(f"Keep: {result['keep']}, Repair: {result['repair']}")
+                print(f"Replay: {result['replay']}, Drop: {result['drop']}")
+            else:
+                print(result["message"])
+        """
+        params: Dict[str, Any] = {}
+        if recompute:
+            params["recompute"] = True
+        resp = self._http.get(
+            f"/api/v1/agents/{agent_name}/compat-summary", params=params
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def impact_report(
+        self,
+        agent_name: str,
+        manifest_id: Optional[str] = None,
+        baseline_manifest_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Aggregate Impact Report for an agent's manifest transition.
+
+        One call returns everything the dashboard's Impact Report shows:
+        ``surface_changes`` (the manifest diff with per-change severity and
+        sample trace IDs), ``affected_trace_count`` (the canonical "N traces
+        affected" number), ``compat_summary`` (keep/repair/replay/drop),
+        ``severity`` + ``severity_reason``, and ``human_summary``.
+
+        Defaults to the agent's latest transition (newest manifest vs its
+        parent); pass ``manifest_id`` and/or ``baseline_manifest_id`` to pin
+        either side of the comparison.
+
+        Args:
+            agent_name: Agent to report on.
+            manifest_id: Candidate manifest (default: newest).
+            baseline_manifest_id: Baseline manifest (default: candidate's parent).
+
+        Returns:
+            Dict with status ("ok" / "no_transition"), surface_changes,
+            affected_trace_count, compat_summary, severity, human_summary.
+
+        Example::
+
+            report = client.impact_report("my-agent")
+            if report["status"] == "ok":
+                print(report["human_summary"])
+                print(f"{report['affected_trace_count']} traces affected")
+        """
+        params: Dict[str, Any] = {}
+        if manifest_id:
+            params["manifest_id"] = manifest_id
+        if baseline_manifest_id:
+            params["baseline_manifest_id"] = baseline_manifest_id
+        resp = self._http.get(
+            f"/api/v1/agents/{agent_name}/impact-report", params=params
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    # ── Repair ────────────────────────────────────────────────────
+    # Closes the detect→impact→REPAIR→export loop without the dashboard.
+
+    def repair_preview(
+        self, old_manifest_id: str, new_manifest_id: str, sample_size: int = 5
+    ) -> Dict[str, Any]:
+        """Preview mechanical repair rules for an old→new manifest transition.
+
+        Returns ``{"rules": [...], "previews": [...], "total_eligible": int}``,
+        or ``{"rules": [], "previews": [], "message"/"error": ...}`` when there
+        is nothing to repair / a manifest is not found. Each rule in ``rules`` is
+        positionally indexed; pass those 0-based indices to
+        ``repair_apply(..., approved_rule_indices=...)`` to apply a subset.
+        ``sample_size`` must be 1..50 (server-enforced).
+        """
+        payload: Dict[str, Any] = {
+            "old_manifest_id": old_manifest_id,
+            "new_manifest_id": new_manifest_id,
+            "sample_size": sample_size,
+        }
+        resp = self._http.post("/api/v1/repair/preview", json=payload)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def repair_apply(
+        self,
+        old_manifest_id: str,
+        new_manifest_id: str,
+        approved_rule_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Apply repairs for an old→new manifest transition.
+
+        With ``approved_rule_indices=None`` applies ALL eligible rules
+        (``POST /repair/apply`` → ``{batch_id, status, total_episodes,
+        repaired_count, failed_count}``). With a non-empty list applies only
+        those rules (``POST /repair/apply-selective`` → ``{batch_id, status,
+        total_episodes, repaired_count, rules_applied}``). The indices are
+        0-based positions into the ``rules`` array returned by
+        :meth:`repair_preview`.
+        """
+        if approved_rule_indices:
+            payload: Dict[str, Any] = {
+                "old_manifest_id": old_manifest_id,
+                "new_manifest_id": new_manifest_id,
+                "approved_rule_indices": approved_rule_indices,
+            }
+            resp = self._http.post("/api/v1/repair/apply-selective", json=payload)
+        else:
+            payload = {
+                "old_manifest_id": old_manifest_id,
+                "new_manifest_id": new_manifest_id,
+            }
+            resp = self._http.post("/api/v1/repair/apply", json=payload)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_repair_batch(self, batch_id: str) -> Dict[str, Any]:
+        """Fetch a repair batch's status + per-trace results (GET /repair/{id})."""
+        resp = self._http.get(f"/api/v1/repair/{batch_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_dataset_examples(
+        self, dataset_id: str, version_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get the materialized examples of a dataset version.
+
+        Args:
+            dataset_id: The dataset to read.
+            version_id: The version to read. Accepts ``None``/``"latest"`` for
+                the most recent version, ``"v3"`` for version 3, or a full
+                version UUID. Defaults to the latest version.
+
+        Returns:
+            ``{"dataset_id", "version_id", "count", "examples": [...]}`` where
+            each example is the per-row JSON from the export (typically
+            ``{"messages": [...], ...}``).
+
+        Notes:
+            There is no dedicated ``/examples`` endpoint on the backend —
+            example rows are served by the version ``export`` route
+            (``GET /api/v1/datasets/{id}/versions/{vid}/export``) as JSONL.
+            This method resolves the version, pulls that JSONL, and parses it
+            into a list so callers get structured rows without a 404.
+        """
+        resolved = self.resolve_version_id(dataset_id, version_id)
+        resp = self._http.get(
+            f"/api/v1/datasets/{dataset_id}/versions/{resolved}/export",
+            params={"format": "jsonl"},
+        )
+        _raise_for_status(resp)
+        examples = [
+            json.loads(line) for line in resp.text.splitlines() if line.strip()
+        ]
+        return {
+            "dataset_id": dataset_id,
+            "version_id": resolved,
+            "count": len(examples),
+            "examples": examples,
+        }
+
+    # ── Lifecycle ──────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Flush remaining traces and close the HTTP client."""
+        self.flush()
+        self._http.close()
+
+    def __enter__(self) -> "DecimalAIClient":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()

@@ -1,0 +1,195 @@
+# The notebook's single source of truth. It hardcodes ZERO numbers and exactly
+# one URL — the raw link to this file — so repairing rot is a one-line edit here
+# on `main`, picked up by every already-open Colab tab on its next run. Editing
+# .ipynb JSON to correct a stale figure is how the previous generation of demo
+# notebooks decayed.
+#
+# WHY A DEMO SKILL GOES STALE. Registry skills get unpublished, re-benchmarked
+# and re-versioned. Of the eight slugs an earlier docs tutorial named, three now
+# 404 and one fell from a headline number to +4.5 pts. The gates below are
+# checked against the live API by scripts/check_notebook_manifest.py on a daily
+# cron, so a skill that drifts out of range files an issue instead of silently
+# becoming a bad first impression.
+
+demo_skill:
+  slug: flsa-exemption-test
+
+  # IDENTITY PINS, not just existence. A slug that still resolves is not the
+  # same as the skill you meant: `crisis-response-protocol` returns HTTP 200
+  # today and is now a suicide-prevention import from a medical-skills repo. An
+  # existence check goes green on that. These two fields are what make the
+  # check mean something.
+  author_display_name: ashenpivot
+  source_type: platform
+
+  # Pinned so cell 0.7 prints the body that was MEASURED, not whatever is
+  # latest. `_sync_eval_yaml` can rewrite a suite in place without minting a new
+  # version, so "latest" and "what the number was measured on" drift apart.
+  version: 1
+
+  # THE CASE WHERE OUR OWN SKILL LOSES. Deliberately.
+  #
+  # case-22 is a computer systems analyst paid $32.00/hour. Expected YES/none —
+  # 29 CFR 541.400(b) exempts an hourly computer employee at or above $27.63/hr,
+  # and the prompt invokes that exemption by name. The BARE model gets it right.
+  # The skill answers NO/salary_basis and is graded `fail_kept`. Our benchmark
+  # catches our own skill making an answer worse.
+  #
+  # Why not the flip that flatters us. The obvious pick was case-01 — a software
+  # specialist at $80/hour where the skill flips YES to NO and the delta looks
+  # decisive. But case-01 is the SAME fact pattern as case-22: an hourly computer
+  # employee far above the $27.63 threshold. If case-22's expected answer is
+  # right, case-01's is wrong, and the "wrong" no-skill answer is the correct
+  # one. The suite contradicts itself, and a notebook whose entire thesis is
+  # "check our work" cannot lead with the case where our work does not survive
+  # being checked. Discovered 2026-08-10 while building Tier 1.
+  #
+  # This is the stronger cell anyway. "Here is a case where the skill we are
+  # selling makes the answer worse, and our own benchmark says so" is a claim no
+  # competitor can copy, and it costs one case out of twenty-three.
+  demo_case: case-22
+
+  # The contested one, kept ONLY so the notebook can show the contradiction and
+  # so nobody re-promotes it to demo_case without reading the above.
+  contested_case: case-01
+
+gates:
+  # Every one of these is asserted live before the notebook renders a claim.
+  # If any fails, the notebook falls through to `fallback_slug` and SAYS SO
+  # rather than printing a number it cannot stand behind.
+  min_delta_pts: 20
+  min_cases: 20
+  require_grading_method: judged
+
+  # The load-bearing one, and the newest. Since the case-binding guard shipped,
+  # a run whose per-case bindings cannot be proven serves `case_prompt: null`.
+  # 47% of platform-authored measured skills are in that state, so "has a great
+  # lift" is no longer sufficient — the notebook must confirm it can actually
+  # SHOW the evidence before it builds a cell around it.
+  require_all_prompts_served: true
+
+# A warm spare, gate-checked on the same cron so it is known-good on the day it
+# is needed rather than discovered broken at that moment. Verified live
+# 2026-08-10: +30.43 pts, 23 cases, judged, source_type platform.
+# Pinned by identity for the same reason the demo skill is: falling through to a
+# slug that still resolves but is now something else is worse than falling over.
+fallback_slug: boundary-value-enumeration
+fallback_author_display_name: alderping
+fallback_source_type: platform
+
+# HONESTY BUDGET — figures the notebook is allowed to quote about the registry
+# ITSELF (cell 0.6). Recomputed by the cron, because a number about how much
+# evidence we withhold is exactly the number that must not go stale.
+registry_disclosure:
+  measured_public_skills: 1429
+  graded_cases: 30506
+  cases_withheld_pct: 12.6
+  platform_cases_withheld_pct: 56.6
+  github_import_cases_withheld_pct: 0.7
+  as_of: "2026-08-10"
+
+  # How far these may drift before the cron calls it. The two counts are
+  # recomputed EXACTLY from the listing and only ever grow, so their tolerance is
+  # a percentage of themselves.
+  #
+  # The three withheld percentages are ESTIMATED from a per-source sample: the
+  # only place a withheld prompt is visible is the ~50KB per-skill /benchmark
+  # payload, there are ~1,400 of them, and the edge limiter is a small bucket
+  # with a slow refill. So the checker adds that sample's own jackknife 95%
+  # margin on top of `withheld_drift_pts` before it fails — sampling noise
+  # reported as drift would train us to ignore this job, which is how three
+  # slugs reached 404.
+  #
+  # BE HONEST ABOUT WHAT THAT BUYS. Withholding is near all-or-nothing within a
+  # run, so 25 skills of the ~57%-withheld platform arm carry a margin around
+  # ±13 pts. The daily job therefore catches a REGIME change (a backfill lands,
+  # a case-binding regression ships) and not a 56.6 → 60 slide. To refresh these
+  # numbers exactly, run the checker with `--disclosure --disclosure-full` (or
+  # the workflow's `full_disclosure` input), which censuses every measured skill.
+  tolerance:
+    counts_drift_pct: 15
+    withheld_drift_pts: 3
+    disclosure_sample_per_source: 25
+    as_of_max_age_days: 45
+
+# ── TIER 2 (route_and_trace.ipynb) ────────────────────────────────────────────
+# Tier 2 reads `demo_skill` above for its target and everything below for its
+# staging. Kept in the same file for the same reason as everything else here: a
+# figure that goes stale is a one-line YAML edit, not notebook surgery.
+#
+# Tier 2 is written to survive this whole block being ABSENT (a Colab tab open
+# against an older `main` gets the embedded copy in the notebook and a printed
+# note). So adding keys here is safe; renaming them is not.
+tier2:
+  # THE LIBRARY THE READER HAS NOT BUILT YET, built for them. Three real
+  # registry skills, pinned by version so cell 2.0 splices the same bytes the
+  # token count is computed from. Chosen so each one fails DIFFERENTLY — that is
+  # the whole argument, and a reader who thinks the set was rigged can swap it
+  # here and re-run:
+  #
+  #   1. the one that matches the question,
+  #   2. one that matches the WORDS in the question and nothing else
+  #      (a $80/hour, 40-hour-week fact pattern reads as tax math),
+  #   3. one that matches nothing about the question and still gets a vote,
+  #      because its contract says "apply whenever you write markdown".
+  #
+  # Order is load-bearing and deliberately UNFAVOURABLE to the point being made:
+  # the relevant skill goes FIRST, the friendliest possible arrangement for the
+  # arm we are criticising.
+  splice_skills:
+    - slug: flsa-exemption-test
+      version: 1
+      why: matches the question
+    - slug: progressive-tax-bracket-math
+      version: 1
+      why: matches the WORDS in the question ($80/hour, 40 hours) and nothing else
+    - slug: markdown-semantic-wrap
+      version: 1
+      why: matches nothing, and still imposes a house output format on every answer
+
+  # How many benchmark cases the re-run lane uses. Eight is ~35% of the suite and
+  # costs about 30 model calls across the three arms — small enough that a reader
+  # on a free key finishes, large enough that one flipped case does not swing the
+  # percentage past belief. The lane is the head of the suite in case order, not
+  # a hand-picked set: picking the cases would be picking the answer.
+  lane_cases: 8
+
+  # How many routed skills get their BODY spliced back in the routed arm. One,
+  # because the argument is "stop paying for the skills you did not need" and
+  # top-1 is the strongest form of that claim. `/skills/route` returns menu ROWS
+  # (name + description) — never a body — so the notebook fetches the body of
+  # what routing chose. Raising this is how you find the point where routing's
+  # savings and its recall trade against each other.
+  route_top_k: 1
+
+  # Stamped on every trace cell 2.4 sends, so a reader can find (and delete) the
+  # rows this notebook created in their workspace.
+  agent_name: notebook-tier2
+
+  # Preference order, first available wins. The notebook LISTS the models the
+  # reader's key can actually reach and picks from this list rather than pinning
+  # one: a hard-pinned model id is the single most reliable way to make a
+  # notebook 404 six months from now, and the free AI Studio tier rotates what it
+  # serves. First entry is what the registry number was measured on, so a reader
+  # whose key reaches it is comparing like with like; anything below it is a
+  # different model and the notebook says so.
+  model_candidates:
+    - gemini-3.6-flash
+    - gemini-3.5-flash
+    - gemini-2.5-flash
+    - gemini-2.0-flash
+
+  # Colab secret names, in the order the notebook tries them. NEVER read with
+  # input(): a key typed into a cell is a key in the browser's history and in the
+  # .ipynb the reader later shares.
+  model_key_secrets: [GOOGLE_API_KEY, GEMINI_API_KEY]
+  decimal_key_secrets: [DECIMAL_API_KEY, DECIMALAI_API_KEY]
+
+  # The server-side budget that decides whether `/skills/route` RANKS or just
+  # returns everything (`llm.routing.desc_token_budget` / `max_menu_rows` in the
+  # backend config). Mirrored here only so cell 2.3 can explain the `full_menu`
+  # strategy it will almost certainly get on a fresh workspace, using the same
+  # numbers the server used. The response also echoes `desc_tokens` / `rows_total`
+  # — the cell prints those, and these are the fallback when it does not.
+  routing_desc_token_budget: 1500
+  routing_max_menu_rows: 30

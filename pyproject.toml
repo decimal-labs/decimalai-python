@@ -1,0 +1,233 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "decimalai"
+version = "0.10.0"
+description = "Open source SDK for manifest-aware agent change management"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Decimal AI"}]
+
+dependencies = [
+    "pydantic>=2.0",
+    "httpx>=0.28.1",
+    "click>=8.0",
+    # Floored at 1.28.0 — the lowest opentelemetry at which the OpenInference
+    # instrumentor stack (the spans this SDK exists to route) actually *works*,
+    # not just co-installs. Below it the floor lane installs but fails at import:
+    # semconv < 0.46b0 lacks `opentelemetry.semconv.attributes` (the instrumentors'
+    # BaseInstrumentor imports it), and opentelemetry-instrumentation < 0.49b0
+    # imports `pkg_resources` (absent from modern/uv venvs). 1.28.0 pairs with
+    # semconv 0.49b0 + instrumentation 0.49b0 — first version both are satisfied.
+    # (Was >=1.20, a co-installs-but-import-breaks fiction.) Verify by installing
+    # the lowest version every floor allows and importing the instrumentors.
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-api>=1.28.0",
+    # Floor rationale: the SDK code imports only skillevaluation.parser (stable since
+    # 0.1.0) and the runner CLI (0.2.0). Floored at 0.4.0 for `skillevaluation.safety`,
+    # which `decimalai skills scan` imports. Verify by installing at the floor
+    # and importing.
+    "skillevaluation>=0.4.0",
+]
+
+[project.optional-dependencies]
+# Framework/provider adapters are extras, not core deps (since 2026-07-23).
+# Every framework import in the package is function-local and guarded with an
+# ImportError naming its extra, so a core-only install stays importable.
+# langchain-core is floored at 1.3.0: the lowest that co-installs with the modern
+# framework set (the floor lane verifies this), and CVE-clean — the 1.2.x
+# branch (1.2.0–1.2.27) shipped CVE-2026-40087 + CVE-2026-44843 unpatched;
+# 1.3.x+ is clean. (Was >=0.3.84,!=1.2.*; 0.3.x can't co-install with the
+# current framework set, so that floor was unreachable.)
+langchain = [
+    "langchain-core>=1.3.0,<2",  # Cap the major: a future langchain-core 2.x could break installs; imports are try/except-guarded. Verify by installing at the floor and importing.
+]
+# 2.26.0 is the effective floor (lowest that co-resolves with the modern
+# set). Resolve-verified; live-verify pending an OpenAI run (key quota-blocked).
+# The `openai` SDK is never imported by decimalai code — this extra exists so
+# `pip install "decimalai[openai]"` co-installs the provider SDK the
+# init(openai=True) one-liner instruments.
+openai = [
+    "openai>=2.26.0,<3",  # Cap the major (mirrors the backend's google-genai<3 policy)
+]
+openai-agents = ["openai-agents>=0.17.2"]
+# Runtime extra for the native Claude Agent SDK integration
+# (decimalai.init(claude_agent_sdk=True)). Floor mirrors claude-agent-sdk-tests;
+# NOT yet verified at the floor — refine by installing at the floor and importing.
+claude-agent-sdk = ["claude-agent-sdk>=0.1.0"]
+# Runtime extra for the Pydantic AI skill loader (decimalai.pydantic_ai.install).
+# Floor is conservative and NOT yet verified at the floor (the adapter only needs
+# Agent.__init__ + @agent.system_prompt, both stable since early releases) —
+# refine by installing at the floor and importing.
+pydantic-ai = ["pydantic-ai>=0.1.0"]
+# Runtime extra for the native Google ADK plugin (decimalai.init(adk=True)).
+# Floor mirrors adk-tests (the version the adapter was built+verified against).
+adk = ["google-adk>=2.0.0"]
+langgraph = ["langgraph>=0.6.0"]
+# Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).
+# Floored at 0.10.20 — where LlamaIndex's instrumentation dispatcher + SpanHandler
+# API landed, which decimalai/llamaindex.py registers against. Refine by
+# installing at the floor and importing.
+llamaindex = ["llama-index-core>=0.10.20"]
+evals = ["litellm>=1.30"]
+# Everything above in one install. Self-referential extra — floors stay
+# defined once in their own extras.
+all = [
+    "decimalai[langchain,openai,openai-agents,claude-agent-sdk,pydantic-ai,adk,langgraph,llamaindex,evals]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-mock>=3.0",
+    "responses>=0.23",
+    # See the [langchain] extra; floored at 1.3.0 (effective floor, CVE-clean).
+    "langchain-core>=1.3.0",
+    # openai-agents moved out of core deps into an extra; keep it in dev so the
+    # default unit suite still exercises the openai_agents adapter.
+    "openai-agents>=0.17.2",
+    # langgraph — needed for the create_react_agent introspection test. Lightweight
+    # enough to include in `dev` (langgraph itself is small; the heavy bit
+    # is the compiled-graph tooling, not network).
+    # Floored at 0.6.0 — the lowest langgraph that ships `langgraph._internal`,
+    # which the modern langgraph-prebuilt imports (0.5.x and below break).
+    "langgraph>=0.6.0",
+    # agentversion (the OSS manifest spec) is an OPTIONAL runtime import for
+    # decimalai.export_manifest: present → canonical jcs-sha256 hash + a manifest
+    # that validates with zero warnings; absent → the SDK's own surface hash
+    # under an honest algorithm label (export_manifest never hard-requires it,
+    # so it stays out of the main `dependencies`). It's a *test* dep here so the
+    # converter's validate/diff assertions run in the default unit suite
+    # (tests/test_export_agentversion.py). Floored at >=0.2.0: the SDK now uses
+    # 0.2.0-only modules — agentversion.contract.contract_from_components (the
+    # shared contract assembler) and agentversion.a2a.manifest_to_agent_card
+    # (ManifestSnapshot.to_a2a_card) — so a 0.1.0 resolve fails test collection.
+    # >=0.2.1 specifically: the new behavioral_policy/environment contract
+    # surfaces + the tool_calling_mode/runtime_version lift land in 0.2.1's
+    # contract_from_components, which the conformance test compares against.
+    # NOTE: the release-gate constraints file still pins ==0.1.0 — regenerate it
+    # and re-verify at the floor before shipping.
+    "agentversion>=0.2.1",
+]
+# Optional extras needed only for live-LLM e2e tests (tests/integration/test_framework_live_llm.py).
+# Install with: pip install -e ".[live-llm-tests]"
+live-llm-tests = [
+    "google-genai>=1.65.0",
+    "langchain-google-genai>=4.2.2",
+    "langchain-openai>=0.3.34",
+    "langgraph>=0.6.0",
+    "openai>=2.26.0",
+    "openai-agents>=0.17.2",
+    # Anthropic/Claude provider lane: anthropic drives the native messages
+    # tool-use loop (_live_helpers.anthropic_tool_loop); langchain-anthropic
+    # backs the ChatAnthropic cells in the generic-framework lanes. Floors are
+    # resolve-verified at the floor: 0.3.0
+    # can't co-install with langchain-core 1.3.0 (lowest co-installable is 0.3.21),
+    # and langchain-anthropic 0.3.21 in turn requires anthropic>=0.69.0 — so the
+    # old >=0.40.0 / >=0.3.0 pair was an unreachable fiction. Live-verify still
+    # pending an ANTHROPIC_API_KEY run, but the install floors are now real.
+    "anthropic>=0.69.0",
+    "langchain-anthropic>=0.3.21",
+]
+# Optional extras for the live CrewAI OTEL test (tests/integration/test_framework_live_crewai.py).
+# CrewAI + its OpenInference bridges are heavy (~80 transitive pkgs) and pin a
+# native google-genai provider, so they live in their own extra rather than
+# bloating live-llm-tests. Install with: pip install -e ".[crewai-tests]"
+crewai-tests = [
+    "crewai[google-genai]>=1.14.6",
+    "openinference-instrumentation-crewai>=1.1.8",
+    "openinference-instrumentation-google-genai>=1.0.2",
+]
+# Optional extras for the live Google ADK test (tests/integration/test_framework_live_adk.py).
+# google-adk pulls a large transitive runtime (its own server/CLI), so it lives in
+# its own extra rather than bloating live-llm-tests. Floor is the version the
+# native-plugin adapter was built+verified against; refine by installing at the floor.
+# Install with: pip install -e ".[adk-tests]"
+adk-tests = [
+    "google-adk>=2.0.0",
+]
+# Optional extras for the live LlamaIndex test (tests/integration/test_framework_live_llamaindex.py).
+# Covers BOTH adapter paths: the native span handler (decimalai.llamaindex.install) and the OTEL
+# exporter via OpenInference. Pulls llama-index-core + the three provider LLM bindings + the
+# OpenInference LlamaIndex instrumentor. The native runtime extra (`llamaindex`) floors core at
+# 0.10.20 (where the SpanHandler API landed); this *test* extra floors higher because the current
+# google_genai binding + the OpenInference instrumentor need a modern core. Floors are conservative
+# and NOT yet verified at the floor (no llama-index install at authoring) — refine by
+# installing at the floor. Install with: pip install -e ".[llamaindex-tests]"
+llamaindex-tests = [
+    "llama-index-core>=0.12.0",
+    "llama-index-llms-openai>=0.3.0",
+    "llama-index-llms-anthropic>=0.6.0",
+    "llama-index-llms-google-genai>=0.1.0",
+    "openinference-instrumentation-llama-index>=3.0.0",
+]
+# Optional extras for the live Claude Agent SDK test
+# (tests/integration/test_framework_live_claude_agent_sdk.py). The Claude Agent SDK
+# is Anthropic's agent framework; its query() drives the Claude Code engine, so the
+# live test also needs the `claude` CLI on PATH (the test skips when it's absent) and
+# an ANTHROPIC_API_KEY. anthropic-only lane (FRAMEWORK_PROVIDERS). Floor is conservative
+# and NOT yet verified at the floor (no claude-agent-sdk install at authoring) — refine
+# by installing at the floor. Install with: pip install -e ".[claude-agent-sdk-tests]"
+claude-agent-sdk-tests = [
+    "claude-agent-sdk>=0.1.0",
+]
+# Optional extras for the live direct-provider test
+# (tests/integration/test_framework_live_providers.py). Covers the no-framework
+# one-liner: decimalai.init(openai=/anthropic=/google=True) / providers.instrument().
+# Each provider needs BOTH its SDK and its OpenInference instrumentor (the latter
+# is what providers.instrument() enables). All six floors are verified at the
+# floor: the lowest-direct resolution lands exactly these
+# versions, they co-install, and all three instrumentors import against their
+# floor SDK (needs the core opentelemetry>=1.28.0 floor — see the dependencies
+# block). anthropic stays at 0.40.0 here (not live-llm-tests' 0.69.0): this extra
+# has no langchain-anthropic to force it up, and the anthropic instrumentor imports
+# fine against SDK 0.40.0. Install with: pip install -e ".[providers-tests]"
+providers-tests = [
+    "openai>=2.26.0",
+    "anthropic>=0.40.0",
+    "google-genai>=1.65.0",
+    "openinference-instrumentation-openai>=0.1.18",
+    "openinference-instrumentation-anthropic>=0.1.14",
+    "openinference-instrumentation-google-genai>=1.0.2",
+]
+
+[project.scripts]
+decimalai = "decimalai.cli.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/decimal-labs/decimalai-python"
+Documentation = "https://docs.decimal.ai"
+Repository = "https://github.com/decimal-labs/decimalai-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["decimalai"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: end-to-end tests against a live backend",
+    "live_llm: end-to-end tests that make real LLM API calls (requires RUN_LIVE_LLM_TESTS=1 + provider key)",
+    "simple_agent: live_llm sub-marker — 2-tool shopping smoke test",
+    "complex: live_llm sub-marker — 5-tool customer support agent",
+    "error_recovery: live_llm sub-marker — failing-tool / agent-recovery",
+    "multi_agent: live_llm sub-marker — orchestrator → specialist handoff",
+    "streaming: live_llm sub-marker — streamed agent events",
+    "parallel_tools: live_llm sub-marker — multiple tool calls in a single LLM step",
+    "manifest_drift: live_llm sub-marker — prompt change triggers new manifest + regression-check",
+    "otel: live_llm sub-marker — OpenTelemetry SpanExporter ingest path (CrewAI/AutoGen/etc.)",
+    "crewai: live_llm sub-marker — real CrewAI Crew on Gemini through the OTEL exporter",
+    "adk: live_llm sub-marker — real Google ADK agent on Gemini through the native plugin",
+    "llamaindex: live_llm sub-marker — real LlamaIndex RAG query engine through the native span handler + the OTEL exporter",
+    "claude_agent_sdk: live_llm sub-marker — real Claude Agent SDK query() run through the native stream tracer",
+    "providers: live_llm sub-marker — direct/no-framework provider-SDK calls (raw openai/anthropic/google.genai) through the one-liner instrumentor",
+    "skill_routing: live_llm sub-marker — real model picks the right skill from the SkillRouter menu, and the offered→activated routing join closes",
+    "heavy: live_llm sub-marker — deep/large stress traces (long dependent loops, wide big-payload fan-out, 3-level nested tree, kitchen-sink combined shape). Runs in the release gate BY DEFAULT (opt out with --skip-heavy); excluded from the routine live sweep via `-m 'live_llm and not heavy'`; alone via `-m heavy`.",
+]
+# Don't pick up integration or live-LLM tests in the default test run — they
+# need a live backend and (for live_llm) a provider API key.
+addopts = "-m 'not integration and not live_llm'"
+# Only collect the real suite. examples/ holds runnable demo scripts — e.g.
+# examples/test_examples.py uses a def test(name, fn) mini-runner — that a bare
+# `pytest` from the repo root would otherwise mis-collect and error on.
+testpaths = ["tests"]
