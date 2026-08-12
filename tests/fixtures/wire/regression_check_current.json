@@ -1,0 +1,40 @@
+{
+  "id": "rc_current_c",
+  "agent_name": "support-agent",
+  "baseline_manifest_id": "mfst_baseline_curr",
+  "candidate_manifest_id": "mfst_candidate_curr",
+  "status": "completed",
+  "verdict": "high_risk",
+  "verdict_message": "247 traces will break.",
+  "high_risk_count": 247,
+  "medium_risk_count": 89,
+  "low_risk_count": 1666,
+  "total_traces_analyzed": 2002,
+  "diff_summary": {
+    "total_changes": 3,
+    "changes": [
+      {"type": "tool_renamed", "name": "find_v2", "severity": "medium",
+       "detail": {"old_name": "search_v1", "new_name": "find_v2", "content_hash": "abc"}},
+      {"type": "tool_removed", "name": "deprecated_lookup", "severity": "high"},
+      {"type": "prompt_section_rewritten", "name": "refund_policy", "severity": "medium"}
+    ]
+  },
+  "pr_context": {
+    "repo": "acme/support-bot",
+    "pr_number": 99,
+    "branch": "feat/tool-rename",
+    "commit_sha": "deadbeef1234"
+  },
+  "impacts": [
+    {
+      "id": "imp_1",
+      "surface_change_type": "tool_removed",
+      "surface_name": "deprecated_lookup",
+      "severity": "high",
+      "affected_trace_count": 247,
+      "sample_trace_ids": ["t_1", "t_2", "t_3"],
+      "explanation": "247 traces called the removed `deprecated_lookup` tool. These will error or fall back when this change ships."
+    }
+  ],
+  "created_at": "2026-05-14T01:00:00Z"
+}

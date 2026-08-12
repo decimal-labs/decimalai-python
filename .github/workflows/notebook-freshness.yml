@@ -1,0 +1,279 @@
+name: Notebook freshness
+
+# The onboarding notebooks in examples/measure-a-skill/ hardcode zero numbers:
+# every figure is fetched live and gate-checked against manifest.yaml first. That
+# design only pays off if something ELSE fails when the pinned skill rots — so
+# this is that something.
+#
+# Registry skills churn hard. Of the eight slugs an earlier docs tutorial named,
+# three now 404 and a fourth fell from a headline number to +4.5 pts. Drift like
+# that never touches a PR, which is why the schedule below is daily and why a
+# failed scheduled run FILES AN ISSUE (see the last step): "the weekly job went
+# red and nobody looked" is exactly how those three slugs reached 404.
+on:
+  pull_request:
+    # Deliberately `pull_request`, never `pull_request_target`. On a public repo
+    # `pull_request` runs a fork's PR WITHOUT repository secrets;
+    # `pull_request_target` would hand a drive-by PR the secret context. This
+    # job needs no secrets at all — every request it makes is anonymous — and
+    # the GITHUB_TOKEN it does use is scoped in `permissions:` below.
+    branches: [main]
+    paths:
+      - "examples/measure-a-skill/**"
+      - "scripts/check_notebook_manifest.py"
+      - "tests/test_notebook_examples.py"
+      - ".github/workflows/notebook-freshness.yml"
+  schedule:
+    # 06:20 UTC daily. Offset off the hour so it doesn't queue behind everyone
+    # else's midnight cron.
+    - cron: "20 6 * * *"
+  workflow_dispatch:
+    inputs:
+      full_disclosure:
+        description: >-
+          Recompute the withheld-evidence percentages EXACTLY instead of sampling
+          (~1.4k requests, tens of minutes). Use this when refreshing the figures
+          in manifest.yaml — the daily sample can only catch gross drift.
+        type: boolean
+        default: false
+
+concurrency:
+  group: notebook-freshness-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write # only the issue-filing step uses this
+
+jobs:
+  manifest:
+    name: Pinned skills still back the notebook's claims
+    runs-on: ubuntu-latest
+    # The public registry rate-limits anonymous traffic, so the checker paces
+    # itself at one request per second and backs off for up to a minute after a
+    # 429. The daily run also
+    # walks the measured listing (~15 pages) and samples per source; the
+    # opt-in full recompute fetches every measured skill's benchmark, which is
+    # what the generous ceiling is for.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # PyYAML only — the checker is otherwise stdlib. Installing the SDK here
+      # would make a packaging break look like a rotted skill.
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Check the manifest against the live registry
+        shell: bash
+        # PR runs check the gates only — ~8 requests, though the measured listing
+        # alone can take 20-60s to answer. The daily run also recomputes the
+        # registry_disclosure figures: a number about how much evidence we
+        # withhold is exactly the number that must not go stale. That walk costs
+        # ~100 requests and several minutes, which is too slow for every PR.
+        #
+        # `set -o pipefail` is load-bearing: without it the pipeline exits with
+        # `tee`'s status (always 0) and this step passes green no matter what the
+        # checker said. This is the second time that has bitten this org.
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            ARGS="--disclosure"
+          fi
+          if [ "${{ inputs.full_disclosure }}" = "true" ]; then
+            ARGS="--disclosure --disclosure-full"
+          fi
+          code=0
+          python scripts/check_notebook_manifest.py $ARGS 2>&1 | tee freshness.out || code=$?
+
+          # Exit 2 means the registry never answered — a rate-limit, a restart,
+          # a DNS blip. The check did not RUN; nothing rotted. Give it one more
+          # shot after five minutes, long enough to outlast a deploy, before
+          # writing the day off.
+          if [ "$code" -eq 2 ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "::notice::registry unreachable — retrying once in 5 minutes"
+            sleep 300
+            code=0
+            python scripts/check_notebook_manifest.py $ARGS 2>&1 | tee freshness.out || code=$?
+          fi
+
+          # Which checks actually ran, into the run summary. A green tick that
+          # means "I asserted nothing" is the failure mode this whole workflow is
+          # about, and it is invisible unless the run says what it performed.
+          {
+            echo '### Notebook freshness'
+            echo '```'
+            sed -n '/^CHECKS PERFORMED/,/^VERDICT /p' freshness.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$code" -eq 2 ]; then
+            # THE DOWNGRADE, AND ITS GUARD. Exit 2 is downgraded to success
+            # because a network blip must never be reported as a rotted skill —
+            # a warning annotation, not a failure, and NOT an issue. The cost is
+            # that several unreachable days in a row are only visible as repeated
+            # warnings on the Actions tab; if that ever happens the fix is an
+            # alert on this workflow, not a louder exit code here.
+            #
+            # But the downgrade is only safe while exit 2 means EXACTLY "the
+            # registry never answered AND I had no offline complaints either".
+            # Until 2026-08-10 it did not: the checker ran its offline checks
+            # first (including manifest.yaml vs the copy embedded in the
+            # notebook), then discarded those findings unprinted the moment a
+            # later request timed out. Combined with this downgrade, a PR that
+            # genuinely broke the manifest went GREEN whenever the edge limiter
+            # was throttling. The checker now exits 1 in that case; the two
+            # greps below are the belt to its braces, so a regression there
+            # cannot silently re-arm this line.
+            verdict="$(grep -m1 '^VERDICT ' freshness.out || true)"
+            if [ -z "$verdict" ]; then
+              echo "::error::The checker exited 2 without printing a VERDICT line, so this run" \
+                   "cannot prove it found nothing offline. Not downgrading."
+              exit 1
+            fi
+            case "$verdict" in
+              *offline_problems=0*) ;;
+              *)
+                echo "::error::$verdict"
+                echo "::error::exit 2 NOT downgraded — the checker found problems that do not need" \
+                     "the registry to be true. An unreachable registry is not a reason to ignore them."
+                exit 1
+                ;;
+            esac
+            echo "::warning::Notebook freshness check could not reach the registry; it did not run. $verdict"
+            exit 0
+          fi
+          exit $code
+
+      # A red PR check blocks a human who is already looking. A red SCHEDULED run
+      # blocks nobody — it sits in the Actions tab until three slugs are 404.
+      - name: File an issue when the daily check finds drift
+        if: failure() && github.event_name != 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = 'The daily notebook-freshness check failed: the skills pinned in ' +
+              '`examples/measure-a-skill/manifest.yaml` no longer back what the notebooks claim.\n\n' +
+              'Every line below names the exact YAML key to change. The notebooks hardcode no ' +
+              'numbers, so the fix is a one-line edit on `main` — already-open Colab tabs pick it ' +
+              'up on their next run.\n\n';
+            try {
+              body += '```\n' + fs.readFileSync('freshness.out', 'utf8').slice(0, 55000) + '\n```\n';
+            } catch (e) {
+              body += '_(no output captured — the step failed before the checker ran)_\n';
+            }
+            body += `\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const title = 'Onboarding notebooks: the pinned registry skill has drifted';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'notebook-drift',
+            });
+            if (existing.data.length) {
+              // Comment rather than open a second issue: a new issue per day is
+              // how a real signal turns into noise people filter out.
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['notebook-drift'],
+              });
+            }
+
+  keyless:
+    name: Notebooks run with no credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # What Colab preinstalls (requests, pyyaml) plus whatever the tier
+      # notebooks `!pip install` for themselves — in Colab those lines really do
+      # run, so having the package present is the faithful reproduction. A
+      # notebook that adds a dependency not listed here SKIPS with a message
+      # naming it, rather than silently going untested.
+      #
+      # The SDK itself is deliberately NOT installed: Tier 0's whole claim is
+      # that it runs on a cold machine with nothing configured, and installing
+      # our own package would quietly test a different notebook than the one a
+      # reader opens.
+      - name: Install what Colab ships
+        run: pip install pytest requests pyyaml google-genai
+
+      - name: Execute the notebooks with every credential scrubbed
+        shell: bash
+        # `-m "not live_llm"` re-selects the integration-marked execution test
+        # that the repo's default addopts filter (`-m 'not integration and not
+        # live_llm'`) excludes — a command-line -m replaces the one in addopts.
+        # Verified with --collect-only: 13 items by default, 16 with this flag.
+        # The test skips (never silently passes) if either host is unreachable.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_notebook_examples.py -m "not live_llm" -v 2>&1 | tee keyless.out
+
+      - name: Confirm the keyless tests were actually selected
+        shell: bash
+        # A green pytest run that collected the notebook tests and a green run
+        # that DESELECTED all of them print the same "passed" line at the bottom.
+        # Since the live one carries `integration` and pyproject's addopts filter
+        # that marker out, one edit to addopts — or dropping the -m above — turns
+        # this job into a very fast, very green no-op. So count the items.
+        run: |
+          set -o pipefail
+          live=$(grep -c 'test_notebook_runs_keyless_without_traceback\[' keyless.out || true)
+          offline=$(grep -c 'test_notebook_runs_keyless_with_no_network\[' keyless.out || true)
+          echo "collected: $live live keyless item(s), $offline offline keyless item(s)"
+          if [ "$live" -eq 0 ] || [ "$offline" -eq 0 ]; then
+            echo "::error::The keyless tests were not collected (live=$live, offline=$offline)." \
+                 "This job proved nothing. Check pyproject's addopts and the -m flag above."
+            exit 1
+          fi
+          skipped=$(grep -c 'test_notebook_runs_keyless_without_traceback\[.*SKIPPED' keyless.out || true)
+          if [ "$skipped" -eq "$live" ]; then
+            echo "::warning::All $live live keyless item(s) SKIPPED — the registry was unreachable." \
+                 "The offline twin still ran; the end-to-end claim is untested for this run."
+          fi
+
+      - name: File an issue when the daily keyless run breaks
+        if: failure() && github.event_name != 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = 'The onboarding notebooks no longer run on a cold machine with no ' +
+              'credentials — a visitor\'s first experience of this SDK is now a traceback.\n\n';
+            try {
+              body += '```\n' + fs.readFileSync('keyless.out', 'utf8').slice(0, 55000) + '\n```\n';
+            } catch (e) {}
+            body += `\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            // Its own label, not the drift one: "the pinned skill moved" and "the
+            // notebook crashes on a cold machine" are different problems with
+            // different owners, and threading them together buries one of them.
+            const title = 'Onboarding notebooks no longer run keyless';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'notebook-keyless',
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['notebook-keyless'],
+              });
+            }

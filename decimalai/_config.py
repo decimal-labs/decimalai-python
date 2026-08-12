@@ -1,0 +1,526 @@
+"""Global configuration for the DecimalAI SDK.
+
+Manages a singleton config + client that all integrations share.
+Populated by ``decimalai.init()``.
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional
+
+logger = logging.getLogger("decimalai")
+
+# Try to load .env if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
+
+@dataclass
+class DecimalConfig:
+    """Configuration for the DecimalAI SDK."""
+
+    api_key: str = ""
+    base_url: str = "https://api.decimal.ai"
+    project: Optional[str] = None
+    enabled: bool = True
+    # When True, the SDK runs in CI manifest-extraction mode:
+    # - Background trace sender does NOT start
+    # - Framework integrations capture manifest data but do not send traces
+    # - The user's init script is expected to call decimalai.flush_manifest_for_ci()
+    #   to upload the captured manifest as a candidate for regression check.
+    # Set automatically when DECIMALAI_MODE=manifest_only env var is present.
+    manifest_only: bool = False
+    # Populated by the init-time verify probe (None if verify=False).
+    # When True, the backend requires every ingested trace to carry a
+    # manifest_id; the SDK uses this to surface a clearer error if its
+    # own auto-manifest registration fails.
+    backend_require_manifest_on_ingest: Optional[bool] = None
+    # When True, framework adapters inject the routed skill's BODY (the knowledge K) into the
+    # prompt at runtime — not just a menu row — so a benchmarked skill's value actually reaches the
+    # agent. Off by default (menu-only, unchanged). Enable via init(inject_skill_body=True) or
+    # DECIMALAI_INJECT_SKILL_BODY=1.
+    inject_skill_body: bool = field(
+        default_factory=lambda: os.environ.get("DECIMALAI_INJECT_SKILL_BODY", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    # Progressive disclosure: register the native load_skill tool on
+    # adapters that own their tool loop (openai_agents, pydantic_ai) whenever
+    # the skill loader is enabled — so a surfaced description is always
+    # executable. On by default; kill switch DECIMALAI_LOAD_SKILL_TOOL=0 or
+    # init(load_skill_tool=False).
+    load_skill_tool: bool = field(
+        default_factory=lambda: os.environ.get("DECIMALAI_LOAD_SKILL_TOOL", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    # Which channel is authoritative for delivering skills to the model:
+    #   "harness" — a native skill-loading runtime (Claude Code/Cursor) loads
+    #               skills from disk; the SDK keeps mirroring them there
+    #               (disk_sync on). Today's behavior.
+    #   "router"  — the SDK router is the single injection channel; the SDK stops
+    #               writing skills to disk (disk_sync off) so it never duplicates.
+    #   "auto"    — router when an adapter's skill loader is active, else harness.
+    # Only affects an adapter once its router loader is enabled — a no-op otherwise.
+    # Set via init(skill_authority=...) or DECIMALAI_SKILL_AUTHORITY.
+    skill_authority: str = field(
+        default_factory=lambda: (
+            os.environ.get("DECIMALAI_SKILL_AUTHORITY", "").strip().lower() or "auto"
+        )
+    )
+    # Internal
+    _max_batch_size: int = field(default=50, repr=False)
+    _flush_interval_seconds: float = field(default=5.0, repr=False)
+
+    @property
+    def api_headers(self) -> dict[str, str]:
+        # DEPRECATED (0.10.0): `project` no longer emits an `X-Decimal-Project`
+        # header. The platform never read it — trace scoping is resolved from
+        # the API key alone, and a trace's project_id is set only for a
+        # project-scoped key — so every value sent here was discarded on
+        # arrival. Sending a header the server ignores made `project=` look
+        # like it grouped traces when it did nothing at all.
+        # Grouping that actually works: workspaces (resolved from the key, or
+        # the X-Workspace-Id header the dashboard sends).
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def resolve_disk_sync(self, loader_active: bool) -> bool:
+        """Whether an adapter should mirror platform skills to disk (disk_sync).
+
+        Router authority => False (the router is the sole injector; writing to
+        disk only creates duplicates for a native skill-loading runtime).
+        Harness authority => True (today's behavior). "auto" resolves to router
+        only when the adapter's router skill loader is active.
+        """
+        authority = (self.skill_authority or "auto").lower()
+        if authority == "router":
+            return False
+        if authority == "harness":
+            return True
+        return not loader_active  # auto
+
+
+class DecimalConfigError(Exception):
+    """Raised when the SDK is misconfigured."""
+
+    pass
+
+
+# ── Global singleton ───────────────────────────────────────────
+
+_config: Optional[DecimalConfig] = None
+_client: Optional["DecimalAIClient"] = None  # type: ignore[name-defined]
+
+
+def _get_config() -> DecimalConfig:
+    """Return the global config, raising if init() hasn't been called."""
+    if _config is None:
+        raise DecimalConfigError(
+            "DecimalAI SDK not initialized. Call decimalai.init(api_key=...) first."
+        )
+    return _config
+
+
+def _get_client() -> "DecimalAIClient":  # type: ignore[name-defined]
+    """Return the global HTTP client, raising if init() hasn't been called."""
+    if _client is None:
+        raise DecimalConfigError(
+            "DecimalAI SDK not initialized. Call decimalai.init(api_key=...) first."
+        )
+    return _client
+
+
+def _is_enabled() -> bool:
+    """Check if tracing is enabled (False = no-op mode)."""
+    return _config is not None and _config.enabled
+
+
+def _is_manifest_only() -> bool:
+    """True if the SDK is in CI manifest-extraction mode.
+
+    Framework integrations should call this to decide whether to skip
+    trace emission while still allowing manifest capture. Set via the
+    DECIMALAI_MODE=manifest_only env var (handled in init()).
+    """
+    return _config is not None and _config.manifest_only
+
+
+# ── Export observability ──────────────────────────────────────
+
+@dataclass(frozen=True)
+class ExportStatus:
+    """Snapshot of the background trace exporter's state.
+
+    Returned by ``decimalai.export_status()``. Use this in production
+    health checks, CI assertions, or any monitoring code that needs
+    to answer "are my traces actually arriving at the backend?"
+
+    Example::
+
+        st = decimalai.export_status()
+        if st.consecutive_failures >= 3:
+            alert_oncall(f"DecimalAI traces failing: {st.last_error!r}")
+        if st.sent == 0 and st.failed > 0:
+            raise RuntimeError("All traces are failing — check API key.")
+
+    ``last_manifest_error`` is reported separately from ``last_error``
+    so callers can distinguish "manifest registration failed (then the
+    trace was rejected for missing manifest_id)" from "the trace POST
+    itself failed for an unrelated reason like 401 or timeout".
+    """
+
+    sent: int
+    failed: int
+    queue_depth: int
+    consecutive_failures: int
+    last_error: Optional[str]
+    last_error_at: Optional[datetime]
+    last_success_at: Optional[datetime]
+    last_manifest_error: Optional[str] = None
+    last_manifest_error_at: Optional[datetime] = None
+
+
+# Type alias for the on_export_error callback. Receives (exception,
+# trace_id_or_None). Called from the background sender thread; user
+# code must be thread-safe.
+ExportErrorCallback = Callable[[BaseException, Optional[str]], None]
+
+
+# ── Background Sender ─────────────────────────────────────────
+
+class BackgroundSender:
+    """Non-blocking trace sender using a single daemon thread.
+
+    Traces are submitted to a ThreadPoolExecutor so the calling thread
+    (the user's agent) is never blocked on HTTP I/O.
+
+    Tracks send-side observability (sent/failed/streaks/timestamps) so
+    callers can introspect via ``decimalai.export_status()`` or react
+    via ``decimalai.on_export_error(cb)`` without polling logs. Pre-2026
+    the only signal was a per-failure WARNING log + a single
+    ``_last_send_error`` field — enough to debug but not enough to
+    monitor in production.
+    """
+
+    def __init__(self) -> None:
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending: list[Any] = []  # Futures for flush()
+        # submit() runs on arbitrary caller
+        # threads; without a lock the read-modify-write on self._pending (append
+        # + reassign-on-prune) can lose futures, so flush() may exit before some
+        # work is awaited (silent trace drop on a fast exit). Guard every
+        # _pending mutation/snapshot with this dedicated lock — held only around
+        # list ops, never across future.result().
+        self._pending_lock = threading.Lock()
+
+        # Observability — read/written from the sender thread on
+        # completion AND from the caller thread via export_status().
+        # All numeric fields go behind _state_lock; the lock is taken
+        # only at completion + read time, so it's not on the hot path.
+        self._state_lock = threading.Lock()
+        self._sent_count: int = 0
+        self._failed_count: int = 0
+        self._consecutive_failures: int = 0
+        self._last_send_error: Optional[BaseException] = None
+        self._last_send_error_at: Optional[datetime] = None
+        self._last_success_at: Optional[datetime] = None
+
+        # Manifest-registration errors are tracked separately from
+        # trace-send errors so callers can tell the two failure modes
+        # apart (the trace POST then rejects with a confusingly
+        # different error — "manifest_id required" — when manifest
+        # registration silently fell back to a synthetic UUID). Set by
+        # ``record_manifest_error`` (called from generic.py /
+        # langchain.py / openai_agents.py after retries are exhausted).
+        self._last_manifest_error: Optional[BaseException] = None
+        self._last_manifest_error_at: Optional[datetime] = None
+
+        # User callbacks for failures. Called from the sender thread.
+        self._error_callbacks: List[ExportErrorCallback] = []
+
+        # Has the consecutive-failure escalation banner already fired
+        # in this streak? Reset on success. Prevents log spam when the
+        # backend goes down and 50 traces all fail with the same error.
+        self._escalation_fired: bool = False
+
+    # ---- executor lifecycle ----
+
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="decimal-sender"
+            )
+        return self._executor
+
+    # ---- public observability ----
+
+    def register_error_callback(self, cb: ExportErrorCallback) -> None:
+        """Register a callback fired on each background-send failure.
+
+        Called from the sender thread, so user code must be thread-safe.
+        Use this to route export failures into Sentry/Datadog/PagerDuty
+        or to raise a custom exception in a background monitor thread.
+        Multiple callbacks are supported and called in registration order.
+        """
+        self._error_callbacks.append(cb)
+
+    def status(self, queue_depth_hint: Optional[int] = None) -> ExportStatus:
+        """Snapshot the current send-side state.
+
+        ``queue_depth_hint`` is the count of in-flight futures, computed
+        outside the lock to avoid contending with the sender thread.
+        Pass None to have status() count under the lock.
+        """
+        if queue_depth_hint is not None:
+            queue_depth = queue_depth_hint
+        else:
+            with self._pending_lock:
+                queue_depth = len([f for f in self._pending if not f.done()])
+        with self._state_lock:
+            return ExportStatus(
+                sent=self._sent_count,
+                failed=self._failed_count,
+                queue_depth=queue_depth,
+                consecutive_failures=self._consecutive_failures,
+                last_error=(
+                    f"{type(self._last_send_error).__name__}: "
+                    f"{str(self._last_send_error)[:200]}"
+                    if self._last_send_error is not None
+                    else None
+                ),
+                last_error_at=self._last_send_error_at,
+                last_success_at=self._last_success_at,
+                last_manifest_error=(
+                    f"{type(self._last_manifest_error).__name__}: "
+                    f"{str(self._last_manifest_error)[:200]}"
+                    if self._last_manifest_error is not None
+                    else None
+                ),
+                last_manifest_error_at=self._last_manifest_error_at,
+            )
+
+    def record_manifest_error(self, exc: BaseException) -> None:
+        """Record a manifest-registration failure (synchronous, caller-thread).
+
+        Called by ``_maybe_register_manifest`` paths after exhausting
+        retries. Surfaces in ``ExportStatus.last_manifest_error`` so
+        callers can tell "manifest registration failed → trace then
+        rejected as missing manifest_id" apart from "trace POST itself
+        failed".
+        """
+        with self._state_lock:
+            self._last_manifest_error = exc
+            self._last_manifest_error_at = datetime.now(timezone.utc)
+
+    # ---- internal completion handlers ----
+
+    def _record_success(self) -> None:
+        with self._state_lock:
+            self._sent_count += 1
+            self._last_success_at = datetime.now(timezone.utc)
+            self._consecutive_failures = 0
+            self._escalation_fired = False
+
+    def _record_failure(self, exc: BaseException, trace_id: Optional[str] = None) -> None:
+        with self._state_lock:
+            self._failed_count += 1
+            self._last_send_error = exc
+            self._last_send_error_at = datetime.now(timezone.utc)
+            self._consecutive_failures += 1
+            consec = self._consecutive_failures
+            fired = self._escalation_fired
+            if consec >= 3 and not fired:
+                self._escalation_fired = True
+                escalate = True
+            else:
+                escalate = False
+
+        # Per-failure log (current behavior) — kept WARNING so the line
+        # remains greppable. Escalation banner only fires once per streak.
+        logger.warning(
+            "decimalai: Background send failed — %s: %s. "
+            "The trace was NOT ingested. "
+            "Call decimalai.export_status() for a summary.",
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        logger.debug("Background send failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+        if escalate:
+            logger.error(
+                "decimalai: %d consecutive trace exports have failed. "
+                "Last error: %s: %s. "
+                "Check your API key, base_url, and backend logs. "
+                "Use decimalai.on_export_error(cb) for programmatic alerting.",
+                consec,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+
+        # Fire user callbacks. Don't let one bad callback break the chain.
+        for cb in list(self._error_callbacks):
+            try:
+                cb(exc, trace_id)
+            except Exception:
+                logger.debug("on_export_error callback raised", exc_info=True)
+
+    # ---- submit / flush / shutdown ----
+
+    def submit(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Submit work to the background thread.
+
+        Wraps the user-supplied callable so success/failure both update
+        the observability counters even when the caller never calls
+        flush() — e.g., long-running daemons that just submit traces
+        and rely on the sender thread to drain them.
+        """
+        executor = self._ensure_executor()
+
+        def _runner() -> Any:
+            try:
+                result = fn(*args, **kwargs)
+                self._record_success()
+                return result
+            except Exception as exc:
+                # Try to dig out a trace_id for the callback. The
+                # caller's args may be a Trace object or dict; best-effort.
+                tid = _extract_trace_id(args)
+                self._record_failure(exc, tid)
+                raise
+
+        future = executor.submit(_runner)
+        # Tag so flush() knows _runner has already recorded the outcome
+        # (success counter or failure callback). Futures injected by tests
+        # bypass _runner and need flush() to record on their behalf.
+        try:
+            setattr(future, "_dai_recorded_in_runner", True)
+        except (AttributeError, TypeError):
+            pass
+        with self._pending_lock:
+            self._pending.append(future)
+            # Prune completed futures to avoid unbounded growth.
+            self._pending = [f for f in self._pending if not f.done()]
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Wait for all pending work to complete.
+
+        Counters and last_send_error are normally updated inside the
+        ``_runner`` wrapper added by ``submit``. For futures that were
+        injected into ``_pending`` directly (test fixtures, advanced
+        callers wiring their own queues), flush() records the outcome
+        here as a safety net.
+        """
+        # Snapshot-and-clear under the lock, then await OUTSIDE it so submit()
+        # and status() never block on the (potentially multi-second) drain.
+        with self._pending_lock:
+            pending = self._pending
+            self._pending = []
+        for future in pending:
+            try:
+                future.result(timeout=timeout)
+                # Future succeeded — only record if it wasn't already
+                # counted by _runner.
+                if not getattr(future, "_dai_recorded_in_runner", False):
+                    self._record_success()
+            except Exception as exc:
+                # Recorded by _runner unless the future was injected
+                # directly into _pending (tests do this); record here
+                # in that case so observability stays accurate.
+                if not getattr(future, "_dai_recorded_in_runner", False):
+                    self._record_failure(exc)
+
+    def shutdown(self) -> None:
+        """Flush pending work and shut down the executor."""
+        self.flush()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
+
+def _extract_trace_id(args: tuple) -> Optional[str]:
+    """Best-effort: pull a trace_id off the first positional arg.
+
+    The sender is called with (client.ingest_trace, trace) where trace
+    is a pydantic model with an `.id` attr. Return that id as a string
+    if available, else None. Never raise — this is callback metadata.
+    """
+    if not args:
+        return None
+    first = args[0]
+    tid = getattr(first, "id", None)
+    if tid is None and isinstance(first, dict):
+        tid = first.get("id") or first.get("trace_id")
+    if tid is None:
+        return None
+    try:
+        return str(tid)
+    except Exception:
+        return None
+
+
+# Global sender instance
+_sender = BackgroundSender()
+
+
+# ---- atexit summary ----------------------------------------------------
+
+def _emit_shutdown_summary() -> None:
+    """Print a one-line stderr summary on process exit IF anything failed.
+
+    Silent on the happy path (sent_count > 0 and failed_count == 0).
+    Loud at the right moment — users notice startup banners more than
+    mid-session warnings, so flushing the diagnostic at shutdown catches
+    "wait, where were my traces?" cases without spamming healthy runs.
+    """
+    try:
+        st = _sender.status()
+        if st.failed == 0 and st.sent > 0:
+            return  # happy path — stay silent
+        if st.failed == 0 and st.sent == 0:
+            # User never sent anything; could be a no-op script.
+            return
+        # Anything failed → emit summary.
+        sys.stderr.write(
+            "decimalai: shutdown summary — "
+            f"{st.sent} trace(s) sent, {st.failed} failed"
+            + (f" (last error: {st.last_error})" if st.last_error else "")
+            + ". Call decimalai.export_status() for details.\n"
+        )
+    except Exception:
+        # Never crash on the way out.
+        pass
+
+
+def _shutdown() -> None:
+    """Flush pending traces, emit summary, clean up. Called via atexit."""
+    global _client
+    try:
+        _sender.shutdown()
+    except Exception:
+        pass
+    try:
+        _emit_shutdown_summary()
+    except Exception:
+        pass
+    if _client is not None:
+        try:
+            if hasattr(_client, "close"):
+                _client.close()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown)
