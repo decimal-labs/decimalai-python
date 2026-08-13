@@ -201,11 +201,11 @@ Honest-measurement note: menu-only (loader on, no body injection, no `load_skill
 
 Every published skill is reachable without installing anything:
 
-- **Web copy-paste** — open any skill's scorecard page on [decimal.ai](https://decimal.ai/skills), copy the SKILL.md, and paste it into your repo (*live at launch*).
-- **Raw URLs** — `https://decimal.ai/s/<slug>/SKILL.md` serves the raw markdown (version-pinned: `/s/<slug>@<version>/SKILL.md`); `https://decimal.ai/s/<slug>.json` serves machine-readable metadata (lift summary, benchmark models, trust/safety bands); `https://decimal.ai/llms.txt` indexes the registry for agents (*live at launch*).
+- **Web copy-paste** — open any skill's scorecard page on [app.decimal.ai/skills](https://app.decimal.ai/skills), hit **Copy SKILL.md**, and paste it into your repo.
+- **Raw URLs** — `https://app.decimal.ai/s/<slug>/SKILL.md` serves the raw markdown (version-pinned: `/s/<slug>@<version>/SKILL.md`); `https://app.decimal.ai/s/<slug>.json` serves machine-readable metadata (lift summary, benchmark models, trust/safety bands); `https://app.decimal.ai/llms.txt` indexes the registry for agents.
 - **CLI pull (no account)** — `decimalai skills pull <slug>` writes just the file to disk; no fork, no signup. (`decimalai skills install <slug>` forks + syncs if you do have a key.)
-- **MCP server** — search and install skills from any MCP client (*publishing at launch*).
-- **Claude Code plugin** — `/decimalai:install <slug>` from inside Claude Code (*publishing at launch*).
+- **MCP server** — search and read skills from any MCP client (`pip install decimalai-mcp`).
+- **Claude Code plugin** — `/decimalai:install <slug>` from inside Claude Code (not yet available).
 
 See the full [SDK Skills Reference](https://docs.decimal.ai/sdk/python) for all methods.
 

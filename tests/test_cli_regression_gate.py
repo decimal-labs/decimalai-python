@@ -1,10 +1,8 @@
 """The CLI gate must not pass an `unverified` verdict silently.
 
-2026-07-28. The backend gained an `unverified` verdict — structural changes found,
-no traffic to measure them against. The GitHub Action learned to rank it; this CLI
-did not, and `rank.get(verdict, 0)` returned 0, so `decimalai regression-check`
-exited 0 at EVERY --fail-on setting. That CLI is the documented path for non-GitHub
-CI, and the docs show `--fail-on medium`.
+An `unverified` verdict means structural changes were found with no traffic to
+measure them against. This CLI ranks it exactly as the GitHub Action does, so the
+two gates agree.
 
 Ranked by the DIFF's severity rather than a fixed value: a fixed rank is wrong in
 both directions — too low and a deleted tool merges green, too high and a one-line

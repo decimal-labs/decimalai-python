@@ -170,8 +170,6 @@ class TestQuotaExceededIsTerminal:
 
     A quota and a rate limit share the 429 status code but nothing else: a rate limit
     clears in seconds, a quota does not clear until the billing period rolls over.
-    Measured on prod 2026-08-08, orgs pinned against their storage cap 429'd every trace
-    post, and each one burned 3 attempts before the payload was discarded.
     """
 
     @staticmethod
@@ -218,7 +216,7 @@ class TestQuotaExceededIsTerminal:
     @patch("time.sleep")
     def test_is_not_caught_by_except_rate_limit(self, mock_sleep):
         """Code that catches a rate limit in order to sleep and retry must NOT
-        swallow a quota — that would silently restore the old drop-the-payload path."""
+        swallow a quota — that would reintroduce the drop-the-payload path."""
         assert not issubclass(DecimalQuotaExceededError, DecimalRateLimitError)
 
     @patch("time.sleep")

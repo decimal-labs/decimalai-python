@@ -128,7 +128,7 @@ def test_langchain_manifest_drift_triggers_regression_check(provider, model):
     assert v2["id"] != v1["id"]
 
     # ── Auto-detected drift: v2 is active, v1 is superseded ───────────
-    # This is the central moat assertion: registering a new manifest with
+    # This is the central assertion: registering a new manifest with
     # a changed prompt automatically supersedes the prior one. That state
     # transition IS the drift signal — surfaces the timeline UI, the
     # version-vs-version compare, and the prompt-changed regression alert.

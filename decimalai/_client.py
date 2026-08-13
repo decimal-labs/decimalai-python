@@ -297,10 +297,9 @@ class DecimalAIClient:
                 return resp
 
             # A plan quota is TERMINAL — it does not clear until the billing period rolls
-            # over, so the retry loop below can only burn wall-clock and then drop the
-            # payload. Measured on prod 2026-08-08: orgs pinned against their storage cap
-            # 429'd every single trace post, and each one cost 3 attempts before being
-            # discarded. Bail immediately with an error that says what is actually wrong.
+            # over, so the retry loop below can only burn wall-clock: each 429 costs 3
+            # attempts before the payload is dropped. Fail fast with an error that names
+            # the exhausted dimension.
             quota_dimension = resp.headers.get("X-Quota-Exceeded")
             if quota_dimension:
                 body = {}
@@ -604,8 +603,8 @@ class DecimalAIClient:
 
         Returns:
             Impact report dict with verdict, severity counts, and per-surface
-            impact entries. See `_serialize_regression_check` in the backend
-            for the full schema.
+            impact entries. See ``RegressionCheckResponse`` in
+            ``decimalai._responses`` for the full schema.
         """
         payload: Dict[str, Any] = {
             "agent_name": agent_name,

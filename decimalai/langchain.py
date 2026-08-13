@@ -46,9 +46,8 @@ logger = logging.getLogger("decimalai.langchain")
 # DEBUG. The categories below are all user-actionable problems (missing
 # SKILL.md, network down, wrong API key, etc.) that the prior implementation
 # hid at DEBUG level — invisible at the default WARNING root logger level.
-# Silent SDK misbehavior has bitten users before (an earlier release quietly
-# swept personal skills into the org registry with nothing logged), so we
-# surface once-per-category by default rather than staying quiet.
+# Staying quiet hides real misconfiguration, so we surface
+# once-per-category by default.
 _warned_once: set[str] = set()
 
 

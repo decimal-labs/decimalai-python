@@ -246,9 +246,10 @@ def _handle_load_skill(name: str) -> str:
 def _make_load_skill_tool() -> Any:
     """Build the native load_skill FunctionTool (the progressive-disclosure path).
 
-    The OpenAI Agents SDK owns its tool loop, so the tool result is routed
-    back mid-turn for free — this adapter ships the tool live (langchain /
-    anthropic patch a non-loop layer and stay prompt-injection)."""
+    The OpenAI Agents SDK owns its tool loop, so a load_skill tool result is
+    routed back to the model mid-turn. This adapter therefore registers
+    load_skill as a real tool; the langchain / anthropic adapters wrap a layer
+    with no tool loop, so they surface skills in the prompt instead."""
     try:
         from agents import function_tool
     except Exception:
@@ -303,8 +304,8 @@ def _make_skill_aware_instructions(base: str):
             if not fragment:
                 return base
             # Tell the model how bodies arrive — only when this
-            # agent actually has the tool. The server fragment keeps the
-            # activation-statement instruction unchanged (Stage-M parity).
+            # agent actually has the tool. We append to the server fragment
+            # and leave its activation-statement instruction unchanged.
             if _agent_has_load_skill_tool(agent):
                 from .skill_router import LOAD_SKILL_PROMPT_HINT
                 fragment = f"{fragment}\n{LOAD_SKILL_PROMPT_HINT}"

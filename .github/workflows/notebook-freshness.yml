@@ -78,7 +78,7 @@ jobs:
         #
         # `set -o pipefail` is load-bearing: without it the pipeline exits with
         # `tee`'s status (always 0) and this step passes green no matter what the
-        # checker said. This is the second time that has bitten this org.
+        # checker said.
         run: |
           set -o pipefail
           ARGS=""
@@ -121,15 +121,10 @@ jobs:
             # alert on this workflow, not a louder exit code here.
             #
             # But the downgrade is only safe while exit 2 means EXACTLY "the
-            # registry never answered AND I had no offline complaints either".
-            # Until 2026-08-10 it did not: the checker ran its offline checks
-            # first (including manifest.yaml vs the copy embedded in the
-            # notebook), then discarded those findings unprinted the moment a
-            # later request timed out. Combined with this downgrade, a PR that
-            # genuinely broke the manifest went GREEN whenever the edge limiter
-            # was throttling. The checker now exits 1 in that case; the two
-            # greps below are the belt to its braces, so a regression there
-            # cannot silently re-arm this line.
+            # registry never answered AND there were no offline complaints
+            # either". The checker is written to exit 1 rather than 2 whenever
+            # it has an offline finding to report; the two greps below enforce
+            # that here, so a regression there cannot silently re-arm this line.
             verdict="$(grep -m1 '^VERDICT ' freshness.out || true)"
             if [ -z "$verdict" ]; then
               echo "::error::The checker exited 2 without printing a VERDICT line, so this run" \

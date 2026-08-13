@@ -580,7 +580,7 @@ def init(
     if otel or crewai or autogen:
         # Use the manifest-capable exporter (decimalai.otel) — it buffers spans
         # by root span (no per-batch fragmentation) AND registers a manifest
-        # from the captured model/tools/prompt, so the versioning moat engages
+        # from the captured model/tools/prompt, so manifest versioning works
         # for CrewAI/AutoGen/generic-OTel. (The older integrations.otel exporter
         # did neither.)
         from .otel import instrument as _otel_install
@@ -722,9 +722,10 @@ def register_manifest(
             ``{"sources": [...], ...}`` (declares the context surface; ``"closed"``
             mode flags undeclared context sources).
         skills: List of skill descriptors ``[{"name": ..., "hash": ...}]``
-            (declares the skill registry — pillar 1).
+            (declares the agent's skill set so skill changes are versioned).
         workflow: Workflow/graph topology descriptor ``{"name": ..., "hash": ...}``
-            (declares the agent's graph for the versioning moat).
+            (declares the agent's graph topology so topology changes diff as a
+            version change).
         behavioral_policy: Versioned policy-document surface ``{"policy_id",
             "policy_hash", "rules"?}`` — binds the agent to a named policy
             artifact (refund rules, a safety guardrail set, an escalation SOP…)
@@ -915,8 +916,8 @@ def flush_manifest_for_ci(
 ) -> dict:
     """Upload a manifest as a CI regression-check candidate and write the ID.
 
-    This is the helper called by the customer's init_for_decimal.py script
-    when running under DECIMALAI_MODE=manifest_only. It:
+    This is the helper your CI init script calls when running under
+    ``DECIMALAI_MODE=manifest_only``. It:
 
     1. Registers the manifest via the standard /api/v1/manifests endpoint
        (the backend stores it; the regression-check service will treat it

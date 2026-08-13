@@ -193,7 +193,7 @@ and patch releases are fixes.
   trustworthy timestamp the backend's `newer_wins` falls back to local-wins and a
   clone never overwrites the dashboard.
 - **`init(crewai=True)` / `init(autogen=True)` / `init(otel=True)` now register
-  a manifest (the versioning moat was silently off for them).** These flags wired
+  a manifest (manifest versioning was silently off for them).** These flags wired
   a manifest-blind exporter that also fragmented one agent run into many traces
   (per-span `SimpleSpanProcessor`); they now use the manifest-capable
   `decimalai.otel` exporter (root-span buffering + manifest registration), as
@@ -271,10 +271,9 @@ and patch releases are fixes.
   client methods (`create_experiment`, `get_experiment`,
   `get_experiment_results`, `submit_experiment_result(s)`,
   `complete_experiment`, `compare_experiments`) backed the now-removed
-  `/api/v1/experiments` endpoints and never worked end-to-end. The backend
-  surface was formally retired on 2026-06-24 (the permission-matrix resource
-  and the fleet reachability probe were dropped); this release stops the
-  published wheel from shipping the dead client methods.
+  `/api/v1/experiments` endpoints, which were retired on 2026-06-24. This
+  release stops the published wheel from shipping the corresponding client
+  methods.
 
 ## [0.5.0] — 2026-06-14
 

@@ -252,11 +252,10 @@ def test_notebook_runs_keyless_without_traceback(nb_path, tmp_path):
 
     ok, detail = registry_reachable()
     if not ok:
-        # A skip, never a pass. The public registry rate-limits anonymous
-        # traffic at the edge and runs one backend instance, so "unreachable
-        # right now" is a real state that must not be reported as a broken
-        # notebook — the same distinction scripts/check_notebook_manifest.py
-        # draws with its exit code 2.
+        # A skip, never a pass. The public API can be unreachable or throttling
+        # for reasons that have nothing to do with the notebook, so that state
+        # must not be reported as a broken notebook — the same distinction
+        # scripts/check_notebook_manifest.py draws with its exit code 2.
         pytest.skip(f"registry unreachable ({detail}) — cannot exercise the notebook end to end")
 
     source, needs = code_source(nb_path)

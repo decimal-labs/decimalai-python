@@ -17,10 +17,12 @@ Conventions:
   pure-unit CI.
 
 What each test asserts:
-1. `decimalai.<framework>.install()` does not raise.
-2. Running the agent emits at least one trace.
-3. The trace is retrievable from the backend by agent_name.
-4. The trace has the expected manifest, user_input, and final_output.
+1. Running the adapter emits at least one trace.
+2. The trace is retrievable from the backend by agent_name.
+3. The generic-decorator case additionally asserts an auto-detected manifest_id.
+
+Note: these tests wire the adapter explicitly (@decimalai.trace, CallbackHandler,
+DecimalTracingProcessor) rather than through the global instrument() entry point.
 """
 
 from __future__ import annotations

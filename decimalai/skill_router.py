@@ -159,7 +159,7 @@ def load_skill_tool_spec() -> Dict[str, Any]:
 
 # Appended to the prompt fragment by adapters when the load_skill tool is
 # registered — the server-side fragment keeps the activation-statement
-# instruction unchanged (Stage-M grades that exact shape).
+# instruction unchanged so evaluation stays on-distribution with production.
 LOAD_SKILL_PROMPT_HINT = (
     "If a skill applies, call the load_skill tool with its exact name to read "
     "its full instructions before using it."
@@ -1398,10 +1398,8 @@ class SkillRouter:
         ``GET /skills/{name}/body`` runs the Use/Fork resolver, so it answers
         for a **linked** skill — a Use pointer at a public skill owned by the
         publisher's org — as well as one you own. Every other read path here is
-        org-scoped (``GET /skills/{name}`` resolves via
-        ``resolve_org_skill(org_id=...)``), and that is the entire reason
-        :meth:`install` had to fork before it could write files: the disk
-        writer never cared who owned the skill, the FETCH did.
+        scoped to skills your org owns, which is why :meth:`install` forks
+        before it writes files.
 
         Returns None when the response lacks the export fields, which means an
         older backend — the caller then falls back to the org-scoped path and
@@ -1478,10 +1476,9 @@ class SkillRouter:
     def _attachments_for_export(self, skill_id: str) -> List[Dict[str, Any]]:
         """Attachment bodies for a skill you own OR one you only link to.
 
-        ``/api/v1/skills/{id}/attachments`` is org-scoped
-        (``_get_skill_or_404(db, skill_id, org_id)``), so it cannot see a linked
-        skill. The public registry serves the same files —
-        ``/api/v1/registry/skills/{id}/attachments`` to list and
+        ``/api/v1/skills/{id}/attachments`` is scoped to skills your org owns,
+        so it cannot see a linked skill. The public registry serves the same
+        files — ``/api/v1/registry/skills/{id}/attachments`` to list and
         ``.../{attachment_id}`` for one WITH content — and a Use target is by
         definition public, so that path is always available for exactly the
         skills the org-scoped one refuses.
@@ -1637,12 +1634,14 @@ class SkillRouter:
     ) -> Dict[str, Any]:
         """Publish one of your org's skills to the public registry.
 
-        The server enforces three gates before flipping ``visibility`` to
+        The server enforces four gates before flipping ``visibility`` to
         ``public``:
 
-        1. Caller must be the skill owner (or org admin).
-        2. Skill must have ≥3 versions — proves it's been iterated on.
-        3. Skill must have ≥10 total activations — proves it's been used.
+        1. Caller must be the skill creator (or org admin).
+        2. The version being published must have eval cases AND at least
+           one completed benchmark run — a run that *fails* is fine, a
+           missing or error-dominated one is not.
+        3. The safety scan must pass.
         4. Skill name must not collide with any other public skill
            (registry org imports OR another community publisher).
 
@@ -2012,9 +2011,8 @@ class SkillRouter:
             raise ValueError(f"scope must be 'workspace' or 'agent', got {scope!r}")
         if mode not in ("latest", "pinned"):
             raise ValueError(f"mode must be 'latest' or 'pinned', got {mode!r}")
-        # Exact-name resolution only — `q=` ranks the whole corpus, so items[0]
-        # used to record a *use* of a skill the caller never named (which also
-        # corrupts the usage telemetry SkillScore is built on).
+        # Exact-name resolution only — `q=` is a semantic search that ranks the
+        # whole corpus, so items[0] is not a match.
         from ._registry_resolve import RESOLVE_LIMIT, find_exact, not_found_message
 
         try:

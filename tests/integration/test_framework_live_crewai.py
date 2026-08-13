@@ -6,8 +6,8 @@ Phoenix conventions (``llm.model_name``, inline ``llm.output_messages.*.message
 rather than the GenAI semconv the Layer-5 test uses. This layer proves the
 exporter handles *that* dialect end-to-end with a **real Gemini-backed Crew**:
 
-  * Build a 2-tool (`get_price`, `calculate`) shopping Crew on
-    ``gemini-2.5-flash`` and actually run it.
+  * Build a 2-tool (`get_price`, `calculate`) shopping Crew on the current
+    Gemini budget-tier model (resolved by ``h.matrix``) and actually run it.
   * Bridge it through ``CrewAIInstrumentor`` + ``GoogleGenAIInstrumentor`` →
     ``DecimalSpanExporter`` → backend.
   * Assert the assembled trace carries every LLM step, both tools (harvested

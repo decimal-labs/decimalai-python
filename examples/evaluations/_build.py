@@ -154,12 +154,12 @@ cells = [
 
     md("## Part 4: Online Evaluation (Auto-Score Production Traffic)\n"
        "\n"
-       "Pass your evaluators to the `install()` function. Every trace is\n"
+       "Pass your evaluators to the `instrument()` function. Every trace is\n"
        "automatically scored before being sent to DecimalAI."),
 
     code("# Online eval with LangChain\n"
-         "# from decimalai.langchain import install\n"
-         "# install(\n"
+         "# from decimalai.langchain import instrument\n"
+         "# instrument(\n"
          "#     agent_name=\"support-agent\",\n"
          "#     evals=[check_answered, quality_score, check_hallucination],\n"
          "# )\n"

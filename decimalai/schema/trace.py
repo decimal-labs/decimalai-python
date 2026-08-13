@@ -106,7 +106,7 @@ class RunTrace(BaseModel):
     # SkillRouter: the `rt_<24-hex>` ID of the routing decision that
     # surfaced skills for this trace. When set, the platform joins
     # `routing_decision × trace_skill_activation` on this column to
-    # answer offered-vs-activated — the moat metric for skill quality.
+    # answer offered-vs-activated — the primary skill-quality metric.
     # Populated by framework adapters that call
     # `SkillRouter.build_prompt_fragment()` at prompt-assembly time.
     routing_id: Optional[str] = None

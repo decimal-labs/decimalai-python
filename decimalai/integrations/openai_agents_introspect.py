@@ -6,9 +6,10 @@ with explicit `tools`, `instructions`, `model`, and `handoffs` fields,
 which makes structural extraction cleaner than LangChain (no walk
 through Runnable wrappers).
 
-Used by `decimalai.flush_manifest_for_ci(chain=...)`. The function
-returns the same `(tools, prompts, models)` shape so the CI flush path
-treats both SDKs identically.
+Not yet wired into `decimalai.flush_manifest_for_ci()` — that path
+introspects LangChain objects only. OpenAI Agents SDK users should pass
+`tools=`/`prompts=`/`models=` explicitly, or call `introspect_agent()`
+themselves and forward the result.
 
 Design notes
 ------------

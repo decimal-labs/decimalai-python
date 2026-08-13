@@ -1,6 +1,6 @@
 """Lock in: Tier-2 fuzzy body matching works for auto-discovered skills.
 
-Deep-audit finding (sdk-core): detect_skill_activations Tier-2 reads
+``detect_skill_activations`` Tier-2 reads
 ``skill.get('body') or skill.get('body_markdown')`` and only fuzzy-matches
 when non-empty — but parse_skill_md / discover_skills descriptors carried
 NO body, so Tier-2 could never fire for the SDK's own auto-discovery.

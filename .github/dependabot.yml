@@ -16,11 +16,8 @@ updates:
       # (actions/checkout@v7 broke docs CI). Take majors deliberately + tested;
       # minor/patch (incl. security) still auto-PR.
       #
-      # This block sat at column 0 — a top-level `ignore:` key, which is not in
-      # Dependabot's schema. An unknown top-level key makes Dependabot reject the
-      # whole file, so NO updates ran here at all: the SHA pin in
-      # .github/workflows/publish.yml that says "Dependabot maintains the pin" was
-      # not being maintained. Re-nested under this entry. Same bug and same fix as
-      # regression-check/.github/dependabot.yml (2026-06-22).
+      # `ignore` must stay nested under this update entry. At column 0 it is a
+      # top-level key, which is not in Dependabot's schema, and an unknown
+      # top-level key makes Dependabot reject the whole file.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]

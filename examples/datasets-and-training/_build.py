@@ -26,7 +26,7 @@ cells = [
        "4. Export for OpenAI fine-tuning or other providers\n"
        "\n"
        "> This notebook demonstrates the API calls and data formats.\n"
-       "> The actual dataset building is done through the DecimalAI dashboard."),
+       "> Dataset building is driven from the DecimalAI dashboard; export and push are available from the SDK."),
 
     md("## Setup"),
 
@@ -116,18 +116,19 @@ cells = [
        "\n"
        "Once built, you can export the dataset and use it for fine-tuning."),
 
-    code("# The export API (called from dashboard or SDK)\n"
-         "# dataset = decimalai.export_dataset(\n"
-         "#     dataset_id=\"ds-abc123\",\n"
-         "#     format=\"openai_jsonl\",\n"
-         "# )\n"
+    code("# Pull a built dataset version to a local JSONL file (real SDK call):\n"
+         "# result = decimalai.pull_dataset(\"ds-abc123\", \"./train.jsonl\")\n"
+         "# print(f\"Wrote {result['row_count']} rows to {result['file_path']}\")\n"
          "#\n"
-         "# # This gives you a JSONL file ready for:\n"
+         "# # ...or from the CLI:\n"
+         "# # decimalai datasets export ds-abc123 --format jsonl -o ./train.jsonl\n"
+         "#\n"
+         "# # The JSONL is ready for OpenAI fine-tuning:\n"
          "# # openai api fine_tuning.jobs.create \\\n"
-         "# #   --training-file dataset.jsonl \\\n"
+         "# #   --training-file train.jsonl \\\n"
          "# #   --model gpt-4o-mini\n"
          "\n"
-         "print(\"ℹ️  Export your dataset from the dashboard or use the SDK.\")"),
+         "print(\"ℹ️  Export your dataset with decimalai.pull_dataset(...) or `decimalai datasets export`.\")"),
 
     md("## The Continuous Improvement Loop\n"
        "\n"

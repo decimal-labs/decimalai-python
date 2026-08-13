@@ -72,15 +72,12 @@ Exit codes. FINDINGS BEAT SILENCE — read this before touching the order.
        never be allowed to erase what this script already knows.
 
     That precedence is the whole point of the check ledger printed at the end of
-    every run, on every exit path. Until 2026-08-10 this script ran its offline
-    checks first, collected their findings, and then discarded them unprinted
-    the moment a later request timed out. The workflow downgrades exit 2 to
-    success — so a pull request that genuinely broke the manifest went GREEN
-    whenever the edge limiter happened to be throttling, and the output said
-    only "the check DID NOT RUN". Reproduced by pointing API at a dead port with
-    a planted manifest/FALLBACK mismatch; it returned 2 and printed nothing
-    about the mismatch. A check that cannot say WHICH checks it performed can
-    always be mistaken for one that passed.
+    every run, on every exit path. An offline finding is a complete verdict and
+    is always reported, even when the network leg fails: a finding established
+    before a later request times out is never discarded unprinted. The workflow
+    downgrades exit 2 to success, so a swallowed finding would leave a genuinely
+    broken manifest looking green. A check that cannot say WHICH checks it
+    performed can always be mistaken for one that passed.
 """
 
 from __future__ import annotations
@@ -518,8 +515,7 @@ def check_demo_extras(manifest, slug, run, *, pace):
     elif body.lstrip()[:1] == "<" or "<!DOCTYPE html" in body[:500]:
         # HTTP 200 lies in front of an auth wall: a protected path serves the
         # sign-in PAGE with a 200, so the status code proves nothing and the body
-        # is the only evidence. This one has cost this org five separate outages
-        # of exactly this shape.
+        # is the only evidence.
         problems.append(
             f"demo_skill.version: {SKILL_MD_URL.format(slug=slug, version=version)} answered 200 "
             "with HTML — the raw body is behind an auth wall or an error page, and cell 0.7 "

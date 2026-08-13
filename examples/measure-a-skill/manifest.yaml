@@ -23,8 +23,8 @@ demo_skill:
   source_type: platform
 
   # Pinned so cell 0.7 prints the body that was MEASURED, not whatever is
-  # latest. `_sync_eval_yaml` can rewrite a suite in place without minting a new
-  # version, so "latest" and "what the number was measured on" drift apart.
+  # latest. A suite can be updated in place without minting a new version, so
+  # "latest" and "what the number was measured on" drift apart.
   version: 1
 
   # THE CASE WHERE OUR OWN SKILL LOSES. Deliberately.
@@ -186,8 +186,7 @@ tier2:
   decimal_key_secrets: [DECIMAL_API_KEY, DECIMALAI_API_KEY]
 
   # The server-side budget that decides whether `/skills/route` RANKS or just
-  # returns everything (`llm.routing.desc_token_budget` / `max_menu_rows` in the
-  # backend config). Mirrored here only so cell 2.3 can explain the `full_menu`
+  # returns everything. Mirrored here only so cell 2.3 can explain the `full_menu`
   # strategy it will almost certainly get on a fresh workspace, using the same
   # numbers the server used. The response also echoes `desc_tokens` / `rows_total`
   # — the cell prints those, and these are the fallback when it does not.

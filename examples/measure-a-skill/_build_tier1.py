@@ -422,6 +422,10 @@ print("temperature   0     max_output_tokens 2048   (both match the published ru
         "| **A — bare** | nothing | — |\n"
         "| **B — the skill** | the published `SKILL.md`, verbatim | the skill's author |\n"
         "\n"
+        "*The demo skill is a worked example of measurement, not legal guidance. Nothing here —\n"
+        "the skill, its answers, or the regulations cited below — is legal advice, and none of it\n"
+        "should be relied on for a real classification decision.*\n"
+        "\n"
         "**The envelope is not ours to invent.** Both arms are wrapped in the exact text the\n"
         "published runner wrapped *its* two arms in — same preamble, same `User:` line, same\n"
         "trailing instruction. The slot is the only difference, which is what makes the difference\n"
@@ -841,11 +845,10 @@ else:
         "cell says so.\n"
         "\n"
         "**The one asymmetry, stated plainly.** Your side is graded live, by the judge and the\n"
-        "all-criteria rule in 1.5. Our side is the scorecard's own per-case verdict, which runs\n"
-        "through a **calibration gate**: expectations the skill made *worse* are ruled ineligible,\n"
-        "and a case left with no eligible expectation is scored as a failure in *both* arms. Same\n"
-        "cases and same arms, two graders — that is the first thing to suspect if the numbers\n"
-        "drift, ahead of anything about the skill.\n"
+        "all-criteria rule in 1.5. Our side is not re-graded here at all: the scorecard's own\n"
+        "per-case verdict is what the published headline is computed from, and this cell reads\n"
+        "that verdict back exactly as recorded. Same cases and same arms, two graders — that is\n"
+        "the first thing to suspect if the numbers drift, ahead of anything about the skill.\n"
         "\n"
         "**Read the per-case rows, not the total.** At six cases one flip is 16.7 points, so the\n"
         "aggregate cannot settle anything on its own. The flips can."
@@ -1015,9 +1018,7 @@ else:
             continue
         print(f"  {c:<34}{len(rows):>4}" +
               "".join(f"{sum(1 for r in rows if r.get('outcome') == o):>14}" for o in OUTS))
-    print("  a fail_kept is a case neither arm passed — which includes cases where the")
-    print("  calibration gate ruled the only expectation ineligible, scoring it as a failure")
-    print("  on both sides rather than crediting either.")
+    print("  a fail_kept is a case neither arm passed.")
 
     # PER-CASE EVIDENCE, NOT A SECOND SCORE. Read straight off the two recorded
     # transcripts with the same parser cell 1.4 used: cases where the arm WITHOUT
@@ -1163,7 +1164,7 @@ else:
         "with what each arm actually said.\n"
         "\n"
         "What is still ours: the skill, the cases, the expectations, the choice of judge model,\n"
-        "and the calibration gate behind the headline. Cell 1.9 is the only part where none of\n"
+        "and the per-case scoring behind the headline. Cell 1.9 is the only part where none of\n"
         "that applies. If you want the rest under your control, that is the next notebook — a\n"
         "DecimalAI account gets you routing and traces over **your** skills and **your** cases,\n"
         "and the same benchmark run on evidence you own.\n"

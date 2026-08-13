@@ -260,7 +260,7 @@ Provider-specific options summary:
      also not an install() parameter).
 
 For more information:
-  📖 DecimalAI Skills: https://docs.decimal.ai/skills
+  📖 DecimalAI Skills: https://docs.decimal.ai/guides/skills
   🏠 Dashboard: https://app.decimal.ai/skills
 """)
 

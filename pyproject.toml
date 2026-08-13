@@ -51,7 +51,7 @@ langchain = [
 # `pip install "decimalai[openai]"` co-installs the provider SDK the
 # init(openai=True) one-liner instruments.
 openai = [
-    "openai>=2.26.0,<3",  # Cap the major (mirrors the backend's google-genai<3 policy)
+    "openai>=2.26.0,<3",  # Cap the major: a future openai 3.x could break installs.
 ]
 openai-agents = ["openai-agents>=0.17.2"]
 # Runtime extra for the native Claude Agent SDK integration

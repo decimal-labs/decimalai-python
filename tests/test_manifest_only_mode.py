@@ -27,7 +27,7 @@ def clean_env(monkeypatch):
     for k in list(os.environ.keys()):
         if k.startswith("DECIMAL") or k.startswith("GITHUB_"):
             monkeypatch.delenv(k, raising=False)
-    # Else normal-mode init() phones home to verify the backend and reds the suite whenever online.
+    # Otherwise init() runs its default health probe against the configured backend, which has no listener in tests.
     monkeypatch.setenv("DECIMALAI_SKIP_VERIFY", "1")
     return monkeypatch
 

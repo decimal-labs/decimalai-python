@@ -446,14 +446,10 @@ class TraceContext:
         models = self._seen_models if self._seen_models else None
         subagents = self.subagents
 
-        # Always register a manifest, even an empty one. This method used
-        # to early-return when no tools/models/skills/subagents had been
-        # accumulated — which left the trace with no manifest_id, and the
-        # backend rejects those with a 400 ('manifest_id' is required).
-        # The simplest possible SDK flow (start_trace + set_input/output,
-        # no tools) hit exactly that path and produced zero visible
-        # traces. Registering a minimal manifest (agent name only) keeps
-        # the no-components case working.
+        # Always register a manifest, even a minimal one (agent name only).
+        # The backend requires a manifest_id on ingest, so a trace with no
+        # tools/models/skills/subagents still needs one — do not early-return
+        # here when the accumulators are empty.
         agent_name = self.agent_name or "unknown"
         snapshot = extract_from_config(
             agent_name=agent_name,

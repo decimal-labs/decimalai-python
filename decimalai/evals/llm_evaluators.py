@@ -7,7 +7,8 @@ relevance, factuality, and toxicity. They support two execution modes:
    with their own API key. Unlimited usage.
 
 2. **Server-side (managed)**: Calls the DecimalAI backend, which uses
-   the platform's LLM key. Metered by billing plan (no free tier).
+   the platform's LLM key. Metered against your plan's evaluation quota —
+   see the pricing page for per-plan limits.
 
 Example (client-side)::
 

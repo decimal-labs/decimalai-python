@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Complex Realistic Trace — stress-tests the trace UI with a deep, multi-tool, retry-laden agent run.
+"""Complex Realistic Trace — a deep, multi-tool, retry-laden agent run.
 
 Designed to produce a single trace with:
   - 10+ tool calls across distinct domains (stock data, news, analysis)
@@ -7,11 +7,8 @@ Designed to produce a single trace with:
   - One deliberate retry path (a "flaky" tool that fails on first invocation)
   - Multi-step reasoning that forces the agent to chain tool outputs
 
-The result: a trace deep enough to expose limits in the trace UI
-(waterfall density, span filtering, expand/collapse behavior).
-
-Kept as a seeding script so any time the trace UI is being tested against
-realistic data, this script can re-seed it.
+The result is a single trace with a dense waterfall, nested LLM spans and a
+visible retry — a good way to see how a real multi-step agent renders end to end.
 
 Prerequisites
 -------------

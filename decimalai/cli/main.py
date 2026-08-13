@@ -1082,13 +1082,11 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
     # traversal/absolute name before it reaches os.path.join (arbitrary file write).
     from ..disk_export import SkillExportUnsafePathError, _safe_skill_dirname
     try:
-        # `url_slug`, not `name`. A registry name may be
-        # namespaced (`microsoft/azure-kusto`) and a slash cannot be a single
-        # path component — which is why this refused 72.6% of the registry with
-        # "unsafe skill name ... may be malicious". The guard was right; it was
-        # reading the wrong field. `url_slug` is the slash-free identifier minted
-        # for this; falling back to `name` keeps older backends working, and for
-        # a plain name the two are identical.
+        # `url_slug`, not `name`. A registry name may be namespaced
+        # (`owner/skill`) and a slash cannot be a single path component.
+        # `url_slug` is the slash-free identifier minted for this; falling back
+        # to `name` keeps older backends working, and for a plain name the two
+        # are identical.
         name = _safe_skill_dirname(detail.get("url_slug") or detail.get("name") or slug)
     except SkillExportUnsafePathError as e:
         click.echo(f"  ✗ Refusing to pull: {e}", err=True)
@@ -2696,10 +2694,9 @@ def _should_fail(verdict: str, fail_on: str, structural_severity: str | None = N
     agent reds the build.
 
     This mirrors the GitHub Action's shouldFail. Both gates must agree, because this
-    CLI is the documented path for non-GitHub CI — and until this change it had no
-    ``unverified`` key at all, so ``rank.get(verdict, 0)`` returned 0 and the gate
-    exited 0 at EVERY --fail-on setting. A gate that silently passes an unknown
-    verdict is worse than one that errors on it.
+    CLI is the documented path for non-GitHub CI. An unknown verdict must never rank
+    0 — a gate that silently passes what it does not recognize is worse than one that
+    errors.
 
     A backend that does not send ``structural_severity`` falls back to low/warn
     rather than inventing a failure, so an older server cannot start reding builds.
@@ -2847,8 +2844,8 @@ def demo():
     Two one-command demos against your workspace, sharing one teardown:
 
     \b
-        decimalai demo regression   # "Your agent changed" (Door 1 + 2)
-        decimalai demo skills       # "Find skills that work" (Door 3)
+        decimalai demo regression   # "Your agent changed" (CI gate + interactive repair)
+        decimalai demo skills       # "Find skills that work"
         decimalai demo reset        # remove ALL demo data
 
     Each seed is reset-on-run by default, so you always land in the same
@@ -2876,8 +2873,8 @@ def demo_regression(reset, web, api_key, base_url, project):
     Seeds a v1→v2 agent (model swap, tool rename/removal, prompt rewrite)
     plus a real trace corpus, runs the regression check, and prints the
     URL straight to the impact report — the keep/repair/replay/drop
-    fan-out behind both Door 1 (CI / pre-deploy) and Door 2 (interactive
-    repair→build→export).
+    fan-out you get both in CI / pre-deploy and in the interactive
+    repair→build→export flow.
     """
     import urllib.parse
 
@@ -2958,9 +2955,8 @@ def demo_skills(reset, web, api_key, base_url, project):
     Seeds three demo skills into your workspace (org-scoped — other orgs
     never see them) with deliberately varied effectiveness, runs the
     registry stats recompute, and prints links to the registry and the
-    top skill's detail page — where per-model pass rates and the cross-org
-    router activation rate make the "registry that knows what works"
-    punchline land.
+    top skill's detail page, which shows per-model pass rates and the
+    cross-org router activation rate.
     """
     client = _make_client(api_key, base_url, project)
     web_url = _demo_web_url(base_url, web)

@@ -1,9 +1,7 @@
 """Tests for the no-silent-overwrite invariant in disk_export.
 
-The docs promise that installing a skill never touches files that already
-exist, but the SKILL.md write used open(path, 'w'), which silently
-overwrites any pre-existing file at the target path. These tests mechanize
-the promise: an explicit `force=True` is now required to overwrite.
+export_skill_to_disk never overwrites a file that already exists on disk; an
+explicit `force=True` is required. These tests mechanize that guarantee.
 """
 
 from __future__ import annotations
@@ -78,9 +76,8 @@ def test_attachment_collision_also_raises():
 
 
 def test_user_authored_skill_md_is_protected():
-    """The motivating scenario: user manually created `.claude/skills/pdf/SKILL.md`,
-    then runs `decimal registry install pdf`. Pre-fix this silently overwrote
-    their work. Post-fix it raises before touching the file."""
+    """A SKILL.md the user authored at the target path is preserved: running
+    `decimal registry install pdf` over it raises before touching the file."""
     with tempfile.TemporaryDirectory() as root:
         # Simulate user-authored file
         user_dir = os.path.join(root, ".claude", "skills", "pdf")

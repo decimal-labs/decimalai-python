@@ -1,10 +1,9 @@
 """Tests for native-tracer routing_id stamping.
 
 The framework adapters (langchain / anthropic / pydantic_ai) already stamp
-a SkillRouter `routing_id` onto the RunTrace so the platform's
-`routing_decision × trace_skill_activation` join (offered-vs-activated)
-can close. These tests cover the parity fix for the native
-`@decimalai.trace` / `start_trace` path:
+a SkillRouter `routing_id` onto the RunTrace so the backend can correlate
+which skills were offered with which were activated. These tests cover the
+parity fix for the native `@decimalai.trace` / `start_trace` path:
 
   - TraceContext.set_routing_id() populates build_trace().routing_id
   - module-level decimalai.set_routing_id() works inside a traced function

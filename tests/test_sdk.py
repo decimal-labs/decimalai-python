@@ -281,7 +281,7 @@ class TestCallbackHandler:
         assert call.status == Status.ERROR
         assert call.finish_reason == FinishReason.ERROR
 
-    def test_llm_error_drains_streaming_buffer_h209(self):
+    def test_llm_error_drains_streaming_buffer(self):
         """A streaming LLM call that errors mid-stream must drop its
         buffered tokens from `_streaming_buffers`. Without this, the
         global handler accumulates one entry per errored streaming call
@@ -315,7 +315,7 @@ class TestCallbackHandler:
 # ── Bounded _resolve_agent_name walk ──
 
 
-def test_resolve_agent_name_terminates_on_cycle_h210():
+def test_resolve_agent_name_terminates_on_cycle():
     """If `_spans` ever contains a parent_span_id cycle (malformed
     parent_run_id from LangChain, or a corrupted custom callback), the
     old `while span_id and span_id in self._spans` looped forever and
@@ -374,7 +374,7 @@ def test_resolve_agent_name_returns_nearest_agent_ancestor():
 # ── Tool description flows through to manifest ──
 
 
-def test_on_tool_start_captures_description_h211():
+def test_on_tool_start_captures_description():
     """`on_tool_start` previously read `description` into a local
     variable and discarded it — `_seen_tools[name]` only had `name` and
     `schema`. A description change like "Search the web" → "Search the

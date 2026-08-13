@@ -1,9 +1,5 @@
 """Coverage for the install-path traversal guard.
 
-`grep -r "traversal\\|UnsafePath" tests/` returned nothing before this file — the
-guard shipped untested, which is part of why `skills sync` was found in 2026-08-04
-writing a server-supplied name to disk without calling it at all.
-
 Threat model: the backend supplies the skill name. A malicious or compromised
 registry entry must not be able to write into ~/.bashrc, .git/hooks, cron.d, or an
 SSH config on the installing machine.
@@ -37,7 +33,7 @@ def test_accepts_a_plain_single_component(name):
         "../evil",
         "../../etc/passwd",
         "nested/child",
-        "microsoft/azure-kusto",  # a namespaced registry name is NOT a dirname
+        "acme/example-tool",  # a namespaced registry name is NOT a dirname
         "back\\slash",
         "..\\windows",
         "/absolute",
@@ -67,44 +63,42 @@ def test_refuses_rather_than_sanitizing():
         _safe_skill_dirname("../../.ssh/authorized_keys")
 
 
-# ── the split that makes `decimalai skills pull` work again ─────────
+# ── the split between the on-disk directory and the declared name ─────────
 
 def test_export_uses_url_slug_for_the_directory_and_name_for_frontmatter(tmp_path):
-    """decimalai skills pull <namespaced-skill> used to fail outright.
+    """A server-supplied skill name must never escape its own directory.
 
-    A registry name may be `owner/skill`. That is the skill's IDENTITY and must
-    stay in the SKILL.md frontmatter, but it cannot be a single path component —
-    so `_safe_skill_dirname` refused it and the CLI printed "unsafe skill name
-    ... The skill source may be malicious." for 72.6% of the registry.
-
-    The guard was never wrong; it was fed the wrong field. `url_slug` is the
-    slash-free identifier the platform serves alongside the name. These pin the
-    SPLIT: directory from url_slug, declared name from name.
+    INVARIANT: the on-disk directory comes from `url_slug` and the declared
+    identity comes from `name`. A registry name may be `owner/skill` — that is
+    the skill's IDENTITY and belongs in the SKILL.md frontmatter, but it is not
+    a single path component, so it can never be used as a directory name.
+    `url_slug` is the slash-free identifier the platform serves alongside the
+    name, and it is the only field the export path may turn into a directory.
     """
     from decimalai.disk_export import export_skill_to_disk
 
     result = export_skill_to_disk(
         {
-            "name": "microsoft/azure-kusto",
-            "url_slug": "microsoft-azure-kusto",
-            "description": "Query Azure Data Explorer.",
-            "body_markdown": "# Azure Kusto\n\nQuery things.",
+            "name": "acme/example-tool",
+            "url_slug": "acme-example-tool",
+            "description": "Query the example data store.",
+            "body_markdown": "# Example Tool\n\nQuery things.",
         },
         agents=["claude-code"],
         project_root=str(tmp_path),
     )
 
-    assert result["skill_dirname"] == "microsoft-azure-kusto"
-    assert result["skill_name"] == "microsoft/azure-kusto"
+    assert result["skill_dirname"] == "acme-example-tool"
+    assert result["skill_name"] == "acme/example-tool"
 
     written = result["written_paths"][0]
     # The directory is the slug — one level, where agents actually look.
-    assert "microsoft-azure-kusto" in written
-    assert "microsoft/azure-kusto" not in written
+    assert "acme-example-tool" in written
+    assert "acme/example-tool" not in written
 
     # …and the file still DECLARES the real, namespaced identity.
     content = open(written, encoding="utf-8").read()
-    assert "name: microsoft/azure-kusto" in content
+    assert "name: acme/example-tool" in content
 
 
 def test_export_falls_back_to_name_when_url_slug_is_absent(tmp_path):

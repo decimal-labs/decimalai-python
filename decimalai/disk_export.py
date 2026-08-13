@@ -354,14 +354,13 @@ def export_skill_to_disk(
         agents = ["universal"]
 
     root = project_root or os.getcwd()
-    # DIRECTORY NAME vs DECLARED NAME are two different things, and conflating them
-    # in one variable is why `decimalai skills pull` refused 72.6% of the registry.
+    # DIRECTORY NAME vs DECLARED NAME are two different things — a skill's `name`
+    # may be namespaced (`owner/skill`), which is not a valid single path component.
     #
-    # A skill's `name` may be namespaced (`microsoft/azure-kusto`) — that is its
-    # identity, and it is what the SKILL.md frontmatter must keep declaring. But a
-    # slash cannot be a single path component, so `_safe_skill_dirname` correctly
-    # rejected it: "unsafe skill name ... The skill source may be malicious." The
-    # guard was never wrong; it was being fed the wrong field.
+    # The namespaced form is the skill's identity, and it is what the SKILL.md
+    # frontmatter must keep declaring. But a slash cannot be a single path
+    # component, and `_safe_skill_dirname` rejects one outright, so `name` cannot
+    # double as the directory name.
     #
     # `url_slug` is the slash-free identifier the backend mints for
     # exactly this. Falling back to `name` keeps older backends working — and for a

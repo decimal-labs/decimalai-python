@@ -12,7 +12,7 @@ package, or both — say which if you know.
 Two ways to reach us, either is fine:
 
 - **GitHub private vulnerability reporting** — **Security → Report a vulnerability** on this
-  repository. That opens a private advisory only maintainers can see.
+  repository. That opens a private report only maintainers can see.
 - **Email** — [hello@decimal.ai](mailto:hello@decimal.ai). A PGP key is available on request if you
   would rather not send details in cleartext.
 
@@ -72,8 +72,10 @@ actually do:
 - We tell you whether we consider it in scope and what we intend to do.
 - We follow coordinated disclosure. We agree a timeline with you rather than impose one, and we will
   not ask you to stay quiet indefinitely.
-- We are happy to credit you in the advisory, the `CHANGELOG.md` entry, and the release notes. Tell
-  us how you would like to be named, or say that you would rather not be.
+- We do not publish standalone security advisories. A fix ships in a normal release, and the
+  `CHANGELOG.md` entry for that release describes what changed.
+- We are happy to credit you in that entry. Tell us how you would like to be named, or say that you
+  would rather not be.
 
 There is no paid bug bounty. That is a resourcing decision, not a judgment about the value of your
 work.

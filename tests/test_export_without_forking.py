@@ -3,9 +3,8 @@
 `install()` forks and then writes files, so wanting a skill on disk forced you
 to take a copy. The disk writer never cared who owned the skill -- it wants a
 name, a description and a body. It was the FETCH that forced the fork:
-`GET /skills/{name}` resolves via `resolve_org_skill(org_id=...)`, and a linked
-skill (a Use pointer at a public skill owned by the publisher's org) is not in
-your org.
+`GET /skills/{name}` is scoped to your org, and a linked skill (a Use pointer at
+a public skill owned by the publisher's org) is not in your org.
 
 `GET /skills/{name}/body` runs the Use/Fork resolver instead, so it answers for
 both. It now carries `skill_id` and `description` too, which is what makes it

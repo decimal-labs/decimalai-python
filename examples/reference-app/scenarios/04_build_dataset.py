@@ -2,8 +2,11 @@
 """Scenario 4: Build a clean SFT dataset.
 
 Demonstrates the end of the DecimalAI loop:
-- View the impact report (which traces are compatible)
-- Build a training dataset from passing, version-compatible traces
+- The impact report (which traces are compatible)
+- The shape of a training dataset built from passing, version-compatible traces
+
+Illustrative only: this scenario prints the shape of the report and of one SFT
+training row. It makes no API calls.
 """
 
 import json
@@ -23,6 +26,9 @@ def main():
     print("=" * 55)
     print("  Scenario 4: Build Clean Dataset")
     print("=" * 55)
+    print()
+    print("  (Illustrative output — this scenario prints the SHAPE of an impact")
+    print("   report and an SFT training row; it makes no API calls.)")
     print()
 
     # ── Show the impact report ──
@@ -99,7 +105,7 @@ def main():
     # ── Summary ──
     print("  ─" * 27)
     print()
-    print("  ✅ The full DecimalAI workflow:")
+    print("  The full DecimalAI workflow:")
     print()
     print("     1. Agent v1 ran → 10 traces captured")
     print("     2. Agent updated to v2 → manifest change detected")

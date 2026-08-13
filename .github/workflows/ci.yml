@@ -98,7 +98,7 @@ jobs:
         # E501 (line length): handled by formatter, not relevant.
         # E402: intentional lazy imports to avoid circular import.
         # F821: intentional forward refs (already have # type: ignore).
-        # F841: unused vars (debug leftovers; tracked separately, not blocking).
+        # F841: unused locals — out of scope for this lint pass.
         run: ruff check decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841
 
       - name: Guard against legacy package name

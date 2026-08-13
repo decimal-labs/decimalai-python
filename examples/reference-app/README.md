@@ -85,14 +85,16 @@ Switches to Agent v2 (adds `process_refund` tool). Runs 3 queries.
 DecimalAI auto-detects the manifest change.
 
 ### Scenario 3: Run Evaluations
-Scores all traces with deterministic evaluators:
+Defines 3 deterministic evaluators and runs them on 3 sample traces, then
+shows how to score real traces with `batch_eval`:
 - `answered_question` — Did the agent actually answer?
 - `response_quality` — Is the response substantial?
 - `no_hedging` — No uncertain language?
 
 ### Scenario 4: Build Dataset
-Queries the impact report and builds a clean SFT dataset from
-passing, version-compatible traces.
+Prints the shape of an impact report and of an SFT training row.
+Illustrative output — this scenario makes no API calls; see
+`client.impact_report()` and `client.build_dataset()` to do it for real.
 
 ## Requirements
 
