@@ -25,6 +25,22 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
+# The one module-level framework import in this file, and it is deliberate: a base
+# class cannot be chosen lazily the way every other langchain import here is. The
+# try/except preserves the guarantee that a core-only install stays importable —
+# without langchain-core the handler simply subclasses object and keeps working by
+# duck typing, which is how it has always worked at runtime.
+#
+# Why bother, given duck typing works: langchain-core annotates
+# ``Callbacks = list[BaseCallbackHandler] | ...``, so passing this handler to
+# ``config={"callbacks": [...]}`` is a type error under mypy and pyright even though
+# it runs correctly. Verified on langchain-core 1.5.3: there is no isinstance check
+# in the callback manager, and traces are byte-identical either way.
+try:  # pragma: no cover - import shape depends on the installed extras
+    from langchain_core.callbacks import BaseCallbackHandler as _CallbackBase
+except Exception:  # noqa: BLE001 - any import failure means "not installed"
+    _CallbackBase = object  # type: ignore[assignment,misc]
+
 from .integrations._lc_compat import (
     extract_message_content,
     extract_model_name,
@@ -556,10 +572,17 @@ def instrument(
 
 
 
-class CallbackHandler:
+class CallbackHandler(_CallbackBase):
     """LangChain/LangGraph callback handler that captures traces for DecimalAI.
 
-    Implements the LangChain BaseCallbackHandler protocol via duck typing.
+    Subclasses ``BaseCallbackHandler`` when langchain-core is installed, and falls
+    back to duck typing when it is not.
+
+    The ``ignore_*`` / ``raise_error`` / ``run_inline`` flags below are CLASS
+    attributes, not assignments in ``__init__``. On the real base class they are
+    read-only properties, so assigning them per instance raises AttributeError the
+    moment langchain-core is present — which is exactly the case this subclassing
+    exists to support.
     Traces are auto-sent to the DecimalAI backend when the root chain
     completes (requires ``decimalai.init()`` to have been called).
 
@@ -569,6 +592,18 @@ class CallbackHandler:
             the root chain finishes. Set False for manual control.
         session_id: Optional session grouping.
     """
+
+    # LangChain BaseCallbackHandler protocol flags. Class-level on purpose — see
+    # the note in the class docstring.
+    raise_error: bool = False
+    run_inline: bool = False
+    ignore_llm: bool = False
+    ignore_retry: bool = True
+    ignore_chain: bool = False
+    ignore_agent: bool = False
+    ignore_retriever: bool = True
+    ignore_chat_model: bool = False
+    ignore_custom_event: bool = True
 
     def __init__(
         self,
@@ -598,17 +633,6 @@ class CallbackHandler:
         self.project = project
         self.parent_trace_id = parent_trace_id
         self.subagents = list(subagents) if subagents else None
-
-        # LangChain BaseCallbackHandler protocol attributes
-        self.raise_error: bool = False
-        self.run_inline: bool = False
-        self.ignore_llm: bool = False
-        self.ignore_retry: bool = True
-        self.ignore_chain: bool = False
-        self.ignore_agent: bool = False
-        self.ignore_retriever: bool = True
-        self.ignore_chat_model: bool = False
-        self.ignore_custom_event: bool = True
 
         self._reset_state()
 
