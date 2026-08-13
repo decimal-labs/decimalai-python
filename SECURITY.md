@@ -12,7 +12,7 @@ package, or both — say which if you know.
 Two ways to reach us, either is fine:
 
 - **GitHub private vulnerability reporting** — **Security → Report a vulnerability** on this
-  repository. That opens a private report only maintainers can see.
+  repository. Only maintainers can see what you send.
 - **Email** — [hello@decimal.ai](mailto:hello@decimal.ai). A PGP key is available on request if you
   would rather not send details in cleartext.
 
