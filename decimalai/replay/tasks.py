@@ -311,7 +311,6 @@ def run(
     agent_name: str,
     verdict: Optional[str] = None,
     limit: int = 100,
-    pairwise_scoring: bool = False,
     on_progress: Optional[Callable[[int, int, ReplayTaskResult], None]] = None,
 ) -> ReplayResults:
     """Run automated replay: fetch prompts, execute agent, submit results.
@@ -335,8 +334,6 @@ def run(
         verdict: Filter prompts by verdict (``"replay"``, ``"drop"``).
             Defaults to replay + drop.
         limit: Maximum number of prompts to replay (default 100).
-        pairwise_scoring: If True, use LLM-based pairwise comparison
-            for scoring (requires GEMINI_API_KEY on the backend). Default False.
         on_progress: Optional callback ``(completed, total, task_result)``
             called after each prompt is processed.
 

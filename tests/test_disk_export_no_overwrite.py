@@ -77,7 +77,7 @@ def test_attachment_collision_also_raises():
 
 def test_user_authored_skill_md_is_protected():
     """A SKILL.md the user authored at the target path is preserved: running
-    `decimal registry install pdf` over it raises before touching the file."""
+    `decimalai skills install pdf` over it raises before touching the file."""
     with tempfile.TemporaryDirectory() as root:
         # Simulate user-authored file
         user_dir = os.path.join(root, ".claude", "skills", "pdf")

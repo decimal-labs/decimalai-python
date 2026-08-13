@@ -19,8 +19,11 @@ WHAT IT CHECKS
     hits a raw.github blip.
 2.  IDENTITY, not existence. `crisis-response-protocol` still returns HTTP 200
     today and is now a suicide-prevention import from a medical-skills repo. A
-    bare existence check goes green on that, so author_display_name and
-    source_type are pinned and compared.
+    bare existence check goes green on that, so the demo skill's immutable id
+    (`skill_id`, compared against the record's `id`) and source_type are pinned
+    and compared. The id rather than the author's display name: a handle is
+    mutable and names a real third party, so pinning it made a profile rename
+    look like a hijacked slug.
 3.  EVERY GATE in `gates:` against the live benchmark_summary. A gate key with
     no implementation here is an error, not a no-op — otherwise tightening the
     YAML would silently do nothing.
@@ -389,14 +392,11 @@ def _g_prompts_served(expected, b, run):
     return None
 
 
-# NO never_hurt / regressed_cases GATE, deliberately. Both are derived under the
-# headline's calibration rule, which sets aside the very expectations a skill made
-# worse — so `never_hurt: true` can be true of a skill that demonstrably turned a
-# right answer wrong (live: flsa-exemption-test case-21 and case-22, where the
-# no-skill arm passes both expectations and the skill fails both). Gating on a
-# badge that can contradict the rows underneath it is worse than not gating.
-# What the notebook shows instead is the pair of pass rates, which needs no
-# interpretation: N of M cases passed with the skill, K of M without.
+# This checker asserts only the keys declared under `gates:` — nothing else.
+# `never_hurt` and `regressed_cases` are run-level summaries, not gate keys, so
+# they are not asserted here. What the notebook shows instead is the pair of
+# pass rates, which needs no interpretation: N of M cases passed with the skill,
+# K of M without.
 GATE_CHECKS = {
     "min_delta_pts": _g_min_delta,
     "min_cases": _g_min_cases,
@@ -408,6 +408,12 @@ GATE_CHECKS = {
 # ──────────────────────────────────────────────────────────────────────
 # Per-skill assertions
 # ──────────────────────────────────────────────────────────────────────
+
+# Manifest pin key → the field it is compared against on the registry record.
+# Only needed where the two differ; anything absent here is compared under its
+# own name.
+PIN_FIELDS = {"skill_id": "id"}
+
 
 def check_skill(slug, *, role, key_prefix, pins, gates, pace, spare_hint, key_sep="."):
     """Assert one skill against its identity pins and every declared gate.
@@ -431,7 +437,11 @@ def check_skill(slug, *, role, key_prefix, pins, gates, pace, spare_hint, key_se
     # Identity before anything else: a slug that still resolves is not the skill
     # you meant.
     for field, expected in pins.items():
-        live = skill.get(field)
+        # The manifest key and the API field are the same name except for the
+        # uuid: the pin is `skill_id` (so the YAML says what it is) and the
+        # registry record calls it `id`. Reading `skill.get("skill_id")` yields
+        # None, which would fail every run with a message about a hijacked slug.
+        live = skill.get(PIN_FIELDS.get(field, field))
         if live != expected:
             problems.append(
                 f"{key_prefix}{key_sep}{field}: manifest pins {expected!r}, the live '{slug}' says "
@@ -899,7 +909,7 @@ def main(argv=None):
     #     an identity pin degrades this whole script to an existence check, which
     #     is precisely the thing that goes green on a slug that is now somebody
     #     else's medical-skills import.
-    for key in ("author_display_name", "source_type", "version", "demo_case"):
+    for key in ("skill_id", "source_type", "version", "demo_case"):
         if demo.get(key) in (None, ""):
             offline_problems.append(
                 f"demo_skill.{key}: missing from manifest.yaml — without it this check cannot "
@@ -937,7 +947,7 @@ def main(argv=None):
             pins={
                 k: v
                 for k, v in {
-                    "author_display_name": demo.get("author_display_name"),
+                    "skill_id": demo.get("skill_id"),
                     "source_type": demo.get("source_type"),
                 }.items()
                 if v is not None  # absence is already reported above; don't double-count

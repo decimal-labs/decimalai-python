@@ -373,7 +373,12 @@ def init(
             never grouped anything. Accepted for back-compat; emits a
             ``DeprecationWarning`` and will be removed. Use workspaces (scoped
             by the API key) to group traces.
-        enabled: Set ``False`` to disable all tracing (integrations become no-ops).
+        enabled: Set ``False`` to disable all tracing. This is a real kill
+            switch: no client is created, and the framework flags below
+            (``langchain``/``openai_agents``/``adk``/``llamaindex``/
+            ``claude_agent_sdk``/``otel``/``crewai``/``autogen``) are ignored —
+            no adapter is installed, no call is made to the DecimalAI API, and
+            no skill files are written to disk.
         langchain: If ``True``, instrument LangChain / LangGraph.
         openai_agents: If ``True``, instrument the OpenAI Agents SDK.
         adk: If ``True``, instrument Google ADK (Agent Development Kit) via a
@@ -548,43 +553,58 @@ def init(
     import decimalai as _self
     _self._global_client = _cfg._client
 
-    # Auto-install langchain tracing if requested
-    if langchain:
-        from .langchain import instrument as _lc_install
-        _lc_install(agent_name=agent_name)
+    # Framework auto-install is gated on `enabled`. This is the kill switch:
+    # an adapter's instrument() is not a passive no-op — it monkey-patches the
+    # framework, calls the DecimalAI API to sync/pull skills, and writes skill
+    # files into the caller's working tree. Running any of that after the
+    # caller said enabled=False is exactly the behaviour the flag exists to
+    # prevent, so the whole block is skipped: no adapter installed, no HTTP
+    # call, nothing written to disk.
+    if not enabled:
+        if langchain or openai_agents or adk or llamaindex or claude_agent_sdk \
+                or otel or crewai or autogen:
+            logger.info(
+                "DecimalAI SDK disabled (enabled=False) — skipping framework "
+                "instrumentation; no adapter installed and no skills synced."
+            )
+    else:
+        # Auto-install langchain tracing if requested
+        if langchain:
+            from .langchain import instrument as _lc_install
+            _lc_install(agent_name=agent_name)
 
-    # Auto-install OpenAI Agents tracing if requested
-    if openai_agents:
-        from .openai_agents import instrument as _oai_install
-        _oai_install(agent_name=agent_name)
+        # Auto-install OpenAI Agents tracing if requested
+        if openai_agents:
+            from .openai_agents import instrument as _oai_install
+            _oai_install(agent_name=agent_name)
 
-    # Auto-install Google ADK tracing if requested
-    if adk:
-        from .adk import instrument as _adk_install
-        _adk_install(agent_name=agent_name)
+        # Auto-install Google ADK tracing if requested
+        if adk:
+            from .adk import instrument as _adk_install
+            _adk_install(agent_name=agent_name)
 
-    # Auto-install LlamaIndex span handler if requested
-    if llamaindex:
-        from .llamaindex import instrument as _li_install
-        _li_install(agent_name=agent_name)
+        # Auto-install LlamaIndex span handler if requested
+        if llamaindex:
+            from .llamaindex import instrument as _li_install
+            _li_install(agent_name=agent_name)
 
-    # Auto-install Claude Agent SDK stream tracing if requested
-    if claude_agent_sdk:
-        from .claude_agent_sdk import instrument as _cas_install
-        _cas_install(agent_name=agent_name)
+        # Auto-install Claude Agent SDK stream tracing if requested
+        if claude_agent_sdk:
+            from .claude_agent_sdk import instrument as _cas_install
+            _cas_install(agent_name=agent_name)
 
-    # Auto-install OTEL exporter for CrewAI, AutoGen, or generic OTEL
-    # CrewAI and AutoGen emit standard OpenTelemetry GenAI spans,
-    # so they use the same exporter — the named flags are just
-    # convenience aliases for discoverability.
-    if otel or crewai or autogen:
-        # Use the manifest-capable exporter (decimalai.otel) — it buffers spans
-        # by root span (no per-batch fragmentation) AND registers a manifest
-        # from the captured model/tools/prompt, so manifest versioning works
-        # for CrewAI/AutoGen/generic-OTel. (The older integrations.otel exporter
-        # did neither.)
-        from .otel import instrument as _otel_install
-        _otel_install(agent_name=agent_name)
+        # Auto-install OTEL exporter for CrewAI, AutoGen, or generic OTEL
+        # CrewAI and AutoGen emit standard OpenTelemetry GenAI spans,
+        # so they use the same exporter — the named flags are just
+        # convenience aliases for discoverability.
+        if otel or crewai or autogen:
+            # Use the manifest-capable exporter (decimalai.otel) — it buffers spans
+            # by root span (no per-batch fragmentation) AND registers a manifest
+            # from the captured model/tools/prompt, so manifest versioning works
+            # for CrewAI/AutoGen/generic-OTel. (The older integrations.otel exporter
+            # did neither.)
+            from .otel import instrument as _otel_install
+            _otel_install(agent_name=agent_name)
 
     # Auto-trace direct provider-SDK calls (no framework) if requested.
     # Each flag enables the matching provider's OpenInference instrumentor,

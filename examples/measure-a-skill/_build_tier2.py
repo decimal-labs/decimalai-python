@@ -897,10 +897,13 @@ cells = [
         "  in this package's *test* extras, so on a plain `pip install decimalai` it logs a\n"
         "  pip hint and traces nothing. It looks like it worked. (`openai=True` has the same\n"
         "  shape: the `openai` extra installs the provider SDK, not the instrumentor.)\n"
-        "- **`init(enabled=False, langchain=True)`** — never combine those. The framework\n"
-        "  flags are applied *outside* the `enabled` gate, and the LangChain install submits a\n"
-        "  background skill pull that calls the API and writes `SKILL.md` files to disk, with\n"
-        "  tracing nominally disabled."
+        "- **`init(enabled=False, langchain=True)`** — this notebook doesn't use LangChain, so\n"
+        "  there is nothing to instrument. It is safe to combine now, and it did not use to be:\n"
+        "  the framework flags used to be applied *outside* the `enabled` gate, so a disabled\n"
+        "  init still ran the LangChain install, which submits a background skill pull that\n"
+        "  calls the API and writes `SKILL.md` files to disk. They are inside the gate as of\n"
+        "  this version — a disabled init installs no adapter, calls nothing and writes\n"
+        "  nothing. On an older pinned `decimalai`, don't combine them."
     ),
     code(
         "# The one branch that is NOT about your key: if 2.2's pip step could not run there is\n"

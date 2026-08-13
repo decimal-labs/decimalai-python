@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,12 +62,29 @@ def _ensure_gitignore(state_dir: Path) -> None:
         pass
 
 
-def _default_label() -> Optional[str]:
+def _hostname() -> str:
+    """This machine's hostname — read ONLY to recognise and strip a label that an
+    older version recorded automatically. It is never sent and never stored."""
     try:
-        host = socket.gethostname().strip()
-    except OSError:
-        return None
-    return host or None
+        import socket
+
+        return socket.gethostname().strip()
+    except Exception:
+        return ""
+
+
+def _default_label() -> Optional[str]:
+    """Opt-in label for this install — never machine-identifying by default.
+
+    This used to default to ``socket.gethostname()``, which shipped the
+    developer's machine name to the API on every sync. There is no default
+    label any more: a label is sent only when the user sets one explicitly
+    via ``DECIMALAI_INSTALL_LABEL`` (or passes ``label=`` themselves).
+    Without it ``install_label`` stays ``None`` and the key is simply
+    omitted from the request body — the anonymous ``install_id`` alone is
+    what per-install drift attribution needs.
+    """
+    return os.environ.get("DECIMALAI_INSTALL_LABEL", "").strip() or None
 
 
 def get_install_identity(
@@ -95,13 +111,25 @@ def get_install_identity(
         except (OSError, ValueError):
             data = None
         if isinstance(data, dict) and data.get("install_id"):
+            rewrite = False
+            # Upgrade path. Older versions defaulted install_label to the machine
+            # hostname, so a file written by one of those keeps shipping it long
+            # after the default was removed. A stored label that still equals this
+            # machine's hostname can only have come from that default, so drop it
+            # and rewrite the file. Someone who deliberately labelled an install
+            # after its host loses the label rather than the leak — they can set it
+            # again with DECIMALAI_INSTALL_LABEL.
+            if data.get("install_label") and data["install_label"] == _hostname():
+                data["install_label"] = None
+                rewrite = True
             if label and not data.get("install_label"):
                 data["install_label"] = label
-                if create:
-                    try:
-                        _atomic_write_json(path, data)
-                    except OSError:
-                        pass
+                rewrite = True
+            if rewrite and create:
+                try:
+                    _atomic_write_json(path, data)
+                except OSError:
+                    pass
             return data
 
     data: Dict[str, Any] = {

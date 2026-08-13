@@ -31,6 +31,14 @@ Example (server-side — uses DecimalAI's key)::
 Example (custom model)::
 
     evals=[Relevance(model="claude-3-5-haiku-20241022")]
+
+**Failures fail closed.** If the judge cannot be reached or cannot be parsed
+(network error, revoked key, rate limit, exhausted quota, empty completion),
+the result is ``passed=False, score=0.0`` with a reason naming the error type,
+and ``metadata["evaluator_error"]`` set. It is never reported as a pass — an
+evaluator that reached no verdict has no grounds to approve the output, and
+``Toxicity`` is a safety check. Use ``metadata["evaluator_error"]`` to tell an
+evaluator outage apart from a genuine quality failure.
 """
 
 from __future__ import annotations
@@ -139,6 +147,25 @@ Respond with ONLY this JSON:
 # ── LLM Calling ──────────────────────────────────────────────────
 
 
+def _evaluator_error(reason: str, error: str) -> Dict[str, Any]:
+    """Build a FAIL-CLOSED response for an evaluator that reached no verdict.
+
+    These evaluators used to answer a network error, an expired key, a rate
+    limit or an exhausted quota with ``{"score": 0.5, "passed": True}`` — i.e.
+    an outage silently reported a PASS on every trace, including ``Toxicity``
+    (category ``quality:safety``), whose whole job is to withhold approval from
+    unsafe output. An evaluator that never saw a verdict has no grounds to
+    report success, so the failure path now fails CLOSED: ``passed=False``,
+    ``score=0.0``, with the reason still naming the error type.
+
+    The ``error`` key marks the result as "the evaluator broke", not "the agent
+    produced a bad answer" — ``_response_to_result`` surfaces it as
+    ``EvalResult.metadata["evaluator_error"]`` so dashboards and gates can tell
+    an infrastructure failure apart from a genuine quality failure.
+    """
+    return {"score": 0.0, "passed": False, "reason": reason, "error": error}
+
+
 def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
     """Call an LLM via litellm and parse the JSON response.
 
@@ -166,8 +193,8 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
             # `max_tokens`→`max_completion_tokens`. Recent litellm handles this for known
             # models, but the default model moves faster than a user's pinned litellm —
             # drop_params makes litellm silently drop/translate params it can't map for
-            # this model instead of 400-ing (which our broad except would mask as a
-            # passing 0.5 eval). Scoped to this call, not litellm's global flag.
+            # this model instead of 400-ing (which our broad except would turn into a
+            # failed eval for every trace). Scoped to this call, not litellm's global flag.
             drop_params=True,
         )
 
@@ -175,11 +202,14 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
         # safety-blocked / empty completion, returns ``content=None``. Calling
         # ``.strip()`` on that crashed with AttributeError and surfaced as a
         # misleading "Eval error" — report an honest empty-response result instead.
+        # No content means no verdict, so this fails closed: a provider that
+        # safety-blocks its own completion is the LAST case that should be
+        # reported as a passing Toxicity check.
         raw = response.choices[0].message.content
         if not raw:
             logger.warning("LLM eval returned empty content (model=%s)", model)
-            return {"score": 0.5, "passed": True,
-                    "reason": "Evaluator returned an empty response"}
+            return _evaluator_error(
+                "Evaluator returned an empty response", "empty_response")
         content = raw.strip()
 
         # Parse JSON from response
@@ -188,7 +218,7 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             # Strip markdown code fences, then extract the first brace-balanced
             # object. A naive ``\{[^}]+\}`` truncates on nested objects or a
-            # ``}`` inside a reason string, yielding a passing 0.5 by accident.
+            # ``}`` inside a reason string, discarding a verdict we actually had.
             fenced = content
             if "```" in fenced:
                 fenced = fenced.split("```", 2)
@@ -223,11 +253,12 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
                             except json.JSONDecodeError:
                                 break
             logger.warning("Could not parse LLM response as JSON: %s", content[:200])
-            return {"score": 0.5, "passed": True, "reason": "Could not parse evaluator response"}
+            return _evaluator_error(
+                "Could not parse evaluator response", "unparseable_response")
 
     except Exception as e:
         logger.warning("LLM eval call failed: %s: %s", type(e).__name__, e)
-        return {"score": 0.5, "passed": True, "reason": f"Eval error: {type(e).__name__}"}
+        return _evaluator_error(f"Eval error: {type(e).__name__}", type(e).__name__)
 
 
 def _call_server(
@@ -262,30 +293,45 @@ def _call_server(
             # Find the check matching our evaluator name
             for check in checks:
                 if check.get("check") == evaluator_name:
+                    # `passed` used to default to True, so a backend response
+                    # that omitted the field reported a pass on no evidence.
+                    # Derive it from the score instead, and default a missing
+                    # score to 0.0 rather than a passing 0.5.
+                    check_score = check.get("score", 0.0)
                     return {
-                        "score": check.get("score", 0.5),
-                        "passed": check.get("passed", True),
+                        "score": check_score,
+                        "passed": check.get(
+                            "passed", float(check_score or 0.0) >= 0.5),
                         "reason": check.get("reasoning") or check.get("detail", ""),
                     }
 
         # Fallback to overall score
         return {
-            "score": data.get("score", 0.5),
+            "score": data.get("score", 0.0),
             "passed": data.get("verdict") == "pass",
             "reason": data.get("reasoning", ""),
         }
 
     except Exception as e:
         logger.warning("Server-side eval failed: %s: %s", type(e).__name__, e)
-        return {"score": 0.5, "passed": True, "reason": f"Server eval error: {type(e).__name__}"}
+        return _evaluator_error(
+            f"Server eval error: {type(e).__name__}", type(e).__name__)
 
 
 def _response_to_result(resp: Dict[str, Any]) -> EvalResult:
-    """Convert an LLM response dict to an EvalResult."""
+    """Convert an LLM response dict to an EvalResult.
+
+    An ``error`` key (set only by ``_evaluator_error``) is carried through as
+    ``metadata["evaluator_error"]`` so a consumer can distinguish "the judge
+    failed" from "the agent failed the judge" — both are non-passing, but only
+    one is worth paging someone about.
+    """
     score = max(0.0, min(1.0, float(resp.get("score", 0.5))))
     passed = resp.get("passed", score >= 0.5)
     reason = resp.get("reason", "")
-    return EvalResult(score=score, passed=passed, reason=reason)
+    error = resp.get("error")
+    metadata = {"evaluator_error": error} if error else None
+    return EvalResult(score=score, passed=passed, reason=reason, metadata=metadata)
 
 
 # ── Base LLM Evaluator ──────────────────────────────────────────

@@ -226,9 +226,11 @@ class TestSkillsSyncInstallWiring:
         )
         runner = CliRunner()
         with runner.isolated_filesystem():
-            # Pre-record this checkout's identity with a known label so the
-            # assertion is exact — otherwise the label defaults to the test
-            # host's name and the id would be freshly minted inside the call.
+            # Pre-record this checkout's identity with an explicit (opt-in)
+            # label so the assertion is exact — otherwise there is no label at
+            # all and the id would be freshly minted inside the call. The
+            # no-label default is covered in
+            # tests/test_no_machine_identity_in_payloads.py.
             ident = _install.get_install_identity(".", label="ci-box")
             _seed("alpha-dir", SKILL_ALPHA)
             with patch("decimalai.cli.main._make_client", return_value=client):

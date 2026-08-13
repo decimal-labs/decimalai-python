@@ -6,7 +6,50 @@ and patch releases are fixes.
 
 ## Unreleased
 
+### Fixed
+
+- **`init(enabled=False)` is now a real kill switch.** The framework flags
+  (`langchain`, `openai_agents`, `adk`, `llamaindex`, `claude_agent_sdk`,
+  `otel`, `crewai`, `autogen`) were applied *outside* the `enabled` gate, so
+  `init(enabled=False, langchain=True)` skipped only the client and then
+  installed the adapter anyway — which calls the DecimalAI API to sync and pull
+  skills, and writes `SKILL.md` files into your project. Turning the SDK off
+  produced network traffic and new files on disk. The flags are inside the gate
+  now: a disabled init installs no adapter, makes no API call and writes
+  nothing. `enabled=True` is unchanged.
+
+  ```python
+  decimalai.init(api_key=..., enabled=False, langchain=True)  # now truly a no-op
+  ```
+
 ### Changed
+
+- **LLM judges now fail closed.** `Relevance`, `Factuality`, `Faithfulness`,
+  `Toxicity` and `Conciseness` used to answer *any* evaluator failure — network
+  error, revoked key, rate limit, exhausted quota, empty or unparseable
+  completion — with `score=0.5, passed=True`. An outage therefore reported a
+  PASS on every trace, including `Toxicity`, whose category is
+  `quality:safety`. Those paths now return `passed=False, score=0.0`, keep a
+  reason naming the error type, and set `metadata["evaluator_error"]` so you
+  can tell an evaluator outage apart from a genuine quality failure. Same for
+  the server-side path (`use_server=True`), and a backend check that omits
+  `passed` no longer defaults to `True`. **If you gate a release or alert on
+  these scores, expect judge outages to surface as failures instead of passing
+  silently** — filter on `metadata["evaluator_error"]` to separate them.
+
+- **The SDK no longer sends anything that identifies your machine.** Two places
+  did. `skills sync` / `skills status` stamped an `install_label` that defaulted
+  to your hostname; there is no default label now, and the key is omitted from
+  the request body entirely unless you opt in with `DECIMALAI_INSTALL_LABEL`
+  (the anonymous per-checkout `install_id` still does the drift attribution, so
+  nothing about `skills status` changes). And registering an `@eval` sent the
+  absolute path of your source file plus the process working directory
+  (`source_location_extra.abs_path` / `.cwd_at_decoration`); only the line
+  number is sent now. The repo-relative `source_location` is unchanged.
+
+  ```bash
+  export DECIMALAI_INSTALL_LABEL=ci-runner-7   # opt in, e.g. on a shared runner
+  ```
 
 - **`install()` on the framework integrations is now `instrument()`.** One word
   was doing two unrelated jobs inside one package: on a framework module it

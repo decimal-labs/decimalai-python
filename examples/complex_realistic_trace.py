@@ -60,8 +60,8 @@ if not GEMINI_API_KEY:
 import decimalai
 decimalai.init(api_key=DECIMAL_API_KEY, base_url=DECIMAL_BASE_URL)
 
-from decimalai.langchain import install
-install(agent_name=AGENT_NAME)
+from decimalai.langchain import instrument
+instrument(agent_name=AGENT_NAME)
 
 # ── LangGraph / LangChain-core imports (langchain itself isn't installed) ──
 from langchain_core.tools import tool

@@ -19,7 +19,15 @@ demo_skill:
   # today and is now a suicide-prevention import from a medical-skills repo. An
   # existence check goes green on that. These two fields are what make the
   # check mean something.
-  author_display_name: ashenpivot
+  #
+  # PIN THE UUID, NOT THE AUTHOR HANDLE. This used to pin
+  # `author_display_name` — a field the author can change from their profile at
+  # any time, and the name of a real third party, printed in a public notebook
+  # and asserted on in cell 0.3. Both problems go away with the immutable id:
+  # it is the only field that cannot be re-pointed at a different skill, and it
+  # names nobody. A rename now costs the reader nothing; before, it broke the
+  # notebook for everyone.
+  skill_id: 7ce7a476-606b-4768-a716-1c9cbf7b24b0
   source_type: platform
 
   # Pinned so cell 0.7 prints the body that was MEASURED, not whatever is

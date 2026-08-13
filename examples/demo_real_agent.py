@@ -58,8 +58,8 @@ AGENT_NAME = "finance-research-agent-live"
 import decimalai
 decimalai.init()
 
-from decimalai.langchain import install
-install(agent_name=AGENT_NAME)
+from decimalai.langchain import instrument
+instrument(agent_name=AGENT_NAME)
 
 # ── Tool Definitions ──────────────────────────────────────────
 
@@ -255,7 +255,7 @@ def main():
     print("🤖 Creating LangChain tool-calling agent with Gemini...")
     agent = build_agent()
     print("   ✅ Agent ready with 3 tools: get_stock_price, calculate, search_news")
-    print("   ✅ DecimalAI tracing installed globally via install()")
+    print("   ✅ DecimalAI tracing registered globally via instrument()")
 
     # Run scenarios
     print(f"\n🚀 Running {len(SCENARIOS)} scenarios...\n")
@@ -266,7 +266,7 @@ def main():
         print("-" * 40)
 
         try:
-            # No callbacks needed — install() handles it!
+            # No callbacks needed — instrument() handles it!
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": scenario["input"]}]}
             )

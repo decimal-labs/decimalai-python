@@ -262,7 +262,8 @@ def wrap(text, width=88, indent="    "):
 # Same manifest as Tier 0 — one source of truth for both notebooks, so a demo
 # skill that goes stale is repaired in one YAML file rather than in two .ipynb
 # blobs. The embedded copy is the fallback for a raw.github blip.
-FALLBACK = {"demo_skill": {"slug": "flsa-exemption-test", "author_display_name": "ashenpivot",
+FALLBACK = {"demo_skill": {"slug": "flsa-exemption-test",
+                           "skill_id": "7ce7a476-606b-4768-a716-1c9cbf7b24b0",
                            "source_type": "platform", "version": 1, "demo_case": "case-22",
                            "contested_case": "case-01"}}
 try:

@@ -8,7 +8,7 @@ catch:
   - Real env-var resolution from the shell (DECIMAL_API_KEY vs
     DECIMALAI_API_KEY — `cli/main.py:49` declares both)
   - Real exit codes consumable by CI (`echo $?` semantics)
-  - `python -m decimalai.cli` vs the installed `decimal` console script
+  - `python -m decimalai.cli` vs the installed `decimalai` console script
   - Pre-import side effects (`__main__.py` execution path)
   - Real stdout / stderr separation
 
@@ -30,7 +30,7 @@ import decimalai
 
 
 # Run `python -m decimalai.cli` so we use the *installed* SDK in the
-# current venv, not whatever shell-resolved binary `decimal` would hit.
+# current venv, not whatever shell-resolved binary `decimalai` would hit.
 # This makes the test work regardless of whether the console script is
 # installed.
 _PYTHON = sys.executable
@@ -157,11 +157,13 @@ def test_module_entrypoint_matches_console_script_behavior():
     assert module_result.returncode == 0
     module_out = module_result.stdout.strip()
 
-    # If the `decimal` console script is on PATH, compare directly.
+    # If the `decimalai` console script is on PATH, compare directly.
+    # `decimalai` is the ONLY console script pyproject declares
+    # ([project.scripts]: decimalai = "decimalai.cli.main:cli").
     import shutil
-    decimal_bin = shutil.which("decimal")
+    decimal_bin = shutil.which("decimalai")
     if not decimal_bin:
-        pytest.skip("`decimal` console script not installed; can't compare")
+        pytest.skip("`decimalai` console script not installed; can't compare")
 
     script_result = subprocess.run(
         [decimal_bin, "--version"],

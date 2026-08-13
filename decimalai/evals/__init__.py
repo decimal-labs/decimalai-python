@@ -48,9 +48,9 @@ def _capture_source_location(fn: Callable) -> Optional[str]:
     (test runners, background workers, async code in different working
     dirs), the relative path captured here becomes stale relative to
     the cwd at upload time and any deep-link from UI → source breaks.
-    Companion `_capture_source_location_extra` records the absolute
-    path + the cwd-at-decoration so a stale relpath can be recovered
-    downstream.
+    That is accepted: the absolute path and the cwd-at-decoration that
+    used to be captured for recovery describe the developer's machine and
+    are no longer collected.
     """
     try:
         import os
@@ -68,24 +68,21 @@ def _capture_source_location(fn: Callable) -> Optional[str]:
 
 
 def _capture_source_location_extra(fn: Callable) -> Optional[Dict[str, Any]]:
-    """Return {'abs_path', 'cwd_at_decoration', 'lineno'} for fn, or None.
+    """Return {'lineno': int} for fn, or None if unavailable.
 
-    Stored alongside the legacy `source_location` string so cwd-shifts
-    between decoration and trace upload don't strand UI deep-links —
-    the backend / UI can prefer `abs_path` when the relpath fails to
-    resolve in the upload-time cwd.
+    Stored alongside the legacy `source_location` string. This used to also
+    carry ``abs_path`` (the absolute path of the file on the developer's
+    machine) and ``cwd_at_decoration`` (the process working directory), so
+    the UI could recover a deep-link when cwd shifted between decoration and
+    upload. Both were filesystem layout from the user's machine and are no
+    longer sent; only the non-identifying line number remains.
     """
     try:
-        import os
         src_file = inspect.getsourcefile(fn) or inspect.getfile(fn)
         if not src_file:
             return None
         _, src_line = inspect.getsourcelines(fn)
-        return {
-            "abs_path": os.path.abspath(src_file),
-            "cwd_at_decoration": os.getcwd(),
-            "lineno": src_line,
-        }
+        return {"lineno": src_line}
     except (OSError, TypeError):
         return None
 
@@ -227,8 +224,9 @@ class DecimalEval:
         self.version = version
         self.is_async = asyncio.iscoroutinefunction(fn)
         self.source_location = _capture_source_location(fn)
-        # `source_location_extra` carries the abs path + decoration-time cwd
-        # so the UI can recover when cwd shifts between decoration and upload.
+        # `source_location_extra` carries only the line number; the abs path
+        # and decoration-time cwd it used to hold identified the developer's
+        # machine and are no longer collected.
         self.source_location_extra = _capture_source_location_extra(fn)
         self.description = (inspect.getdoc(fn) or "").strip() or None
 

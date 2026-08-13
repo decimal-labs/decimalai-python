@@ -263,7 +263,7 @@ class SkillExportFileExistsError(Exception):
     def __init__(self, path: str):
         super().__init__(
             f"Refusing to overwrite existing file: {path}. "
-            "Pass force=True to overwrite (e.g., decimal registry install --force)."
+            "Pass force=True to overwrite (e.g., decimalai skills pull --force)."
         )
         self.path = path
 
