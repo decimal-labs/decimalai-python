@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## Unreleased
+## 0.10.1 — 2026-08-13
 
 ### Fixed
 

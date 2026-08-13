@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decimalai"
-version = "0.10.0"
+version = "0.10.1"
 description = "Open source SDK for manifest-aware agent change management"
 readme = "README.md"
 license = {text = "MIT"}
@@ -201,11 +201,33 @@ decimalai = "decimalai.cli.main:cli"
 # the project page's links, which is the route someone takes to check that a
 # package is real. Verify with a HEAD request before adding one.
 Homepage = "https://decimal.ai"
+Repository = "https://github.com/decimal-labs/decimalai-python"
 Documentation = "https://docs.decimal.ai"
 Changelog = "https://docs.decimal.ai/changelog"
 
 [tool.hatch.build.targets.wheel]
 packages = ["decimalai"]
+
+# DO NOT DELETE — this section is the whole reason the sdist is not a repo dump.
+# Without it hatchling sweeps in EVERY file git does not ignore. That is not
+# hypothetical here: the published 0.10.0 sdist carried `docs/SDK_UPGRADE_v030.md`
+# (an internal audit-remediation write-up) and `test-results/.last-run.json`,
+# neither of which was ever in the repo — they were simply sitting in the tree when
+# `python -m build` ran. An allow-list is the only thing that stops that recurring.
+#
+# tests/ ships because downstream packagers build from the sdist and run the suite;
+# examples/ ships because tests/test_notebook_examples.py walks it and would fail
+# without it. The two travel together — dropping examples/ silently breaks the suite
+# for anyone who is not building from a git checkout.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/decimalai",
+    "/tests",
+    "/examples",
+    "/CHANGELOG.md",
+    "/README.md",
+    "/LICENSE",
+]
 
 [tool.pytest.ini_options]
 markers = [
