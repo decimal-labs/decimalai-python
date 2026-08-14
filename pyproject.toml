@@ -10,6 +10,33 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "Decimal AI"}]
+keywords = [
+    "ai-agents",
+    "llm",
+    "agent-versioning",
+    "regression-testing",
+    "tracing",
+    "observability",
+    "evaluation",
+    "skills",
+    "manifest",
+    "langchain",
+    "openai-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "pydantic>=2.0",
@@ -204,6 +231,8 @@ Homepage = "https://decimal.ai"
 Repository = "https://github.com/decimal-labs/decimalai-python"
 Documentation = "https://docs.decimal.ai"
 Changelog = "https://docs.decimal.ai/changelog"
+Issues = "https://github.com/decimal-labs/decimalai-python/issues"
+Releases = "https://github.com/decimal-labs/decimalai-python/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["decimalai"]

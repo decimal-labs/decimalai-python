@@ -1,13 +1,26 @@
 # DecimalAI Python SDK
 
-The open source SDK for [DecimalAI](https://decimal.ai) — the manifest-aware platform for agent change management.
+**Catch what your next agent change will break** — a structural regression check against your recorded traces, built on manifest-aware versioning of your agent's tools, prompts, models, and skills. The open source SDK for [DecimalAI](https://decimal.ai).
 
+[![PyPI](https://img.shields.io/pypi/v/decimalai)](https://pypi.org/project/decimalai/)
+[![Downloads](https://static.pepy.tech/badge/decimalai/month)](https://pepy.tech/project/decimalai)
+[![CI](https://img.shields.io/github/actions/workflow/status/decimal-labs/decimalai-python/ci.yml?branch=main)](https://github.com/decimal-labs/decimalai-python/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/decimalai)](https://pypi.org/project/decimalai/)
+[![License: MIT](https://img.shields.io/pypi/l/decimalai)](https://github.com/decimal-labs/decimalai-python/blob/main/LICENSE)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/support-agent/support_agent.ipynb)
+
+[Docs](https://docs.decimal.ai) · [Registry](https://app.decimal.ai/skills) · [Leaderboard](https://app.decimal.ai/skills/leaderboard) · [Changelog](https://docs.decimal.ai/changelog)
+
+<!-- hero image: uncomment once docs/assets/sdk-demo.gif is committed
+<img src="https://raw.githubusercontent.com/decimal-labs/decimalai-python/main/docs/assets/sdk-demo.gif" alt="decimalai demo regression — seeding a reference agent and printing the impact report" width="700">
+-->
 
 ## Installation
 
 ```bash
 pip install decimalai
+# or
+uv pip install decimalai
 ```
 
 Requires **Python 3.10+** (`pip` won't install current releases on older Pythons).
@@ -24,22 +37,41 @@ Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `
 
 ## See it in 2 minutes
 
-Both flagship workflows ship with a one-command sandbox — realistic data seeded into your workspace, so you don't have to wait to accumulate your own. Set your API key, then run either demo:
+The regression demo seeds a reference agent (v1 → v2 + a trace corpus) into your workspace and runs the exact pipeline a real PR check runs. It needs a free API key — that's the only setup:
 
 ```bash
-export DECIMAL_API_KEY="dai_sk_..."   # from app.decimal.ai/settings
+export DECIMAL_API_KEY="dai_sk_..."   # free key from app.decimal.ai/settings
+decimalai demo regression             # → impact report: what your next change would break
 ```
 
-**For engineers — catch regressions before they ship**
+The impact report it produces looks like this — captured with the SDK's `decimalai regression-check` against the seeded reference agent, trimmed:
 
-```bash
-decimalai demo regression   # → impact report: what your next change would break
+```text
+  🔍 Decimal Manifest Impact — [Demo] support-agent
+
+  Manifest changes:
+    🟡 tool_renamed — lookup_price
+    🟢 tool_added — refund_order
+    🟡 prompt_section_rewritten — system_prompt  [major, 88.6% changed]
+    🔴 model_changed — gpt-4o-mini  (gpt-4o-mini-2024-07 → gpt-4o-mini-2024-09)
+    🔴 tool_removed — compare_competitors
+
+  Training-data policy (default):
+    prompt_section_rewritten (major) → replay — need re-running first
+    model_changed (major) → drop — excluded from training
 ```
 
-**For prompt engineers — find skills that actually work**
+Everything above comes from a **seeded reference agent — illustrative, run it yourself**. On your own instrumented agent, each change is additionally checked against your recorded traces — a high/medium/low blast radius per trace, not just the structural diff. The API key is needed because the demo seeds data into a workspace on the platform; `decimalai demo reset` removes it all.
+
+No key at all? Two things work without one:
+
+- `decimalai skills pull <slug>` — fetch any published SKILL.md to disk, no account.
+- The [`agentversion`](https://pypi.org/project/agentversion/) manifest flow ([below](#open-standard-agentversion)) — diff and gate agent manifests fully locally.
+
+There's a second demo for the registry side:
 
 ```bash
-decimalai demo skills       # → registry ranked by real production effectiveness
+decimalai demo skills       # → tour the registry: security-scanned skills, benchmarkable with an open A/B spec
 ```
 
 Browsing without an account? Explore the [public skill registry](https://app.decimal.ai/skills) — no signup required.
@@ -115,6 +147,39 @@ python app.py
 - **Fine-tuning** — Launch fine-tuning jobs on OpenAI, Together.AI, or Gemini from the platform
 - **Skills management** — Auto-discover SKILL.md files, sync to platform, install from registry
 - **OTel compatible** — Export spans to any OpenTelemetry backend
+
+## How it fits together
+
+The SDK is the client for the hosted platform and the reference implementation of two open specs — everything it captures is portable by design:
+
+```mermaid
+flowchart LR
+  A[your agent code] --> SDK["decimalai SDK<br/>traces + manifests"]
+  SDK --> API["DecimalAI platform<br/>registry + SkillScore"]
+  SDK -.->|implements| AV[agentversion spec]
+  SDK -.->|implements| SE[skillevaluation spec]
+  RC["regression-check<br/>CI action"] --> API
+```
+
+- [`agentversion`](https://pypi.org/project/agentversion/) — the open manifest spec (versioning, diffing, compatibility)
+- [`skillevaluation`](https://pypi.org/project/skillevaluation/) — the open A/B spec for measuring a skill's lift
+- [`regression-check`](https://github.com/decimal-labs/regression-check) — the GitHub Action that runs the per-PR structural check
+
+## How does DecimalAI compare?
+
+DecimalAI is not a tracing or eval-case platform — it's the structural layer that runs alongside one. LangSmith, Braintrust, and promptfoo watch your agent's *outputs*; DecimalAI versions its *structure* (tools + prompts + models + skills) and diffs every change against your recorded production traffic. Keep your eval tool; add the manifest layer under it.
+
+| Capability | DecimalAI | LangSmith | Braintrust | promptfoo |
+|---|---|---|---|---|
+| Structural regression check against production traces — no eval cases to write | ✅ per-PR impact report ([regression-check](https://github.com/decimal-labs/regression-check)) | ❌ needs datasets; online evals score outputs | ❌ needs datasets; online scoring rates outputs | ❌ needs test cases you write |
+| Whole-agent version manifest, diffable with an open spec | ✅ [agentversion](https://pypi.org/project/agentversion/) — tools + prompts + models + skills | Prompts only (Prompt Hub commits) | Prompts only (versioned prompts + experiments) | ❌ config versioning via your own git |
+| Open A/B spec to measure a skill's lift — re-runnable by anyone | ✅ [skillevaluation](https://pypi.org/project/skillevaluation/) | ❌ | ❌ | ❌ |
+| Skills registry with pre-publish security scanning | ✅ deterministic scan blocks unsafe skills before publish | ❌ | ❌ | ❌ |
+| Output-quality evals: datasets, LLM-as-judge, playgrounds | ❌ by design — keep your eval tool alongside | ✅ | ✅ | ✅ |
+| Adversarial red-teaming of your own app | ❌ | ❌ | ❌ | ✅ |
+| Fully open source, runs 100% locally | Partial — SDK, Action, and specs are MIT / Apache-2.0; the platform is hosted | ❌ self-host is Enterprise-only | ❌ self-host is Enterprise-only | ✅ |
+
+The regression demo (`decimalai demo regression`) runs the real pipeline on a **seeded reference agent** — its numbers are illustrative; run it yourself, then instrument your own agent for real ones. Competitor capabilities checked against each tool's public docs, August 2026.
 
 ## Skills
 
@@ -283,17 +348,17 @@ Tracing a direct LLM SDK with no agent framework? Use the provider flags: `init(
 
 ## Examples
 
-See the [`examples/`](examples/) directory for runnable notebooks with **Open in Colab** badges:
+See the [`examples/`](https://github.com/decimal-labs/decimalai-python/tree/main/examples) directory for runnable notebooks with **Open in Colab** badges:
 
 | Notebook | Description | Colab |
 |----------|-------------|-------|
-| [Quickstart](examples/quickstart/quickstart.ipynb) | Full version-aware loop — no LLM key needed | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart.ipynb) |
-| [LangChain](examples/quickstart/quickstart_langchain.ipynb) | Instrument a LangChain agent | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_langchain.ipynb) |
-| [OpenAI Agents](examples/quickstart/quickstart_openai_agents.ipynb) | Instrument an OpenAI Agents app | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_openai_agents.ipynb) |
-| [Evaluations](examples/evaluations/builtin_evaluators.ipynb) | Run built-in evaluators on traces | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/evaluations/builtin_evaluators.ipynb) |
-| [Datasets](examples/datasets-and-training/build_sft_dataset.ipynb) | Build SFT training datasets | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/datasets-and-training/build_sft_dataset.ipynb) |
-| [Pull & Push](examples/datasets-and-training/pull_and_push.py) | Pull datasets locally, push to HuggingFace Hub | — |
-| [Version-Aware Loop](examples/version-aware-loop/manifest_change.ipynb) | Detect manifest changes and impact | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/version-aware-loop/manifest_change.ipynb) |
+| [Quickstart](https://github.com/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart.ipynb) | Full version-aware loop — no LLM key needed | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart.ipynb) |
+| [LangChain](https://github.com/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_langchain.ipynb) | Instrument a LangChain agent | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_langchain.ipynb) |
+| [OpenAI Agents](https://github.com/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_openai_agents.ipynb) | Instrument an OpenAI Agents app | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart_openai_agents.ipynb) |
+| [Evaluations](https://github.com/decimal-labs/decimalai-python/blob/main/examples/evaluations/builtin_evaluators.ipynb) | Run built-in evaluators on traces | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/evaluations/builtin_evaluators.ipynb) |
+| [Datasets](https://github.com/decimal-labs/decimalai-python/blob/main/examples/datasets-and-training/build_sft_dataset.ipynb) | Build SFT training datasets | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/datasets-and-training/build_sft_dataset.ipynb) |
+| [Pull & Push](https://github.com/decimal-labs/decimalai-python/blob/main/examples/datasets-and-training/pull_and_push.py) | Pull datasets locally, push to HuggingFace Hub | — |
+| [Version-Aware Loop](https://github.com/decimal-labs/decimalai-python/blob/main/examples/version-aware-loop/manifest_change.ipynb) | Detect manifest changes and impact | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/version-aware-loop/manifest_change.ipynb) |
 
 ## Open standard: agentversion
 
@@ -312,6 +377,56 @@ print(classify_compatibility(diff_manifests(last_prod, manifest)).recommended_de
 
 You can reproduce the platform's diffs and verdicts entirely outside DecimalAI — the SDK is the convenience layer over the open standard.
 
+## FAQ
+
+<details>
+<summary><strong>How is this different from LangSmith / Braintrust / Weave?</strong></summary>
+
+They watch your agent's outputs — traces, eval scores, feedback. DecimalAI watches its structure: a versioned manifest of tools + prompts + models + skills, diffed against your recorded traffic. Tracing answers "what happened," evals answer "how well," this answers "is this data still usable now that the agent changed?" It's not either/or — DecimalAI runs alongside them, and we recommend keeping your tracing tool.
+</details>
+
+<details>
+<summary><strong>Isn't the regression check just a linter?</strong></summary>
+
+A linter checks code against static rules someone wrote. This checks an agent change against your actual production history: for each recorded trace, did it depend on a surface this change touches? There's no ruleset to write or maintain — your traffic is the ruleset. The output isn't "style violation," it's "these conversations will break and this slice of your training set is now stale."
+</details>
+
+<details>
+<summary><strong>Are the demo's numbers real? Whose traffic is that?</strong></summary>
+
+The demo runs on a seeded reference agent built for the demo — not a customer's traffic. The pipeline is the real one; the numbers are illustrative, and we say so everywhere they appear. When you run the check on your own instrumented agent, it's your traffic in your workspace.
+</details>
+
+<details>
+<summary><strong>Is the "lift" number on a skill real? Can I reproduce it?</strong></summary>
+
+The measurement spec is open: same task set run in two arms (with the skill injected vs. without), same model, conformance-graded, with a minimum case count, a never-hurt check, and a negative control. `pip install skillevaluation` and re-run any published number. The honest state today: effectiveness figures on the site are labeled "illustrative — run it yourself" until a skill's full benchmark run lands — no skill is claimed as measured unless its number was actually produced by that spec.
+</details>
+
+<details>
+<summary><strong>What data leaves my machine? Do you run my agent?</strong></summary>
+
+DecimalAI never runs your agent and never holds your LLM API keys. The SDK sends traces to your workspace; the PR check is a read query over your own trace store — zero LLM calls. The optional `mode=real` call-replay uses your key, on your opt-in, for same-provider swaps only. Everything the SDK sends is visible in your dashboard and exportable.
+</details>
+
+<details>
+<summary><strong>Do I need an account?</strong></summary>
+
+For the regression check and tracing, yes — a free API key (traces have to live somewhere). Without any account you can still: browse the [registry](https://app.decimal.ai/skills), pull any published skill with `decimalai skills pull <slug>`, and diff agent manifests fully locally with [`agentversion`](https://pypi.org/project/agentversion/).
+</details>
+
+<details>
+<summary><strong>Can I self-host? Why isn't the whole platform open source?</strong></summary>
+
+The measurement layer is open on purpose: [`skillevaluation`](https://pypi.org/project/skillevaluation/) (the A/B eval spec + runner) and [`agentversion`](https://pypi.org/project/agentversion/) (the manifest spec) are on PyPI, and this SDK and the [GitHub Action](https://github.com/decimal-labs/regression-check) are MIT. Every number published is checkable without trusting us. The hosted platform — the trace store, the registry, the scanning pipeline — is not open source; charging for hosting is how a solo-founder project survives. Worst case, you lose a vendor, not your history: the specs are open and your traces are exportable.
+</details>
+
+<details>
+<summary><strong>Why should I trust the security scanner?</strong></summary>
+
+Don't trust it — test it. The first-tier scan is deterministic and findings are shown in full; we planted a skill with a hidden reverse shell against our own registry and it was blocked with 2 critical findings, no human in the loop. And the honest part: a scan is a floor, not a guarantee — which is why there's an intent-review tier on top, an appeal path for authors, and no "0 false positives" claim anywhere.
+</details>
+
 ## Development
 
 ```bash
@@ -321,7 +436,7 @@ ruff check decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841
 git grep -nE 'decimal[-_]ai'   # must find nothing — the package is 'decimalai', no separator
 ```
 
-Run these before opening a PR. CI runs the same commands, plus the LangChain compatibility matrix in `tests/test_langchain_compat.py`.
+Run these before opening a PR. CI runs the same commands, plus the LangChain compatibility matrix in `tests/test_langchain_compat.py`. See [`AGENTS.md`](https://github.com/decimal-labs/decimalai-python/blob/main/AGENTS.md) if you're pointing an AI coding agent at this repo.
 
 ## Documentation
 
@@ -329,4 +444,8 @@ Full docs at [docs.decimal.ai](https://docs.decimal.ai)
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](https://github.com/decimal-labs/decimalai-python/blob/main/LICENSE) for details.
+
+---
+
+[Docs](https://docs.decimal.ai) · [Registry](https://app.decimal.ai/skills) · [SDK](https://github.com/decimal-labs/decimalai-python) · Specs: [agentversion](https://github.com/decimal-labs/agentversion) · [skillevaluation](https://github.com/decimal-labs/skillevaluation) · [regression-check](https://github.com/decimal-labs/regression-check)
