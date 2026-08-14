@@ -8,13 +8,6 @@
 # WHAT IS STILL ON: Dependabot security alerts and security updates. Those are a
 # repository setting, not this file, so a real advisory still raises a PR. Only
 # routine version bumps are paused.
-#
-# WHY: ten open version-bump PRs, every check on them red — not because anything
-# was broken, but because Actions minutes are exhausted on the free plan for
-# PRIVATE repos, so the runner never started (zero steps, 2-8s). Actions is free
-# on public repos, so the flip revives CI. The first honest signal about whether
-# these suites pass should be a run someone triggered deliberately, not ten PRs
-# firing at once into a newly public repo.
 version: 2
 updates:
   - package-ecosystem: "pip"
