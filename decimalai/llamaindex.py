@@ -1,7 +1,7 @@
 """LlamaIndex integration for DecimalAI.
 
 Provides a ``DecimalSpanHandler`` that plugs into LlamaIndex's
-instrumentation dispatcher (v0.10.20+) to capture query engine,
+instrumentation dispatcher (v0.12.0+) to capture query engine,
 retriever, LLM, and embedding spans as DecimalAI traces.
 
 Usage::
@@ -48,7 +48,9 @@ class DecimalSpanHandler:
     Buffers spans by their root span ID, then assembles and sends a
     complete RunTrace when the root span exits.
 
-    Integrates with LlamaIndex's instrumentation dispatcher:
+    Integrates with LlamaIndex's instrumentation dispatcher, which drives
+    handlers exclusively through ``span_enter()`` / ``span_exit()`` /
+    ``span_drop()``. Those delegate to the buffering logic:
     - ``new_span()`` → start buffering
     - ``prepare_to_exit_span()`` → if root, flush → RunTrace
     - ``prepare_to_drop_span()`` → clean up on error
@@ -75,6 +77,70 @@ class DecimalSpanHandler:
     def class_name(self) -> str:
         """Return the class name for LlamaIndex's handler registry."""
         return "DecimalSpanHandler"
+
+    # ── Dispatcher-facing interface ──────────────────────────────
+    #
+    # The dispatcher never calls new_span/prepare_to_* directly — it only
+    # invokes span_enter/span_exit/span_drop, and it wraps each call in
+    # ``except BaseException: pass``, so a missing method is swallowed
+    # silently. Without these three delegates the handler receives nothing.
+
+    def span_enter(
+        self,
+        id_: str,
+        bound_args: Any,
+        instance: Optional[Any] = None,
+        parent_id: Optional[str] = None,
+        tags: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Dispatcher notice that a span started — delegates to ``new_span``."""
+        self.new_span(
+            id_=id_, bound_args=bound_args, instance=instance,
+            parent_span_id=parent_id, tags=tags,
+        )
+
+    def span_exit(
+        self,
+        id_: str,
+        bound_args: Any,
+        instance: Optional[Any] = None,
+        result: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Dispatcher notice that a span completed — delegates to
+        ``prepare_to_exit_span``."""
+        self.prepare_to_exit_span(
+            id_=id_, bound_args=bound_args, instance=instance, result=result,
+        )
+
+    def span_drop(
+        self,
+        id_: str,
+        bound_args: Any,
+        instance: Optional[Any] = None,
+        err: Optional[BaseException] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Dispatcher notice that a span errored — delegates to
+        ``prepare_to_drop_span``."""
+        self.prepare_to_drop_span(
+            id_=id_, bound_args=bound_args, instance=instance, err=err,
+        )
+
+    @property
+    def open_spans(self) -> Dict[str, Dict[str, Any]]:
+        """Spans buffered but not yet flushed, keyed by span id.
+
+        ``Dispatcher.shutdown()`` iterates ``handler.open_spans`` with no
+        exception guard (then span-drops each and calls ``close()``), so
+        the attribute is part of the handler contract.
+        """
+        return self._spans
+
+    def close(self) -> None:
+        """Dispatcher shutdown hook — nothing to release; trees flush as
+        their roots exit (or are dropped by shutdown itself)."""
 
     def new_span(
         self,
@@ -125,6 +191,14 @@ class DecimalSpanHandler:
         if instance is not None and span_data["span_type"] == "llm":
             span_data["is_llm_call"] = True
             span_data["model_name"] = getattr(instance, "model", None) or getattr(instance, "model_name", None)
+            if span_data["model_name"] is None:
+                # Not every wrapper has a .model attr (MockLLM, some vendors),
+                # but every LlamaIndex LLM exposes LLMMetadata.model_name.
+                # metadata is a computed property, so guard it.
+                try:
+                    span_data["model_name"] = instance.metadata.model_name
+                except Exception:
+                    pass
             span_data["temperature"] = getattr(instance, "temperature", None)
             span_data["provider"] = _detect_provider(instance)
 
@@ -498,7 +572,9 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
     (queries, retrieval, LLM calls, synthesis) will be automatically
     captured and sent to the DecimalAI backend.
 
-    Requires ``llama-index-core>=0.10.20`` to be installed.
+    Requires ``llama-index-core>=0.12.0`` to be installed. (Earlier
+    releases either lack the instrumentation dispatcher entirely or call
+    span handlers with an incompatible pre-0.10.30 signature.)
 
     Args:
         agent_name: Name for the agent in DecimalAI. Defaults to
@@ -527,8 +603,11 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
         from llama_index.core.instrumentation import get_dispatcher
     except ImportError:
         raise ImportError(
-            "LlamaIndex is required for this integration. "
-            "Install it with: pip install \"decimalai[llamaindex]\""
+            "This integration requires llama-index-core>=0.12.0 — either "
+            "LlamaIndex is not installed, or the installed llama-index-core "
+            "predates its instrumentation dispatcher. Install or upgrade "
+            "with: pip install -U \"decimalai[llamaindex]\" "
+            "\"llama-index-core>=0.12.0\""
         )
 
     handler = DecimalSpanHandler(agent_name=agent_name)
