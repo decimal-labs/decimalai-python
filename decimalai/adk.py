@@ -297,6 +297,25 @@ def _plugin_class() -> Any:
             await self._complete(getattr(invocation_context, "invocation_id", None))
             return None
 
+        async def on_run_error_callback(self, *, invocation_context: Any, error: Exception):  # noqa: ANN001
+            # End-of-invocation signal for the *error* path. When an exception
+            # escapes the runner (e.g. a model 429), the root agent never
+            # completes, so neither after_agent nor after_run fires — without
+            # this the run state would be orphaned and no trace sent. ADK only
+            # notifies on_run_error when the exception actually escapes (a
+            # recovered model/tool error never reaches here), and it re-raises
+            # afterwards, so finalizing here can't fire on success — and
+            # _complete's pop makes a second finalize a no-op regardless.
+            inv_id = getattr(invocation_context, "invocation_id", None)
+            state = self._get_run(inv_id)
+            if state is None:
+                return None
+            state.status = Status.ERROR
+            if not state.error_message:
+                state.error_message = str(error)
+            await self._complete(inv_id)
+            return None
+
         # ── model boundary ─────────────────────────────────
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any):  # noqa: ANN001
             state = self._get_run(getattr(callback_context, "invocation_id", None))
