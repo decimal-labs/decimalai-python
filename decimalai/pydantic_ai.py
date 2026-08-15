@@ -23,9 +23,8 @@ Tracing for Pydantic AI is observed via the underlying provider SDK
 
 from __future__ import annotations
 
-import warnings
-
 import logging
+import warnings
 from contextvars import ContextVar
 from typing import Any, Optional
 

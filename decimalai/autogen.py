@@ -39,9 +39,8 @@ those yourself with AG2's one-liner::
 from __future__ import annotations
 
 import functools
-import warnings
-
 import logging
+import warnings
 from typing import Any, Optional
 
 logger = logging.getLogger("decimalai.autogen")

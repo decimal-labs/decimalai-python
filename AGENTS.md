@@ -10,7 +10,9 @@ skills) from agent frameworks, sends them to a DecimalAI workspace, and lets you
 regression check of an agent change against recorded traces. It also manages SKILL.md skills
 (discover, sync, install from the public registry).
 
-- Package name: `decimalai` (no separator — never `decimal-ai` or `decimal_ai`)
+- Package name: `decimalai` — one word, never a hyphen or an underscore between "decimal" and "ai".
+  (CI greps the whole tree for the separated spellings, so don't write one out here — not even as
+  an example of what not to do. The guard can't tell a use from a mention.)
 - Language: Python, `requires-python >= 3.10`, fully typed (`py.typed` ships)
 - License: MIT
 - CLI entry point: `decimalai` (Click-based; `decimalai --help` lists commands)

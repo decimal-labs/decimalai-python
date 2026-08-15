@@ -29,9 +29,8 @@ Requires: ``pip install "decimalai[llamaindex]"``
 
 from __future__ import annotations
 
-import warnings
-
 import logging
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4

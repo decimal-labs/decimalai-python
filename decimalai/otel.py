@@ -24,12 +24,11 @@ Manual path (custom TracerProvider)::
 
 from __future__ import annotations
 
-import warnings
-
 import json
 import logging
 import re
 import threading
+import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence

@@ -19,10 +19,9 @@ Custom path (exclusive — replaces default OpenAI tracing)::
 
 from __future__ import annotations
 
-import warnings
-
 import logging
 import threading
+import warnings
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
