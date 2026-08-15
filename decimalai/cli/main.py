@@ -1007,6 +1007,24 @@ def skills_review(skill_name, api_key, base_url, project):
         sys.exit(1)
 
 
+# The anonymous pull path builds no client and reuses no connection, and
+# a cold prod instance has served first requests in 9-28s — a flat 20s
+# timeout killed pulls the server went on to complete. Budget 30s per
+# request and retry once on timeout: the attempt that timed out warms
+# the instance the retry then hits.
+_PULL_HTTP_TIMEOUT = 30.0
+
+
+def _pull_get(url, **kwargs):
+    """GET for the anonymous pull path — one retry on timeout."""
+    import httpx
+
+    try:
+        return httpx.get(url, timeout=_PULL_HTTP_TIMEOUT, **kwargs)
+    except httpx.TimeoutException:
+        return httpx.get(url, timeout=_PULL_HTTP_TIMEOUT, **kwargs)
+
+
 @skills.command("pull")
 @click.argument("slug")
 @click.option(
@@ -1059,7 +1077,7 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
         # `q=` is a semantic search that always ranks *something*; resolve by
         # exact name or fail loudly. Taking items[0] used to write an unrelated
         # skill to disk on any typo and report it as a success.
-        search = httpx.get(url, params={"q": slug, "limit": RESOLVE_LIMIT}, timeout=20.0)
+        search = _pull_get(url, params={"q": slug, "limit": RESOLVE_LIMIT})
         search.raise_for_status()
         items = (search.json() or {}).get("items") or []
         match = find_exact(items, slug)
@@ -1070,7 +1088,7 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
         # The registry's own spelling — `slug` may differ only in case.
         slug = match.get("name") or slug
 
-        detail_resp = httpx.get(f"{url}/{skill_id}", timeout=20.0)
+        detail_resp = _pull_get(f"{url}/{skill_id}")
         detail_resp.raise_for_status()
         detail = detail_resp.json()
     except httpx.HTTPError as e:
@@ -1152,7 +1170,7 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
     attachments = []
     if attachment_count:  # skip the round-trip for the bundle-less majority
         try:
-            atts_resp = httpx.get(f"{url}/{skill_id}/attachments", timeout=20.0)
+            atts_resp = _pull_get(f"{url}/{skill_id}/attachments")
             atts_resp.raise_for_status()
             attachments = (atts_resp.json() or {}).get("attachments") or []
         except httpx.HTTPError as e:
@@ -1165,9 +1183,7 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
         content = att.get("content_text") or ""
         if not content and att_id:
             try:
-                full_resp = httpx.get(
-                    f"{url}/{skill_id}/attachments/{att_id}", timeout=20.0
-                )
+                full_resp = _pull_get(f"{url}/{skill_id}/attachments/{att_id}")
                 full_resp.raise_for_status()
                 content = (full_resp.json() or {}).get("content_text") or ""
             except httpx.HTTPError as e:
@@ -1198,7 +1214,7 @@ def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
     # (typical for GitHub imports). --no-evals skips the fetch entirely.
     if not no_evals:
         try:
-            eval_resp = httpx.get(f"{url}/{skill_id}/eval", timeout=20.0)
+            eval_resp = _pull_get(f"{url}/{skill_id}/eval")
             if eval_resp.status_code == 200:
                 eval_payload = eval_resp.json()
                 eval_yaml = eval_payload.get("eval_yaml_text") or ""
