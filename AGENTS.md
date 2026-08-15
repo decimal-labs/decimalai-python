@@ -75,10 +75,26 @@ Environment variables: `DECIMAL_API_KEY`, `DECIMAL_BASE_URL` (default `https://a
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q --ignore=tests/test_langchain_compat.py
+python -m pytest tests/ -q --ignore=tests/test_langchain_compat.py --ignore=tests/conformance
 ruff check decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841
 git grep -nE 'decimal[-_]ai'   # must find nothing
 ```
 
 Default pytest run excludes `integration` and `live_llm` markers (they need a live backend /
 provider keys). CI additionally runs the LangChain compatibility matrix.
+
+### Framework conformance (`tests/conformance`)
+
+One contract, graded against every framework adapter on real HTTP payloads — the suite that
+answers "does this adapter actually emit a valid trace?", which 626 mock-driven adapter tests
+never could. Tier A is hermetic (stub models, a local probe server, no key, no backend), so it
+gates every push. This repo has no Makefile; the one command is:
+
+```bash
+pip install -e ".[dev,conformance-tests]"    # the eleven frameworks the drivers drive
+python -m pytest tests/conformance -q -rs    # ~90s; ends with the conformance matrix
+```
+
+`pip install -e ".[dev]"` alone is enough to run `tests/conformance/test_coverage.py`, the guard
+that fails when a framework is advertised with no driver. Read `tests/conformance/README.md`
+before adding a framework, changing an assertion, or reacting to a red row.

@@ -45,9 +45,62 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests
+        # tests/conformance is excluded here and owned by the `conformance` job
+        # below. Not because it is slow — because `.[dev]` installs three of the
+        # eleven frameworks its drivers drive, so running it in this job would
+        # report eight adapters "NOT RUN" and still exit 0. A partial conformance
+        # matrix is worse than none: it reads as coverage and is not.
         run: |
           python -m pytest tests/ -q \
-            --ignore=tests/test_langchain_compat.py
+            --ignore=tests/test_langchain_compat.py \
+            --ignore=tests/conformance
+
+  conformance:
+    name: Framework conformance (Tier A, hermetic)
+    runs-on: ubuntu-latest
+    # No provider API key, no platform backend, no network beyond localhost: the
+    # drivers run stub models over a real socket and POST to a local probe server
+    # that validates ingest the way the backend does. That is what lets the
+    # contract gate every push and PR instead of a nightly. See
+    # tests/conformance/README.md.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install SDK (no frameworks yet)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Coverage guard — every advertised framework has a driver
+        # Deliberately BEFORE the framework install. This guard imports no
+        # framework (every driver imports its own lazily, inside run()), so
+        # "somebody added a framework and skipped the driver" fails in seconds
+        # rather than after the multi-minute install below.
+        run: python -m pytest tests/conformance/test_coverage.py -q -m conformance
+
+      - name: Install every framework the drivers drive
+        # The `conformance-tests` extra is the single source for this list —
+        # never retype it here. See its comment in pyproject.toml.
+        run: pip install -e ".[conformance-tests]"
+
+      - name: Run the hermetic conformance matrix
+        # DECIMAL_CONFORMANCE_REQUIRE_ALL turns "a driver could not import its
+        # framework" from a silent skip into a failure. Without it, a broken
+        # install set produces a green job that graded nothing.
+        env:
+          DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
+        # -m conformance is REQUIRED: the marker is deselected in addopts (it
+        # mutates adapter globals, so it cannot share a process with the unit
+        # suite). Without it this command selects zero tests and passes green —
+        # the exact 'green job that graded nothing' this suite exists to remove.
+        run: python -m pytest tests/conformance -q -rs -m conformance
 
   langchain-compat:
     name: LangChain Compat (${{ matrix.langchain-core }})

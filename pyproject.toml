@@ -223,6 +223,62 @@ providers-tests = [
     "openinference-instrumentation-anthropic>=0.1.14",
     "openinference-instrumentation-google-genai>=1.0.2",
 ]
+# Every framework the HERMETIC conformance tier drives (tests/conformance, Tier A —
+# stub models + a local probe server, no provider key, no backend). This is the
+# install set for the `conformance` CI job and for `release_gate`'s conformance
+# phase; it exists so that list lives in ONE place with floors, instead of being
+# retyped in a workflow file.
+#
+# It matters that this is COMPLETE. A driver whose imports are missing is recorded
+# "NOT RUN" and the job still goes green — which is the exact shape of the failure
+# this suite exists to remove (a green suite that proved nothing). Install with:
+#   pip install -e ".[dev,conformance-tests]"
+#
+# Versions are resolve-verified together on 2026-08-15 (ag2/autogen 0.14.1,
+# autogen-core 0.7.5, crewai 1.6.1, google-adk 2.7.0, llama-index-core 0.14.23,
+# claude-agent-sdk 0.2.139, pydantic-ai 2.31.0, openai 2.54.0, langchain-core
+# 1.5.5): all eleven drivers import and run in one venv. The floors below are NOT
+# floor-verified — refine by installing at the floor and running the tier.
+conformance-tests = [
+    # Every runtime framework extra in one line: langchain, langgraph, openai,
+    # openai-agents, claude-agent-sdk, pydantic-ai, adk, llamaindex, evals
+    # (litellm). The `-tests` extras beside them are deliberately NOT reused here
+    # — see the CrewAI note below; they install live-lane provider bindings this
+    # tier has no use for, and one of them makes the set unsatisfiable.
+    "decimalai[all]",
+    # The raw-provider rails: the `anthropic` SDK plus the OpenInference
+    # instrumentors that drivers/anthropic.py and drivers/pydantic_ai.py depend
+    # on (init(anthropic=True) / init(openai=True) warn and SKIP without them,
+    # which would grade those drivers on a tracing path nothing turned on).
+    "decimalai[providers-tests]",
+    # CrewAI. Deliberately NOT the `crewai-tests` extra: that one installs
+    # crewai[google-genai], which pins google-genai<1.65.0 and is flatly
+    # UNSATISFIABLE alongside google-adk>=2.0.0 (which needs >=1.66) — verified
+    # with `uv pip compile --universal`. This tier's CrewAI driver reaches its
+    # model through LiteLLM against a local stub, so the google-genai provider
+    # binding is a live-lane need it does not have. The floor is lower than
+    # crewai-tests' 1.14.6 for the same reason the live lane's is higher: 1.6.1
+    # is what co-resolves with google-adk + litellm here, and it is what the
+    # tier was verified on.
+    "crewai>=1.6.1",
+    "openinference-instrumentation-crewai>=1.1.8",
+    # AG2 / classic AutoGen. The distribution to install is `autogen`, NOT `ag2`:
+    # ag2 1.x publishes only an `ag2` top-level package, and tests/conformance/
+    # drivers/ag2.py imports `autogen` and `autogen.opentelemetry`. Verified the
+    # hard way — with ag2 1.0.2 installed and nothing else, `import autogen`
+    # raises ModuleNotFoundError and the driver is silently skipped.
+    "autogen[openai]>=0.14.0,<1",
+    # Microsoft AutoGen — the OTHER lineage, and a genuinely different adapter path
+    # (drivers/autogen_ms.py drives SingleThreadedAgentRuntime with an explicit
+    # tracer_provider). Co-installs with the line above: different top-level
+    # packages (`autogen_core` / `autogen_agentchat` vs `autogen`).
+    "autogen-core>=0.7.0",
+    "autogen-agentchat>=0.7.0",
+    # drivers/crewai.py reads BOTH instrumentors: CrewAI emits the crew/task spans,
+    # LiteLLM emits the llm ones. The crewai-tests extra carries only the first, so
+    # without this the CrewAI trace arrives with no llm_calls at all.
+    "openinference-instrumentation-litellm>=0.1.30",
+]
 
 [project.scripts]
 decimalai = "decimalai.cli.main:cli"
@@ -264,6 +320,14 @@ include = [
 
 [tool.pytest.ini_options]
 markers = [
+    # Framework conformance (tests/conformance) — ONE contract graded against
+    # every framework adapter, asserted on real HTTP payloads. Tier A is
+    # hermetic (stub model + local probe server, no keys, no backend) and runs
+    # in the default suite on every commit; Tier B runs the SAME contract
+    # functions against a real provider + real backend. See
+    # tests/conformance/README.md.
+    "conformance: hermetic framework-conformance suite (Tier A)",
+    "conformance_live: framework conformance against a real provider + backend (Tier B)",
     "integration: end-to-end tests against a live backend",
     "live_llm: end-to-end tests that make real LLM API calls (requires RUN_LIVE_LLM_TESTS=1 + provider key)",
     "simple_agent: live_llm sub-marker — 2-tool shopping smoke test",
@@ -283,8 +347,19 @@ markers = [
     "heavy: live_llm sub-marker — deep/large stress traces (long dependent loops, wide big-payload fan-out, 3-level nested tree, kitchen-sink combined shape). Runs in the release gate BY DEFAULT (opt out with --skip-heavy); excluded from the routine live sweep via `-m 'live_llm and not heavy'`; alone via `-m heavy`.",
 ]
 # Don't pick up integration or live-LLM tests in the default test run — they
-# need a live backend and (for live_llm) a provider API key.
-addopts = "-m 'not integration and not live_llm'"
+# need a live backend and (for live_llm) a provider API key. `conformance_live`
+# is Tier B of the conformance suite and needs both, so it is excluded for the
+# same reason; Tier A (`conformance`) is hermetic and DOES run by default.
+addopts = "-m 'not integration and not live_llm and not conformance_live and not conformance'"
+# `conformance` is deselected from the DEFAULT run and owned by its own CI job —
+# not because it is optional, but because it deliberately does not reset adapter
+# module globals between phases (running two agents back to back is where sticky
+# process-global state bites, and that is a defect it exists to catch). Those
+# globals then leak into the unit suite: running it inline turns 11 pre-existing
+# failures into 18. It is NOT the "exists but never runs" trap that let the
+# LlamaIndex adapter ship emitting nothing — ci.yml runs it as a required job on
+# every push and PR, and `make ci-workflows` picks that job up automatically.
+# Run it locally with: pytest tests/conformance
 # Only collect the real suite. examples/ holds runnable demo scripts — e.g.
 # examples/test_examples.py uses a def test(name, fn) mini-runner — that a bare
 # `pytest` from the repo root would otherwise mis-collect and error on.

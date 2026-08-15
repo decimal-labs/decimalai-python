@@ -1,0 +1,54 @@
+# Conformance items that are RED today, as `driver:item`.
+#
+# The suite went live against adapters that already had defects. Gating on
+# "everything green" would have meant gating on nothing, because a job that is
+# red on day one gets switched off within a week. So this file is the debt
+# ledger: a failure NOT listed here fails the build, and a line here whose item
+# starts PASSING also fails the build, so the ledger cleans itself up instead of
+# outliving the defect it documents.
+#
+# Same shape as platform's scripts/lint_org_scoping_baseline.txt.
+#
+# Shrink this file. Never add a line to make a build go green — a new red item
+# means the change under test broke something, which is the whole point.
+#
+# Recorded 2026-08-15 against decimalai-python HEAD. Each line names a defect
+# already reported in the framework audit; the fix belongs in the adapter, not
+# here.
+
+# ── LangChain ────────────────────────────────────────────────────────────────
+# llm_calls[0].output.content is a repr of the ChatGeneration object rather than
+# the completion text (extract_output_text's str(gen) last resort fires on every
+# tool-calling turn, where both .text and .message.content are empty).
+langchain:C4
+# agent_name is auto-detected once and sticks for the life of the process, so a
+# second agent in the same process is filed under the first agent's name.
+langchain:C6
+# Under concurrency the skills rail reports offered names the prompt never
+# contained — the router rails are drained per-process, not per-run.
+langchain:C8
+
+# ── OpenAI Agents ────────────────────────────────────────────────────────────
+# user_input_preview is null on every trace.
+openai-agents:C4
+# Offered names are claimed but not present in the prompt the model was shown.
+openai-agents:C8
+# Trace status is hardcoded success, so an errored run is recorded as a success —
+# worse than recording nothing.
+openai-agents:C10
+# The documented one-liner writes .agents/skills/ into the user's working
+# directory (disk_sync defaults on when the loader is off).
+openai-agents:C11
+
+# ── LlamaIndex ───────────────────────────────────────────────────────────────
+# rendered_input and output are null on every LlmCallRecord, so no trace carries
+# the prompt.
+llamaindex:C4
+# Manifest/agent identity leaks across agents via module-global state.
+llamaindex:C6
+# Concurrent runs cross-contaminate.
+llamaindex:C9
+
+# ── Generic OTel ─────────────────────────────────────────────────────────────
+# Spans arrive flat — parent_span_id is hardcoded None in the exporter.
+generic-otel:C5
