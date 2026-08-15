@@ -27,7 +27,11 @@ def _reimport_decimalai(monkeypatch, env: dict[str, str]) -> None:
 
 
 def test_auto_trace_without_api_key_logs_warning(monkeypatch, caplog):
+    # BOTH spellings: since 0.10.2 the auto-init path also accepts the
+    # DECIMALAI_API_KEY alias, so leaving it set in the developer's shell
+    # would resolve a key and skip the warning this test is about.
     monkeypatch.delenv("DECIMAL_API_KEY", raising=False)
+    monkeypatch.delenv("DECIMALAI_API_KEY", raising=False)
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         _reimport_decimalai(monkeypatch, {"DECIMAL_AUTO_TRACE": "langchain"})
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]

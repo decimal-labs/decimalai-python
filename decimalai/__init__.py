@@ -25,7 +25,7 @@ Quick start::
         return resp.choices[0].message.content
 """
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 import atexit
 import logging
@@ -392,6 +392,31 @@ def _activate_crewai_instrumentation(tracer_provider: Any) -> None:
         logger.info("DecimalAI tracing enabled for %s SDK calls (via CrewAI)", pname)
 
 
+# The two spellings of the key variable, in precedence order. `DECIMAL_API_KEY`
+# is primary and is what every error message names; `DECIMALAI_API_KEY` is an
+# accepted alias because the CLI has taken both since it shipped
+# (`envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"]`) and the install snippet on
+# the marketing site exports the alias. Until 0.10.2 the library took only the
+# primary, so pasting that snippet and calling `decimalai.init()` raised
+# "No API key provided" with the key sitting right there in the environment.
+_API_KEY_ENV_VARS = ("DECIMAL_API_KEY", "DECIMALAI_API_KEY")
+
+
+def _api_key_from_env() -> str:
+    """First non-empty key among the accepted env-var spellings.
+
+    Whitespace-only counts as empty: an exported-but-blank primary should fall
+    through to the alias rather than shadow it.
+    """
+    for name in _API_KEY_ENV_VARS:
+        value = os.environ.get(name, "")
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return ""
+
+
 def init(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -440,7 +465,9 @@ def init(
         decimalai.init(google=True)          # ...or Google GenAI
 
     Args:
-        api_key: API key. Falls back to ``DECIMAL_API_KEY`` env var.
+        api_key: API key. Falls back to the ``DECIMAL_API_KEY`` env var, then
+            to its accepted alias ``DECIMALAI_API_KEY`` (the spelling the CLI
+            also takes).
         base_url: Backend URL. Falls back to ``DECIMAL_BASE_URL``, then
             ``https://api.decimal.ai``.
         project: DEPRECATED and inert — the platform never read it, so it has
@@ -504,8 +531,9 @@ def init(
     from ._client import DecimalAIClient
     from ._config import DecimalConfig, DecimalConfigError
 
-    # Resolve API key
-    resolved_key = api_key or os.environ.get("DECIMAL_API_KEY", "")
+    # Resolve API key. Env fallback accepts DECIMAL_API_KEY (primary) and
+    # DECIMALAI_API_KEY (alias), matching the CLI.
+    resolved_key = api_key or _api_key_from_env()
     if isinstance(resolved_key, str):
         resolved_key = resolved_key.strip()
     if not resolved_key and enabled:
@@ -1724,9 +1752,14 @@ def _auto_init_from_env() -> None:
     2. `DECIMAL_API_KEY` present AND `DECIMAL_AUTOINIT != "false"` — bare
        init() so users get ingest + atexit flush without a line of
        boilerplate. Opt out with `DECIMAL_AUTOINIT=false`.
+
+    The key is read through `_api_key_from_env()`, so `DECIMALAI_API_KEY`
+    works here too — otherwise a reader who exported the alias would get the
+    "key missing" warning from path 1 and no bare init from path 2, both
+    while holding a usable key.
     """
     auto_trace = os.environ.get("DECIMAL_AUTO_TRACE", "").strip().lower()
-    api_key = os.environ.get("DECIMAL_API_KEY", "")
+    api_key = _api_key_from_env()
 
     if auto_trace:
         if not api_key:

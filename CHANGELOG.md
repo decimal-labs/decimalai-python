@@ -4,6 +4,31 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## 0.10.2 — 2026-08-15
+
+### Fixed
+
+- **`init()` now accepts `DECIMALAI_API_KEY` as well as `DECIMAL_API_KEY`.**
+  The CLI has taken both spellings since it shipped
+  (`envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"]`), and the copyable
+  install snippet on decimal.ai exports the alias — but the library read only
+  `DECIMAL_API_KEY`, so following that snippet and calling `decimalai.init()`
+  raised `DecimalConfigError: No API key provided` with a usable key sitting in
+  the environment. Both spellings resolve now, in the same order the CLI uses:
+  an explicit `api_key=` argument wins, then `DECIMAL_API_KEY`, then
+  `DECIMALAI_API_KEY`. An exported-but-blank primary falls through to the alias
+  instead of shadowing it. The same resolution applies to the auto-init path,
+  so `DECIMAL_AUTO_TRACE=<framework>` and the bare auto-init both work with
+  either name.
+
+  `DECIMAL_API_KEY` remains the documented primary and is still the variable
+  the error message names — nothing that already worked changes.
+
+  ```bash
+  export DECIMALAI_API_KEY="dai_sk_..."   # was: "No API key provided"
+  python -c "import decimalai; decimalai.init()"
+  ```
+
 ## 0.10.1 — 2026-08-13
 
 ### Fixed
