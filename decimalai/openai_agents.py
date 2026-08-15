@@ -706,9 +706,10 @@ class _TraceAccumulator:
         self.routing_id: Optional[str] = None
         # Skill Rater discovery telemetry. ``skills_offered_in_prompt``
         # is auto-populated by the dynamic-instructions callable from the
-        # Router's offered set; ``skills_loaded_by_agent`` is a manual hook
-        # for callers who want to annotate that the agent read a skill's
-        # body (use `decimalai.log_skill_loaded`).
+        # Router's offered set; ``skills_loaded_by_agent`` is auto-populated
+        # from the Router's loaded-names rail when the native load_skill
+        # tool serves a body (drained at trace-send), plus any manual
+        # annotations (use `decimalai.log_skill_loaded`).
         self.skills_offered_in_prompt: set[str] = set()
         self.skills_loaded_by_agent: set[str] = set()
         # Bodies that reached the model (Router body injection) —
@@ -998,35 +999,116 @@ class DecimalTracingProcessor:
     def _handle_response(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
     ) -> None:
-        """Map a ResponseSpanData (Responses API call) to TraceSpan."""
+        """Map a ResponseSpanData (Responses API call) to LlmCallRecord + TraceSpan.
+
+        The default OpenAI Agents path (OpenAIResponsesModel) emits `response`
+        spans — not `generation` spans — so this handler owns LLM-call capture
+        (model, tokens, latency) for most runs.
+        """
         span_id = _coerce_span_id(getattr(span, "span_id", None)) or uuid4()
         parent_id = _coerce_span_id(getattr(span, "parent_id", None))
         started_at = _parse_iso(getattr(span, "started_at", None))
         ended_at = _parse_iso(getattr(span, "ended_at", None))
 
-        span_error = getattr(span, "error", None)
-        status = Status.ERROR if span_error else Status.SUCCESS
-
         response_obj = getattr(span_data, "response", None)
         response_id = None
-        if response_obj:
+        model = None
+        input_tokens = None
+        output_tokens = None
+        temperature = None
+        max_output_tokens = None
+        if response_obj is not None:
             response_id = getattr(response_obj, "id", None)
+            raw_model = getattr(response_obj, "model", None)
+            model = raw_model if isinstance(raw_model, str) else None
+            usage = getattr(response_obj, "usage", None)
+            if usage is not None:
+                _in = getattr(usage, "input_tokens", None)
+                _out = getattr(usage, "output_tokens", None)
+                input_tokens = _in if isinstance(_in, int) else None
+                output_tokens = _out if isinstance(_out, int) else None
+            _temp = getattr(response_obj, "temperature", None)
+            temperature = _temp if isinstance(_temp, (int, float)) else None
+            _max = getattr(response_obj, "max_output_tokens", None)
+            max_output_tokens = _max if isinstance(_max, int) else None
+        # Fallback: the SDK also stamps a usage dict on the span data itself
+        # (populated on streaming paths where response.usage may be absent).
+        if input_tokens is None and output_tokens is None:
+            usage_dict = getattr(span_data, "usage", None)
+            if isinstance(usage_dict, dict):
+                _in = usage_dict.get("input_tokens")
+                _out = usage_dict.get("output_tokens")
+                input_tokens = _in if isinstance(_in, int) else None
+                output_tokens = _out if isinstance(_out, int) else None
+
+        # Accumulate model info for manifest auto-detection
+        if model and acc.seen_model is None:
+            acc.seen_model = {
+                "provider": _infer_provider(model),
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_output_tokens,
+            }
+
+        raw_input = getattr(span_data, "input", None)
+        output_text = _response_output_text(response_obj) if response_obj else None
+
+        latency_ms = None
+        if started_at and ended_at:
+            latency_ms = int((ended_at - started_at).total_seconds() * 1000)
+
+        # Error handling
+        span_error = getattr(span, "error", None)
+        status = Status.SUCCESS
+        finish_reason = FinishReason.STOP
+        output_dict = {"content": output_text} if output_text else None
+        if span_error:
+            status = Status.ERROR
+            finish_reason = FinishReason.ERROR
+            if output_dict is None:
+                error_msg = span_error.get("message", "") if isinstance(span_error, dict) else str(span_error)
+                output_dict = {"error": error_msg[:500]}
+
+        if response_obj is not None or span_error:
+            call = LlmCallRecord(
+                id=uuid4(),
+                span_id=parent_id,
+                agent_name=acc.agent_name or self.default_agent_name,
+                provider=_infer_provider(model),
+                model_name=model,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                rendered_input=_normalize_messages(raw_input),
+                output=output_dict,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                finish_reason=finish_reason,
+                status=status,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            acc.llm_calls.append(call)
 
         trace_span = TraceSpan(
             id=span_id,
             parent_span_id=parent_id,
-            span_type=SpanType.OTHER,
-            name="response",
+            span_type=SpanType.LLM if response_obj is not None or span_error else SpanType.OTHER,
+            name=f"response:{model}" if model else "response",
             status=status,
             started_at=started_at,
             ended_at=ended_at,
+            input_preview=_preview(raw_input),
+            output_preview=_preview(output_text),
             attributes={"response_id": response_id} if response_id else {},
         )
         acc.spans.append(trace_span)
 
-        # Capture final output from response
-        if response_obj and hasattr(response_obj, "output"):
-            acc.final_output_preview = _preview(response_obj.output)
+        # Capture final output from the response — the extracted text, not the
+        # ResponseOutputMessage repr. Text-less turns (pure tool calls) don't
+        # overwrite a preview captured from an earlier turn.
+        if output_text:
+            acc.final_output_preview = _preview(output_text)
 
     def _handle_handoff(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
@@ -1176,6 +1258,21 @@ class DecimalTracingProcessor:
             acc.skills_delivered.update(drained_delivered)
             acc.skills_offered_in_prompt.update(drained_delivered)  # delivered implies offered
 
+        # Drain the Router's loaded-names rail (bodies the load_skill tool
+        # served mid-run) off the singleton — the tool executor's copied
+        # context never propagates here, so a contextvar can't carry these.
+        # Loaded implies offered + delivered — same ladder semantics as
+        # `log_skill_loaded` on the generic tracer.
+        try:
+            if _skill_router_singleton is not None:
+                drained_loaded = _skill_router_singleton.consume_loaded_names()
+                if drained_loaded:
+                    acc.skills_loaded_by_agent.update(drained_loaded)
+                    acc.skills_delivered.update(drained_loaded)
+                    acc.skills_offered_in_prompt.update(drained_loaded)
+        except Exception:
+            logger.debug("loaded-names drain failed (non-fatal)", exc_info=True)
+
         trace = RunTrace(
             id=uuid4(),
             project=config.project if config else None,
@@ -1321,6 +1418,30 @@ def _preview(obj: Any, max_len: int = 200) -> Optional[str]:
         content = obj.get("content", str(obj))
         return str(content)[:max_len]
     return str(obj)[:max_len]
+
+
+def _response_output_text(response_obj: Any) -> Optional[str]:
+    """Extract the assistant's text from a Responses API ``Response``.
+
+    Prefers the SDK's ``output_text`` convenience property, falling back to
+    walking the ``output`` message items so synthetic/partial objects still
+    work. Returns None when the response produced no text (e.g. a pure
+    tool-call turn).
+    """
+    try:
+        text = getattr(response_obj, "output_text", None)
+        if isinstance(text, str) and text:
+            return text
+        texts: List[str] = []
+        for item in getattr(response_obj, "output", None) or []:
+            for part in getattr(item, "content", None) or []:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str):
+                    texts.append(part_text)
+        return "".join(texts) or None
+    except Exception:
+        logger.debug("Response output text extraction failed", exc_info=True)
+        return None
 
 
 def _normalize_messages(raw: Any) -> Optional[List[Dict[str, Any]]]:

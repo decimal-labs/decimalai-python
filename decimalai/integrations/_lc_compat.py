@@ -1,7 +1,13 @@
 """LangChain version compatibility helpers.
 
 Abstracts version-specific differences in langchain-core so the
-callback handler works across 0.2.x → 0.3.x+.
+callback handler works across 0.2.x → 0.3.x → 1.x.
+
+Known 1.5.x difference (handled in langchain.py, not here): child steps
+reuse the root run_id — an LCEL sequence's ChatPromptTemplate and chat
+model callbacks all arrive with run_id == parent_run_id == the root's
+run_id, so run_id identity no longer distinguishes the outermost run.
+Only parent_run_id=None marks the true outermost callback.
 
 Strategy:
     - Detect installed version at import time

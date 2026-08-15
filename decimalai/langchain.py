@@ -366,7 +366,43 @@ def instrument(
     global _install_agent_name
 
     if _installed:
-        logger.debug("DecimalAI LangChain tracing already installed")
+        # Repeat calls do not reconfigure tracing, but the skill loader is an
+        # independent, idempotent monkey-patch — honor it here so
+        # `decimalai.init(langchain=True)` followed by
+        # `instrument(enable_skill_loader=True)` installs the loader instead
+        # of silently dropping it.
+        if enable_skill_loader and not _skill_loader_installed:
+            from .skill_router import _warn_if_disk_runtime_detected
+            _warn_if_disk_runtime_detected("langchain")
+            _install_skill_loader()
+        # Any other configuration on a repeat call is dropped — say so at
+        # WARNING instead of the old silent DEBUG no-op.
+        ignored = [
+            arg_name for arg_name, value in (
+                ("tools", tools),
+                ("prompts", prompts),
+                ("models", models),
+                ("skills", skills),
+                ("skill_dirs", skill_dirs),
+                ("evals", evals),
+                ("disk_sync", disk_sync),
+            ) if value is not None
+        ]
+        if agent_name is not None and agent_name != _install_agent_name:
+            ignored.insert(0, "agent_name")
+        if not builtin_evals:
+            ignored.append("builtin_evals")
+        if enable_load_skill_tool:
+            ignored.append("enable_load_skill_tool")
+        if ignored:
+            logger.warning(
+                "DecimalAI LangChain tracing already installed; ignoring %s "
+                "from this instrument() call — repeat calls do not "
+                "reconfigure tracing.",
+                ", ".join(ignored),
+            )
+        else:
+            logger.debug("DecimalAI LangChain tracing already installed")
         return
 
     try:
@@ -722,7 +758,7 @@ class CallbackHandler(_CallbackBase):
         span_id = run_id or uuid4()
         parent_id = parent_run_id if parent_run_id in self._spans else None
 
-        # Track root run for auto_send — reset state for each root invocation
+        # Track the root run so state resets for each root invocation
         # This ensures concurrent invocations don't interleave spans
         if self._root_run_id is None:
             if parent_run_id is None or parent_run_id not in self._spans:
@@ -770,6 +806,7 @@ class CallbackHandler(_CallbackBase):
         outputs: Dict[str, Any],
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a chain or graph node ends."""
@@ -785,8 +822,15 @@ class CallbackHandler(_CallbackBase):
 
         self._final_output_preview = _preview(outputs)
 
-        # Auto-send when root chain finishes
-        if span_id == self._root_run_id and self.auto_send:
+        # Auto-send at the true outermost end — the only callback that
+        # carries parent_run_id=None. Matching on `span_id ==
+        # self._root_run_id` broke on langchain-core 1.5.x, which reuses the
+        # root run_id for child steps (ChatPromptTemplate's events arrive
+        # with run_id == parent_run_id == root), so the old check fired at
+        # the PROMPT step's end and sent the trace before the LLM call
+        # existed. The emptiness guard keeps all-skipped runs (e.g. a bare
+        # RunnablePassthrough) from sending empty traces.
+        if parent_run_id is None and self.auto_send and (self._spans or self._llm_calls):
             self._auto_send()
 
     def on_chain_error(
@@ -794,6 +838,7 @@ class CallbackHandler(_CallbackBase):
         error: BaseException,
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a chain errors."""
@@ -807,8 +852,9 @@ class CallbackHandler(_CallbackBase):
         if self._span_stack and self._span_stack[-1] == span_id:
             self._span_stack.pop()
 
-        # Auto-send on root error too
-        if span_id == self._root_run_id and self.auto_send:
+        # Auto-send on the outermost error too — same parent_run_id=None
+        # boundary as on_chain_end (see the note there).
+        if parent_run_id is None and self.auto_send and (self._spans or self._llm_calls):
             self._auto_send()
 
     # ── Sub-agent resolution ───────────────────────────────
@@ -1204,6 +1250,17 @@ class CallbackHandler(_CallbackBase):
             for n in drained_delivered:
                 self._skills_delivered.add(n)
                 self._skills_offered_in_prompt.add(n)  # delivered implies offered
+
+        # Drain the Router's loaded-names rail off the singleton — this
+        # adapter registers no native load_skill tool, but a user-supplied
+        # tool that calls the singleton's `load_skill(...)` still lands its
+        # serves here.
+        try:
+            if _skill_router_singleton is not None:
+                for n in _skill_router_singleton.consume_loaded_names():
+                    self.log_skill_loaded(name=n)
+        except Exception:
+            logger.debug("loaded-names drain failed (non-fatal)", exc_info=True)
 
         # Derive trace status from collected spans/LLM calls: if any errored,
         # the run errored. on_chain_error/on_llm_error mark these ERROR.

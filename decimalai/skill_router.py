@@ -388,9 +388,10 @@ class SkillRouter:
 
         router = SkillRouter(
             api_key="dai_sk_...",
-            base_url="https://api.decimal.ai",
             agent_name="my-agent",
         )
+        # base_url defaults to the same resolution decimalai.init() uses:
+        # explicit argument, else DECIMAL_BASE_URL, else https://api.decimal.ai.
 
         # Get the skill menu prompt fragment
         menu = router.get_menu()
@@ -407,7 +408,7 @@ class SkillRouter:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.decimal.ai",
+        base_url: Optional[str] = None,
         agent_name: Optional[str] = None,
         strategy: str = "auto",
         max_menu_size: int = 20,
@@ -421,7 +422,14 @@ class SkillRouter:
         body_load_deadline_s: float = 20.0,
     ):
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        # Same resolution decimalai.init() uses (explicit → DECIMAL_BASE_URL
+        # → default) so a directly-constructed router doesn't silently split
+        # a non-default deployment onto the public host.
+        self.base_url = (
+            base_url
+            or os.environ.get("DECIMAL_BASE_URL", "")
+            or "https://api.decimal.ai"
+        ).rstrip("/")
         self.agent_name = agent_name
         self.strategy = strategy
         self.max_menu_size = max_menu_size
@@ -444,6 +452,14 @@ class SkillRouter:
         # Fallback body-load budget for tool-execution contexts that did not
         # inherit the prompt-build ContextVar (see load_skill).
         self._last_budget: Optional[_BodyLoadBudget] = None
+        # 'loaded' = the model pulled a skill's BODY on demand through the
+        # load_skill tool (progressive disclosure, step 3). Instance state,
+        # NOT a contextvar like the offered/delivered rails: loads fire
+        # mid-run inside the framework's tool executor, whose copied context
+        # never propagates back to the adapter's trace-send path — the same
+        # reality behind the `_last_budget` fallback above. Adapters drain
+        # this off their router singleton via `consume_loaded_names()`.
+        self._loaded_names: List[str] = []
         # Full-menu cache (single slot, force-refresh to invalidate).
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
@@ -723,6 +739,12 @@ class SkillRouter:
         # Body-load activation signal — trace ingest persists
         # skills_loaded_by_agent; joined with RoutingDecision.offered_skill_names
         # this is the server-side multi-skill activation record (step 3 of progressive disclosure).
+        # The rail is what adapter traces drain (`consume_loaded_names` at
+        # trace-send); the generic call below only reaches a native
+        # @decimalai.trace context, which is absent under the adapters —
+        # there it raises and the load would otherwise go unrecorded.
+        if name not in self._loaded_names:
+            self._loaded_names.append(name)
         try:
             from .generic import log_skill_loaded
             log_skill_loaded(name=name)
@@ -730,6 +752,20 @@ class SkillRouter:
             logger.debug("load_skill: no active trace to record the load", exc_info=True)
 
         return f"## Skill: {name}\n\n{body}"
+
+    def consume_loaded_names(self) -> List[str]:
+        """Read + clear the names whose body `load_skill` served since the
+        last drain. Adapter trace-send paths call this on their router
+        singleton — the same instance whose load_skill tool served the
+        bodies — and stamp the names onto ``skills_loaded_by_agent``.
+        Known cost (same as the `_last_budget` fallback): concurrent runs
+        sharing one router drain into whichever trace sends first.
+        """
+        if not self._loaded_names:
+            return []
+        drained = list(self._loaded_names)
+        self._loaded_names.clear()
+        return drained
 
     def get_menu_prompt(
         self,
