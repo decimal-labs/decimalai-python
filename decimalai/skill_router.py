@@ -460,6 +460,19 @@ class SkillRouter:
         # reality behind the `_last_budget` fallback above. Adapters drain
         # this off their router singleton via `consume_loaded_names()`.
         self._loaded_names: List[str] = []
+        # Instance mirror of the routing decision — routing_id + offered +
+        # delivered names — for the same reason `_loaded_names` exists, one
+        # step earlier in the run: prompt assembly also happens in a copied
+        # context (LangChain runs its callbacks under `copy_context()`, the
+        # OpenAI Agents runner copies around the instructions callable), so
+        # the contextvar rails above are invisible to the adapter's
+        # trace-send path. The contextvars stay authoritative where they DO
+        # propagate (the generic tracer, the anthropic adapter); adapters
+        # union this rail in via `consume_routing_id()` /
+        # `consume_offered_names()` / `consume_delivered_names()`.
+        self._routing_id_rail: Optional[str] = None
+        self._offered_names_rail: List[str] = []
+        self._delivered_names_rail: List[str] = []
         # Full-menu cache (single slot, force-refresh to invalidate).
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
@@ -767,6 +780,59 @@ class SkillRouter:
         self._loaded_names.clear()
         return drained
 
+    def _record_routing_rails(
+        self,
+        routing_id: Optional[str],
+        offered_names: Optional[List[str]],
+        delivered_names: Optional[List[str]],
+    ) -> None:
+        """Mirror one routing decision onto the instance rails.
+
+        Names accumulate (dedup-append, like `_loaded_names`) because a
+        multi-LLM-call turn routes more than once and the adapter drains
+        only at trace-send; `routing_id` is last-write-wins, matching the
+        contextvar rails the adapters set per call.
+        """
+        if routing_id:
+            self._routing_id_rail = routing_id
+        for name in offered_names or ():
+            if name not in self._offered_names_rail:
+                self._offered_names_rail.append(name)
+        for name in delivered_names or ():
+            if name not in self._delivered_names_rail:
+                self._delivered_names_rail.append(name)
+
+    def consume_routing_id(self) -> Optional[str]:
+        """Read + clear the most recent routing id minted since the last
+        drain. Adapters fall back to this when their own routing-id
+        contextvar comes back empty because prompt assembly ran in a
+        copied context. Same concurrency cost as `consume_loaded_names`.
+        """
+        rid = self._routing_id_rail
+        self._routing_id_rail = None
+        return rid
+
+    def consume_offered_names(self) -> List[str]:
+        """Read + clear the names offered (menu rows) since the last drain.
+        The instance-state twin of `consume_last_offered_names`.
+        """
+        if not self._offered_names_rail:
+            return []
+        drained = list(self._offered_names_rail)
+        self._offered_names_rail.clear()
+        return drained
+
+    def consume_delivered_names(self) -> List[str]:
+        """Read + clear the names whose BODY the prompt fragment carried
+        since the last drain. The instance-state twin of
+        `consume_last_delivered_names`.
+        """
+        if not self._delivered_names_rail:
+            return []
+        drained = list(self._delivered_names_rail)
+        self._delivered_names_rail.clear()
+        return drained
+
     def get_menu_prompt(
         self,
         query: Optional[str] = None,
@@ -870,6 +936,7 @@ class SkillRouter:
                 _last_delivered_names_ctx.set(
                     list(delivered_names) if delivered_names else None
                 )
+                self._record_routing_rails(routing_id, offered_names, delivered_names)
                 _stamp_active_trace(routing_id, offered_names, delivered_names)
                 return fragment, routing_id
 
@@ -958,6 +1025,11 @@ class SkillRouter:
         )
         _body_budget_ctx.set(fresh_budget)
         self._last_budget = fresh_budget
+
+        # Mirror onto the instance rails before stamping — the adapters
+        # whose contextvars never reach trace-send read the routing
+        # telemetry off the router itself.
+        self._record_routing_rails(routing_id, offered_names, delivered_names)
 
         # Stamp the active generic trace (raw-loop quickstart) —
         # adapter paths stamp their own trace objects, so this is a no-op

@@ -169,6 +169,47 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+def _clean_names(names: Any) -> List[str]:
+    """Keep only non-blank strings — same filter as `_add_skills_offered`."""
+    if not isinstance(names, (list, tuple, set)):
+        return []
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+
+def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
+    """Drain the Router singleton's instance rails —
+    ``(routing_id, offered, delivered, loaded)``.
+
+    The contextvars above stay authoritative wherever they propagate, but
+    under the Agents runner they don't: the dynamic instructions callable
+    and the tool executor both run in a copied context whose writes never
+    reach this trace-send path, so every rail above came back empty on a
+    run that demonstrably routed. The Router carries the same values as
+    instance state; `_send_trace` unions both. Known cost (same as
+    `consume_loaded_names`): concurrent runs sharing one router singleton
+    drain into whichever trace sends first.
+    """
+    if _skill_router_singleton is None:
+        return None, [], [], []
+    try:
+        routing_id = _skill_router_singleton.consume_routing_id()
+        offered = _skill_router_singleton.consume_offered_names()
+        delivered = _skill_router_singleton.consume_delivered_names()
+        loaded = _skill_router_singleton.consume_loaded_names()
+    except Exception:
+        # A router object from an older SDK carries none of these methods.
+        logger.debug("router-rail drain failed (non-fatal)", exc_info=True)
+        return None, [], [], []
+    # Sanitize here rather than at the merge: `set.update("abc")` on a
+    # stray string would silently add three one-letter "skills".
+    return (
+        routing_id if isinstance(routing_id, str) else None,
+        _clean_names(offered),
+        _clean_names(delivered),
+        _clean_names(loaded),
+    )
+
+
 # ── SkillRouter dynamic loader ──────────────────────────────
 # When `install(enable_skill_loader=True)` runs, we monkey-patch
 # `agents.Agent.__init__` so every Agent created afterwards has its
@@ -1239,11 +1280,18 @@ class DecimalTracingProcessor:
                 entry["hash"] = h
             active_skills_list.append(entry)
 
+        # Drain the Router's instance rails first, unconditionally — see
+        # `_drain_router_rails`. Unconditional because an undrained rail
+        # leaks into the NEXT trace.
+        rail_routing_id, rail_offered, rail_delivered, rail_loaded = _drain_router_rails()
+
         # SkillRouter: consume the routing_id set by the dynamic
         # instructions callable. We read at trace-end (not start)
         # because the instructions callable fires AFTER on_trace_start.
+        # The rail is the fallback: the runner copies the context around
+        # that callable, so its contextvar write never reaches here.
         if acc.routing_id is None:
-            acc.routing_id = _consume_routing_id()
+            acc.routing_id = _consume_routing_id() or rail_routing_id
 
         # Drain the per-trace offered-names contextvar populated
         # by the skill loader callable. Merge with any direct
@@ -1251,27 +1299,25 @@ class DecimalTracingProcessor:
         drained_offered = _consume_skills_offered()
         if drained_offered:
             acc.skills_offered_in_prompt.update(drained_offered)
+        if rail_offered:
+            acc.skills_offered_in_prompt.update(rail_offered)
 
         # Drain the delivered-names contextvar (Router body injection).
         drained_delivered = _consume_skills_delivered()
         if drained_delivered:
             acc.skills_delivered.update(drained_delivered)
             acc.skills_offered_in_prompt.update(drained_delivered)  # delivered implies offered
+        if rail_delivered:
+            acc.skills_delivered.update(rail_delivered)
+            acc.skills_offered_in_prompt.update(rail_delivered)
 
-        # Drain the Router's loaded-names rail (bodies the load_skill tool
-        # served mid-run) off the singleton — the tool executor's copied
-        # context never propagates here, so a contextvar can't carry these.
-        # Loaded implies offered + delivered — same ladder semantics as
+        # Bodies the load_skill tool served mid-run. Loaded implies
+        # offered + delivered — same ladder semantics as
         # `log_skill_loaded` on the generic tracer.
-        try:
-            if _skill_router_singleton is not None:
-                drained_loaded = _skill_router_singleton.consume_loaded_names()
-                if drained_loaded:
-                    acc.skills_loaded_by_agent.update(drained_loaded)
-                    acc.skills_delivered.update(drained_loaded)
-                    acc.skills_offered_in_prompt.update(drained_loaded)
-        except Exception:
-            logger.debug("loaded-names drain failed (non-fatal)", exc_info=True)
+        if rail_loaded:
+            acc.skills_loaded_by_agent.update(rail_loaded)
+            acc.skills_delivered.update(rail_loaded)
+            acc.skills_offered_in_prompt.update(rail_loaded)
 
         trace = RunTrace(
             id=uuid4(),
