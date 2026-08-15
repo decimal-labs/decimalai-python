@@ -11,9 +11,7 @@
 
 [Docs](https://docs.decimal.ai) · [Registry](https://app.decimal.ai/skills) · [Leaderboard](https://app.decimal.ai/skills/leaderboard) · [Changelog](https://docs.decimal.ai/changelog)
 
-<!-- hero image: uncomment once docs/assets/sdk-demo.gif is committed
-<img src="https://raw.githubusercontent.com/decimal-labs/decimalai-python/main/docs/assets/sdk-demo.gif" alt="decimalai demo regression — seeding a reference agent and printing the impact report" width="700">
--->
+<img src="https://raw.githubusercontent.com/decimal-labs/decimalai-python/main/docs/assets/sdk-demo.gif" alt="decimalai demo regression — seeding a reference agent, then the manifest-impact report: graded changes, risk breakdown, verdict" width="780">
 
 ## Installation
 
