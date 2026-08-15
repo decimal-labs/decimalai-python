@@ -565,6 +565,10 @@ class DecimalSpanExporter:
             model_name=model,
             temperature=temperature,
             max_output_tokens=max_tokens,
+            # The FULL rendered request/response, not the 200-char previews —
+            # these are what SFT derivation reads.
+            rendered_input=_rendered_input_from_attrs(attrs),
+            output=_output_message_from_attrs(attrs),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=latency_ms,
@@ -816,11 +820,114 @@ def _extract_declared_tools(attrs: Dict[str, Any]) -> List[str]:
     return names
 
 
-# OpenInference carries the input chat messages on the LLM span as
-# llm.input_messages.{i}.message.role / .content — the same attribute namespace
-# the inline tool calls above use (CrewAI, LlamaIndex/Phoenix, …).
-_OI_MSG_ROLE_RE = re.compile(r"^llm\.input_messages\.(\d+)\.message\.role$")
-_OI_MSG_CONTENT_RE = re.compile(r"^llm\.input_messages\.(\d+)\.message\.content$")
+# OpenInference carries the chat messages on the LLM span as
+# llm.{input,output}_messages.{i}.message.role / .content — the same attribute
+# namespace the inline tool calls above use (CrewAI, LlamaIndex/Phoenix, …).
+# The GenAI semconv has an indexed spelling of its own
+# (gen_ai.prompt.{i}.role / .content, gen_ai.completion.{i}...).
+_MSG_KEY_RES = {
+    "input": (
+        re.compile(r"^llm\.input_messages\.(\d+)\.message\.(role|content)$"),
+        re.compile(r"^gen_ai\.prompt\.(\d+)\.(role|content)$"),
+    ),
+    "output": (
+        re.compile(r"^llm\.output_messages\.(\d+)\.message\.(role|content)$"),
+        re.compile(r"^gen_ai\.completion\.(\d+)\.(role|content)$"),
+    ),
+}
+
+# A multi-part (multi-modal) OpenInference message puts its text under
+# …{i}.message.contents.{j}.message_content.text instead of …{i}.message.content.
+_MSG_PART_RES = {
+    "input": re.compile(
+        r"^llm\.input_messages\.(\d+)\.message\.contents\.(\d+)\.message_content\.text$"
+    ),
+    "output": re.compile(
+        r"^llm\.output_messages\.(\d+)\.message\.contents\.(\d+)\.message_content\.text$"
+    ),
+}
+
+# Every key in the indexed-message namespaces above, content and metadata
+# alike. _content_from_attrs skips them: role and tool_call keys are metadata,
+# and a substring scan would otherwise return the ROLE ("system"/"assistant")
+# as the preview — the whole namespace belongs to _messages_from_attrs.
+_INDEXED_MSG_NAMESPACE_RE = re.compile(
+    r"^(llm\.(input|output)_messages|gen_ai\.(prompt|completion))\.\d+\."
+)
+
+_DEFAULT_ROLE = {"input": "user", "output": "assistant"}
+
+
+def _messages_from_attrs(
+    attrs: Dict[str, Any], direction: str
+) -> Optional[List[Dict[str, Any]]]:
+    """Rebuild one direction's chat messages from indexed span attributes.
+
+    Frameworks that follow OpenInference (CrewAI, LlamaIndex/Phoenix, …) split
+    each message across ``…{i}.message.role`` and ``…{i}.message.content``
+    keys. Returns them in index order as ``{"role", "content"}`` dicts — the
+    shape the other adapters normalize to — or None when the span carries no
+    indexed messages.
+
+    A message whose content is absent (an assistant turn that only made tool
+    calls) is kept with an empty content so turn order survives; its tool calls
+    are carried separately on ``LlmCallRecord.tool_calls``.
+    """
+    found: Dict[int, Dict[str, str]] = {}
+    parts: Dict[int, Dict[int, str]] = {}
+    for key, val in attrs.items():
+        part = _MSG_PART_RES[direction].match(key)
+        if part:
+            parts.setdefault(int(part.group(1)), {})[int(part.group(2))] = str(val)
+            continue
+        for pattern in _MSG_KEY_RES[direction]:
+            m = pattern.match(key)
+            if m:
+                found.setdefault(int(m.group(1)), {})[m.group(2)] = str(val)
+                break
+    for idx, by_part in parts.items():
+        found.setdefault(idx, {}).setdefault(
+            "content", "".join(by_part[j] for j in sorted(by_part))
+        )
+    if not found:
+        return None
+    return [
+        {
+            "role": found[idx].get("role") or _DEFAULT_ROLE[direction],
+            "content": found[idx].get("content", ""),
+        }
+        for idx in sorted(found)
+    ]
+
+
+def _rendered_input_from_attrs(
+    attrs: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    """The rendered request for ``LlmCallRecord.rendered_input``.
+
+    Indexed messages when the span carries them; otherwise a single user
+    message wrapping whatever prompt content is there (a bare
+    ``gen_ai.prompt``/``input.value`` string) — the same fallback the other
+    adapters apply to non-message input.
+    """
+    messages = _messages_from_attrs(attrs, "input")
+    if messages:
+        return messages
+    content = _content_from_attrs(attrs, "input")
+    if content is None:
+        return None
+    return [{"role": "user", "content": content}]
+
+
+def _output_message_from_attrs(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The response message for ``LlmCallRecord.output``."""
+    messages = _messages_from_attrs(attrs, "output")
+    if messages:
+        return messages[0]
+    content = _content_from_attrs(attrs, "output")
+    if content is None:
+        return None
+    return {"role": "assistant", "content": content}
 
 
 def _extract_system_prompt(attrs: Dict[str, Any]) -> Optional[str]:
@@ -831,19 +938,9 @@ def _extract_system_prompt(attrs: Dict[str, Any]) -> Optional[str]:
     Returns the RENDERED prompt (callers should capture only the first per
     trace — see _assemble_trace).
     """
-    roles: Dict[str, str] = {}
-    contents: Dict[str, str] = {}
-    for key, val in attrs.items():
-        m = _OI_MSG_ROLE_RE.match(key)
-        if m:
-            roles[m.group(1)] = str(val).lower()
-            continue
-        m = _OI_MSG_CONTENT_RE.match(key)
-        if m:
-            contents[m.group(1)] = str(val)
-    for idx in sorted(roles, key=int):
-        if roles[idx] in ("system", "developer") and contents.get(idx):
-            return contents[idx]
+    for message in _messages_from_attrs(attrs, "input") or ():
+        if message["role"].lower() in ("system", "developer") and message["content"]:
+            return message["content"]
     # GenAI-semconv fallback.
     for key in ("gen_ai.system_instructions", "gen_ai.prompt"):
         val = attrs.get(key)
@@ -888,17 +985,22 @@ def _classify_span(name: str, attrs: Dict[str, Any]) -> SpanType:
     return SpanType.OTHER
 
 
-def _preview_from_attrs(
-    attrs: Dict[str, Any], direction: str, max_len: int = 200
-) -> Optional[str]:
-    """Extract a preview string from span attributes."""
+def _content_from_attrs(attrs: Dict[str, Any], direction: str) -> Optional[str]:
+    """Extract one direction's content from unstructured span attributes."""
     # Patterns are direction-specific: ``gen_ai.prompt`` is an input-side key
     # and ``gen_ai.completion`` output-side, so neither may serve the other
     # direction (an output preview must never surface the prompt).
     if direction == "input":
-        key_patterns = ("gen_ai.input", "llm.input", "input", "gen_ai.prompt")
+        key_patterns = (
+            "gen_ai.input", "llm.input", "input", "gen_ai.prompt",
+            # AG2 tool spans; the key contains neither "input" nor "prompt".
+            "gen_ai.tool.call.arguments",
+        )
     else:
-        key_patterns = ("gen_ai.output", "llm.output", "output", "gen_ai.completion")
+        key_patterns = (
+            "gen_ai.output", "llm.output", "output", "gen_ai.completion",
+            "gen_ai.tool.call.result",
+        )
     for key_pattern in key_patterns:
         for key, val in attrs.items():
             key_lower = key.lower()
@@ -907,9 +1009,24 @@ def _preview_from_attrs(
             # they are counts, not content, and must never become previews.
             if "token" in key_lower or "usage" in key_lower:
                 continue
+            if _INDEXED_MSG_NAMESPACE_RE.match(key_lower):
+                continue
             if key_pattern in key_lower:
-                return str(val)[:max_len]
+                return str(val)
     return None
+
+
+def _preview_from_attrs(
+    attrs: Dict[str, Any], direction: str, max_len: int = 200
+) -> Optional[str]:
+    """Extract a preview string from span attributes."""
+    messages = _messages_from_attrs(attrs, direction)
+    if messages:
+        joined = "\n".join(m["content"] for m in messages if m["content"])
+        if joined:
+            return joined[:max_len]
+    content = _content_from_attrs(attrs, direction)
+    return content[:max_len] if content is not None else None
 
 
 def _infer_provider(model: Optional[str]) -> Optional[str]:

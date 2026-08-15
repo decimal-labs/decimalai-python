@@ -30,6 +30,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
 
+# Shared with the manifest-capable exporter so both rails read the indexed
+# OpenInference message attributes identically. Pure-stdlib module, no cycle.
+from ..otel import _messages_from_attrs
+
 logger = logging.getLogger("decimalai.integrations.otel")
 
 # ── OTel GenAI semantic convention attribute keys ─────────────────
@@ -57,6 +61,7 @@ _INPUT_ATTR_KEYS = [
     "input",                       # OpenInference
     "input.value",                 # OpenInference v2
     "llm.input_messages",          # LangSmith-style
+    "gen_ai.tool.call.arguments",  # GenAI semconv tool span (AG2)
 ]
 _OUTPUT_ATTR_KEYS = [
     "gen_ai.content.completion",   # GenAI semconv
@@ -64,6 +69,7 @@ _OUTPUT_ATTR_KEYS = [
     "output",                      # OpenInference
     "output.value",                # OpenInference v2
     "llm.output_messages",         # LangSmith-style
+    "gen_ai.tool.call.result",     # GenAI semconv tool span (AG2)
 ]
 
 # DecimalAI-specific attributes users can set on spans
@@ -214,6 +220,10 @@ class DecimalSpanExporter:
                 llm_calls.append(LlmCallRecord(
                     model_name=str(model_name) if model_name else None,
                     provider=str(attrs.get(OTEL_GEN_AI_SYSTEM, "")),
+                    # The FULL rendered request/response — the previews below
+                    # are display strings, these are the SFT artifact.
+                    rendered_input=_rendered_input_from_attrs(attrs),
+                    output=_output_message_from_attrs(attrs),
                     input_tokens=int(input_tokens) if input_tokens else None,
                     output_tokens=int(output_tokens) if output_tokens else None,
                     temperature=float(attrs.get(OTEL_GEN_AI_REQUEST_TEMPERATURE, 0)) if attrs.get(OTEL_GEN_AI_REQUEST_TEMPERATURE) else None,
@@ -227,17 +237,17 @@ class DecimalSpanExporter:
 
                 # Try to extract user input from this LLM span
                 if not user_input:
-                    user_input = _extract_content(attrs, _INPUT_ATTR_KEYS)
+                    user_input = _extract_preview(attrs, "input")
                 # Always update final_output (last LLM span wins)
-                output_content = _extract_content(attrs, _OUTPUT_ATTR_KEYS)
+                output_content = _extract_preview(attrs, "output")
                 if output_content:
                     final_output = output_content
 
             elif is_tool_span:
                 # ── Tool execution span (CrewAI / AutoGen) ──
                 resolved_name = str(tool_name or span.name or "unknown_tool")
-                tool_input = _extract_content(attrs, _INPUT_ATTR_KEYS) or ""
-                tool_output = _extract_content(attrs, _OUTPUT_ATTR_KEYS) or ""
+                tool_input = _extract_preview(attrs, "input") or ""
+                tool_output = _extract_preview(attrs, "output") or ""
 
                 trace_spans.append(TraceSpan(
                     span_type=SpanType.TOOL,
@@ -273,8 +283,8 @@ class DecimalSpanExporter:
                 except ValueError:
                     span_type = SpanType.OTHER
 
-                span_input = _extract_content(attrs, _INPUT_ATTR_KEYS)
-                span_output = _extract_content(attrs, _OUTPUT_ATTR_KEYS)
+                span_input = _extract_preview(attrs, "input")
+                span_output = _extract_preview(attrs, "output")
 
                 trace_spans.append(TraceSpan(
                     span_type=span_type,
@@ -377,7 +387,9 @@ def install_otel(
 # ── Helpers ──────────────────────────────────────────────────────
 
 
-def _extract_content(attrs: Dict[str, Any], keys: List[str]) -> Optional[str]:
+def _extract_content(
+    attrs: Dict[str, Any], keys: List[str], max_len: Optional[int] = 500
+) -> Optional[str]:
     """Try multiple attribute keys to extract text content from a span.
 
     Different OTEL instrumentors use different attribute names for
@@ -388,8 +400,48 @@ def _extract_content(attrs: Dict[str, Any], keys: List[str]) -> Optional[str]:
         if val:
             text = str(val)
             if text and text != "None":
-                return text[:500]
+                return text if max_len is None else text[:max_len]
     return None
+
+
+def _extract_preview(attrs: Dict[str, Any], direction: str) -> Optional[str]:
+    """Content for one direction, message-aware.
+
+    OpenInference splits each message across ``…{i}.message.role`` and
+    ``…{i}.message.content`` keys, none of which the flat lookup above can
+    reach — so the message contents are read first, in index order.
+    """
+    messages = _messages_from_attrs(attrs, direction)
+    if messages:
+        joined = "\n".join(m["content"] for m in messages if m["content"])
+        if joined:
+            return joined[:500]
+    keys = _INPUT_ATTR_KEYS if direction == "input" else _OUTPUT_ATTR_KEYS
+    return _extract_content(attrs, keys)
+
+
+def _rendered_input_from_attrs(
+    attrs: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    """The rendered request for ``LlmCallRecord.rendered_input`` — untruncated."""
+    messages = _messages_from_attrs(attrs, "input")
+    if messages:
+        return messages
+    content = _extract_content(attrs, _INPUT_ATTR_KEYS, max_len=None)
+    if content is None:
+        return None
+    return [{"role": "user", "content": content}]
+
+
+def _output_message_from_attrs(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The response message for ``LlmCallRecord.output`` — untruncated."""
+    messages = _messages_from_attrs(attrs, "output")
+    if messages:
+        return messages[0]
+    content = _extract_content(attrs, _OUTPUT_ATTR_KEYS, max_len=None)
+    if content is None:
+        return None
+    return {"role": "assistant", "content": content}
 
 
 def _ns_to_datetime(ns: int) -> datetime:
