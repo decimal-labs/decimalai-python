@@ -95,10 +95,14 @@ pydantic-ai = ["pydantic-ai>=0.1.0"]
 adk = ["google-adk>=2.0.0"]
 langgraph = ["langgraph>=0.6.0"]
 # Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).
-# Floored at 0.10.20 — where LlamaIndex's instrumentation dispatcher + SpanHandler
-# API landed, which decimalai/llamaindex.py registers against. Refine by
-# installing at the floor and importing.
-llamaindex = ["llama-index-core>=0.10.20"]
+# Floored at 0.12.0 — VERIFIED at the floor: a MockLLM query engine through the
+# real dispatcher exports a trace. The old 0.10.20 floor was fiction twice over:
+# llama_index.core.instrumentation does not exist there, and where it does exist
+# pre-0.10.30 the dispatcher calls handlers as span_enter(instance, id=...),
+# which raises TypeError inside decimalai/llamaindex.py and — unlike 0.12's
+# guarded dispatch — takes the user's query down with it (verified on 0.10.24).
+# Same floor the adapter's own ImportError message and [llamaindex-tests] state.
+llamaindex = ["llama-index-core>=0.12.0"]
 evals = ["litellm>=1.30"]
 # Everything above in one install. Self-referential extra — floors stay
 # defined once in their own extras.

@@ -34,7 +34,7 @@ import warnings
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 logger = logging.getLogger("decimalai.llamaindex")
 
@@ -73,6 +73,11 @@ class DecimalSpanHandler:
         self._manifest_tracker = ManifestTracker()
         self._manifest_id: Optional[str] = None
         self._manifest_lock = threading.Lock()
+        # The model config seen on ANY tree so far. Sticky: index construction
+        # and bare retrieval have no model, and letting the manifest drop back
+        # to model-less between two query trees would churn the manifest
+        # version on every such tree without any real config change.
+        self._seen_model: Optional[Dict[str, Any]] = None
 
     def class_name(self) -> str:
         """Return the class name for LlamaIndex's handler registry."""
@@ -289,6 +294,38 @@ class DecimalSpanHandler:
             current = self._parents[current]
         return current
 
+    def _ancestors(self, span_id: str) -> List[str]:
+        """Parent chain of ``span_id``, nearest first.
+
+        Bounded by a visited set — a malformed parent link that cycles would
+        otherwise spin the caller's thread inside the dispatcher.
+        """
+        chain: List[str] = []
+        current = self._parents.get(span_id)
+        seen = {span_id}
+        while current is not None and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            current = self._parents.get(current)
+        return chain
+
+    def _outermost_ancestor_in(self, span_id: str, ids: set[str]) -> str:
+        """Highest ancestor of ``span_id`` that is in ``ids``, else ``span_id``."""
+        outermost = span_id
+        for ancestor in self._ancestors(span_id):
+            if ancestor in ids:
+                outermost = ancestor
+        return outermost
+
+    def _nearest_ancestor_span(
+        self, span_id: str, span_uuids: Dict[str, UUID]
+    ) -> Optional[UUID]:
+        """TraceSpan id of the nearest ancestor that was emitted as a span."""
+        for ancestor in self._ancestors(span_id):
+            if ancestor in span_uuids:
+                return span_uuids[ancestor]
+        return None
+
     def _extract_llm_result(self, span_data: Dict[str, Any], result: Any) -> None:
         """Extract token counts and model info from an LLM response."""
         # Handle ChatResponse / CompletionResponse
@@ -340,53 +377,85 @@ class DecimalSpanHandler:
 
         root_data = self._spans.get(root_id, {})
 
-        # Separate LLM calls from regular spans
-        llm_calls: List[LlmCallRecord] = []
-        trace_spans: List[TraceSpan] = []
-        # Manifest auto-detection: accumulate the first LLM span's model config.
-        seen_model: Optional[Dict[str, Any]] = None
+        llm_ids = {sd["id"] for sd in spans_data if sd.get("is_llm_call")}
+        # Mint every TraceSpan id up front: a child has to reference its
+        # parent's id, and the dispatcher hands spans over in enter order, not
+        # parent-resolved order. LLM spans become LlmCallRecords instead, so
+        # they get no TraceSpan id and a child of one re-parents to the nearest
+        # ancestor that does (never a dangling reference).
+        span_uuids: Dict[str, UUID] = {
+            sd["id"]: uuid4() for sd in spans_data if sd["id"] not in llm_ids
+        }
 
+        # LlamaIndex instruments both the public wrapper (``OpenAI.predict``)
+        # and the inner call it delegates to (``OpenAI.chat``), so ONE real
+        # request enters the tree as two spans — and only the inner one sees
+        # the raw response, hence the token counts. Group each nested LLM span
+        # with its outermost LLM ancestor and emit one record per group.
+        llm_groups: Dict[str, List[Dict[str, Any]]] = {}
         for sd in spans_data:
             if sd.get("is_llm_call"):
-                if seen_model is None and sd.get("model_name"):
-                    seen_model = {
-                        "provider": sd.get("provider"),
-                        "model": sd.get("model_name"),
-                        "temperature": sd.get("temperature"),
-                    }
-                latency_ms = None
-                if sd.get("started_at") and sd.get("ended_at"):
-                    latency_ms = int((sd["ended_at"] - sd["started_at"]).total_seconds() * 1000)
+                outer_id = self._outermost_ancestor_in(sd["id"], llm_ids)
+                group = llm_groups.setdefault(outer_id, [])
+                # Wrapper first — _merge_llm_spans reads the call's wall clock
+                # off group[0].
+                if sd["id"] == outer_id:
+                    group.insert(0, sd)
+                else:
+                    group.append(sd)
 
-                llm_calls.append(LlmCallRecord(
-                    model_name=sd.get("model_name"),
-                    provider=sd.get("provider"),
-                    input_tokens=sd.get("input_tokens"),
-                    output_tokens=sd.get("output_tokens"),
-                    temperature=sd.get("temperature"),
-                    latency_ms=latency_ms,
-                    status=Status.SUCCESS if sd["status"] == "success" else Status.ERROR,
-                    started_at=sd.get("started_at"),
-                    ended_at=sd.get("ended_at"),
-                ))
-            else:
-                span_type = {
-                    "query": SpanType.AGENT,
-                    "retrieve": SpanType.RETRIEVAL,
-                    "synthesize": SpanType.OTHER,
-                    "embed": SpanType.OTHER,
-                    "llm": SpanType.LLM,
-                }.get(sd.get("span_type", "other"), SpanType.OTHER)
+        llm_calls: List[LlmCallRecord] = []
+        trace_spans: List[TraceSpan] = []
+        # Manifest auto-detection: accumulate the first LLM call's model config.
+        seen_model: Optional[Dict[str, Any]] = None
 
-                trace_spans.append(TraceSpan(
-                    span_type=span_type,
-                    name=sd.get("name", "unknown"),
-                    status=Status.SUCCESS if sd["status"] == "success" else Status.ERROR,
-                    started_at=sd.get("started_at"),
-                    ended_at=sd.get("ended_at"),
-                    input_preview=sd.get("input_preview"),
-                    output_preview=sd.get("output_preview"),
-                ))
+        for outer_id, group in llm_groups.items():
+            sd = _merge_llm_spans(group)
+            if seen_model is None and sd.get("model_name"):
+                seen_model = {
+                    "provider": sd.get("provider"),
+                    "model": sd.get("model_name"),
+                    "temperature": sd.get("temperature"),
+                }
+            latency_ms = None
+            if sd.get("started_at") and sd.get("ended_at"):
+                latency_ms = int((sd["ended_at"] - sd["started_at"]).total_seconds() * 1000)
+
+            llm_calls.append(LlmCallRecord(
+                span_id=self._nearest_ancestor_span(outer_id, span_uuids),
+                model_name=sd.get("model_name"),
+                provider=sd.get("provider"),
+                input_tokens=sd.get("input_tokens"),
+                output_tokens=sd.get("output_tokens"),
+                temperature=sd.get("temperature"),
+                latency_ms=latency_ms,
+                status=Status.SUCCESS if sd["status"] == "success" else Status.ERROR,
+                started_at=sd.get("started_at"),
+                ended_at=sd.get("ended_at"),
+            ))
+
+        for sd in spans_data:
+            if sd["id"] in llm_ids:
+                continue
+            span_type = {
+                "query": SpanType.AGENT,
+                "retrieve": SpanType.RETRIEVAL,
+                "synthesize": SpanType.OTHER,
+                "embed": SpanType.OTHER,
+                "llm": SpanType.LLM,
+            }.get(sd.get("span_type", "other"), SpanType.OTHER)
+
+            trace_spans.append(TraceSpan(
+                id=span_uuids[sd["id"]],
+                parent_span_id=self._nearest_ancestor_span(sd["id"], span_uuids),
+                span_type=span_type,
+                name=sd.get("name", "unknown"),
+                status=Status.SUCCESS if sd["status"] == "success" else Status.ERROR,
+                started_at=sd.get("started_at"),
+                ended_at=sd.get("ended_at"),
+                input_preview=sd.get("input_preview"),
+                output_preview=sd.get("output_preview"),
+            ))
 
         # Determine overall trace status
         has_error = any(sd["status"] == "error" for sd in spans_data)
@@ -419,25 +488,33 @@ class DecimalSpanHandler:
         self._cleanup_tree(root_id)
 
     def _maybe_register_manifest(self, seen_model: Optional[Dict[str, Any]]) -> None:
-        """Register a manifest from the run's model config.
+        """Register a manifest for this run, even when it used no model.
 
         LlamaIndex span handlers surface model/retriever spans (not a single
         agent config object), so the manifest is model-centric — enough for
         manifest diff/compat gating to engage where model drift matters.
-        Thread-safe; only registers when the manifest hash changes.
+
+        Index construction and bare retrieval legitimately have no model, so
+        there is nothing to auto-detect — but ingest requires a manifest_id, so
+        skipping registration there meant every such tree 400'd and the trace
+        was lost. Register the model-less manifest instead (agent name only);
+        the model, once seen, sticks so later model-less trees reuse the same
+        hash rather than flip-flopping the manifest version.
+
+        Thread-safe; only calls the backend when the manifest hash changes.
         """
         from . import _config
 
         if not _config._is_enabled():
             return
-        models = {"default": seen_model} if seen_model and seen_model.get("model") else None
-        if not models:
-            return
 
         from .schema.manifest import extract_from_config
 
-        snapshot = extract_from_config(agent_name=self.agent_name, models=models)
         with self._manifest_lock:
+            if seen_model and seen_model.get("model"):
+                self._seen_model = seen_model
+            models = {"default": self._seen_model} if self._seen_model else None
+            snapshot = extract_from_config(agent_name=self.agent_name, models=models)
             if not self._manifest_tracker.check_and_update(snapshot):
                 return  # Same hash — already registered.
             try:
@@ -448,10 +525,21 @@ class DecimalSpanHandler:
                     "Registered LlamaIndex manifest %s (hash=%s)",
                     self._manifest_id, snapshot.manifest_hash[:12],
                 )
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Failed to register LlamaIndex manifest, continuing", exc_info=True
                 )
+                # Surface the real cause on export_status(), where the trace
+                # POST is about to fail with a confusingly different error
+                # ("manifest_id is required") against a strict backend.
+                try:
+                    _config._sender.record_manifest_error(exc)
+                except Exception:
+                    pass
+                # check_and_update already committed this hash; without the
+                # reset every later tree short-circuits on it and registration
+                # is never retried, so one blip poisons the whole process.
+                self._manifest_tracker.reset()
                 self._manifest_id = snapshot.id
 
     def _cleanup_tree(self, root_id: str) -> None:
@@ -463,6 +551,26 @@ class DecimalSpanHandler:
 
 
 # ── Helper functions ─────────────────────────────────────────────
+
+
+def _merge_llm_spans(group: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collapse one instrumented LLM call — wrapper plus inner call — into one.
+
+    ``group[0]`` is the outermost span (the widest wall clock, so its
+    started_at/ended_at win); the rest are the inner calls it delegates to,
+    which is where the token counts land. Fill each field from the first member
+    that has it, so the merged record is the union of both halves.
+    """
+    merged = dict(group[0])
+    for field in ("model_name", "provider", "input_tokens", "output_tokens", "temperature"):
+        if merged.get(field) is None:
+            for sd in group[1:]:
+                if sd.get(field) is not None:
+                    merged[field] = sd[field]
+                    break
+    if any(sd.get("status") == "error" for sd in group):
+        merged["status"] = "error"
+    return merged
 
 
 def _classify_span(instance: Optional[Any]) -> str:
