@@ -318,6 +318,80 @@ def _verify_backend_at_init(
         )
 
 
+def _activate_crewai_instrumentation(tracer_provider: Any) -> None:
+    """Activate CrewAI span emission onto the DecimalAI OTEL exporter.
+
+    Installing the exporter alone is not enough for CrewAI: current CrewAI
+    does not emit spans to the global TracerProvider on its own, so
+    ``init(crewai=True)`` without an active instrumentor captures NOTHING —
+    silently. The OpenInference CrewAI instrumentor supplies the agent/task/
+    tool spans, and the per-provider OpenInference instrumentors (OpenAI,
+    Anthropic, Google GenAI) supply the LLM request detail — model name,
+    token counts — for whichever provider SDKs are importable.
+
+    Missing or broken instrumentor packages warn-and-skip, never raise —
+    the same contract as the ``openai``/``anthropic``/``google`` init flags
+    (see :mod:`decimalai.providers`). A known failure shape: the CrewAI
+    instrumentor can require a newer ``opentelemetry`` than CrewAI itself
+    pins, in which case activation fails at import/instrument time and the
+    warning below is the only signal.
+    """
+    try:
+        from openinference.instrumentation.crewai import CrewAIInstrumentor
+    except ImportError:
+        logger.warning(
+            "decimalai.init(crewai=True): CrewAI does not emit OpenTelemetry "
+            "spans on its own, and the OpenInference CrewAI instrumentor is "
+            "not installed — NO CrewAI traces will be captured. Enable it "
+            "with: pip install openinference-instrumentation-crewai"
+        )
+        return
+    try:
+        CrewAIInstrumentor().instrument(tracer_provider=tracer_provider)
+    except Exception:
+        logger.warning(
+            "decimalai.init(crewai=True): failed to activate the OpenInference "
+            "CrewAI instrumentor — NO CrewAI traces will be captured. This is "
+            "usually an opentelemetry version conflict between the "
+            "instrumentor and CrewAI's own pins.",
+            exc_info=True,
+        )
+        return
+    logger.info("DecimalAI tracing enabled for CrewAI (OpenInference instrumentor)")
+
+    # LLM request detail rides on the provider SDK's spans, not CrewAI's.
+    # Mirror decimalai.providers' auto mode — instrument every importable
+    # provider SDK — but attach to the exporter's provider directly instead
+    # of going through providers.instrument(), whose pipeline setup would
+    # add a SECOND exporter and double-ingest every trace.
+    from . import providers as _providers
+
+    for pname, spec in _providers._PROVIDERS.items():
+        if not _providers._sdk_present(spec.sdk_module):
+            continue
+        instrumentor_cls = _providers._load_instrumentor(spec)
+        if instrumentor_cls is None:
+            logger.info(
+                "decimalai.init(crewai=True): the %s SDK is present but its "
+                "instrumentor isn't — CrewAI traces will lack %s model/token "
+                "detail. Enable it with: pip install %s",
+                pname, pname, spec.pip,
+            )
+            continue
+        try:
+            instrumentor_cls().instrument(tracer_provider=tracer_provider)
+        except Exception:
+            logger.warning(
+                "decimalai: failed to instrument the %s SDK for CrewAI "
+                "(continuing)", pname, exc_info=True,
+            )
+            continue
+        # Mark it globally instrumented so a later init(openai=True) doesn't
+        # build a second exporter pipeline for a provider already captured.
+        _providers._instrumented.add(pname)
+        logger.info("DecimalAI tracing enabled for %s SDK calls (via CrewAI)", pname)
+
+
 def init(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -386,8 +460,15 @@ def init(
         llamaindex: If ``True``, instrument LlamaIndex (v0.10.20+).
         claude_agent_sdk: If ``True``, instrument Anthropic's Claude Agent SDK
             (``claude-agent-sdk``) by wrapping its ``query()`` stream. Anthropic-native.
-        crewai: If ``True``, instrument CrewAI (via OpenTelemetry).
-        autogen: If ``True``, instrument AutoGen / AG2 (via OpenTelemetry).
+        crewai: If ``True``, instrument CrewAI. CrewAI emits no OTel spans by
+            itself, so this activates the OpenInference CrewAI instrumentor
+            (plus provider instrumentors for importable LLM SDKs); if
+            ``openinference-instrumentation-crewai`` isn't installed, a
+            warning explains that no traces will be captured.
+        autogen: If ``True``, instrument AutoGen / AG2. On AG2, agents
+            constructed after ``init()`` are auto-instrumented via
+            ``autogen.opentelemetry``; see :mod:`decimalai.autogen` for
+            agents created earlier.
         otel: If ``True``, install a generic OpenTelemetry exporter.
             Use this for any OTEL-compatible framework not listed above.
         openai: If ``True``, auto-trace direct OpenAI SDK calls (no
@@ -593,10 +674,11 @@ def init(
             from .claude_agent_sdk import instrument as _cas_install
             _cas_install(agent_name=agent_name)
 
-        # Auto-install OTEL exporter for CrewAI, AutoGen, or generic OTEL
-        # CrewAI and AutoGen emit standard OpenTelemetry GenAI spans,
-        # so they use the same exporter — the named flags are just
-        # convenience aliases for discoverability.
+        # Auto-install OTEL exporter for CrewAI, AutoGen, or generic OTEL.
+        # The exporter is shared, but the exporter alone only *receives* spans —
+        # neither CrewAI nor AG2 emits any to the global TracerProvider by
+        # default, so the named flags must also activate the matching
+        # instrumentation or they are silent no-ops (zero traces).
         if otel or crewai or autogen:
             # Use the manifest-capable exporter (decimalai.otel) — it buffers spans
             # by root span (no per-batch fragmentation) AND registers a manifest
@@ -604,7 +686,12 @@ def init(
             # for CrewAI/AutoGen/generic-OTel. (The older integrations.otel exporter
             # did neither.)
             from .otel import instrument as _otel_install
-            _otel_install(agent_name=agent_name)
+            _otel_provider = _otel_install(agent_name=agent_name)
+            if crewai:
+                _activate_crewai_instrumentation(_otel_provider)
+            if autogen:
+                from .autogen import _activate_ag2_instrumentation
+                _activate_ag2_instrumentation(_otel_provider)
 
     # Auto-trace direct provider-SDK calls (no framework) if requested.
     # Each flag enables the matching provider's OpenInference instrumentor,
@@ -1681,7 +1768,10 @@ def _auto_init_from_env() -> None:
             init()
             logger.debug("DecimalAI auto-init from DECIMAL_API_KEY (bare mode)")
         except Exception:
-            logger.warning(
+            # Bare init was never explicitly requested (env-var presence is the
+            # consent signal), so its failure is informational — a WARNING here
+            # prefixes every CLI invocation that imports the package.
+            logger.info(
                 "DecimalAI bare auto-init failed — call decimalai.init() manually. "
                 "Set logging to DEBUG for the traceback."
             )

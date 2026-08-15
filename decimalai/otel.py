@@ -64,6 +64,14 @@ _ALT_OUTPUT_TOKEN_KEYS = (
     "llm.token_count.completion",
 )
 
+# gen_ai.operation.name values that are never themselves an LLM request.
+# Agent frameworks (AG2 among them) stamp gen_ai.request.model onto their
+# agent/conversation/tool spans as metadata; without this gate each such
+# span would become a phantom LlmCallRecord.
+_NON_LLM_OPERATIONS = frozenset(
+    {"invoke_agent", "create_agent", "conversation", "execute_tool"}
+)
+
 
 def instrument(
     agent_name: Optional[str] = None,
@@ -72,7 +80,7 @@ def instrument(
     skills: Optional[List[Dict[str, Any]]] = None,
     skill_dirs: Optional[List[str]] = None,
     prompts: Optional[Dict[str, str]] = None,
-) -> None:
+) -> Any:
     """Install DecimalAI as an OpenTelemetry span exporter.
 
     Sets up a ``TracerProvider`` with a ``BatchSpanProcessor`` that
@@ -89,6 +97,14 @@ def instrument(
             manifest instead of the rendered system prompt auto-harvested from
             spans — use this when the rendered prompt carries per-run content
             (RAG chunks, dates) that would otherwise flip the manifest hash.
+
+    Returns:
+        The ``TracerProvider`` the exporter was installed on (also set as
+        the global tracer provider). Callers that need to activate an
+        instrumentor against this exact provider (e.g. the CrewAI / AG2
+        activation in :func:`decimalai.init`) should pass it explicitly
+        rather than rely on the global — OTEL honors
+        ``set_tracer_provider`` only once per process.
 
     Raises:
         ImportError: If ``opentelemetry-sdk`` is not installed.
@@ -138,6 +154,7 @@ def instrument(
         agent_name,
         service_name,
     )
+    return provider
 
 
 class DecimalSpanExporter:
@@ -346,8 +363,13 @@ class DecimalSpanExporter:
                         if sname and sname not in active_skills:
                             active_skills[sname] = entry.get("hash")
 
-            # Determine if this is an LLM span
+            # Determine if this is an LLM span. An explicit non-LLM
+            # gen_ai.operation.name wins over the model attribute — see
+            # _NON_LLM_OPERATIONS.
             model = _get_first(attrs, _GENAI_MODEL, *_ALT_MODEL_KEYS)
+            operation = str(attrs.get("gen_ai.operation.name") or "").lower()
+            if operation in _NON_LLM_OPERATIONS:
+                model = None
 
             if model:
                 # This is an LLM call — create LlmCallRecord
@@ -870,16 +892,22 @@ def _preview_from_attrs(
     attrs: Dict[str, Any], direction: str, max_len: int = 200
 ) -> Optional[str]:
     """Extract a preview string from span attributes."""
-    # Try common attribute patterns
-    for key_pattern in (
-        f"gen_ai.{direction}",
-        f"llm.{direction}",
-        f"{direction}",
-        "gen_ai.prompt",
-        "gen_ai.completion",
-    ):
+    # Patterns are direction-specific: ``gen_ai.prompt`` is an input-side key
+    # and ``gen_ai.completion`` output-side, so neither may serve the other
+    # direction (an output preview must never surface the prompt).
+    if direction == "input":
+        key_patterns = ("gen_ai.input", "llm.input", "input", "gen_ai.prompt")
+    else:
+        key_patterns = ("gen_ai.output", "llm.output", "output", "gen_ai.completion")
+    for key_pattern in key_patterns:
         for key, val in attrs.items():
-            if key_pattern in key.lower():
+            key_lower = key.lower()
+            # Token counts carry the direction as a substring too
+            # (gen_ai.usage.input_tokens, llm.usage.completion_tokens) —
+            # they are counts, not content, and must never become previews.
+            if "token" in key_lower or "usage" in key_lower:
+                continue
+            if key_pattern in key_lower:
                 return str(val)[:max_len]
     return None
 
