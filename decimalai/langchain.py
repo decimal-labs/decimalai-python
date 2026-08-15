@@ -173,6 +173,47 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+def _clean_names(names: Any) -> List[str]:
+    """Keep only non-blank strings — same filter as `_add_skills_offered`."""
+    if not isinstance(names, (list, tuple, set)):
+        return []
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+
+def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
+    """Drain the Router singleton's instance rails —
+    ``(routing_id, offered, delivered, loaded)``.
+
+    The contextvars above stay authoritative wherever they propagate, but
+    under LangChain they don't: the BaseChatModel patch writes them inside
+    the runnable's context, and LangChain dispatches this handler's
+    callbacks under `copy_context()`, so every rail came back empty on a
+    run that demonstrably injected a menu. The Router carries the same
+    values as instance state; `build_trace` unions both. Known cost (same
+    as `consume_loaded_names`): concurrent runs sharing one router
+    singleton drain into whichever trace sends first.
+    """
+    if _skill_router_singleton is None:
+        return None, [], [], []
+    try:
+        routing_id = _skill_router_singleton.consume_routing_id()
+        offered = _skill_router_singleton.consume_offered_names()
+        delivered = _skill_router_singleton.consume_delivered_names()
+        loaded = _skill_router_singleton.consume_loaded_names()
+    except Exception:
+        # A router object from an older SDK carries none of these methods.
+        logger.debug("router-rail drain failed (non-fatal)", exc_info=True)
+        return None, [], [], []
+    # Sanitize here rather than at the merge: a stray string would
+    # otherwise be added one letter at a time as three "skills".
+    return (
+        routing_id if isinstance(routing_id, str) else None,
+        _clean_names(offered),
+        _clean_names(delivered),
+        _clean_names(loaded),
+    )
+
+
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
@@ -314,6 +355,13 @@ def _install_skill_loader() -> None:
 # Global instrument() config — stored for per-invocation handler creation
 _install_agent_name: Optional[str] = None
 
+# Last-resort trace label. The ingest API requires a trace-level
+# `agent_name`; a trace that ships None is rejected with
+# TRACE_VALIDATION_FAILED and lost. Named after the adapter, matching the
+# defaults the other adapters already carry ("llamaindex-agent",
+# "otel-agent", "claude-agent").
+DEFAULT_AGENT_NAME = "langchain-agent"
+
 
 def instrument(
     agent_name: Optional[str] = None,
@@ -340,7 +388,9 @@ def instrument(
 
     Args:
         agent_name: Default agent name for all traces. If None, the name
-            is auto-detected from the chain/agent being executed.
+            is auto-detected from the chain/agent being executed, and
+            falls back to ``"langchain-agent"`` when the executed
+            runnable carries no usable name.
         tools: Explicit tool descriptors for manifest hashing. If omitted,
             tools are auto-detected from LangChain bind_tools.
         prompts: Explicit prompt dict {"system": "..."}. If omitted,
@@ -623,7 +673,9 @@ class CallbackHandler(_CallbackBase):
     completes (requires ``decimalai.init()`` to have been called).
 
     Args:
-        agent_name: Name of the agent (shown in the UI).
+        agent_name: Name of the agent (shown in the UI). If None, it is
+            auto-detected from the root chain, then from the global
+            ``instrument(agent_name=...)``, then ``"langchain-agent"``.
         auto_send: If True (default), automatically send the trace when
             the root chain finishes. Set False for manual control.
         session_id: Optional session grouping.
@@ -859,12 +911,30 @@ class CallbackHandler(_CallbackBase):
 
     # ── Sub-agent resolution ───────────────────────────────
 
+    def _agent_name_or_default(self) -> str:
+        """The name this handler's records ship under — never None.
+
+        `on_chain_start`'s auto-detection cannot fire when the root
+        runnable is one of `_SKIP_CHAIN_TYPES` — `prompt | llm` is a
+        RunnableSequence, so the callback returns before the detection
+        block — nor for a bare `llm.invoke()`, which emits no chain
+        callback at all. Both left `agent_name` None all the way into the
+        payload, and the ingest API rejects that: every LCEL trace from
+        `init(langchain=True)` was dropped with TRACE_VALIDATION_FAILED.
+
+        Resolution is deliberately NOT written back to `self.agent_name`:
+        that field staying None is what lets a later root chain with a real
+        name still be auto-detected.
+        """
+        return self.agent_name or _install_agent_name or DEFAULT_AGENT_NAME
+
     def _resolve_agent_name(self, parent_run_id: Optional[UUID] = None) -> Optional[str]:
         """Resolve the agent name for an LLM call by walking parent spans.
 
         Finds the nearest ancestor span of type AGENT and returns its name.
-        Falls back to ``self.agent_name`` if no agent-type parent is found,
-        preserving backward compatibility for the single-agent case.
+        Falls back to ``_agent_name_or_default()`` if no agent-type parent
+        is found, preserving backward compatibility for the single-agent
+        case.
 
         The walk is bounded. If `_spans` ever contains a parent_span_id
         cycle (malformed `parent_run_id` from LangChain, or a custom
@@ -884,7 +954,7 @@ class CallbackHandler(_CallbackBase):
             if span.span_type == SpanType.AGENT and span.name:
                 return span.name
             span_id = span.parent_span_id
-        return self.agent_name
+        return self._agent_name_or_default()
 
     # ── Agent lifecycle (no-op, suppresses warnings) ────────
 
@@ -1237,12 +1307,19 @@ class CallbackHandler(_CallbackBase):
                 entry["hash"] = h
             active_skills_list.append(entry)
 
+        # Drain the Router's instance rails first, unconditionally — see
+        # `_drain_router_rails`. Unconditional because an undrained rail
+        # leaks into the NEXT trace.
+        rail_routing_id, rail_offered, rail_delivered, rail_loaded = _drain_router_rails()
+
         # Drain the offered-names contextvar populated by the
         # BaseChatModel patch; merge with any direct log_skill_offered calls.
         drained_offered = _consume_skills_offered()
         if drained_offered:
             for n in drained_offered:
                 self._skills_offered_in_prompt.add(n)
+        for n in rail_offered:
+            self._skills_offered_in_prompt.add(n)
 
         # Drain the delivered-names contextvar (Router body injection).
         drained_delivered = _consume_skills_delivered()
@@ -1250,17 +1327,15 @@ class CallbackHandler(_CallbackBase):
             for n in drained_delivered:
                 self._skills_delivered.add(n)
                 self._skills_offered_in_prompt.add(n)  # delivered implies offered
+        for n in rail_delivered:
+            self._skills_delivered.add(n)
+            self._skills_offered_in_prompt.add(n)
 
-        # Drain the Router's loaded-names rail off the singleton — this
-        # adapter registers no native load_skill tool, but a user-supplied
-        # tool that calls the singleton's `load_skill(...)` still lands its
-        # serves here.
-        try:
-            if _skill_router_singleton is not None:
-                for n in _skill_router_singleton.consume_loaded_names():
-                    self.log_skill_loaded(name=n)
-        except Exception:
-            logger.debug("loaded-names drain failed (non-fatal)", exc_info=True)
+        # Bodies served by the singleton's `load_skill(...)` — this adapter
+        # registers no native load_skill tool, but a user-supplied tool
+        # that calls it still lands its serves here.
+        for n in rail_loaded:
+            self.log_skill_loaded(name=n)
 
         # Derive trace status from collected spans/LLM calls: if any errored,
         # the run errored. on_chain_error/on_llm_error mark these ERROR.
@@ -1273,7 +1348,7 @@ class CallbackHandler(_CallbackBase):
         return RunTrace(
             id=self._trace_id,
             project=config.project if config else None,
-            agent_name=self.agent_name,
+            agent_name=self._agent_name_or_default(),
             session_id=self.session_id,
             parent_trace_id=self.parent_trace_id,
             status=trace_status,
@@ -1287,8 +1362,11 @@ class CallbackHandler(_CallbackBase):
             active_skills=active_skills_list,
             manifest_id=_manifest_id,
             # SkillRouter: stamp the routing_id set by the BaseChatModel
-            # monkey-patch so the offered-vs-activated join can close.
-            routing_id=_consume_routing_id(),
+            # monkey-patch so the offered-vs-activated join can close. The
+            # rail is the fallback: LangChain runs callbacks under
+            # `copy_context()`, so the patch's contextvar write never
+            # reaches this build.
+            routing_id=_consume_routing_id() or rail_routing_id,
             # Skill Rater discovery telemetry. Sorted for
             # deterministic output (tests, diffs).
             skills_offered_in_prompt=sorted(self._skills_offered_in_prompt),
@@ -1447,7 +1525,9 @@ class CallbackHandler(_CallbackBase):
         if not tools and not prompts and not models and not skills and not subagents:
             return
 
-        agent_name = self.agent_name or "unknown"
+        # Same label the trace ships under, or the manifest lands on a
+        # different agent than the traces that reference its manifest_id.
+        agent_name = self._agent_name_or_default()
         snapshot = extract_from_config(
             agent_name=agent_name,
             tools=tools,
