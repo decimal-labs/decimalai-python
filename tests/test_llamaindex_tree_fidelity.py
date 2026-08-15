@@ -6,9 +6,11 @@ the handler". This file covers the three fidelity defects found once the
 adapter started emitting (2026-08-15), each of which was live against the
 local backend:
 
-  1. A tree with NO LLM call (index construction, a bare retrieve) got no
-     manifest, so ingest 400'd with "manifest_id is required" and the trace
-     was lost — a retrieval-only flow scored sent=0 failed=3.
+  1. A tree with NO LLM call (a bare retrieve) got no manifest, so ingest
+     400'd with "manifest_id is required" and the trace was lost — a
+     retrieval-only flow scored sent=0 failed=3. (Index construction was in
+     this bucket too until 2026-08-15, when it stopped being traced at all —
+     see test_llamaindex_setup_and_streaming.py.)
   2. `_flush_tree` minted a fresh TraceSpan per span and never carried the
      parent link, so a real 14-span RAG tree stored 12 flat spans.
   3. LlamaIndex instruments both the public wrapper (`OpenAI.predict`) and
@@ -92,7 +94,11 @@ def _flush_and_get_traces():
 
 
 def _index_tree(handler, root="SentenceSplitter-0"):
-    """An index-construction tree: nested splitters, not a model in sight."""
+    """An index-construction tree: nested splitters, not a model in sight.
+
+    No longer traced (it is setup, not a run) — kept so the tests that assert
+    it stays OFF the wire can build one.
+    """
     handler.new_span(root, None, instance=SentenceSplitter(), parent_span_id=None)
     handler.new_span("SentenceSplitter-1", None, instance=SentenceSplitter(),
                      parent_span_id=root)
@@ -100,6 +106,16 @@ def _index_tree(handler, root="SentenceSplitter-0"):
                                  instance=SentenceSplitter(), result=["node"])
     handler.prepare_to_exit_span(root, None, instance=SentenceSplitter(),
                                  result=["node"])
+
+
+def _retrieval_tree(handler, root="VectorIndexRetriever-0"):
+    """A model-less RUN: `as_retriever().retrieve()` — retrieval + embedding."""
+    handler.new_span(root, None, instance=Retriever(), parent_span_id=None)
+    handler.new_span(f"{root}-emb", None, instance=OpenAIEmbedding(),
+                     parent_span_id=root)
+    handler.prepare_to_exit_span(f"{root}-emb", None, instance=OpenAIEmbedding(),
+                                 result=[0.1])
+    handler.prepare_to_exit_span(root, None, instance=Retriever(), result=["doc"])
 
 
 def _llm_tree(handler, root="RetrieverQueryEngine-0", model="gpt-4o-mini"):
@@ -121,14 +137,14 @@ def _llm_tree(handler, root="RetrieverQueryEngine-0", model="gpt-4o-mini"):
 # ── 1. An LLM-free tree still satisfies ingest ───────────────────────
 
 class TestLlmFreeTreeGetsManifest:
-    def test_index_tree_registers_manifest_and_stamps_trace(self):
-        """Index construction has no model, hence nothing to auto-detect —
-        but ingest requires a manifest_id, so the model-less manifest must be
-        registered anyway. Skipping it lost the trace to a 400."""
+    def test_model_less_run_registers_manifest_and_stamps_trace(self):
+        """A model-less RUN has nothing to auto-detect — but ingest requires a
+        manifest_id, so the model-less manifest must be registered anyway.
+        Skipping it lost the trace to a 400."""
         import decimalai._config as cfg
 
         h = DecimalSpanHandler(agent_name="rag")
-        _index_tree(h)
+        _retrieval_tree(h)
 
         trace = _flush_and_get_traces()[0]
         cfg._client.register_manifest.assert_called_once()
@@ -159,7 +175,7 @@ class TestLlmFreeTreeGetsManifest:
 
         h = DecimalSpanHandler(agent_name="rag")
         _llm_tree(h)
-        _index_tree(h)
+        _retrieval_tree(h)
 
         traces = _flush_and_get_traces()
         assert len(traces) == 2
@@ -175,9 +191,9 @@ class TestLlmFreeTreeGetsManifest:
         import decimalai._config as cfg
 
         h = DecimalSpanHandler(agent_name="rag")
-        _index_tree(h)
+        _retrieval_tree(h)
         _llm_tree(h)
-        _index_tree(h, root="SentenceSplitter-2")
+        _retrieval_tree(h, root="VectorIndexRetriever-2")
 
         traces = _flush_and_get_traces()
         assert len(traces) == 3
@@ -198,8 +214,8 @@ class TestLlmFreeTreeGetsManifest:
         cfg._client.register_manifest.side_effect = [boom, {"manifest_id": "m1"}]
 
         h = DecimalSpanHandler(agent_name="rag")
-        _index_tree(h)
-        _index_tree(h, root="SentenceSplitter-2")
+        _retrieval_tree(h)
+        _retrieval_tree(h, root="VectorIndexRetriever-2")
 
         traces = _flush_and_get_traces()
         assert cfg._client.register_manifest.call_count == 2, (
