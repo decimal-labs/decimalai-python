@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a bug in the decimalai Python SDK
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Framework adapter
+      description: Which integration were you using when the bug occurred?
+      options:
+        - None / core only
+        - langchain
+        - langgraph
+        - openai
+        - openai-agents
+        - llamaindex
+        - claude-agent-sdk
+        - pydantic-ai
+        - adk
+        - evals
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: textarea
+    id: pip-show
+    attributes:
+      label: Output of `pip show decimalai`
+      description: Paste the full output so we know the installed version and location.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal code snippet or sequence of steps that triggers the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs actual behavior
+      description: What you expected to happen, and what happened instead (include any traceback).
+    validations:
+      required: true
+  - type: textarea
+    id: trace-snippet
+    attributes:
+      label: Trace snippet (optional)
+      description: >-
+        A relevant excerpt of the exported trace, if you have one.
+        Do NOT paste API keys or other secrets — redact them first.
+    validations:
+      required: false
