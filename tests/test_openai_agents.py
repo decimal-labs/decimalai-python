@@ -465,8 +465,14 @@ class TestInstall:
     def test_install_without_openai_agents_raises(self):
         """install() should raise ImportError if openai-agents is not installed."""
         saved = {}
+        # Only the third-party `agents` package — a substring match also swept
+        # out `decimalai.openai_agents`, and re-importing THAT under the patch
+        # builds a second module object and rebinds it on the `decimalai`
+        # package. Restoring sys.modules does not restore the package
+        # attribute, so later tests reset globals on one object while the
+        # adapter under test reads the other.
         for key in list(sys.modules.keys()):
-            if "agents" in key and "test" not in key:
+            if key == "agents" or key.startswith("agents."):
                 saved[key] = sys.modules.pop(key)
 
         try:

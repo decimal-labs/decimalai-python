@@ -1,6 +1,6 @@
 """Top-level test conftest for the DecimalAI Python SDK.
 
-Two cross-cutting concerns are handled here so individual test modules
+Three cross-cutting concerns are handled here so individual test modules
 don't have to:
 
 1. **Init-time verify probe is bypassed** via the ``DECIMALAI_SKIP_VERIFY``
@@ -24,6 +24,19 @@ don't have to:
    restores them after. A test that reimports the package gets to see its
    reimported view during the test body; the next test sees the original
    instances again. The fix is invisible to tests — no per-test changes.
+
+3. **LangChain global instrumentation is torn down after each test.**
+   ``decimalai.langchain.instrument()`` publishes a handler into a module
+   ContextVar and hands that var to langchain-core's
+   ``register_configure_hook``. Both are process-global and the hook list has
+   no unregister, so the ContextVar is the only half a test can put back —
+   and the adapter offers no uninstall to do it with. Any test that installs
+   (directly, or indirectly through a ``DECIMAL_AUTO_TRACE=langchain``
+   module-load auto-init) therefore leaves a live handler behind for the rest
+   of the session, and every LATER test that runs a real chain with its own
+   per-call handler is traced TWICE — it asserts one trace and gets two.
+   The ``_clear_langchain_global_handler`` autouse fixture below is that
+   missing teardown.
 """
 from __future__ import annotations
 
@@ -77,6 +90,22 @@ def _restore_decimalai_modules():
         # in OTHER test files keep pointing at live globals.
         for name, mod in snapshot.items():
             sys.modules[name] = mod
+
+
+@pytest.fixture(autouse=True)
+def _clear_langchain_global_handler():
+    """Drop the process-global LangChain handler an install leaves behind.
+
+    See concern 3 in the module docstring for the double-tracing failure this
+    prevents. Only reaches for the adapter when a test already imported it, so
+    it never drags langchain-core into a run that didn't ask for it.
+    """
+    try:
+        yield
+    finally:
+        lc_mod = sys.modules.get("decimalai.langchain")
+        if lc_mod is not None:
+            lc_mod._decimal_callback_var.set(None)
 
 
 @pytest.fixture(autouse=True)

@@ -393,6 +393,8 @@ class TestDormantAdapters:
         # install() early-returns when already installed — force a fresh
         # pass so the dormancy warning path actually runs. disk_sync=False
         # keeps the install away from disk discovery / background sync.
+        # The global handler this publishes is torn down by the autouse
+        # _clear_langchain_global_handler fixture in tests/conftest.py.
         monkeypatch.setattr(lc, "_installed", False)
 
         with caplog.at_level(logging.WARNING, logger="decimalai.langchain"):
