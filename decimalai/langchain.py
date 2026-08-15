@@ -46,7 +46,7 @@ from .integrations._lc_compat import (
     extract_output_dict,
     extract_provider,
     extract_token_usage,
-    has_tool_calls,
+    extract_tool_call_names,
     normalize_role,
 )
 from .schema.common import FinishReason, SpanType, Status
@@ -84,10 +84,11 @@ _SKIP_CHAIN_TYPES = frozenset({
     "RunnableAssign", "RunnablePick", "RunnableEach",
 })
 
-# ContextVar for global callback registration
-_decimal_callback_var: ContextVar[Optional[CallbackHandler]] = ContextVar(
-    "decimal_langchain_callback", default=None
-)
+# ContextVar for global callback registration. Defined at the bottom of this
+# module, once `CallbackHandler` exists — its DEFAULT has to be the global
+# handler, and a ContextVar's default is fixed at construction. See
+# `_publish_handler` for why that matters (it is the whole of the
+# worker-thread bug).
 
 _installed = False
 
@@ -96,6 +97,10 @@ _manifest_tracker = ManifestTracker()
 _manifest_id: Optional[str] = None  # Set after first successful registration
 _manifest_lock = threading.Lock()  # Thread safety for manifest registration
 _explicit_manifest_config: Optional[Dict[str, Any]] = None  # From instrument() kwargs
+# Agent names we have already asked the platform about on the
+# "nothing to declare" path (see `_adopt_active_manifest`). One probe per
+# agent per process, hit or miss.
+_manifest_adoption_probed: set[str] = set()
 
 # Global eval state — populated by instrument()
 _evals: List[Any] = []  # List of DecimalEval instances
@@ -170,6 +175,52 @@ def _consume_skills_delivered() -> List[str]:
         return []
     _skills_delivered_ctx.set(None)
     return sorted(s)
+
+
+def _registered_manifest_id(result: Any, snapshot: Any) -> str:
+    """The id to stamp on traces after a register call.
+
+    Guards the response shape. `manifest_id` goes straight into
+    `RunTrace.manifest_id`, which pydantic types as `Optional[str]`, so a
+    response that omits the key or answers with a non-string used to raise
+    inside `build_trace` — and that exception is caught one frame up as
+    "failed to queue trace", i.e. the run is lost with a misleading reason.
+    Falling back to the snapshot's own id keeps traces flowing.
+    """
+    manifest_id = result.get("manifest_id") if isinstance(result, dict) else None
+    if isinstance(manifest_id, str) and manifest_id:
+        return manifest_id
+    return str(snapshot.id)
+
+
+def _adopt_active_manifest(agent_name: str) -> Optional[str]:
+    """Return the id of the agent's currently-active manifest, if any.
+
+    A process that starts up with nothing to declare (a worker that only
+    runs pure-Python chains, a re-deployed replica) must not register an
+    empty manifest over the contract a sibling process already declared —
+    the diff would read the absent surfaces as deletions. Asking the
+    platform is what makes the "never regress" rule hold across processes
+    and restarts, not just within one.
+
+    Best-effort: any failure returns None and the caller falls back to
+    registering the placeholder.
+    """
+    from . import _config
+
+    try:
+        client = _config._get_client()
+        resp = client.list_manifests(limit=5, agent_name=agent_name)
+        rows = resp.get("manifests") if isinstance(resp, dict) else None
+        for row in rows or []:
+            if isinstance(row, dict) and row.get("status") == "active" and row.get("id"):
+                return str(row["id"])
+    except Exception:
+        logger.debug(
+            "Could not look up an existing manifest for %s (non-fatal)",
+            agent_name, exc_info=True,
+        )
+    return None
 
 
 def _clean_names(names: Any) -> List[str]:
@@ -261,13 +312,59 @@ def _extract_query_from_messages(messages: Any) -> Optional[str]:
     return None
 
 
+def _as_message_list(input_value: Any) -> Optional[List[Any]]:
+    """Normalize a `BaseChatModel.invoke` input to a message list, or None.
+
+    None means "this shape cannot carry an injected system message" — the
+    caller must then leave the input alone AND consult no Router, because
+    the mere act of calling `build_prompt_fragment` mints a routing_id and
+    fills the Router's offered/delivered rails, which `build_trace` later
+    stamps onto the trace. Doing that on a call we cannot inject into is
+    how an LCEL run came to claim a routing_id and 30 offered skill names
+    while the model provably saw neither.
+    """
+    if isinstance(input_value, list):
+        return list(input_value)
+    if isinstance(input_value, str):
+        try:
+            from langchain_core.messages import HumanMessage
+        except ImportError:
+            return None
+        return [HumanMessage(content=input_value)]
+    # PromptValue (ChatPromptValue / StringPromptValue) — the shape every
+    # `prompt | llm` LCEL chain hands the model. It converts losslessly to
+    # messages, which is exactly what `invoke` does with it internally, so
+    # injecting here is the same call the model would have received.
+    to_messages = getattr(input_value, "to_messages", None)
+    if callable(to_messages):
+        try:
+            messages = to_messages()
+        except Exception:
+            logger.debug("PromptValue.to_messages() failed (non-fatal)", exc_info=True)
+            return None
+        if isinstance(messages, list):
+            return list(messages)
+    return None
+
+
 def _inject_skills_into_input(input_value: Any) -> Any:
     """Prepend a SkillRouter-built system message to a chat model's input.
 
-    Accepts the three common input shapes LangChain's BaseChatModel.invoke
-    sees: a string, a list of messages (BaseMessage / dict), or a
-    PromptValue. Falls through unchanged on anything else.
+    Accepts the three input shapes LangChain's BaseChatModel.invoke sees: a
+    string, a list of messages (BaseMessage / dict), and a PromptValue.
+    Falls through unchanged — and without consulting the Router at all — on
+    anything else, so the trace never claims a routing decision that did not
+    reach the model.
     """
+    # Shape dispatch FIRST. This used to run last, after the Router had
+    # already been consulted and its routing_id + offered names stamped on
+    # the trace — so every `prompt | llm` chain (a PromptValue, which the old
+    # code could not inject into) reported a full skill menu the model never
+    # saw.
+    messages = _as_message_list(input_value)
+    if messages is None:
+        return input_value
+
     router = _get_skill_router()
     if router is None:
         return input_value
@@ -277,7 +374,7 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     except ImportError:
         return input_value
 
-    query = _extract_query_from_messages(input_value)
+    query = _extract_query_from_messages(messages)
     try:
         fragment, routing_id = router.build_prompt_fragment(query=query)
     except Exception:
@@ -299,15 +396,7 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     if not fragment:
         return input_value
 
-    sys_msg = SystemMessage(content=fragment)
-    if isinstance(input_value, list):
-        return [sys_msg, *input_value]
-    if isinstance(input_value, str):
-        # Convert string → [system_with_skills, human_with_query]
-        from langchain_core.messages import HumanMessage
-        return [sys_msg, HumanMessage(content=input_value)]
-    # Unrecognized shape (PromptValue, etc.) — leave untouched.
-    return input_value
+    return [SystemMessage(content=fragment), *messages]
 
 
 def _install_skill_loader() -> None:
@@ -360,6 +449,45 @@ _install_agent_name: Optional[str] = None
 # defaults the other adapters already carry ("llamaindex-agent",
 # "otel-agent", "claude-agent").
 DEFAULT_AGENT_NAME = "langchain-agent"
+
+
+def _publish_handler(
+    agent_name: Optional[str], register_configure_hook: Any,
+) -> CallbackHandler:
+    """Make the module's global handler the process-wide LangChain callback.
+
+    The published handler is the ContextVar's DEFAULT, not merely its value
+    in the installing context — which is the entire threading fix.
+    LangChain's configure hook installs the handler only when
+    `var.get()` is non-None, and in a Context that never had a value set
+    `.get()` can only answer with the default. A worker started with
+    `threading.Thread` gets exactly such a fresh empty Context, so against
+    the old `default=None` var four chains on four threads produced ZERO
+    traces and not one warning. `instrument()` used to `.set(handler)` in
+    the calling context, which reaches `copy_context()` children (the
+    `.batch` executor, asyncio tasks) but never a plain thread.
+
+    `handle_class=CallbackHandler` is the other half, and it is not
+    optional — publishing by default without it makes duplicate tracing
+    WORSE. With `handle_class=None` LangChain dedupes the global handler by
+    object IDENTITY, so a caller who runs `instrument()` and ALSO passes
+    `config={"callbacks": [CallbackHandler(...)]}` gets both handlers, and
+    both ship a trace. Because a span's id IS the LangChain run_id, the two
+    traces carry identical span ids; the backend's `_insertable_rows`
+    id-dedup keeps the first and stores the second with zero spans and zero
+    llm_calls — a phantom empty trace on the agent's timeline for every
+    single run. Deduping by TYPE means an explicitly-passed handler
+    suppresses the global one, which is what "per-call control" always
+    meant.
+    """
+    _global_handler.agent_name = agent_name
+    _global_handler.auto_send = True
+    _global_handler.reset()
+    _decimal_callback_var.set(_global_handler)
+    register_configure_hook(
+        _decimal_callback_var, True, handle_class=CallbackHandler,
+    )
+    return _global_handler
 
 
 def instrument(
@@ -623,9 +751,7 @@ def instrument(
         except Exception:
             _warn_once_then_debug("skill_sync_setup", "Skill sync setup failed (non-fatal)")
 
-    handler = CallbackHandler(agent_name=agent_name, auto_send=True)
-    _decimal_callback_var.set(handler)
-    register_configure_hook(_decimal_callback_var, inheritable=True)
+    _publish_handler(agent_name, register_configure_hook)
 
     # SkillRouter dynamic loader — opt-in. When enabled,
     # BaseChatModel.invoke/ainvoke get monkey-patched so a SystemMessage
@@ -656,7 +782,111 @@ def instrument(
     )
 
 
+# Ceiling on root runs one handler tracks at once. Reached only when a root
+# chain starts and never ends; see `_new_run_state`.
+_MAX_LIVE_RUNS = 256
 
+# Sort key for records that never got a timestamp.
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+class _RunState:
+    """Everything one root run needs to build its own trace.
+
+    Every field here used to be a single slot on the handler, which was
+    survivable only while runs were strictly serial. ``instrument()``
+    publishes exactly ONE handler process-wide, and LangChain copies the
+    context for parallel work — ``ContextThreadPoolExecutor`` for
+    ``chain.batch([...])``, the event loop for ``asyncio.gather(ainvoke)``
+    — so three concurrent runs shared one set of slots. ``on_chain_start``
+    only reset when ``_root_run_id`` was None, so runs 2 and 3 appended
+    into run 1's dicts, and the first outermost ``on_chain_end`` shipped
+    the still-open sibling spans (the backend answers ``spans[N]:
+    'ended_at' is required``, a 400) and wiped the state the other two had
+    yet to use. Net: 0 of 3 runs persisted. Keyed per root run, the same
+    batch produces three complete traces.
+    """
+
+    __slots__ = (
+        "root_run_id", "member_ids", "opened_at", "is_leaf_root", "agent_hint",
+        "trace_id", "spans", "llm_calls", "tool_calls", "tool_requests",
+        "span_stack", "trace_started_at", "user_input_preview",
+        "final_output_preview", "seen_tools", "seen_model", "seen_prompts",
+        "seen_output_contract", "streaming_buffers", "active_skills",
+        "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
+    )
+
+    def __init__(
+        self,
+        root_run_id: Optional[UUID] = None,
+        *,
+        is_leaf_root: bool = False,
+    ) -> None:
+        self.root_run_id = root_run_id
+        # Every run_id (root, nested chain, LLM call, tool) that belongs to
+        # this run, so the reverse `_root_of` index can be pruned on close.
+        self.member_ids: set[UUID] = {root_run_id} if root_run_id else set()
+        self.opened_at: datetime = datetime.now(timezone.utc)
+        # True when the root IS a leaf callback (a model call or a tool) —
+        # a bare `llm.invoke()` emits no chain callbacks at all, so nothing
+        # else will ever close or send this run.
+        self.is_leaf_root = is_leaf_root
+        self.agent_hint: Optional[str] = None
+
+        self.trace_id: UUID = uuid4()
+        self.spans: Dict[UUID, TraceSpan] = {}
+        self.llm_calls: Dict[UUID, LlmCallRecord] = {}
+        self.tool_calls: Dict[UUID, ToolCallRecord] = {}
+        # llm_call id -> tool names that call asked for, in order. Used to
+        # attach tool records across a graph's node boundary.
+        self.tool_requests: Dict[UUID, List[str]] = {}
+        self.span_stack: List[UUID] = []
+        self.trace_started_at: Optional[datetime] = None
+        self.user_input_preview: Optional[str] = None
+        self.final_output_preview: Optional[str] = None
+        # Manifest auto-detection accumulators
+        self.seen_tools: Dict[str, Dict[str, Any]] = {}  # name -> {schema, ...}
+        self.seen_model: Optional[Dict[str, Any]] = None
+        self.seen_prompts: Dict[str, str] = {}  # role -> text
+        self.seen_output_contract: Optional[Dict[str, Any]] = None  # response_format
+        self.streaming_buffers: Dict[UUID, List[str]] = {}  # token buffers
+        # Skill activation tracking
+        self.active_skills: Dict[str, Optional[str]] = {}
+        # Skill Rater discovery telemetry. `skills_offered_in_prompt` is
+        # auto-populated from the Router's offered set via the
+        # BaseChatModel.invoke patch; `skills_loaded_by_agent` is a manual
+        # hook (use `decimalai.log_skill_loaded` or the explicit
+        # `CallbackHandler.log_skill_loaded` method).
+        self.skills_offered_in_prompt: set[str] = set()
+        self.skills_loaded_by_agent: set[str] = set()
+        # Bodies that reached the model (Router body injection) — between
+        # offered and activated; never implies activation.
+        self.skills_delivered: set[str] = set()
+
+
+def _bind_current_run_fields(cls: type) -> type:
+    """Republish `_RunState` fields as `handler._<field>`, read and write.
+
+    `handler._spans`, `handler._seen_model`, `handler._trace_started_at` and
+    the rest were plain attributes before trace state moved per-run. They are
+    load-bearing for manual `auto_send=False` use, so keep them — pointed at
+    the most recently started run.
+    """
+    def _make(name: str) -> property:
+        def getter(self: Any) -> Any:
+            return getattr(self._current, name)
+
+        def setter(self: Any, value: Any) -> None:
+            setattr(self._current, name, value)
+
+        return property(getter, setter)
+
+    for field in cls._CURRENT_FIELDS:  # type: ignore[attr-defined]
+        setattr(cls, f"_{field}", _make(field))
+    return cls
+
+
+@_bind_current_run_fields
 class CallbackHandler(_CallbackBase):
     """LangChain/LangGraph callback handler that captures traces for DecimalAI.
 
@@ -721,37 +951,98 @@ class CallbackHandler(_CallbackBase):
         self.parent_trace_id = parent_trace_id
         self.subagents = list(subagents) if subagents else None
 
+        # Live root runs, keyed by their root run_id, plus the map from
+        # every run_id we have seen to the root that owns it. Guarded by an
+        # RLock: `.batch()` dispatches a run's children on LangChain's
+        # ContextThreadPoolExecutor, so these dicts are written from several
+        # threads at once.
+        self._runs: Dict[UUID, _RunState] = {}
+        self._root_of: Dict[UUID, UUID] = {}
+        self._state_lock = threading.RLock()
         self._reset_state()
 
+    # ── Per-run state ──────────────────────────────────────
+    #
+    # Everything a trace is built from lives on a `_RunState` keyed by root
+    # run, never on the handler. `self._current` is the most recently
+    # STARTED run and backs the legacy `handler._spans` / `handler._seen_model`
+    # / … attributes below, which are part of this class's public-ish surface
+    # (manual `auto_send=False` use, and tests).
+
     def _reset_state(self) -> None:
-        """Reset all trace-building state."""
-        self._trace_id: UUID = uuid4()
-        self._spans: Dict[UUID, TraceSpan] = {}
-        self._llm_calls: Dict[UUID, LlmCallRecord] = {}
-        self._tool_calls: Dict[UUID, ToolCallRecord] = {}
-        self._span_stack: List[UUID] = []
-        self._trace_started_at: Optional[datetime] = None
-        self._user_input_preview: Optional[str] = None
-        self._final_output_preview: Optional[str] = None
-        self._root_run_id: Optional[UUID] = None
-        # Manifest auto-detection accumulators
-        self._seen_tools: Dict[str, Dict[str, Any]] = {}  # name -> {schema, ...}
-        self._seen_model: Optional[Dict[str, Any]] = None
-        self._seen_prompts: Dict[str, str] = {}  # role -> text
-        self._seen_output_contract: Optional[Dict[str, Any]] = None
-        self._streaming_buffers: Dict[UUID, List[str]] = {}  # token buffers for streaming  # response_format
-        # Skill activation tracking
-        self._active_skills: Dict[str, Optional[str]] = {}
-        # Skill Rater discovery telemetry. `_skills_offered_in_prompt`
-        # is auto-populated from the Router's offered set via the
-        # BaseChatModel.invoke patch; `_skills_loaded_by_agent` is a manual
-        # hook (use `decimalai.log_skill_loaded` or the explicit
-        # `CallbackHandler.log_skill_loaded` method below).
-        self._skills_offered_in_prompt: set[str] = set()
-        self._skills_loaded_by_agent: set[str] = set()
-        # Bodies that reached the model (Router body injection) —
-        # between offered and activated; never implies activation.
-        self._skills_delivered: set[str] = set()
+        """Drop every in-flight run and start from one fresh, detached state."""
+        with self._state_lock:
+            self._runs.clear()
+            self._root_of.clear()
+            self._current: _RunState = _RunState()
+
+    def _new_run_state(self, root_run_id: UUID, *, is_leaf_root: bool = False) -> _RunState:
+        """Open a state for a new root run and make it the current one."""
+        state = _RunState(root_run_id, is_leaf_root=is_leaf_root)
+        with self._state_lock:
+            if len(self._runs) >= _MAX_LIVE_RUNS:
+                # A root whose end callback never arrived (a hard kill inside
+                # a node, a framework that swallows the error) would otherwise
+                # pin its state forever. Evict the oldest so a long-lived
+                # process cannot grow without bound.
+                oldest = min(self._runs.values(), key=lambda s: s.opened_at)
+                self._forget_run(oldest)
+                _warn_once_then_debug(
+                    "run_state_evicted",
+                    f"Dropping the oldest of {_MAX_LIVE_RUNS} in-flight LangChain "
+                    f"runs — a root chain started but never ended, so its trace "
+                    f"is lost. Trace {oldest.trace_id} ({oldest.agent_hint or 'unnamed'}).",
+                )
+            self._runs[root_run_id] = state
+            self._root_of[root_run_id] = root_run_id
+            state.member_ids.add(root_run_id)
+            self._current = state
+        return state
+
+    def _forget_run(self, state: _RunState) -> None:
+        """Remove a run's bookkeeping. Caller holds `_state_lock`."""
+        if state.root_run_id is not None:
+            self._runs.pop(state.root_run_id, None)
+        for member in state.member_ids:
+            if self._root_of.get(member) == state.root_run_id:
+                self._root_of.pop(member, None)
+
+    def _state_for(
+        self,
+        run_id: Optional[UUID],
+        parent_run_id: Optional[UUID] = None,
+    ) -> Optional[_RunState]:
+        """Resolve the run state that owns `run_id`, or None if it is gone.
+
+        None is a normal outcome, not an error: it is what a duplicate
+        callback delivery looks like after the run has already been shipped
+        and popped, which is precisely how double instrumentation used to
+        emit a second, empty trace.
+        """
+        with self._state_lock:
+            for candidate in (run_id, parent_run_id):
+                if candidate is None:
+                    continue
+                root = self._root_of.get(candidate)
+                if root is not None:
+                    state = self._runs.get(root)
+                    if state is not None:
+                        if run_id is not None and run_id not in state.member_ids:
+                            state.member_ids.add(run_id)
+                            self._root_of[run_id] = root
+                        return state
+            return None
+
+    # Legacy single-slot attributes, delegated to the current run state so
+    # `handler._spans[...]`, `handler._active_skills = {...}` and friends keep
+    # working for manual (auto_send=False) callers and tests.
+    _CURRENT_FIELDS = (
+        "trace_id", "spans", "llm_calls", "tool_calls", "span_stack",
+        "trace_started_at", "user_input_preview", "final_output_preview",
+        "root_run_id", "seen_tools", "seen_model", "seen_prompts",
+        "seen_output_contract", "streaming_buffers", "active_skills",
+        "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
+    )
 
     def log_skill_offered(self, *, names: List[str]) -> None:
         """Manually record skills that were offered in the system prompt."""
@@ -799,6 +1090,21 @@ class CallbackHandler(_CallbackBase):
             id_list = serialized.get("id", [])
             name = id_list[-1] if id_list else ""
 
+        span_id = run_id or uuid4()
+
+        # Claim this run for a trace BEFORE the skip check. A skipped wrapper
+        # is still a real node in the callback tree — `prompt | llm` with no
+        # `run_name` is a RunnableSequence, i.e. the outermost run of the
+        # whole invocation — and its children arrive carrying its run_id as
+        # their parent. Returning early without recording it left every child
+        # looking parentless, which is how a second concurrent run used to be
+        # mistaken for a continuation of the first.
+        state = self._state_for(run_id, parent_run_id)
+        is_new_root = state is None
+        if state is None:
+            state = self._new_run_state(span_id)
+            state.agent_hint = str(name) or None
+
         # Skip noisy internal LangChain wrappers
         if any(name.startswith(skip) for skip in _SKIP_CHAIN_TYPES):
             return
@@ -806,20 +1112,7 @@ class CallbackHandler(_CallbackBase):
         if not name:
             name = "chain"
 
-        span_id = run_id or uuid4()
-        parent_id = parent_run_id if parent_run_id in self._spans else None
-
-        # Track the root run so state resets for each root invocation
-        # This ensures concurrent invocations don't interleave spans
-        if self._root_run_id is None:
-            if parent_run_id is None or parent_run_id not in self._spans:
-                # This is a new root invocation — reset all state
-                old_agent = self.agent_name
-                old_session = self.session_id
-                self._reset_state()
-                self.agent_name = old_agent
-                self.session_id = old_session
-            self._root_run_id = span_id
+        parent_id = parent_run_id if parent_run_id in state.spans else None
 
         # Auto-detect span type
         span_type = SpanType.AGENT
@@ -838,16 +1131,16 @@ class CallbackHandler(_CallbackBase):
             started_at=datetime.now(timezone.utc),
             input_preview=_preview(inputs),
         )
-        self._spans[span_id] = span
-        self._span_stack.append(span_id)
+        state.spans[span_id] = span
+        state.span_stack.append(span_id)
 
         # Capture first input as trace-level preview
-        if self._trace_started_at is None:
-            self._trace_started_at = span.started_at
-            self._user_input_preview = _preview(inputs)
+        if state.trace_started_at is None:
+            state.trace_started_at = span.started_at
+            state.user_input_preview = _preview(inputs)
 
         # Auto-detect agent_name from root chain if not explicitly set
-        if self.agent_name is None and parent_run_id is None:
+        if self.agent_name is None and (parent_run_id is None or is_new_root):
             detected = str(name)
             if detected and detected not in ('chain', 'unknown'):
                 self.agent_name = detected
@@ -861,17 +1154,27 @@ class CallbackHandler(_CallbackBase):
         **kwargs: Any,
     ) -> None:
         """Called when a chain or graph node ends."""
+        state = self._state_for(run_id, parent_run_id)
+        if state is None:
+            # Already shipped and popped. The common cause is the same
+            # callback delivered twice (two handlers installed, or a
+            # re-registered configure hook) — which used to run the send path
+            # a second time against wiped state and put a phantom EMPTY trace
+            # in the dashboard, whose spans then collided by id with the real
+            # trace's.
+            return
+
         span_id = run_id
-        if span_id and span_id in self._spans:
-            span = self._spans[span_id]
+        if span_id and span_id in state.spans:
+            span = state.spans[span_id]
             span.status = Status.SUCCESS
             span.ended_at = datetime.now(timezone.utc)
             span.output_preview = _preview(outputs)
 
-        if self._span_stack and self._span_stack[-1] == span_id:
-            self._span_stack.pop()
+        if state.span_stack and state.span_stack[-1] == span_id:
+            state.span_stack.pop()
 
-        self._final_output_preview = _preview(outputs)
+        state.final_output_preview = _preview(outputs)
 
         # Auto-send at the true outermost end — the only callback that
         # carries parent_run_id=None. Matching on `span_id ==
@@ -881,8 +1184,8 @@ class CallbackHandler(_CallbackBase):
         # the PROMPT step's end and sent the trace before the LLM call
         # existed. The emptiness guard keeps all-skipped runs (e.g. a bare
         # RunnablePassthrough) from sending empty traces.
-        if parent_run_id is None and self.auto_send and (self._spans or self._llm_calls):
-            self._auto_send()
+        if parent_run_id is None:
+            self._close_run(state)
 
     def on_chain_error(
         self,
@@ -893,20 +1196,31 @@ class CallbackHandler(_CallbackBase):
         **kwargs: Any,
     ) -> None:
         """Called when a chain errors."""
+        state = self._state_for(run_id, parent_run_id)
+        if state is None:
+            return
+
         span_id = run_id
-        if span_id and span_id in self._spans:
-            span = self._spans[span_id]
+        if span_id and span_id in state.spans:
+            span = state.spans[span_id]
             span.status = Status.ERROR
             span.ended_at = datetime.now(timezone.utc)
             span.output_preview = str(error)[:200]
 
-        if self._span_stack and self._span_stack[-1] == span_id:
-            self._span_stack.pop()
+        if state.span_stack and state.span_stack[-1] == span_id:
+            state.span_stack.pop()
 
         # Auto-send on the outermost error too — same parent_run_id=None
         # boundary as on_chain_end (see the note there).
-        if parent_run_id is None and self.auto_send and (self._spans or self._llm_calls):
-            self._auto_send()
+        if parent_run_id is None:
+            self._close_run(state)
+
+    def _close_run(self, state: _RunState) -> None:
+        """Retire one root run: stop routing callbacks to it, then send it."""
+        with self._state_lock:
+            self._forget_run(state)
+        if self.auto_send and (state.spans or state.llm_calls):
+            self._auto_send(state)
 
     # ── Sub-agent resolution ───────────────────────────────
 
@@ -927,7 +1241,11 @@ class CallbackHandler(_CallbackBase):
         """
         return self.agent_name or _install_agent_name or DEFAULT_AGENT_NAME
 
-    def _resolve_agent_name(self, parent_run_id: Optional[UUID] = None) -> Optional[str]:
+    def _resolve_agent_name(
+        self,
+        parent_run_id: Optional[UUID] = None,
+        state: Optional[_RunState] = None,
+    ) -> Optional[str]:
         """Resolve the agent name for an LLM call by walking parent spans.
 
         Finds the nearest ancestor span of type AGENT and returns its name.
@@ -935,25 +1253,48 @@ class CallbackHandler(_CallbackBase):
         is found, preserving backward compatibility for the single-agent
         case.
 
-        The walk is bounded. If `_spans` ever contains a parent_span_id
-        cycle (malformed `parent_run_id` from LangChain, or a custom
-        callback corrupting `_spans`), the old `while span_id and
+        The walk is bounded. If the run's spans ever contain a
+        parent_span_id cycle (malformed `parent_run_id` from LangChain, or a
+        custom callback corrupting them), the old `while span_id and
         span_id in self._spans` looped forever, blocking the LangChain
         dispatcher thread. Two guards: a `seen` set so we break on
         cycles, and a hop cap of 32 — agent topologies don't go deeper
         than ~10 in practice.
         """
+        spans = (state or self._current).spans
         span_id = parent_run_id
         seen: set[UUID] = set()
         for _ in range(32):
-            if not span_id or span_id in seen or span_id not in self._spans:
+            if not span_id or span_id in seen or span_id not in spans:
                 break
             seen.add(span_id)
-            span = self._spans[span_id]
+            span = spans[span_id]
             if span.span_type == SpanType.AGENT and span.name:
                 return span.name
             span_id = span.parent_span_id
         return self._agent_name_or_default()
+
+    # ── LLM / tool run routing ─────────────────────────────
+
+    def _state_for_leaf(
+        self,
+        run_id: Optional[UUID],
+        parent_run_id: Optional[UUID],
+    ) -> _RunState:
+        """Resolve (or open) the run state owning an LLM or tool callback.
+
+        An LLM callback with no resolvable parent means a bare
+        `llm.invoke()` — no chain callbacks are emitted for it at all. That
+        used to leave the record stranded in the handler's one set of slots:
+        no trace was ever sent for it, and the stranded record was then
+        shipped inside whatever unrelated run next reached the send path
+        (observed: a bare call's prompt surfacing in a later
+        `RunnableLambda` trace). It now gets a root of its own.
+        """
+        state = self._state_for(run_id, parent_run_id)
+        if state is not None:
+            return state
+        return self._new_run_state(run_id or uuid4(), is_leaf_root=True)
 
     # ── Agent lifecycle (no-op, suppresses warnings) ────────
 
@@ -969,9 +1310,12 @@ class CallbackHandler(_CallbackBase):
         """Buffer streaming tokens per LLM call."""
         if run_id is None:
             return
-        if run_id not in self._streaming_buffers:
-            self._streaming_buffers[run_id] = []
-        self._streaming_buffers[run_id].append(token)
+        state = self._state_for(run_id, kwargs.get("parent_run_id"))
+        if state is None:
+            return
+        if run_id not in state.streaming_buffers:
+            state.streaming_buffers[run_id] = []
+        state.streaming_buffers[run_id].append(token)
 
     def on_llm_start(
         self,
@@ -983,25 +1327,40 @@ class CallbackHandler(_CallbackBase):
         invocation_params: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        """Called when an LLM call starts."""
+        """Called when a (completion, non-chat) LLM call starts."""
         call_id = run_id or uuid4()
         params = invocation_params or {}
+        state = self._state_for_leaf(call_id, parent_run_id)
 
         rendered_input = [{"role": "user", "content": p} for p in prompts]
 
+        provider = extract_provider(params, serialized)
+        model_name = extract_model_name(params)
         call = LlmCallRecord(
             id=call_id,
             span_id=parent_run_id,
-            agent_name=self._resolve_agent_name(parent_run_id),
-            provider=extract_provider(params, serialized),
-            model_name=extract_model_name(params),
+            agent_name=self._resolve_agent_name(parent_run_id, state),
+            provider=provider,
+            model_name=model_name,
             temperature=params.get("temperature"),
             max_output_tokens=params.get("max_tokens"),
             rendered_input=rendered_input,
             status=Status.RUNNING,
             started_at=datetime.now(timezone.utc),
         )
-        self._llm_calls[call_id] = call
+        state.llm_calls[call_id] = call
+
+        # A completion model is still a declared model. Only `on_chat_model_
+        # start` used to record one, so a non-chat LLM produced an empty
+        # manifest and every one of its traces 400'd on the manifest gate.
+        if model_name and not state.seen_model:
+            state.seen_model = {
+                "provider": provider or "unknown",
+                "model": model_name,
+                "temperature": params.get("temperature"),
+                "max_tokens": params.get("max_tokens"),
+                "top_p": params.get("top_p"),
+            }
 
     def on_chat_model_start(
         self,
@@ -1016,6 +1375,7 @@ class CallbackHandler(_CallbackBase):
         """Called when a chat model starts."""
         call_id = run_id or uuid4()
         params = invocation_params or {}
+        state = self._state_for_leaf(call_id, parent_run_id)
 
         rendered_input = []
         for msg_list in messages:
@@ -1028,7 +1388,7 @@ class CallbackHandler(_CallbackBase):
         call = LlmCallRecord(
             id=call_id,
             span_id=parent_run_id,
-            agent_name=self._resolve_agent_name(parent_run_id),
+            agent_name=self._resolve_agent_name(parent_run_id, state),
             provider=extract_provider(params, serialized),
             model_name=extract_model_name(params),
             temperature=params.get("temperature"),
@@ -1066,13 +1426,13 @@ class CallbackHandler(_CallbackBase):
             except Exception:
                 pass
 
-        self._llm_calls[call_id] = call
+        state.llm_calls[call_id] = call
 
         # Auto-detect model and prompts for manifest
         provider = extract_provider(params, serialized)
         model_name = extract_model_name(params)
-        if model_name and not self._seen_model:
-            self._seen_model = {
+        if model_name and not state.seen_model:
+            state.seen_model = {
                 "provider": provider or "unknown",
                 "model": model_name,
                 "temperature": params.get("temperature"),
@@ -1082,8 +1442,8 @@ class CallbackHandler(_CallbackBase):
 
         # Capture structured output schema (response_format) as output_contract
         resp_fmt = params.get("response_format")
-        if resp_fmt and isinstance(resp_fmt, dict) and not self._seen_output_contract:
-            self._seen_output_contract = resp_fmt
+        if resp_fmt and isinstance(resp_fmt, dict) and not state.seen_output_contract:
+            state.seen_output_contract = resp_fmt
         # Capture system/human prompts from chat messages (auto-detection)
         # NOTE: This captures the RENDERED prompt, not the template.
         # If prompts include dynamic content (RAG chunks, dates, few-shot
@@ -1094,11 +1454,11 @@ class CallbackHandler(_CallbackBase):
             for msg in msg_list:
                 role = normalize_role(msg)
                 content = extract_message_content(msg)
-                if role in ("system", "developer") and content and role not in self._seen_prompts:
-                    self._seen_prompts[role] = content
-                elif role in ("system", "developer") and content and role in self._seen_prompts:
+                if role in ("system", "developer") and content and role not in state.seen_prompts:
+                    state.seen_prompts[role] = content
+                elif role in ("system", "developer") and content and role in state.seen_prompts:
                     # Prompt changed within the same trace — likely dynamic
-                    if content != self._seen_prompts[role]:
+                    if content != state.seen_prompts[role]:
                         logger.warning(
                             "Auto-detected %s prompt changed within trace. "
                             "If your prompts include dynamic content (RAG, dates, "
@@ -1108,22 +1468,24 @@ class CallbackHandler(_CallbackBase):
                         )
 
         # Auto-detect skill activations from system prompts
-        if self._seen_prompts:
-            self._detect_skills_from_prompts()
+        if state.seen_prompts:
+            self._detect_skills_from_prompts(state)
 
     def on_llm_end(
         self,
         response: Any,
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when an LLM call ends."""
         call_id = run_id
-        if not call_id or call_id not in self._llm_calls:
+        state = self._state_for(call_id, parent_run_id)
+        if not call_id or state is None or call_id not in state.llm_calls:
             return
 
-        call = self._llm_calls[call_id]
+        call = state.llm_calls[call_id]
         call.status = Status.SUCCESS
         call.ended_at = datetime.now(timezone.utc)
         if call.started_at:
@@ -1138,8 +1500,13 @@ class CallbackHandler(_CallbackBase):
         if hasattr(response, "generations") and response.generations:
             gen = response.generations[0][0] if response.generations[0] else None
             if gen and hasattr(gen, "message"):
-                if has_tool_calls(gen.message):
+                requested = extract_tool_call_names(gen.message)
+                if requested:
                     call.finish_reason = FinishReason.TOOL_CALLS
+                    # Remember WHICH tools this turn asked for — `build_trace`
+                    # needs it to attach the resulting ToolCallRecords across a
+                    # graph node boundary. See the note there.
+                    state.tool_requests[call_id] = requested
                 else:
                     call.finish_reason = FinishReason.STOP
 
@@ -1148,8 +1515,8 @@ class CallbackHandler(_CallbackBase):
         call.output_tokens = output_tokens
 
         # Handle streaming buffer — join buffered tokens
-        if call_id in self._streaming_buffers:
-            tokens = self._streaming_buffers.pop(call_id)
+        if call_id in state.streaming_buffers:
+            tokens = state.streaming_buffers.pop(call_id)
             if tokens:
                 call.streaming = True
                 call.streaming_token_count = len(tokens)
@@ -1158,17 +1525,23 @@ class CallbackHandler(_CallbackBase):
                     call.output = call.output or {}
                     call.output["streaming_content"] = "".join(tokens)
 
+        self._close_if_leaf_root(state, call_id)
+
     def on_llm_error(
         self,
         error: BaseException,
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when an LLM call errors."""
         call_id = run_id
-        if call_id and call_id in self._llm_calls:
-            call = self._llm_calls[call_id]
+        state = self._state_for(call_id, parent_run_id)
+        if state is None:
+            return
+        if call_id and call_id in state.llm_calls:
+            call = state.llm_calls[call_id]
             call.status = Status.ERROR
             call.ended_at = datetime.now(timezone.utc)
             call.output = {"error": str(error)[:500]}
@@ -1180,7 +1553,36 @@ class CallbackHandler(_CallbackBase):
         # long-lived processes that hit many streaming failures (flaky
         # provider, timeout, content filter).
         if call_id is not None:
-            self._streaming_buffers.pop(call_id, None)
+            state.streaming_buffers.pop(call_id, None)
+
+        self._close_if_leaf_root(state, call_id)
+
+    def _close_if_leaf_root(
+        self, state: _RunState, run_id: Optional[UUID],
+    ) -> None:
+        """Ship a run whose ROOT is this leaf callback.
+
+        A bare `llm.invoke()` (and, rarely, a tool invoked outside any
+        chain) emits no chain callbacks at all, so no `on_chain_end` is
+        coming to close or send it — and leaving it open would also pin the
+        state until the in-flight cap evicts it.
+        """
+        if not state.is_leaf_root or run_id is None or state.root_run_id != run_id:
+            return
+        if state.trace_started_at is None:
+            call = state.llm_calls.get(run_id)
+            span = state.spans.get(run_id)
+            started = (call.started_at if call else None) or (
+                span.started_at if span else None
+            )
+            state.trace_started_at = started or state.opened_at
+            if call and call.rendered_input:
+                state.user_input_preview = _preview(
+                    call.rendered_input[-1].get("content")
+                )
+            elif span:
+                state.user_input_preview = span.input_preview
+        self._close_run(state)
 
     # ── Tool lifecycle ─────────────────────────────────────
 
@@ -1196,6 +1598,7 @@ class CallbackHandler(_CallbackBase):
         """Called when a tool starts."""
         tool_id = run_id or uuid4()
         tool_name = serialized.get("name", "unknown")
+        state = self._state_for_leaf(tool_id, parent_run_id)
 
         span = TraceSpan(
             id=tool_id,
@@ -1206,7 +1609,7 @@ class CallbackHandler(_CallbackBase):
             started_at=datetime.now(timezone.utc),
             input_preview=str(input_str)[:200],
         )
-        self._spans[tool_id] = span
+        state.spans[tool_id] = span
 
         tool_call = ToolCallRecord(
             id=tool_id,
@@ -1214,7 +1617,7 @@ class CallbackHandler(_CallbackBase):
             args={"input": input_str} if isinstance(input_str, str) else {},
             status=Status.RUNNING,
         )
-        self._tool_calls[tool_id] = tool_call
+        state.tool_calls[tool_id] = tool_call
 
         # Auto-detect tools for manifest.
         # Include `description` so that manifest diffs and tool-impact
@@ -1222,8 +1625,8 @@ class CallbackHandler(_CallbackBase):
         # rewriting a tool's description — "Search the web" → "Search the
         # corporate intranet" — produces NO manifest signal, even though
         # it can completely change how the model uses the tool.
-        if str(tool_name) not in self._seen_tools:
-            self._seen_tools[str(tool_name)] = {
+        if str(tool_name) not in state.seen_tools:
+            state.seen_tools[str(tool_name)] = {
                 "name": str(tool_name),
                 "description": serialized.get("description", ""),
                 "schema": serialized.get("schema"),
@@ -1234,38 +1637,50 @@ class CallbackHandler(_CallbackBase):
         output: str,
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a tool ends."""
         tool_id = run_id
-        if tool_id and tool_id in self._spans:
-            span = self._spans[tool_id]
+        state = self._state_for(tool_id, parent_run_id)
+        if state is None:
+            return
+        if tool_id and tool_id in state.spans:
+            span = state.spans[tool_id]
             span.status = Status.SUCCESS
             span.ended_at = datetime.now(timezone.utc)
             span.output_preview = str(output)[:200]
 
-        if tool_id and tool_id in self._tool_calls:
-            tc = self._tool_calls[tool_id]
+        if tool_id and tool_id in state.tool_calls:
+            tc = state.tool_calls[tool_id]
             tc.status = Status.SUCCESS
             tc.result = str(output)[:1000]
+
+        self._close_if_leaf_root(state, tool_id)
 
     def on_tool_error(
         self,
         error: BaseException,
         *,
         run_id: Optional[UUID] = None,
+        parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a tool errors."""
         tool_id = run_id
-        if tool_id and tool_id in self._spans:
-            span = self._spans[tool_id]
+        state = self._state_for(tool_id, parent_run_id)
+        if state is None:
+            return
+        if tool_id and tool_id in state.spans:
+            span = state.spans[tool_id]
             span.status = Status.ERROR
             span.ended_at = datetime.now(timezone.utc)
 
-        if tool_id and tool_id in self._tool_calls:
-            tc = self._tool_calls[tool_id]
+        if tool_id and tool_id in state.tool_calls:
+            tc = state.tool_calls[tool_id]
             tc.status = Status.ERROR
+
+        self._close_if_leaf_root(state, tool_id)
 
     # ── Retriever + text (no-op) ───────────────────────────
 
@@ -1283,24 +1698,18 @@ class CallbackHandler(_CallbackBase):
 
     # ── Build & send ───────────────────────────────────────
 
-    def build_trace(self) -> RunTrace:
-        """Assemble the collected spans and LLM calls into a RunTrace."""
+    def build_trace(self, state: Optional[_RunState] = None) -> RunTrace:
+        """Assemble one run's spans and LLM calls into a RunTrace."""
         from . import _config
 
         config = _config._config
+        state = state or self._current
 
-        # Attach tool calls to their parent LLM calls
-        for tc in self._tool_calls.values():
-            tool_span = self._spans.get(tc.id)
-            if tool_span and tool_span.parent_span_id:
-                for lc in self._llm_calls.values():
-                    if lc.span_id == tool_span.parent_span_id:
-                        lc.tool_calls.append(tc)
-                        break
+        self._attach_tool_calls(state)
 
         # Build active_skills list
         active_skills_list: List[Dict[str, Any]] = []
-        for name, h in self._active_skills.items():
+        for name, h in state.active_skills.items():
             entry: Dict[str, Any] = {"name": name}
             if h:
                 entry["hash"] = h
@@ -1316,48 +1725,51 @@ class CallbackHandler(_CallbackBase):
         drained_offered = _consume_skills_offered()
         if drained_offered:
             for n in drained_offered:
-                self._skills_offered_in_prompt.add(n)
+                state.skills_offered_in_prompt.add(n)
         for n in rail_offered:
-            self._skills_offered_in_prompt.add(n)
+            state.skills_offered_in_prompt.add(n)
 
         # Drain the delivered-names contextvar (Router body injection).
         drained_delivered = _consume_skills_delivered()
         if drained_delivered:
             for n in drained_delivered:
-                self._skills_delivered.add(n)
-                self._skills_offered_in_prompt.add(n)  # delivered implies offered
+                state.skills_delivered.add(n)
+                state.skills_offered_in_prompt.add(n)  # delivered implies offered
         for n in rail_delivered:
-            self._skills_delivered.add(n)
-            self._skills_offered_in_prompt.add(n)
+            state.skills_delivered.add(n)
+            state.skills_offered_in_prompt.add(n)
 
         # Bodies served by the singleton's `load_skill(...)` — this adapter
         # registers no native load_skill tool, but a user-supplied tool
         # that calls it still lands its serves here.
         for n in rail_loaded:
-            self.log_skill_loaded(name=n)
+            if isinstance(n, str) and n.strip():
+                state.skills_loaded_by_agent.add(n.strip())
+                state.skills_offered_in_prompt.add(n.strip())
+                state.skills_delivered.add(n.strip())
 
         # Derive trace status from collected spans/LLM calls: if any errored,
         # the run errored. on_chain_error/on_llm_error mark these ERROR.
         trace_status = Status.SUCCESS
-        if any(s.status == Status.ERROR for s in self._spans.values()) or any(
-            lc.status == Status.ERROR for lc in self._llm_calls.values()
+        if any(s.status == Status.ERROR for s in state.spans.values()) or any(
+            lc.status == Status.ERROR for lc in state.llm_calls.values()
         ):
             trace_status = Status.ERROR
 
         return RunTrace(
-            id=self._trace_id,
+            id=state.trace_id,
             project=config.project if config else None,
             agent_name=self._agent_name_or_default(),
             session_id=self.session_id,
             parent_trace_id=self.parent_trace_id,
             status=trace_status,
             source_type="production",
-            started_at=self._trace_started_at,
+            started_at=state.trace_started_at,
             ended_at=datetime.now(timezone.utc),
-            user_input_preview=self._user_input_preview,
-            final_output_preview=self._final_output_preview,
-            spans=list(self._spans.values()),
-            llm_calls=list(self._llm_calls.values()),
+            user_input_preview=state.user_input_preview,
+            final_output_preview=state.final_output_preview,
+            spans=list(state.spans.values()),
+            llm_calls=list(state.llm_calls.values()),
             active_skills=active_skills_list,
             manifest_id=_manifest_id,
             # SkillRouter: stamp the routing_id set by the BaseChatModel
@@ -1368,10 +1780,71 @@ class CallbackHandler(_CallbackBase):
             routing_id=_consume_routing_id() or rail_routing_id,
             # Skill Rater discovery telemetry. Sorted for
             # deterministic output (tests, diffs).
-            skills_offered_in_prompt=sorted(self._skills_offered_in_prompt),
-            skills_loaded_by_agent=sorted(self._skills_loaded_by_agent),
-            skills_delivered=sorted(self._skills_delivered),
+            skills_offered_in_prompt=sorted(state.skills_offered_in_prompt),
+            skills_loaded_by_agent=sorted(state.skills_loaded_by_agent),
+            skills_delivered=sorted(state.skills_delivered),
         )
+
+    def _attach_tool_calls(self, state: _RunState) -> None:
+        """Hang each ToolCallRecord off the model turn that requested it.
+
+        A ToolCallRecord only reaches the wire through
+        ``LlmCallRecord.tool_calls``, so a record with no LLM call to hang
+        off is a record the platform never sees.
+
+        The old rule was one exact match — ``tool_span.parent_span_id ==
+        llm_call.span_id``. That holds for a flat LCEL agent and for nothing
+        else. In a LangGraph / ``create_agent`` graph the model runs under
+        the ``agent`` node and the tool under a sibling ``tools`` node, so no
+        tool span's parent ever equals an LLM call's span id and EVERY tool
+        record was dropped. Fall back to the turn that asked for this tool by
+        name, then to the most recent turn that started before it.
+        """
+        if not state.tool_calls or not state.llm_calls:
+            return
+
+        def _started(record_id: UUID) -> datetime:
+            span = state.spans.get(record_id)
+            return (span.started_at if span and span.started_at else None) or _EPOCH
+
+        by_span: Dict[UUID, LlmCallRecord] = {}
+        for lc in state.llm_calls.values():
+            if lc.span_id is not None:
+                by_span.setdefault(lc.span_id, lc)
+
+        # name -> the turns that requested it, oldest first. Popped as they
+        # are claimed so a turn asking for the same tool twice (parallel tool
+        # calls) matches two separate records.
+        requested_by: Dict[str, List[LlmCallRecord]] = {}
+        for call_id, names in state.tool_requests.items():
+            lc = state.llm_calls.get(call_id)
+            if lc is None:
+                continue
+            for name in names:
+                requested_by.setdefault(name, []).append(lc)
+        for queue in requested_by.values():
+            queue.sort(key=lambda lc: lc.started_at or _EPOCH)
+
+        ordered_calls = sorted(
+            state.llm_calls.values(), key=lambda lc: lc.started_at or _EPOCH
+        )
+
+        for tc in sorted(state.tool_calls.values(), key=lambda t: _started(t.id)):
+            tool_span = state.spans.get(tc.id)
+            target = None
+            if tool_span and tool_span.parent_span_id:
+                target = by_span.get(tool_span.parent_span_id)
+            if target is None:
+                queue = requested_by.get(tc.tool_name)
+                if queue:
+                    target = queue.pop(0)
+            if target is None:
+                tool_started = _started(tc.id)
+                for lc in ordered_calls:
+                    if (lc.started_at or _EPOCH) <= tool_started:
+                        target = lc
+            if target is not None and tc not in target.tool_calls:
+                target.tool_calls.append(tc)
 
     def get_trace(self) -> RunTrace:
         """Build the trace and reset for the next invocation."""
@@ -1388,20 +1861,23 @@ class CallbackHandler(_CallbackBase):
         """
         return str(self._trace_id)
 
-    def _auto_send(self) -> None:
-        """Send the trace via the background sender (called on root chain end)."""
+    def _auto_send(self, state: Optional[_RunState] = None) -> None:
+        """Send one run's trace via the background sender (on root end)."""
         from . import _config
+
+        state = state or self._current
 
         if not _config._is_enabled():
             logger.debug("Tracing disabled, skipping auto-send")
             return
 
         # Auto-register manifest on first trace (or when agent changes)
-        self._maybe_register_manifest()
+        self._maybe_register_manifest(state)
 
         try:
             client = _config._get_client()
-            trace = self.get_trace()
+            trace = self.build_trace(state)
+            self._retire(state)
 
             # Run evals before sending
             eval_scores = self._run_evals(trace)
@@ -1420,8 +1896,16 @@ class CallbackHandler(_CallbackBase):
                 trace.manifest_id or "none",
             )
         except Exception:
-            logger.exception("Failed to queue trace %s", self._trace_id)
-            self._reset_state()
+            logger.exception("Failed to queue trace %s", state.trace_id)
+            self._retire(state)
+
+    def _retire(self, state: _RunState) -> None:
+        """Drop a shipped run so the legacy `handler._*` view moves on."""
+        with self._state_lock:
+            self._forget_run(state)
+            if self._current is state:
+                self._current = _RunState()
+
     def _run_evals(self, trace: RunTrace) -> List[Dict[str, Any]]:
         """Run all registered evals against the trace."""
         from .evals import DecimalEval, run_evals, trace_to_trace_data
@@ -1449,12 +1933,13 @@ class CallbackHandler(_CallbackBase):
             logger.warning("Eval execution failed: %s", e)
             return []
 
-    def _detect_skills_from_prompts(self) -> None:
+    def _detect_skills_from_prompts(self, state: Optional[_RunState] = None) -> None:
         """Auto-detect skill activations from system/developer prompts.
 
         Uses the global skills registry (from instrument()) to match
         skill references in the rendered system prompt text.
         """
+        state = state or self._current
         skills_registry = (_explicit_manifest_config or {}).get("skills")
         if not skills_registry:
             return
@@ -1462,7 +1947,7 @@ class CallbackHandler(_CallbackBase):
         try:
             from .skills import detect_skill_activations
             # Build system text from seen prompts
-            system_text = "\n".join(self._seen_prompts.values())
+            system_text = "\n".join(state.seen_prompts.values())
             if not system_text:
                 return
 
@@ -1471,20 +1956,76 @@ class CallbackHandler(_CallbackBase):
                 skills_registry,
             )
             for skill_name in detected:
-                if skill_name not in self._active_skills:
+                if skill_name not in state.active_skills:
                     registry_hash = next(
                         (s.get("hash") for s in skills_registry
                          if s.get("name") == skill_name),
                         None,
                     )
-                    self._active_skills[skill_name] = registry_hash
+                    state.active_skills[skill_name] = registry_hash
         except Exception:
             _warn_once_then_debug(
                 "skill_activation_detection",
                 "Skill auto-detection from prompts failed",
             )
 
-    def _maybe_register_manifest(self) -> None:
+    def _resolve_manifest_for_empty_run(self) -> None:
+        """Give a run with nothing to declare a manifest_id to ship under.
+
+        See the long note in `_maybe_register_manifest`. Order: keep what
+        this process already has → adopt the agent's active manifest from
+        the platform → register a zero-component placeholder.
+        """
+        global _manifest_id
+
+        from . import _config
+
+        if _manifest_id is not None:
+            return  # Already have one — never regress it to an empty manifest.
+
+        agent_name = self._agent_name_or_default()
+
+        with _manifest_lock:
+            if _manifest_id is not None:
+                return
+            if agent_name not in _manifest_adoption_probed:
+                _manifest_adoption_probed.add(agent_name)
+                adopted = _adopt_active_manifest(agent_name)
+                if adopted:
+                    _manifest_id = adopted
+                    logger.debug(
+                        "Adopted the platform's active manifest %s for %s "
+                        "(this run had nothing to declare)",
+                        adopted, agent_name,
+                    )
+                    return
+
+            # No manifest anywhere for this agent — register the placeholder.
+            # Zero components on purpose: a fake `{"provider": "unknown"}`
+            # model would both lie and still diff as major later. Zero
+            # components hash to a per-agent constant, so repeat
+            # registrations dedup onto the same v1 instead of minting
+            # versions.
+            snapshot = extract_from_config(agent_name=agent_name)
+            if not _manifest_tracker.check_and_update(snapshot):
+                return
+            try:
+                client = _config._get_client()
+                result = client.register_manifest(snapshot)
+                _manifest_id = _registered_manifest_id(result, snapshot)
+                logger.info(
+                    "Registered placeholder manifest %s for %s — this run "
+                    "declared no tools, prompts or models",
+                    _manifest_id, agent_name,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to register placeholder manifest, continuing without",
+                    exc_info=True,
+                )
+                _manifest_id = snapshot.id
+
+    def _maybe_register_manifest(self, state: Optional[_RunState] = None) -> None:
         """Extract and register manifest if not already done.
 
         Thread-safe via _manifest_lock.
@@ -1494,6 +2035,8 @@ class CallbackHandler(_CallbackBase):
         from . import _config
         if not _config._is_enabled():
             return
+
+        state = state or self._current
 
         # Use explicit config from instrument() if provided
         tools = None
@@ -1506,22 +2049,52 @@ class CallbackHandler(_CallbackBase):
             models = _explicit_manifest_config.get("models")
 
         # Fall back to auto-detected values
-        if not tools and self._seen_tools:
-            tools = list(self._seen_tools.values())
-        if not prompts and self._seen_prompts:
-            prompts = dict(self._seen_prompts)
-        if not models and self._seen_model:
-            models = {"default": self._seen_model}
+        if not tools and state.seen_tools:
+            tools = list(state.seen_tools.values())
+        if not prompts and state.seen_prompts:
+            prompts = dict(state.seen_prompts)
+        if not models and state.seen_model:
+            models = {"default": state.seen_model}
 
         # Include output contract if detected
         output_contract = None
-        if self._seen_output_contract:
-            output_contract = self._seen_output_contract
+        if state.seen_output_contract:
+            output_contract = state.seen_output_contract
 
-        # Need at least something to register
         skills = (_explicit_manifest_config or {}).get("skills")
         subagents = self.subagents
+
+        # ── "Nothing to declare" ────────────────────────────
+        # This used to `return`, and that return was the single largest
+        # source of trace loss on this adapter: ingest requires a
+        # manifest_id (`require_manifest_on_ingest` defaults true and is
+        # true on prod), so a legitimate run that exposes no model, tool or
+        # prompt — a pure-Python LCEL chain, a `RunnableLambda` step, a
+        # completion (non-chat) model — lost 100% of its traces to a 400.
+        #
+        # The naive fix ("always register") has a trap we measured against
+        # the local backend: a zero-component manifest registered AFTER a
+        # populated one supersedes it, and the shared agentversion diff
+        # reads the absent surfaces as deletions — `model_runtime: provider
+        # 'openai' → ''` breaking/major AND `tool_registry: search removed`,
+        # recommended_decision "replay". That is a false claim that the
+        # user deleted their tools, and it poisons the version history that
+        # manifest-aware versioning exists to keep honest.
+        #
+        # So an empty snapshot is treated as "we have nothing to add",
+        # never as a new declaration:
+        #   1. if this process already has a manifest for the agent, keep it
+        #   2. else adopt the agent's active manifest from the platform
+        #      (survives process restarts and multi-process deployments,
+        #      where a process-local guard alone would still regress)
+        #   3. only if the agent has no manifest at all do we register the
+        #      zero-component placeholder — and with no predecessor there
+        #      is no diff to fabricate.
+        # The forward transition (placeholder → first real declaration) is
+        # left as a real version bump: it says a model was declared where
+        # none had been, which is true, and it deletes nothing.
         if not tools and not prompts and not models and not skills and not subagents:
+            self._resolve_manifest_for_empty_run()
             return
 
         # Same label the trace ships under, or the manifest lands on a
@@ -1546,7 +2119,7 @@ class CallbackHandler(_CallbackBase):
             try:
                 client = _config._get_client()
                 result = client.register_manifest(snapshot)
-                _manifest_id = result.get("manifest_id", snapshot.id)
+                _manifest_id = _registered_manifest_id(result, snapshot)
                 logger.info(
                     "Registered manifest %s (hash=%s, components=%d)",
                     _manifest_id,
@@ -1567,6 +2140,19 @@ class CallbackHandler(_CallbackBase):
     def get_completed_trace(self) -> RunTrace:
         """Alias for get_trace() (backwards compat)."""
         return self.get_trace()
+
+
+# The one handler `instrument()` publishes process-wide, and — critically —
+# the ContextVar's DEFAULT, so `var.get()` answers with it inside a worker
+# thread's fresh empty Context too. Constructed here rather than inside
+# `instrument()` because a ContextVar's default is fixed at construction.
+# Inert until `instrument()` registers the configure hook: LangChain never
+# reads the var before that.
+_global_handler = CallbackHandler(auto_send=True)
+
+_decimal_callback_var: ContextVar[Optional[CallbackHandler]] = ContextVar(
+    "decimal_langchain_callback", default=_global_handler,
+)
 
 
 def _preview(obj: Any, max_len: int = 2000) -> str:

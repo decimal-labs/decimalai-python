@@ -343,7 +343,19 @@ class TestLangchainInstall:
         lc_mod._installed = False
 
     def test_install_registers_hook(self):
-        """install() should call register_configure_hook with the callback var."""
+        """install() should call register_configure_hook with the callback var.
+
+        `handle_class` is load-bearing, not decoration. LangChain installs the
+        hooked handler whenever `context_var.get()` is non-None, and since the
+        var's default IS the global handler (so a `threading.Thread` worker,
+        which starts with a fresh empty Context, is traced at all), a caller
+        who passes their own `config={"callbacks": [CallbackHandler(...)]}`
+        would otherwise get BOTH handlers. Both ship a trace, and because a
+        span's id is the LangChain run_id the two traces carry identical span
+        ids — the backend keeps the first and stores the second with zero
+        spans, i.e. a phantom empty trace per run. `handle_class` makes the
+        dedup type-based so the explicit handler wins.
+        """
         with patch(
             "decimalai.langchain.register_configure_hook",
             create=True,
@@ -356,11 +368,15 @@ class TestLangchainInstall:
                     register_configure_hook=mock_hook
                 ),
             }):
-                from decimalai.langchain import install, _decimal_callback_var
+                from decimalai.langchain import (
+                    CallbackHandler,
+                    _decimal_callback_var,
+                    install,
+                )
                 install()
 
                 mock_hook.assert_called_once_with(
-                    _decimal_callback_var, inheritable=True
+                    _decimal_callback_var, True, handle_class=CallbackHandler
                 )
 
     def test_install_is_idempotent(self):

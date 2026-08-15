@@ -181,6 +181,26 @@ def has_tool_calls(message: Any) -> bool:
     return len(extract_tool_calls(message)) > 0
 
 
+def extract_tool_call_names(message: Any) -> List[str]:
+    """Names of the tools an assistant message asked to run, in order.
+
+    The handler uses this to attach a ``ToolCallRecord`` to the model turn
+    that actually requested it. Matching on the callback tree alone is not
+    enough: in a LangGraph / ``create_agent`` graph the model runs under the
+    ``agent`` node and the tool under a sibling ``tools`` node, so the tool
+    span's parent never equals the LLM call's span id.
+
+    Duplicates are preserved — a parallel tool call that invokes the same
+    tool twice must yield two entries, or the second invocation has no turn
+    left to attach to.
+    """
+    return [
+        str(tc.get("name"))
+        for tc in extract_tool_calls(message)
+        if tc.get("name")
+    ]
+
+
 # ── Token Usage Extraction ─────────────────────────────────────
 
 def extract_token_usage(response: Any) -> Tuple[Optional[int], Optional[int]]:
