@@ -1,0 +1,29 @@
+# Configures GitHub's "Generate release notes" button (Releases → auto-generated notes).
+# Config only: it changes how notes are GROUPED, it never publishes a release.
+#
+# Every label named below exists in this repo — a category whose labels are all
+# unused simply renders empty, and an unlabeled PR falls through to the "*"
+# catch-all, which MUST stay last (the first matching category wins).
+changelog:
+  exclude:
+    labels:
+      - dependencies
+      - github_actions
+    authors:
+      - dependabot
+      - dependabot[bot]
+      - github-actions
+      - github-actions[bot]
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"
