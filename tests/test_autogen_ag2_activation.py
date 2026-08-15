@@ -65,7 +65,9 @@ def test_agents_constructed_after_activation_are_instrumented(monkeypatch):
 
     da._activate_ag2_instrumentation(provider)
 
-    instrument_llm_wrapper.assert_called_once_with(tracer_provider=provider)
+    instrument_llm_wrapper.assert_called_once_with(
+        tracer_provider=provider, capture_messages=True
+    )
     instrument_agent.assert_not_called()
 
     agent = ConversableAgent(name="assistant")

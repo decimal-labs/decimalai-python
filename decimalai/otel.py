@@ -56,7 +56,12 @@ _GENAI_FINISH_REASON = "gen_ai.response.finish_reasons"
 # OpenInference convention (Arize Phoenix instrumentations — CrewAI, LlamaIndex,
 # etc.); without it those spans carry no model and never become LLM calls.
 _ALT_MODEL_KEYS = ("llm.request.model", "llm.model", "llm.model_name", "model")
-_ALT_PROVIDER_KEYS = ("llm.system", "llm.provider", "ai.provider")
+# `gen_ai.provider.name` is what current GenAI semconv calls the provider
+# (`gen_ai.system` is the older spelling); AG2 emits only the new one, so
+# without it every AG2 span fell through to guessing from the model id.
+_ALT_PROVIDER_KEYS = (
+    "gen_ai.provider.name", "llm.system", "llm.provider", "ai.provider",
+)
 _ALT_INPUT_TOKEN_KEYS = ("llm.usage.prompt_tokens", "llm.token_count.prompt")
 _ALT_OUTPUT_TOKEN_KEYS = (
     "llm.usage.completion_tokens",
@@ -70,6 +75,11 @@ _ALT_OUTPUT_TOKEN_KEYS = (
 _NON_LLM_OPERATIONS = frozenset(
     {"invoke_agent", "create_agent", "conversation", "execute_tool"}
 )
+
+# Version label for the manifest a run registers when it observed no model, no
+# tool and no prompt. See _ManifestRegistry for why it is labelled rather than
+# left to the backend's v1/v2/v3 auto-increment.
+_UNDECLARED_LABEL = "undeclared"
 
 
 def instrument(
@@ -131,7 +141,10 @@ def instrument(
         )
 
     resource = Resource.create({SERVICE_NAME: service_name})
-    provider = TracerProvider(resource=resource)
+    # shutdown_on_exit=False + our own earlier hook: the SDK's default exit
+    # flush runs too late to reach the background sender. See
+    # _register_flush_atexit.
+    provider = TracerProvider(resource=resource, shutdown_on_exit=False)
 
     # Resolve skills (auto-discover or explicit)
     resolved_skills = skills
@@ -147,6 +160,7 @@ def instrument(
     )
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace_api.set_tracer_provider(provider)
+    _register_flush_atexit(provider)
 
     logger.info(
         "DecimalAI OTEL exporter installed (agent_name=%s, service=%s)",
@@ -154,6 +168,204 @@ def instrument(
         service_name,
     )
     return provider
+
+
+class _ManifestRegistry:
+    """Per-agent manifest state for an OTel exporter — always has an id to give.
+
+    Two rules, both learned the hard way:
+
+    **Always declare something.** The backend requires ``manifest_id`` on
+    ingest (``require_manifest_on_ingest``, on by default and on in
+    production), so an exporter that registers a manifest only when it
+    happened to see a model/tool/prompt loses 100% of the traces that saw
+    none — every Microsoft AutoGen run (its runtime spans carry no GenAI
+    attributes at all) and every AG2/CrewAI turn that neither called a tool
+    nor made a model call. Those traces 400'd. So a run with nothing to
+    declare still registers: a snapshot with ZERO components, labelled
+    ``undeclared``.
+
+    Zero components is the honest encoding of "nothing to declare": every
+    contract surface is ABSENT, which is what the diff engine reads as
+    "not declared". The tempting alternative — synthesizing placeholder
+    components (a model of ``provider="unknown"``, an empty tool registry) —
+    writes a false claim into the contract AND makes the first real
+    observation diff as ``provider: 'unknown' → 'openai'``, i.e. major /
+    breaking. Absence says nothing; a placeholder says something wrong.
+
+    **Never un-declare.** The accumulators are cumulative per agent, not per
+    trace. A manifest describes the AGENT, not one turn: a turn where the
+    model didn't call ``search`` has not REMOVED ``search``. Before this,
+    ``seen_tools`` was rebuilt from each trace in isolation, so two identical
+    turns of an unchanged AG2 agent (which declares tools only by *executing*
+    them) registered two manifest versions and the platform reported
+    ``tool_registry breaking/major "search removed"`` with a ``replay``
+    decision — a fabricated breaking change on an agent nobody touched.
+    Accumulating monotonically means the snapshot can grow (a genuine
+    addition, which the diff calls minor/non-breaking) but never shrink.
+
+    Same reason a "nothing observed" trace that follows a populated one
+    reuses the last manifest instead of registering the empty snapshot: an
+    empty snapshot ON TOP of a populated one is exactly the "everything was
+    removed" diff, the worst version-history poisoning available.
+
+    And when nothing has ever been observed for an agent that the workspace
+    ALREADY has an active manifest for (a redeploy, another rail, an explicit
+    ``decimalai.register_manifest``), the existing manifest is adopted rather
+    than a fresh ``undeclared`` version minted on top of it — "nothing to
+    declare" means "running under the contract already declared".
+    """
+
+    def __init__(
+        self,
+        skills: Optional[List[Dict[str, Any]]] = None,
+        prompts: Optional[Dict[str, str]] = None,
+    ):
+        self._skills = skills
+        # Explicit static prompt templates ({"system": ...}); when set, these
+        # win over the rendered system prompt auto-harvested from spans.
+        self._explicit_prompts = prompts
+        self._lock = threading.Lock()
+        self._by_agent: Dict[str, "_AgentManifestState"] = {}
+
+    def manifest_id_for(
+        self,
+        agent_name: str,
+        *,
+        model: Optional[Dict[str, Any]] = None,
+        tools: Optional[Dict[str, Dict[str, Any]]] = None,
+        prompts: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Fold one trace's observations in and return the manifest id to stamp.
+
+        Returns None only when the SDK is disabled or registration failed
+        without even a synthetic id to fall back on.
+        """
+        from . import _config
+
+        if not _config._is_enabled():
+            return None
+
+        with self._lock:
+            state = self._by_agent.get(agent_name)
+            if state is None:
+                state = _AgentManifestState()
+                self._by_agent[agent_name] = state
+
+            # Monotonic merge — first observation of each component wins, and
+            # nothing is ever dropped. See the class docstring.
+            for tool_name, tool in (tools or {}).items():
+                state.tools.setdefault(tool_name, tool)
+            if state.model is None and model:
+                state.model = model
+            for prompt_name, prompt_text in (prompts or {}).items():
+                state.prompts.setdefault(prompt_name, prompt_text)
+
+            declared_tools = list(state.tools.values()) or None
+            declared_models = {"default": state.model} if state.model else None
+            declared_prompts = self._explicit_prompts or (state.prompts or None)
+            undeclared = not (
+                declared_tools or declared_models or declared_prompts or self._skills
+            )
+
+            if undeclared:
+                if state.manifest_id is not None:
+                    # Already have an id (adopted, or an earlier undeclared
+                    # registration). Re-registering the empty snapshot would be
+                    # a no-op at best; keep the id.
+                    return state.manifest_id
+                if not state.adoption_checked:
+                    state.adoption_checked = True
+                    adopted = self._adopt_active_manifest(agent_name)
+                    if adopted:
+                        state.manifest_id = adopted
+                        logger.info(
+                            "Nothing to declare for agent %s — reusing its active "
+                            "manifest %s rather than registering an empty version",
+                            agent_name, adopted,
+                        )
+                        return adopted
+
+            snapshot = extract_from_config(
+                agent_name=agent_name,
+                tools=declared_tools,
+                models=declared_models,
+                prompts=declared_prompts,
+                skills=self._skills,
+                # A named label instead of the backend's v1/v2/v3 auto-increment,
+                # so the timeline reads "undeclared → v1" (first declaration)
+                # rather than "v1 → v2" (which reads as a change to a contract
+                # that was never declared). Labels with no `vN` token don't
+                # participate in auto-increment, so this doesn't consume v1.
+                version_label=_UNDECLARED_LABEL if undeclared else None,
+            )
+
+            if not state.tracker.check_and_update(snapshot):
+                return state.manifest_id  # Same hash — already registered
+
+            try:
+                client = _config._get_client()
+                result = client.register_manifest(snapshot)
+                state.manifest_id = result.get("manifest_id", snapshot.id)
+                logger.info(
+                    "Registered manifest %s from OTel spans (agent=%s, hash=%s, "
+                    "components=%d)",
+                    state.manifest_id,
+                    agent_name,
+                    snapshot.manifest_hash[:12],
+                    len(snapshot.components),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to register manifest from OTel spans for agent %s",
+                    agent_name, exc_info=True,
+                )
+                _config._sender.record_manifest_error(exc)
+                # Forget the hash so the NEXT trace retries. The fallback id
+                # below is a client-side uuid the backend has never seen, and
+                # it rejects an unknown manifest_id the same as a missing one —
+                # so caching it would turn one blip (a restart, a network hiccup)
+                # into permanent trace loss for the rest of the process.
+                state.tracker.reset()
+                state.manifest_id = snapshot.id
+            return state.manifest_id
+
+    def _adopt_active_manifest(self, agent_name: str) -> Optional[str]:
+        """The id of ``agent_name``'s already-active manifest, if it has one."""
+        from . import _config
+
+        try:
+            client = _config._get_client()
+            resp = client.list_manifests(limit=20, agent_name=agent_name)
+            for manifest in (resp or {}).get("manifests") or []:
+                if (
+                    manifest.get("status") == "active"
+                    and manifest.get("agent_name") == agent_name
+                    and manifest.get("id")
+                ):
+                    return str(manifest["id"])
+        except Exception:
+            # Best-effort: a lookup failure (or an unexpected response shape)
+            # just means we register the undeclared snapshot instead.
+            logger.debug(
+                "Could not look up an existing manifest for %s", agent_name,
+                exc_info=True,
+            )
+        return None
+
+
+class _AgentManifestState:
+    """One agent's cumulative manifest view inside a :class:`_ManifestRegistry`."""
+
+    __slots__ = ("tracker", "manifest_id", "tools", "model", "prompts", "adoption_checked")
+
+    def __init__(self) -> None:
+        self.tracker = ManifestTracker()
+        self.manifest_id: Optional[str] = None
+        self.tools: Dict[str, Dict[str, Any]] = {}
+        self.model: Optional[Dict[str, Any]] = None
+        self.prompts: Dict[str, str] = {}
+        self.adoption_checked = False
 
 
 class DecimalSpanExporter:
@@ -178,12 +390,15 @@ class DecimalSpanExporter:
         self.default_agent_name = agent_name
         self._skills = skills
         # Explicit static prompt templates ({"system": ...}); when set, these
-        # win over the rendered system prompt auto-harvested from spans.
+        # win over the rendered system prompt auto-harvested from spans. The
+        # registry below applies that precedence — kept here as the record of
+        # what this exporter was constructed with.
         self._explicit_prompts = prompts
-        # Manifest tracking state
-        self._manifest_tracker = ManifestTracker()
-        self._manifest_id: Optional[str] = None
-        self._manifest_lock = threading.Lock()
+        # Manifest tracking state — per agent name, cumulative. One process can
+        # export traces for several agents (the name is auto-detected from each
+        # root span), and the manifest hash does NOT include the agent name, so
+        # a single shared tracker would hand agent B the id it minted for A.
+        self._manifests = _ManifestRegistry(skills=skills, prompts=prompts)
         # Spans of one trace can arrive across multiple export() batches, so
         # buffer them by trace_id and finalize once the root span shows up.
         self._pending: Dict[int, List[Any]] = defaultdict(list)
@@ -247,14 +462,14 @@ class DecimalSpanExporter:
             if result is not None:
                 run_trace, seen_model, seen_tools, seen_prompts = result
                 agent_name = run_trace.agent_name or "otel-agent"
-                self._maybe_register_manifest(
+                # Stamp the manifest onto the trace AFTER registration — the
+                # trace was assembled before it ran, and without an id the
+                # backend rejects the trace under require_manifest_on_ingest.
+                # There is always an id to stamp now, including for a run that
+                # observed no model/tool/prompt (see _ManifestRegistry).
+                run_trace.manifest_id = self._maybe_register_manifest(
                     agent_name, seen_model, seen_tools, seen_prompts
                 )
-                # Stamp the just-registered manifest onto the trace. The trace
-                # was assembled before registration ran, so its manifest_id is
-                # still stale (None on the first export) — without this the
-                # backend rejects it under require_manifest_on_ingest.
-                run_trace.manifest_id = self._manifest_id
                 self._send(run_trace)
         except Exception:
             logger.exception(
@@ -439,9 +654,16 @@ class DecimalSpanExporter:
                     if "ERROR" in str(otel_status.status_code):
                         span_status = Status.ERROR
 
-                # Accumulate tools for manifest auto-detection
-                if span_type == SpanType.TOOL and name not in seen_tools:
-                    seen_tools[name] = {"name": name}
+                # Accumulate tools for manifest auto-detection. Prefer the
+                # declared tool name over the span name: AG2 names its tool
+                # spans "execute_tool <fn>", which would put the operation
+                # prefix into the manifest's tool registry and re-key every
+                # tool if the framework ever renames its spans.
+                if span_type == SpanType.TOOL:
+                    tool_name = str(
+                        attrs.get("gen_ai.tool.name") or attrs.get("tool.name") or name
+                    )
+                    seen_tools.setdefault(tool_name, {"name": tool_name})
 
                 trace_span = TraceSpan(
                     id=uuid4(),
@@ -503,7 +725,9 @@ class DecimalSpanExporter:
             spans=trace_spans,
             llm_calls=llm_calls,
             active_skills=active_skills_list,
-            manifest_id=self._manifest_id,
+            # Stamped by _finalize_trace once the manifest for this agent has
+            # been registered — the caller knows the agent name by then.
+            manifest_id=None,
         ), seen_model, seen_tools, seen_prompts
 
     def _make_llm_call(
@@ -575,7 +799,7 @@ class DecimalSpanExporter:
             status=status,
             started_at=started_at,
             ended_at=ended_at,
-            tool_calls=_extract_openinference_tool_calls(attrs),
+            tool_calls=_extract_tool_calls(attrs),
         )
 
     def _send(self, trace: RunTrace) -> None:
@@ -587,7 +811,7 @@ class DecimalSpanExporter:
 
         try:
             client = _config._get_client()
-            _config._sender.submit(client.ingest_trace, trace)
+            _submit_or_send_inline(client, trace)
             logger.debug(
                 "Queued OTEL trace %s (%d spans, %d llm_calls, manifest=%s) for agent %s",
                 trace.id,
@@ -605,55 +829,88 @@ class DecimalSpanExporter:
         seen_model: Optional[Dict[str, Any]],
         seen_tools: Dict[str, Dict[str, Any]],
         seen_prompts: Optional[Dict[str, str]] = None,
-    ) -> None:
-        """Register manifest from accumulated OTel span data.
+    ) -> Optional[str]:
+        """Fold this trace's observations into the agent's manifest.
 
-        Thread-safe via _manifest_lock. Only registers if the
-        manifest hash has changed since last registration.
+        Returns the manifest id to stamp on the trace. Always registers
+        something — a run that observed nothing still needs an id or the
+        backend rejects its trace. Delegates to :class:`_ManifestRegistry`,
+        which owns the accumulate-never-shrink rules.
         """
-        from . import _config
-
-        if not _config._is_enabled():
-            return
-
-        tools = list(seen_tools.values()) if seen_tools else None
-        models = {"default": seen_model} if seen_model else None
-        # An explicit static template (install(prompts=...)) wins over the
-        # auto-harvested rendered prompt — see the rendered-vs-template note in
-        # _assemble_trace.
-        prompts = self._explicit_prompts or (seen_prompts or None)
-
-        if not tools and not models and not self._skills and not prompts:
-            return
-
-        snapshot = extract_from_config(
-            agent_name=agent_name,
-            tools=tools,
-            models=models,
-            prompts=prompts,
-            skills=self._skills,
+        return self._manifests.manifest_id_for(
+            agent_name,
+            model=seen_model,
+            tools=seen_tools,
+            # An explicit static template (instrument(prompts=...)) wins over
+            # the auto-harvested rendered prompt — see the rendered-vs-template
+            # note in _assemble_trace; the registry applies that precedence.
+            prompts=seen_prompts,
         )
-
-        with self._manifest_lock:
-            if not self._manifest_tracker.check_and_update(snapshot):
-                return  # Same hash — already registered
-
-            try:
-                client = _config._get_client()
-                result = client.register_manifest(snapshot)
-                self._manifest_id = result.get("manifest_id", snapshot.id)
-                logger.info(
-                    "Registered manifest %s from OTel spans (hash=%s, components=%d)",
-                    self._manifest_id,
-                    snapshot.manifest_hash[:12],
-                    len(snapshot.components),
-                )
-            except Exception:
-                logger.warning("Failed to register manifest from OTel spans", exc_info=True)
-                self._manifest_id = snapshot.id
 
 
 # ── Utilities ──────────────────────────────────────────────
+
+
+def _submit_or_send_inline(client: Any, trace: RunTrace) -> None:
+    """Queue a trace on the background sender, falling back to a direct POST.
+
+    The background sender is a ``ThreadPoolExecutor``, and CPython runs
+    ``threading._shutdown()`` — which is where the executor's own exit hook
+    refuses further work — BEFORE ordinary ``atexit`` callbacks. So any flush
+    that happens from a plain ``atexit`` handler (a user's own
+    ``TracerProvider``, which defaults to ``shutdown_on_exit=True``) hits
+    ``RuntimeError: cannot schedule new futures after interpreter shutdown``
+    and the trace is lost. :func:`_register_flush_atexit` moves our own
+    provider's flush earlier; this covers the paths we don't own by sending
+    the trace on the calling thread instead of dropping it.
+    """
+    from . import _config
+
+    try:
+        _config._sender.submit(client.ingest_trace, trace)
+        return
+    except RuntimeError:
+        logger.debug(
+            "Background sender unavailable (interpreter shutting down) — "
+            "sending trace %s inline", trace.id,
+        )
+    try:
+        client.ingest_trace(trace)
+    except Exception as exc:
+        _config._sender._record_failure(exc, str(trace.id))
+        raise
+    _config._sender._record_success()
+
+
+def _register_flush_atexit(provider: Any) -> None:
+    """Flush ``provider`` early enough that the background sender is still alive.
+
+    ``TracerProvider(shutdown_on_exit=True)`` registers its shutdown as an
+    ordinary ``atexit`` callback, and those run AFTER
+    ``threading._shutdown()`` has already stopped the thread pool the SDK
+    sends on — so a plain script (no explicit ``flush()``) exported zero
+    traces on the whole community rail. ``threading._register_atexit`` runs
+    during ``threading._shutdown()``, in reverse registration order, so a hook
+    registered here runs before the pool's own — the flush lands while it can
+    still be queued and drained.
+
+    Falls back to plain ``atexit`` on a runtime without the private hook; the
+    inline-send fallback in :func:`_submit_or_send_inline` still saves the
+    trace there.
+    """
+    import atexit
+
+    def _flush() -> None:
+        try:
+            provider.shutdown()
+        except Exception:  # pragma: no cover - never crash on the way out
+            logger.debug("TracerProvider shutdown failed", exc_info=True)
+
+    register = getattr(threading, "_register_atexit", None)
+    if register is not None:
+        register(_flush)
+    else:  # pragma: no cover - CPython < 3.9 / alternative runtimes
+        atexit.register(_flush)
 
 
 def _get_trace_id(span: Any) -> int:
@@ -770,9 +1027,52 @@ _OI_TOOLCALL_ARGS_RE = re.compile(
 )
 
 
-def _extract_openinference_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
+def _semconv_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
+    """Tool calls carried as ``tool_call`` parts in ``gen_ai.output.messages``.
+
+    The GenAI-semconv counterpart of the OpenInference indexed keys below —
+    without it an AG2 assistant turn's tool calls reached neither
+    ``LlmCallRecord.tool_calls`` nor the manifest's tool registry.
+    """
+    records: List[ToolCallRecord] = []
+    raw = attrs.get("gen_ai.output.messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return records
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return records
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        for part in entry.get("parts") or ():
+            if not isinstance(part, dict) or part.get("type") != "tool_call":
+                continue
+            name = part.get("name")
+            if not name:
+                continue
+            args = part.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (ValueError, TypeError):
+                    args = {"raw": args}
+            records.append(
+                ToolCallRecord(
+                    tool_name=str(name),
+                    args=args if isinstance(args, dict) else {},
+                )
+            )
+    return records
+
+
+def _extract_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
     """Pull tool calls the model made in this step from OpenInference
-    ``llm.output_messages.*.message.tool_calls.*`` attributes."""
+    ``llm.output_messages.*.message.tool_calls.*`` attributes, or from the
+    GenAI-semconv ``gen_ai.output.messages`` array."""
     found: Dict[tuple, Dict[str, Any]] = {}
     for key, val in attrs.items():
         m = _OI_TOOLCALL_NAME_RE.match(key)
@@ -796,7 +1096,7 @@ def _extract_openinference_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRec
         if not isinstance(args, dict):
             args = {}
         records.append(ToolCallRecord(tool_name=name, args=args))
-    return records
+    return records or _semconv_tool_calls(attrs)
 
 
 def _extract_declared_tools(attrs: Dict[str, Any]) -> List[str]:
@@ -856,17 +1156,96 @@ _INDEXED_MSG_NAMESPACE_RE = re.compile(
 
 _DEFAULT_ROLE = {"input": "user", "output": "assistant"}
 
+# Current GenAI semconv carries the whole conversation as ONE attribute holding
+# a JSON array — `gen_ai.input.messages` / `gen_ai.output.messages`, each entry
+# `{"role", "parts": [...]}` — rather than the indexed keys above. AG2 emits
+# this shape (both the agent spans and, with capture_messages on, the chat
+# span); reading only the indexed spelling made every AG2 preview the raw JSON.
+_SEMCONV_MSG_KEYS = {
+    "input": ("gen_ai.input.messages",),
+    "output": ("gen_ai.output.messages",),
+}
+
+
+def _text_from_parts(parts: Any) -> str:
+    """Flatten a GenAI-semconv message ``parts`` list to plain text.
+
+    Text parts contribute their content; a tool-call part contributes a compact
+    ``name(arguments)`` rendering and a tool result its response, so a turn that
+    only called tools still previews as something a human can read instead of
+    an empty string.
+    """
+    if isinstance(parts, str):
+        return parts
+    if not isinstance(parts, (list, tuple)):
+        return ""
+    chunks: List[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "tool_call":
+            args = part.get("arguments")
+            if not isinstance(args, str):
+                args = json.dumps(args, default=str) if args else ""
+            chunks.append(f"{part.get('name', 'tool')}({args})")
+        elif ptype == "tool_call_response":
+            chunks.append(str(part.get("response", "")))
+        else:
+            content = part.get("content") or part.get("text")
+            if content is not None:
+                chunks.append(str(content))
+    return "\n".join(c for c in chunks if c)
+
+
+def _semconv_messages_from_attrs(
+    attrs: Dict[str, Any], direction: str
+) -> Optional[List[Dict[str, Any]]]:
+    """Rebuild one direction's messages from the GenAI-semconv JSON attribute."""
+    for key in _SEMCONV_MSG_KEYS[direction]:
+        raw = attrs.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+        if isinstance(raw, dict):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)) or not raw:
+            continue
+        messages: List[Dict[str, Any]] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                messages.append({"role": _DEFAULT_ROLE[direction], "content": entry})
+            elif isinstance(entry, dict):
+                messages.append({
+                    "role": str(entry.get("role") or _DEFAULT_ROLE[direction]),
+                    "content": _text_from_parts(
+                        entry.get("parts", entry.get("content", ""))
+                    ),
+                })
+        if messages:
+            return messages
+    return None
+
 
 def _messages_from_attrs(
     attrs: Dict[str, Any], direction: str
 ) -> Optional[List[Dict[str, Any]]]:
-    """Rebuild one direction's chat messages from indexed span attributes.
+    """Rebuild one direction's chat messages from span attributes.
 
-    Frameworks that follow OpenInference (CrewAI, LlamaIndex/Phoenix, …) split
-    each message across ``…{i}.message.role`` and ``…{i}.message.content``
-    keys. Returns them in index order as ``{"role", "content"}`` dicts — the
-    shape the other adapters normalize to — or None when the span carries no
-    indexed messages.
+    Two wire shapes, both supported. Frameworks that follow OpenInference
+    (CrewAI, LlamaIndex/Phoenix, …) split each message across
+    ``…{i}.message.role`` and ``…{i}.message.content`` keys; frameworks on
+    current GenAI semconv (AG2 among them) put the whole array in one
+    ``gen_ai.{input,output}.messages`` JSON attribute. Returns them in order as
+    ``{"role", "content"}`` dicts — the shape the other adapters normalize to —
+    or None when the span carries neither.
 
     A message whose content is absent (an assistant turn that only made tool
     calls) is kept with an empty content so turn order survives; its tool calls
@@ -889,7 +1268,7 @@ def _messages_from_attrs(
             "content", "".join(by_part[j] for j in sorted(by_part))
         )
     if not found:
-        return None
+        return _semconv_messages_from_attrs(attrs, direction)
     return [
         {
             "role": found[idx].get("role") or _DEFAULT_ROLE[direction],

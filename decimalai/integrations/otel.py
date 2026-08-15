@@ -30,9 +30,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
 
-# Shared with the manifest-capable exporter so both rails read the indexed
-# OpenInference message attributes identically. Pure-stdlib module, no cycle.
-from ..otel import _messages_from_attrs
+# Shared with the manifest-capable exporter so both rails read the message
+# attributes identically and register manifests by the same rules. Pure-stdlib
+# module, no cycle.
+from ..otel import (
+    _extract_system_prompt,
+    _ManifestRegistry,
+    _messages_from_attrs,
+    _submit_or_send_inline,
+)
 
 logger = logging.getLogger("decimalai.integrations.otel")
 
@@ -110,6 +116,12 @@ class DecimalSpanExporter:
         self.agent_name = agent_name
         # Buffer spans by trace_id to assemble into RunTrace
         self._trace_buffers: Dict[str, List[Any]] = {}
+        # Every trace this exporter produced used to go out with no
+        # manifest_id, so under require_manifest_on_ingest (the default, and on
+        # in production) the backend 400'd 100% of them — install_otel() looked
+        # wired up and delivered nothing. Shares the manifest-capable exporter's
+        # registry so both rails accumulate and version identically.
+        self._manifests = _ManifestRegistry()
 
     def export(self, spans: Sequence[Any]) -> Any:
         """Export a batch of OTel spans to DecimalAI."""
@@ -146,7 +158,6 @@ class DecimalSpanExporter:
         client: Any,
     ) -> None:
         """Convert a batch of OTel spans to a RunTrace and send."""
-        from .. import _config
         from ..schema.common import FinishReason, SpanType, Status
         from ..schema.trace import LlmCallRecord, RunTrace, TraceSpan
 
@@ -157,6 +168,11 @@ class DecimalSpanExporter:
         latest_end = None
         user_input = None
         final_output = None
+        # Manifest accumulators for this trace; folded into the per-agent
+        # cumulative view by _ManifestRegistry below.
+        seen_model: Optional[Dict[str, Any]] = None
+        seen_tools: Dict[str, Dict[str, Any]] = {}
+        seen_prompts: Dict[str, str] = {}
 
         for span in spans:
             attrs = dict(span.attributes or {})
@@ -235,6 +251,29 @@ class DecimalSpanExporter:
                     ended_at=end_time,
                 ))
 
+                # Manifest auto-detection: first model wins, first system
+                # prompt wins (a later, dynamically-built one is per-run
+                # content and would flip the manifest hash mid-trace).
+                if seen_model is None and model_name:
+                    seen_model = {
+                        "provider": str(attrs.get(OTEL_GEN_AI_SYSTEM) or "") or None,
+                        "model": str(model_name),
+                        "temperature": (
+                            float(attrs[OTEL_GEN_AI_REQUEST_TEMPERATURE])
+                            if attrs.get(OTEL_GEN_AI_REQUEST_TEMPERATURE) is not None
+                            else None
+                        ),
+                        "max_tokens": (
+                            int(attrs[OTEL_GEN_AI_REQUEST_MAX_TOKENS])
+                            if attrs.get(OTEL_GEN_AI_REQUEST_MAX_TOKENS) is not None
+                            else None
+                        ),
+                    }
+                if "system" not in seen_prompts:
+                    system_prompt = _extract_system_prompt(attrs)
+                    if system_prompt:
+                        seen_prompts["system"] = system_prompt
+
                 # Try to extract user input from this LLM span
                 if not user_input:
                     user_input = _extract_preview(attrs, "input")
@@ -246,6 +285,7 @@ class DecimalSpanExporter:
             elif is_tool_span:
                 # ── Tool execution span (CrewAI / AutoGen) ──
                 resolved_name = str(tool_name or span.name or "unknown_tool")
+                seen_tools.setdefault(resolved_name, {"name": resolved_name})
                 tool_input = _extract_preview(attrs, "input") or ""
                 tool_output = _extract_preview(attrs, "output") or ""
 
@@ -303,10 +343,22 @@ class DecimalSpanExporter:
                     if span_output:
                         final_output = span_output[:500]
 
+        # Register/refresh this agent's manifest before assembling the trace —
+        # the backend rejects a trace with no manifest_id, and a run that
+        # observed no model/tool/prompt still gets one (see _ManifestRegistry).
+        resolved_agent_name = agent_name or "unknown"
+        manifest_id = self._manifests.manifest_id_for(
+            resolved_agent_name,
+            model=seen_model,
+            tools=seen_tools,
+            prompts=seen_prompts,
+        )
+
         # Assemble RunTrace
         trace = RunTrace(
             id=uuid4(),
-            agent_name=agent_name or "unknown",
+            agent_name=resolved_agent_name,
+            manifest_id=manifest_id,
             status=Status.SUCCESS if all(
                 s.status == Status.SUCCESS for s in trace_spans
             ) and all(
@@ -321,8 +373,9 @@ class DecimalSpanExporter:
             llm_calls=llm_calls,
         )
 
-        # Send via background sender
-        _config._sender.submit(client.ingest_trace, trace)
+        # Send via background sender (falling back to an inline POST when the
+        # interpreter is already tearing the thread pool down).
+        _submit_or_send_inline(client, trace)
         logger.debug(
             "Exported OTel trace %s → RunTrace %s (%d spans, %d llm calls)",
             trace_id[:12], trace.id, len(trace_spans), len(llm_calls),
