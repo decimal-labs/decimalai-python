@@ -184,8 +184,6 @@ tier2:
   model_candidates:
     - gemini-3.6-flash
     - gemini-3.5-flash
-    - gemini-2.5-flash
-    - gemini-2.0-flash
 
   # Colab secret names, in the order the notebook tries them. NEVER read with
   # input(): a key typed into a cell is a key in the browser's history and in the

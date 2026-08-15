@@ -133,8 +133,16 @@ cells = [
         "rather than on page one because until now there was nothing for it to do.\n"
         "\n"
         "**Get one:** [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — Google\n"
-        "account, **no credit card, about twenty seconds**. The free tier covers this notebook\n"
-        "several times over.\n"
+        "account, **no credit card, about twenty seconds**.\n"
+        "\n"
+        "**What it buys, honestly.** The default path makes **~22 model calls** — 2 in cell 1.4,\n"
+        "~18 in 1.6 (six cases x two arms + one judge call each), 2 in 1.9 — and the free\n"
+        "tier's observed daily cap is **20 requests per day per model**. When the runner and\n"
+        "the judge resolve to the same model, one default run spends a full day's budget and\n"
+        "can clip the last cell; `FULL_SUITE = True` (roughly 70 calls) does not fit in a free\n"
+        "day at all. Every model-calling cell prints a running call count so you can see where\n"
+        "you stand, and a spent daily quota is named as such when it happens — it resets at\n"
+        "midnight Pacific.\n"
         "\n"
         "**Where it goes.** From this Colab runtime straight to Google. **DecimalAI never sees\n"
         "it.** Nothing here sends it anywhere: the only DecimalAI traffic in this notebook is the\n"
@@ -357,7 +365,10 @@ def preflight(model_id, served):
     """Swap a retired id for a current flash model, loudly."""
     if not served or model_id in served:
         return model_id
-    for alt in ("gemini-flash-latest", "gemini-2.5-flash"):
+    # No 2.x fallbacks: Gemini 2.x is retired — generateContent 404s even though
+    # models.list still returns the ids, so swapping to 2.5 off the listing would
+    # replace a retired model with another retired model.
+    for alt in ("gemini-flash-latest", "gemini-3.6-flash", "gemini-3.5-flash"):
         if alt in served:
             print(f"  '{model_id}' is not served to this key — using '{alt}' instead.")
             print("  Your run is then a DIFFERENT model's result, which is a real and")
@@ -378,26 +389,51 @@ if CLIENT is not None:
     JUDGE_MODEL = preflight(JUDGE_MODEL, _served)
 
 
+# Every request spends daily quota — retries included, which is why the counter
+# ticks inside the retry loop. Each model-calling cell prints the running total.
+CALLS = {}
+
+
+def calls_so_far():
+    total = sum(CALLS.values())
+    if not total:
+        return "model calls so far: 0"
+    per = "   ".join(f"{m} {n}" for m, n in sorted(CALLS.items()))
+    return (f"model calls so far: {total}   ({per})   "
+            "— observed free-tier cap: 20/day per model")
+
+
 def call_model(prompt, model=None, max_tokens=2048):
     """One raw google-genai call. Returns (text, error). NEVER raises."""
     if CLIENT is None:
         return None, "no model key"
+    mid = model or RUN_MODEL
     cfg = types.GenerateContentConfig(temperature=0, max_output_tokens=max_tokens)
     delay = 4.0
     for attempt in range(4):
+        CALLS[mid] = CALLS.get(mid, 0) + 1
         try:
             r = CLIENT.models.generate_content(
-                model=model or RUN_MODEL, contents=prompt, config=cfg)
+                model=mid, contents=prompt, config=cfg)
             return (r.text or "").strip(), None
         except Exception as exc:
             msg = str(exc)
             low = msg.lower()
-            # A 429 has two completely different meanings and only one of them is
-            # worth waiting out. "Prepayment credits are depleted" is a billing
-            # state: every retry returns it, so backing off just burns minutes.
-            if "deplet" in low or "billing" in low:
-                return None, ("this key's prepaid credits are gone — a billing state, not a "
-                              "rate limit, so retrying will not help")
+            # A 429 has three different meanings, and the word "billing" cannot
+            # tell them apart — EVERY quota 429 says "check your plan and billing
+            # details", the free-tier ones included, so keying on it told
+            # free-tier users their prepaid credits were gone. They never had
+            # any. The quotaId in the error body is what actually distinguishes.
+            if "deplet" in low or "prepaid" in low or "prepayment" in low:
+                return None, ("this key's prepaid credits are depleted — a billing state, "
+                              "not a rate limit, so retrying will not help")
+            if "perday" in low and ("429" in msg or "resource_exhausted" in low):
+                # quotaId like GenerateRequestsPerDayPerProjectPerModel-FreeTier:
+                # the free tier's DAILY cap, spent for the day. Retrying is free
+                # but pointless until it resets at midnight Pacific.
+                return None, (f"the free tier's DAILY quota for {mid} is used up for today "
+                              "— it resets at midnight Pacific; the running call count "
+                              "shows where it went")
             if any(k in msg for k in ("429", "500", "502", "503",
                                       "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
                 time.sleep(delay)
@@ -606,7 +642,9 @@ else:
     print("\n--- and what OUR published run recorded for the same case ---")
     print(f"  without the skill  {(RESULTS[CASE].get('without_skill_output') or '').strip()[:120]!r}")
     print(f"  with the skill     {(RESULTS[CASE].get('with_skill_output') or '').strip()[:120]!r}")
-    print(f"  recorded outcome   {RESULTS[CASE]['outcome']}")''',
+    print(f"  recorded outcome   {RESULTS[CASE]['outcome']}")
+    if HAS_KEY:
+        print("\n" + calls_so_far())''',
     ),
 
     # ── 1.5 blind judge ────────────────────────────────────────────
@@ -812,7 +850,7 @@ else:
         if failed:
             UNGRADED.append((n, failed))
             print(f"  [{i}/{len(picked)}] {n}  skipped — {failed}")
-            if "credits" in failed:
+            if "credits" in failed or "DAILY quota" in failed:
                 print("  Stopping: every remaining call would return the same thing.")
                 break
             continue
@@ -831,7 +869,8 @@ else:
         print(f"  [{i}/{len(picked)}] {n}  " +
               "  ".join(f"{a}={'pass' if MINE[n][a] else 'fail'}" for a in ARMS))
 
-    print(f"\ngraded {len(MINE)} cases" + (f", {len(UNGRADED)} unusable" if UNGRADED else ""))''',
+    print(f"\ngraded {len(MINE)} cases" + (f", {len(UNGRADED)} unusable" if UNGRADED else ""))
+    print(calls_so_far())''',
     ),
 
     # ── 1.7 compare ────────────────────────────────────────────────
@@ -1152,7 +1191,8 @@ else:
     print(wrap(
         "No score, on purpose. There is no expectation to grade against because you wrote the "
         "case, and inventing one now would put us back on both sides of the exam. If the two "
-        "answers disagree, the disagreement is the result.", 88, "  "))"""
+        "answers disagree, the disagreement is the result.", 88, "  "))
+    print("\n" + calls_so_far())"""
     ),
 
     # ── close ──────────────────────────────────────────────────────
