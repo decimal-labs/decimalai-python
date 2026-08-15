@@ -452,6 +452,13 @@ class SkillRouter:
         # Fallback body-load budget for tool-execution contexts that did not
         # inherit the prompt-build ContextVar (see load_skill).
         self._last_budget: Optional[_BodyLoadBudget] = None
+        # Per-run budgets, for callers that can name the run they are in
+        # (``scope=``). `_last_budget` is a single slot on a singleton every
+        # concurrent run shares: two parallel runs overwrite each other's
+        # turn budget, so one run's caps get charged against the other's
+        # loads. A scoped caller gets its own. Bounded LRU so a run that
+        # never finishes cannot pin memory.
+        self._scoped_budgets: "OrderedDict[str, _BodyLoadBudget]" = OrderedDict()
         # 'loaded' = the model pulled a skill's BODY on demand through the
         # load_skill tool (progressive disclosure, step 3). Instance state,
         # NOT a contextvar like the offered/delivered rails: loads fire
@@ -689,7 +696,13 @@ class SkillRouter:
             return None
         return result.get("body") if result else None
 
-    def load_skill(self, name: str, *, agent_name: Optional[str] = None) -> str:
+    def load_skill(
+        self,
+        name: str,
+        *,
+        agent_name: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> str:
         """The load_skill tool handler — fetch a surfaced skill's body on demand.
 
         Always returns a STRING (never raises): either the trimmed body block
@@ -699,22 +712,36 @@ class SkillRouter:
         ``per_body_char_limit`` trim, ``body_load_deadline_s``. Records the
         load on the active trace (``skills_loaded_by_agent``) so the
         offered-vs-loaded join closes server-side.
+
+        Args:
+            scope: an opaque key naming the RUN this load belongs to (the
+                adapter's trace id). Budget accounting and the loaded-names
+                rail are kept per scope, so concurrent runs sharing one
+                router singleton stop consuming each other's turn budget.
+                Omit it and the legacy single-slot fallback applies.
         """
         name = (name or "").strip()
         if not name:
             return "load_skill error: a skill name is required."
 
-        # ContextVar first (isolated per agent run); instance fallback for
-        # frameworks that execute each tool call in a context that did not
-        # inherit the prompt-build context; else start a fresh budget.
-        budget = _body_budget_ctx.get() or self._last_budget
+        # A caller that names its run is the most precise answer available,
+        # so it wins outright: falling back to the ContextVar there would
+        # hand this run whichever budget another run happened to leave in
+        # the current context. Unscoped callers keep the old order —
+        # ContextVar (isolated per agent run) first, then the single-slot
+        # fallback for frameworks that execute each tool call in a context
+        # that did not inherit the prompt-build one.
+        if scope is not None:
+            budget = self._budget_for(scope)
+        else:
+            budget = _body_budget_ctx.get() or self._last_budget
         if budget is None:
             budget = _BodyLoadBudget(
                 self.max_loaded_bodies, self.body_token_budget,
                 self.body_load_deadline_s,
             )
             _body_budget_ctx.set(budget)
-            self._last_budget = budget
+            self._remember_budget(budget, scope)
 
         refusal = budget.check(name)
         if refusal is not None:
@@ -766,13 +793,40 @@ class SkillRouter:
 
         return f"## Skill: {name}\n\n{body}"
 
+    # Cap on how many concurrent runs keep their own turn budget. Runs are
+    # short; anything past this is a leak, so evict oldest-first.
+    _MAX_SCOPED_BUDGETS = 64
+
+    def _budget_for(self, scope: Optional[str]) -> Optional[_BodyLoadBudget]:
+        """This run's turn budget, or the legacy single slot when unscoped."""
+        if scope is None:
+            return self._last_budget
+        budget = self._scoped_budgets.get(scope)
+        if budget is not None:
+            self._scoped_budgets.move_to_end(scope)
+        return budget
+
+    def _remember_budget(
+        self, budget: _BodyLoadBudget, scope: Optional[str],
+    ) -> None:
+        """Store a freshly-minted turn budget against its run."""
+        self._last_budget = budget
+        if scope is None:
+            return
+        self._scoped_budgets[scope] = budget
+        self._scoped_budgets.move_to_end(scope)
+        while len(self._scoped_budgets) > self._MAX_SCOPED_BUDGETS:
+            self._scoped_budgets.popitem(last=False)
+
     def consume_loaded_names(self) -> List[str]:
         """Read + clear the names whose body `load_skill` served since the
         last drain. Adapter trace-send paths call this on their router
         singleton — the same instance whose load_skill tool served the
         bodies — and stamp the names onto ``skills_loaded_by_agent``.
         Known cost (same as the `_last_budget` fallback): concurrent runs
-        sharing one router drain into whichever trace sends first.
+        sharing one router drain into whichever trace sends first. Adapters
+        that can name their run (``scope=``, see `load_skill`) should
+        attribute loads per-run instead and treat this as a reset.
         """
         if not self._loaded_names:
             return []
@@ -858,6 +912,7 @@ class SkillRouter:
         top_k: int = 10,
         bypass_cache: bool = False,
         inject_body: Optional[bool] = None,
+        scope: Optional[str] = None,
     ) -> tuple[str, Optional[str]]:
         """Return ``(prompt_fragment, routing_id)`` — the primitive every adapter calls.
 
@@ -903,6 +958,11 @@ class SkillRouter:
             bypass_cache: When True, ignore the cached value and refetch.
                 The fresh result still populates the cache for
                 subsequent calls.
+            scope: an opaque key naming the RUN this fragment is being
+                built for (the adapter's trace id). The per-turn body-load
+                budget this call resets is then kept per run, so two
+                concurrent runs sharing one router singleton no longer
+                overwrite each other's budget. See `load_skill`.
 
         Returns:
             ``(prompt_fragment, routing_id)``. ``routing_id`` is the
@@ -1024,7 +1084,7 @@ class SkillRouter:
             self.max_loaded_bodies, self.body_token_budget, self.body_load_deadline_s,
         )
         _body_budget_ctx.set(fresh_budget)
-        self._last_budget = fresh_budget
+        self._remember_budget(fresh_budget, scope)
 
         # Mirror onto the instance rails before stamping — the adapters
         # whose contextvars never reach trace-send read the routing

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -54,8 +55,22 @@ logger = logging.getLogger("decimalai.openai_agents")
 
 # ── Global manifest state ──────────────────────────────────
 _manifest_tracker = ManifestTracker()
-_manifest_id: Optional[str] = None  # Set after first successful registration
+_manifest_id: Optional[str] = None  # Most recent successful registration
 _manifest_lock = threading.Lock()  # Thread safety for manifest registration
+
+# Per-agent manifest id. `_manifest_id` alone is a single process-global
+# slot, so in a process running two differently-named agents the second
+# agent's traces were stamped with the FIRST agent's manifest — the
+# manifest→trace join then attributes one agent's runs to another's
+# contract. Keyed by agent_name; `_manifest_id` is kept as the
+# last-registered value for back-compat with callers that read it.
+_manifest_ids: Dict[str, str] = {}
+_manifest_hashes: Dict[str, str] = {}
+
+# Everything this process has ever observed about an agent's structure,
+# unioned across traces: ``agent_name -> {"tools": {...}, "models": {...},
+# "subagents": {...}, "prompts": {...}}``. See `_declare`.
+_declared: Dict[str, Dict[str, Any]] = {}
 
 # ── Thread-local parent trace context ──────────────────────
 # Enables multi-agent linking: set a parent trace ID and all subsequent
@@ -175,18 +190,111 @@ def _clean_names(names: Any) -> List[str]:
     return [n for n in names if isinstance(n, str) and n.strip()]
 
 
-def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
-    """Drain the Router singleton's instance rails —
-    ``(routing_id, offered, delivered, loaded)``.
+# ── Per-run rails, keyed by the Agents SDK's own trace id ───
+# Telemetry produced INSIDE a run (the routing decision assembled by the
+# instructions callable, the bodies the load_skill tool served, the agent
+# object itself) has to reach `_send_trace`, which runs later on the
+# processor's `on_trace_end`. Two earlier carriers both fail here:
+#
+#   ContextVar — the runner awaits `get_system_prompt` and every tool call
+#     through `asyncio.gather`, which puts each coroutine in its own Task
+#     with a COPIED context. Reads see the outer values; writes are
+#     discarded when the task ends, so nothing set in there ever arrives.
+#   Router instance state — survives the copy, but one process-global
+#     singleton serves every concurrent run, so two parallel `Runner.run`
+#     calls drain each other's rails: whichever trace ends first takes the
+#     other's routing_id and offered set, and the second reports none.
+#
+# `get_current_trace()` is a plain contextvar READ, which the copied
+# context does propagate, and it returns the same trace id the processor
+# sees on `on_trace_end` — so it is the one key both sides agree on.
+_run_rails: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_run_rails_lock = threading.Lock()
+# A run whose trace never ends (crashed processor, `shutdown()` never
+# called) would otherwise pin its rail forever; evict oldest-first.
+_RUN_RAILS_MAX = 256
 
-    The contextvars above stay authoritative wherever they propagate, but
-    under the Agents runner they don't: the dynamic instructions callable
-    and the tool executor both run in a copied context whose writes never
-    reach this trace-send path, so every rail above came back empty on a
-    run that demonstrably routed. The Router carries the same values as
-    instance state; `_send_trace` unions both. Known cost (same as
-    `consume_loaded_names`): concurrent runs sharing one router singleton
-    drain into whichever trace sends first.
+
+def _current_run_key() -> Optional[str]:
+    """The active Agents-SDK trace id, or None outside a run."""
+    try:
+        from agents.tracing import get_current_trace
+        trace = get_current_trace()
+    except Exception:
+        return None
+    trace_id = getattr(trace, "trace_id", None)
+    return trace_id if isinstance(trace_id, str) else None
+
+
+def _rails_for(run_key: str) -> Dict[str, Any]:
+    """The rail dict for one run, created on first use."""
+    with _run_rails_lock:
+        rail = _run_rails.get(run_key)
+        if rail is None:
+            rail = {
+                "routing_id": None,
+                "offered": [],
+                "delivered": [],
+                "loaded": [],
+                "agent": None,
+            }
+            _run_rails[run_key] = rail
+            while len(_run_rails) > _RUN_RAILS_MAX:
+                _run_rails.popitem(last=False)
+        else:
+            _run_rails.move_to_end(run_key)
+        return rail
+
+
+def _record_run_rail(
+    *,
+    routing_id: Optional[str] = None,
+    offered: Optional[List[str]] = None,
+    delivered: Optional[List[str]] = None,
+    loaded: Optional[List[str]] = None,
+    agent: Any = None,
+) -> bool:
+    """Stamp routing/loading telemetry onto the CURRENT run's rail.
+
+    Returns False when there is no active run to attribute to (the caller
+    then leaves the value on the legacy contextvar/router rails).
+    """
+    run_key = _current_run_key()
+    if run_key is None:
+        return False
+    rail = _rails_for(run_key)
+    with _run_rails_lock:
+        if routing_id:
+            rail["routing_id"] = routing_id
+        for key, names in (
+            ("offered", offered), ("delivered", delivered), ("loaded", loaded),
+        ):
+            for name in _clean_names(names):
+                if name not in rail[key]:
+                    rail[key].append(name)
+        if agent is not None:
+            rail["agent"] = agent
+    return True
+
+
+def _pop_run_rail(run_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Read + remove one run's rail. None when the run recorded nothing."""
+    if not run_key:
+        return None
+    with _run_rails_lock:
+        return _run_rails.pop(run_key, None)
+
+
+def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
+    """Drain the Router singleton's process-global instance rails.
+
+    Kept as the fallback for runs that produced no per-run rail (a caller
+    driving the Router outside `Runner.run`, or an Agents SDK old enough to
+    lack `get_current_trace`) and, on every send, as a RESET: an undrained
+    global rail would otherwise leak into the next trace. When the run did
+    record its own rail, `_send_trace` discards what this returns —
+    those names are already attributed correctly and per-run, and under
+    concurrency the global copy is a mix of every live run.
     """
     if _skill_router_singleton is None:
         return None, [], [], []
@@ -240,14 +348,104 @@ def _get_skill_router() -> Any:
         return None
 
 
-def _extract_query(ctx: Any) -> Optional[str]:
-    """Best-effort: pull the user's input out of a RunContextWrapper.
+# Responses-API input items that carry no user-authored text — a turn whose
+# last item is one of these is still routed off the last real user message.
+_NON_TEXT_ITEM_TYPES = frozenset({
+    "function_call", "function_call_output", "computer_call",
+    "computer_call_output", "reasoning", "file_search_call",
+    "web_search_call", "code_interpreter_call", "image_generation_call",
+})
 
-    The Agents SDK doesn't formally expose this on a stable attribute,
-    so we probe several known shapes. If nothing matches we fall back
-    to full-menu mode (query=None) — still useful, just no semantic
-    routing for that call.
+
+def _item_text(item: Any) -> str:
+    """Flatten one Responses-API input item's `content` to plain text.
+
+    ``content`` is either a bare string or a list of parts
+    (``{"type": "input_text", "text": ...}`` / ``output_text`` / ``text`` /
+    ``refusal``). Non-text parts (images, audio) contribute nothing.
     """
+    content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            text = (
+                part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            )
+            if not isinstance(text, str):
+                text = (
+                    part.get("refusal") if isinstance(part, dict)
+                    else getattr(part, "refusal", None)
+                )
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _item_role(item: Any) -> Optional[str]:
+    role = item.get("role") if isinstance(item, dict) else getattr(item, "role", None)
+    return role if isinstance(role, str) else None
+
+
+def _item_type(item: Any) -> Optional[str]:
+    itype = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+    return itype if isinstance(itype, str) else None
+
+
+def _query_from_input_items(raw: Any) -> Optional[str]:
+    """The routable query for a turn: the LAST user message's text.
+
+    ``turn_input`` is the whole conversation the caller handed
+    ``Runner.run`` — on turn 6 of a chat that is six items, not one — so
+    routing on ``items[0]`` would pin every turn to the opening message and
+    routing on the concatenation would drown the current ask in history.
+    The last user message IS the current ask. Falls back to the last item
+    with any text (e.g. a caller that passes only assistant context), then
+    to None (full-menu mode).
+    """
+    if isinstance(raw, str):
+        return raw.strip() or None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+
+    fallback: Optional[str] = None
+    for item in reversed(raw):
+        if _item_type(item) in _NON_TEXT_ITEM_TYPES:
+            continue
+        text = _item_text(item).strip()
+        if not text:
+            continue
+        if _item_role(item) == "user":
+            return text
+        if fallback is None:
+            fallback = text
+    return fallback
+
+
+def _extract_query(ctx: Any) -> Optional[str]:
+    """Pull the turn's user input out of an ``agents.RunContextWrapper``.
+
+    The runner stamps the turn's input items on ``ctx.turn_input``
+    immediately before awaiting ``get_system_prompt`` (which is what calls
+    us), so that attribute is the supported seam. It was previously probed
+    for ``ctx.input`` / ``ctx.user_input`` / ``ctx.query`` — none of which
+    the wrapper has ever defined (its public fields are ``context``,
+    ``usage``, ``turn_input``, ``tool_input``) — so every call fell through
+    to ``query=None`` and semantic routing never engaged: the platform
+    logged ``strategy: full_menu`` and dumped the entire catalogue into the
+    prompt instead of the one skill the turn called for.
+
+    The legacy attribute probes are kept AFTER ``turn_input`` for callers
+    who hand us their own duck-typed context object.
+    """
+    query = _query_from_input_items(getattr(ctx, "turn_input", None))
+    if query:
+        return query
     for attr in ("input", "user_input", "query"):
         val = getattr(ctx, attr, None)
         if isinstance(val, str) and val.strip():
@@ -276,11 +474,25 @@ def _handle_load_skill(name: str) -> str:
     router = _get_skill_router()
     if router is None:
         return "load_skill error: skill router unavailable."
+    run_key = _current_run_key()
+    # Only pass `scope` when there IS a run to scope to, so a router that
+    # predates the parameter is untouched on the unscoped path.
+    kwargs = {"scope": run_key} if run_key else {}
     try:
-        return router.load_skill(name)
+        result = router.load_skill(name, **kwargs)
+    except TypeError:
+        # Router from an older SDK — no per-run scope parameter.
+        result = router.load_skill(name)
     except Exception:
         logger.debug("load_skill handler failed (non-fatal)", exc_info=True)
         return f"load_skill error: could not load {name!r} (transient error)."
+    # Attribute the load to THIS run rather than to whichever trace next
+    # drains the router's shared `_loaded_names`. A body actually served
+    # is the only thing that counts as loaded; a budget refusal or a
+    # not-found message is not.
+    if isinstance(result, str) and result.startswith(f"## Skill: {name}"):
+        _record_run_rail(loaded=[name])
+    return result
 
 
 def _make_load_skill_tool() -> Any:
@@ -314,6 +526,27 @@ def _agent_has_load_skill_tool(agent: Any) -> bool:
     )
 
 
+def _load_skill_reachable(agent: Any) -> bool:
+    """Whether load_skill will be on the tool list this turn.
+
+    An agent built BEFORE `instrument(enable_skill_loader=True)` doesn't
+    carry the tool on `agent.tools` — `get_all_tools` appends it at
+    resolution time instead — so checking the declared list alone would
+    suppress the prompt hint for exactly the agents the retrofit exists
+    to serve.
+    """
+    if _agent_has_load_skill_tool(agent):
+        return True
+    return bool(_skill_loader_installed and _load_skill_tool_enabled())
+
+
+# Marks our own wrapped-instructions callable so the class-level
+# `get_system_prompt` retrofit can tell "already skill-aware" from "a
+# callable the user wrote", and so `_introspect_agent` can still see the
+# static base prompt underneath it.
+_BASE_INSTRUCTIONS_ATTR = "__decimalai_base_instructions__"
+
+
 def _make_skill_aware_instructions(base: str):
     """Return a sync callable usable as `Agent.instructions`."""
 
@@ -322,10 +555,22 @@ def _make_skill_aware_instructions(base: str):
             router = _get_skill_router()
             if router is None:
                 return base
-            fragment, routing_id = router.build_prompt_fragment(
-                query=_extract_query(ctx),
-                agent_name=getattr(agent, "name", None),
-            )
+            run_key = _current_run_key()
+            # Only pass `scope` when there IS a run to scope to, so a router
+            # that predates the parameter is untouched on the unscoped path.
+            kwargs = {"scope": run_key} if run_key else {}
+            try:
+                fragment, routing_id = router.build_prompt_fragment(
+                    query=_extract_query(ctx),
+                    agent_name=getattr(agent, "name", None),
+                    **kwargs,
+                )
+            except TypeError:
+                # Router from an older SDK — no per-run scope parameter.
+                fragment, routing_id = router.build_prompt_fragment(
+                    query=_extract_query(ctx),
+                    agent_name=getattr(agent, "name", None),
+                )
             if routing_id:
                 _set_routing_id(routing_id)
             # Pull the names the Router offered for this call and
@@ -341,12 +586,21 @@ def _make_skill_aware_instructions(base: str):
             delivered = consume_last_delivered_names()
             if delivered:
                 _add_skills_delivered(delivered)
+            # The contextvar writes above are made inside the Task the
+            # runner gathers this callable in, so they die with it. Mirror
+            # everything onto THIS run's rail, which `_send_trace` can read.
+            _record_run_rail(
+                routing_id=routing_id,
+                offered=offered,
+                delivered=delivered,
+                agent=agent,
+            )
             if not fragment:
                 return base
-            # Tell the model how bodies arrive — only when this
-            # agent actually has the tool. We append to the server fragment
-            # and leave its activation-statement instruction unchanged.
-            if _agent_has_load_skill_tool(agent):
+            # Tell the model how bodies arrive — only when load_skill will
+            # actually be on this turn's tool list. We append to the server
+            # fragment and leave its activation-statement instruction unchanged.
+            if _load_skill_reachable(agent):
                 from .skill_router import LOAD_SKILL_PROMPT_HINT
                 fragment = f"{fragment}\n{LOAD_SKILL_PROMPT_HINT}"
             return f"{fragment}\n\n{base}".strip() if base else fragment
@@ -355,16 +609,135 @@ def _make_skill_aware_instructions(base: str):
             logger.debug("Skill loader callable failed (non-fatal)", exc_info=True)
             return base
 
+    setattr(instructions_fn, _BASE_INSTRUCTIONS_ATTR, base)
     return instructions_fn
 
 
-def _install_skill_loader() -> None:
-    """Monkey-patch `agents.Agent.__init__` so new Agents auto-load skills.
+# ── Class-level retrofit (works on Agents built before instrument()) ──
+# `__init__` patching can only ever reach objects constructed AFTER the
+# patch, so an Agent defined at import time — the overwhelmingly common
+# shape, since agents are module-level constants — silently got no skills
+# and no load_skill tool. `Agent.get_system_prompt` and
+# `Agent.get_all_tools` are resolved off the CLASS on every turn, so
+# patching them serves every agent regardless of when it was built.
+_agent_hooks_installed = False
+_HOOK_MARKER = "__decimalai_hooked__"
+# Emitted once, not per turn, when we retrofit an agent the constructor
+# patch missed.
+_retrofit_notice_emitted = False
 
-    Idempotent — safe to call multiple times. Only wraps string-typed
-    `instructions`; if a user passed their own callable, we leave it
-    alone (their judgment > ours). Also registers the load_skill tool on
-    every new Agent unless config disables it.
+
+def _install_agent_hooks() -> bool:
+    """Wrap `Agent.get_system_prompt` / `Agent.get_all_tools` once.
+
+    Always installed by `instrument()`, whether or not the skill loader is
+    on: the prompt hook is also how the tracer gets its hands on the live
+    Agent object, which is the only place the agent's declared model and
+    tool schemas exist for runs that never complete a model call.
+
+    Returns True when the hooks are in place.
+    """
+    global _agent_hooks_installed
+    if _agent_hooks_installed:
+        return True
+    try:
+        from agents import Agent
+    except ImportError:
+        return False
+
+    original_gsp = getattr(Agent, "get_system_prompt", None)
+    original_gat = getattr(Agent, "get_all_tools", None)
+    if original_gsp is None or getattr(original_gsp, _HOOK_MARKER, False):
+        return original_gsp is not None
+
+    async def patched_get_system_prompt(self, run_context):  # type: ignore[no-untyped-def]
+        base = await original_gsp(self, run_context)
+        try:
+            # Hand the live agent to the trace processor. This is the ONLY
+            # path on which a run that trips a guardrail or fails its first
+            # model call can still declare a manifest — the spans such a run
+            # emits carry no model and an empty tool list.
+            _record_run_rail(agent=self)
+        except Exception:
+            logger.debug("agent observation failed (non-fatal)", exc_info=True)
+        if not _skill_loader_installed:
+            return base
+        try:
+            current = getattr(self, "instructions", None)
+            if callable(current) and hasattr(current, _BASE_INSTRUCTIONS_ATTR):
+                # Built after instrument(): the constructor already wrapped
+                # `instructions`, and `original_gsp` just called it. Adding
+                # the fragment again here would inject the skills menu twice.
+                return base
+            if callable(current):
+                return base  # a callable the user wrote — their judgment wins
+            _note_retrofit(self)
+            return _make_skill_aware_instructions(base or "")(run_context, self)
+        except Exception:
+            logger.debug("skill-aware prompt retrofit failed (non-fatal)", exc_info=True)
+            return base
+
+    setattr(patched_get_system_prompt, _HOOK_MARKER, True)
+    Agent.get_system_prompt = patched_get_system_prompt  # type: ignore[method-assign]
+
+    if original_gat is not None and not getattr(original_gat, _HOOK_MARKER, False):
+        async def patched_get_all_tools(self, run_context):  # type: ignore[no-untyped-def]
+            tools = await original_gat(self, run_context)
+            if not _skill_loader_installed or not _load_skill_tool_enabled():
+                return tools
+            try:
+                if any(getattr(t, "name", None) == "load_skill" for t in tools):
+                    return tools  # already declared (constructor path, or the user's own)
+                tool = _make_load_skill_tool()
+                if tool is None:
+                    return tools
+                _note_retrofit(self)
+                # Return a new list — never mutate the caller's resolved
+                # tools or the agent's declared `tools` attribute.
+                return [*tools, tool]
+            except Exception:
+                logger.debug(
+                    "load_skill tool retrofit failed (non-fatal)", exc_info=True
+                )
+                return tools
+
+        setattr(patched_get_all_tools, _HOOK_MARKER, True)
+        Agent.get_all_tools = patched_get_all_tools  # type: ignore[method-assign]
+
+    _agent_hooks_installed = True
+    return True
+
+
+def _note_retrofit(agent: Any) -> None:
+    """Log once that we served an Agent the constructor patch never saw."""
+    global _retrofit_notice_emitted
+    if _retrofit_notice_emitted:
+        return
+    _retrofit_notice_emitted = True
+    logger.info(
+        "DecimalAI retrofitted skills onto agent %r, which was constructed "
+        "before instrument(enable_skill_loader=True). Skills and the "
+        "load_skill tool are attached per-run, so nothing is lost; "
+        "call instrument() before building your agents to have them "
+        "attached at construction instead.",
+        getattr(agent, "name", "<unnamed>"),
+    )
+
+
+def _install_skill_loader() -> None:
+    """Turn on per-run skill loading for `agents.Agent`.
+
+    Two layers, both idempotent:
+
+    1. `Agent.__init__` — agents built from here on get their string
+       `instructions` wrapped into the skill-aware callable and the
+       load_skill tool appended to their declared tool list. A
+       user-supplied instructions callable is left alone (their
+       judgment > ours).
+    2. `Agent.get_system_prompt` / `Agent.get_all_tools` (see
+       `_install_agent_hooks`) — the same two affordances, attached at
+       RUN time, for agents that already existed when this was called.
+       Layer 1 marks what it wraps so layer 2 never double-injects.
     """
     global _skill_loader_installed
     if _skill_loader_installed:
@@ -404,11 +777,49 @@ def _install_skill_loader() -> None:
 
     Agent.__init__ = patched_init  # type: ignore[method-assign]
     _skill_loader_installed = True
-    logger.info("DecimalAI SkillRouter loader installed (OpenAI Agents)")
+
+    if _install_agent_hooks():
+        logger.info(
+            "DecimalAI SkillRouter loader installed (OpenAI Agents; agents "
+            "constructed before this call are retrofitted per-run)"
+        )
+    else:
+        # No class hooks to patch → the constructor patch is all we have,
+        # and an already-built agent will silently get no skills. Say so.
+        warnings.warn(
+            "decimalai: this openai-agents build has no "
+            "Agent.get_system_prompt/get_all_tools to hook, so only Agents "
+            "constructed AFTER instrument(enable_skill_loader=True) receive "
+            "skills and the load_skill tool. Move instrument() above your "
+            "Agent(...) definitions, or upgrade openai-agents.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        logger.warning(
+            "DecimalAI SkillRouter loader installed WITHOUT run-time retrofit "
+            "(OpenAI Agents) — agents built before this call get no skills"
+        )
 
 # ── Type aliases for duck-typing against the OpenAI Agents SDK ──
 # We avoid hard imports so the module loads even without openai-agents installed.
 # At runtime, the actual Trace and Span objects are passed to us by the SDK.
+
+
+def _agent_model_name(agent: Any) -> Optional[str]:
+    """Resolve the model NAME an Agent declares.
+
+    ``agent.model`` is either a bare string ("gpt-5-mini") or a Model
+    instance (e.g. an OpenAIChatCompletionsModel pointed at a non-OpenAI
+    provider). ``str()`` on a Model instance yields a useless object repr,
+    so pull ``.model`` / ``.name``.
+    """
+    model = getattr(agent, "model", None)
+    if model is None:
+        return None
+    if isinstance(model, str):
+        return model or None
+    name = getattr(model, "model", None) or getattr(model, "name", None)
+    return name if isinstance(name, str) and name else None
 
 
 def _introspect_agent(agent: Any) -> Dict[str, Any]:
@@ -425,12 +836,18 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
     """
     result: Dict[str, Any] = {}
 
-    # Extract tools with full schemas
+    # Extract tools with full schemas. load_skill is excluded: it is an SDK
+    # affordance this adapter attaches, not part of the agent's declared
+    # contract — including it would make the manifest (and therefore the
+    # version history) differ purely on whether the skill loader was on.
     agent_tools = getattr(agent, "tools", None) or []
     if agent_tools:
         tools_list = []
         for t in agent_tools:
-            tool_entry: Dict[str, Any] = {"name": getattr(t, "name", str(t))}
+            name = getattr(t, "name", None) or str(t)
+            if name == "load_skill":
+                continue
+            tool_entry: Dict[str, Any] = {"name": name}
             # FunctionTool has params_json_schema
             schema = getattr(t, "params_json_schema", None)
             if schema:
@@ -441,29 +858,26 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
                 if schema:
                     tool_entry["schema"] = schema
             tools_list.append(tool_entry)
-        result["tools"] = tools_list
+        if tools_list:
+            result["tools"] = tools_list
 
-    # Extract instructions as prompt
+    # Extract instructions as prompt. When the skill loader wrapped a
+    # string `instructions` into its per-run callable, read the static base
+    # back off the wrapper: without this, turning the loader on silently
+    # DELETED the prompt component from the manifest, and prompt-drift
+    # detection went blind for exactly the installs using skills.
     instructions = getattr(agent, "instructions", None)
+    if callable(instructions):
+        instructions = getattr(instructions, _BASE_INSTRUCTIONS_ATTR, None)
     if instructions and isinstance(instructions, str):
         result["prompts"] = {"system": instructions}
 
-    # Extract model — resolve the model NAME whether `agent.model` is a bare
-    # string ("gpt-5-mini") or a Model instance (e.g. an
-    # OpenAIChatCompletionsModel pointed at a non-OpenAI provider). str() on a
-    # Model instance yields a useless object repr, so pull `.model`/`.name`.
-    model = getattr(agent, "model", None)
-    if model is not None:
-        if isinstance(model, str):
-            model_name = model
-        else:
-            _n = getattr(model, "model", None) or getattr(model, "name", None)
-            model_name = _n if isinstance(_n, str) else ""
-        if model_name:
-            result["models"] = {"default": {
-                "provider": _infer_provider(model_name),
-                "model": model_name,
-            }}
+    model_name = _agent_model_name(agent)
+    if model_name:
+        result["models"] = {"default": {
+            "provider": _infer_provider(model_name),
+            "model": model_name,
+        }}
 
     # Extract handoffs as subagents
     handoffs = getattr(agent, "handoffs", None) or []
@@ -667,6 +1081,12 @@ def instrument(
         from .skill_router import _warn_if_disk_runtime_detected
         _warn_if_disk_runtime_detected("openai_agents")
         _install_skill_loader()
+    else:
+        # Always hook the Agent class, loader or not: the get_system_prompt
+        # wrapper is how the trace processor gets the live Agent object, and
+        # without it a run that never completes a model call has nothing to
+        # declare a manifest from — so ingest 400s and the trace is lost.
+        _install_agent_hooks()
 
     logger.info(
         "DecimalAI OpenAI Agents tracing installed (agent_name=%s, exclusive=%s, agent_introspected=%s, skill_loader=%s, disk_sync=%s)",
@@ -678,13 +1098,161 @@ def instrument(
     )
 
 
+def _declare(
+    agent_name: str,
+    *,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    models: Optional[Dict[str, Dict[str, Any]]] = None,
+    subagents: Optional[List[Dict[str, Any]]] = None,
+    prompts: Optional[Dict[str, str]] = None,
+    from_agent: bool = False,
+) -> Dict[str, Any]:
+    """Merge what one observation saw into the agent's running declaration.
+
+    The manifest an agent registers must describe the AGENT, not whichever
+    slice of it a particular run happened to expose. Registering per-run
+    slices makes the declared surface flap — a run that never reached the
+    tool loop looks like "all tools removed", which agentversion classifies
+    breaking/major and the platform turns into a replay verdict and a
+    fabricated version bump. So the declaration only ever grows: each
+    observation is unioned in, and the union is what gets registered.
+
+    ``from_agent`` marks an observation taken off the ``Agent`` object
+    itself — the author's declaration, as opposed to what a response
+    happened to report.
+    """
+    with _manifest_lock:
+        state = _declared.setdefault(
+            agent_name,
+            {"tools": {}, "models": {}, "subagents": {}, "prompts": {},
+             "models_declared": set()},
+        )
+        for tool in tools or ():
+            name = tool.get("name")
+            if not name:
+                continue
+            # A later observation with a full JSON schema beats an earlier
+            # name-only one (span data carries names; the Agent object carries
+            # schemas), but never the reverse.
+            if len(tool) >= len(state["tools"].get(name, {})):
+                state["tools"][name] = tool
+        for key, cfg in (models or {}).items():
+            if not cfg:
+                continue
+            # The model the agent DECLARES wins over the one a response
+            # reports. They differ — `model="gpt-4.1-mini"` comes back as
+            # `gpt-4.1-mini-2025-04-14` — and letting the resolved snapshot
+            # into the contract means every silent snapshot rotation at the
+            # provider mints a breaking version bump nobody asked for. What
+            # actually ran is already on the trace: `llm_calls[].model_name`
+            # carries the resolved id per call. The manifest states the
+            # declaration; the trace states the execution.
+            if key in state["models_declared"] and not from_agent:
+                continue
+            state["models"][key] = cfg
+            if from_agent:
+                state["models_declared"].add(key)
+        for sub in subagents or ():
+            name = sub.get("name")
+            if name:
+                state["subagents"][name] = sub
+        for key, text in (prompts or {}).items():
+            if text:
+                state["prompts"][key] = text
+        return {
+            "tools": list(state["tools"].values()) or None,
+            "models": dict(state["models"]) or None,
+            "subagents": list(state["subagents"].values()) or None,
+            "prompts": dict(state["prompts"]) or None,
+        }
+
+
+def _adopt_existing_manifest(agent_name: str) -> Optional[str]:
+    """The id of the manifest this agent is already registered under.
+
+    Used when a run has NOTHING structural to declare (no tool, no model —
+    a guardrail tripwire, a run that died before its first model call).
+    Registering an empty manifest there would be a lie in the loud
+    direction: the diff engine reads a contract that goes from empty to
+    populated as ``provider: '' → 'openai'``, which is breaking/major, so
+    one unlucky first run fabricates a "replay everything" version bump on
+    the next healthy one. Pointing the trace at the contract already on
+    file says the honest thing instead — this run declared nothing new.
+    """
+    from . import _config
+
+    try:
+        client = _config._get_client()
+        result = client.list_manifests(agent_name=agent_name, limit=10)
+    except Exception:
+        logger.debug("manifest lookup for %s failed (non-fatal)", agent_name, exc_info=True)
+        return None
+    rows = (result or {}).get("manifests") if isinstance(result, dict) else None
+    if not rows:
+        return None
+    # Newest-first; prefer the ACTIVE row (a superseded one would attribute
+    # the run to a contract the agent has already moved off).
+    candidates = [r for r in rows if isinstance(r, dict)]
+    for row in candidates:
+        if row.get("status") == "active" and isinstance(row.get("id"), str):
+            return row["id"]
+    for row in candidates:
+        if isinstance(row.get("id"), str):
+            return row["id"]
+    return None
+
+
+def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
+    """Register one snapshot, returning the manifest id (None on failure).
+
+    Dedup is keyed by (agent, hash). ``ManifestTracker`` is a single slot
+    and the hash it stores does NOT include the agent name, so two agents
+    with the same structure in one process deduped against each other and
+    the second one's traces came back with no manifest at all.
+    """
+    global _manifest_id
+    from . import _config
+
+    with _manifest_lock:
+        # A caller (notably a test fixture) that swapped in a fresh
+        # ManifestTracker is asking for registration state to be forgotten;
+        # honour that for the per-agent map too, or the reset is a no-op.
+        if _manifest_tracker.last_hash is None and _manifest_hashes:
+            _manifest_hashes.clear()
+            _manifest_ids.clear()
+        known = _manifest_ids.get(agent_name)
+        if known and _manifest_hashes.get(agent_name) == snapshot.manifest_hash:
+            return known  # Same agent, same structure — already registered
+        _manifest_tracker.check_and_update(snapshot)
+        try:
+            client = _config._get_client()
+            result = client.register_manifest(snapshot)
+            manifest_id = result.get("manifest_id", snapshot.id)
+        except Exception:
+            # Leave the per-agent hash unset so the next trace retries; a
+            # transient blip must not permanently stop this agent from ever
+            # declaring a manifest.
+            logger.warning("Failed to register manifest for %s", agent_name, exc_info=True)
+            return None
+        _manifest_ids[agent_name] = manifest_id
+        _manifest_hashes[agent_name] = snapshot.manifest_hash
+        _manifest_id = manifest_id
+        logger.info(
+            "Registered manifest %s for %s (hash=%s, components=%d)",
+            manifest_id,
+            agent_name,
+            snapshot.manifest_hash[:12],
+            len(snapshot.components),
+        )
+        return manifest_id
+
+
 def _register_manifest_from_agent(
     agent: Any,
     agent_name: Optional[str],
     skills: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Register a manifest by introspecting an Agent object at install time."""
-    global _manifest_id
     from . import _config
 
     if not _config._is_enabled():
@@ -693,29 +1261,24 @@ def _register_manifest_from_agent(
     try:
         data = _introspect_agent(agent)
         resolved_name = agent_name or getattr(agent, "name", "unknown")
+        declared = _declare(
+            resolved_name,
+            tools=data.get("tools"),
+            models=data.get("models"),
+            subagents=data.get("subagents"),
+            prompts=data.get("prompts"),
+            from_agent=True,
+        )
 
         snapshot = extract_from_config(
             agent_name=resolved_name,
-            tools=data.get("tools"),
-            prompts=data.get("prompts"),
-            models=data.get("models"),
-            subagents=data.get("subagents"),
+            tools=declared["tools"],
+            prompts=declared["prompts"],
+            models=declared["models"],
+            subagents=declared["subagents"],
             skills=skills,
         )
-
-        with _manifest_lock:
-            if not _manifest_tracker.check_and_update(snapshot):
-                return  # Same hash — already registered
-
-            client = _config._get_client()
-            result = client.register_manifest(snapshot)
-            _manifest_id = result.get("manifest_id", snapshot.id)
-            logger.info(
-                "Registered manifest %s from Agent introspection (hash=%s, components=%d)",
-                _manifest_id,
-                snapshot.manifest_hash[:12],
-                len(snapshot.components),
-            )
+        _register_snapshot(resolved_name, snapshot)
     except Exception:
         logger.warning("Failed to register manifest from Agent introspection", exc_info=True)
 
@@ -755,6 +1318,24 @@ class _TraceAccumulator:
         # Bodies that reached the model (Router body injection) —
         # between offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
+
+    @property
+    def live_agent(self) -> Any:
+        """The `agents.Agent` object this run is executing, if we saw it.
+
+        Recorded by the `get_system_prompt` hook, which the runner calls on
+        every turn — including turns that go on to fail. It is the only
+        source of the agent's declared model and tool schemas for runs whose
+        spans carry neither.
+        """
+        with _run_rails_lock:
+            rail = _run_rails.get(self.trace_id)
+            return rail.get("agent") if rail else None
+
+    @property
+    def declared_model_name(self) -> Optional[str]:
+        agent = self.live_agent
+        return _agent_model_name(agent) if agent is not None else None
 
 
 class DecimalTracingProcessor:
@@ -1006,10 +1587,17 @@ class DecimalTracingProcessor:
         span_error = getattr(span, "error", None)
         status = Status.ERROR if span_error else Status.SUCCESS
 
-        # Accumulate tools for manifest (names only from span data)
+        # Accumulate tools for manifest (names only from span data).
+        # `load_skill` is skipped for the same reason `_introspect_agent`
+        # skips it: it is an SDK affordance this adapter attaches at run
+        # time, so counting it would make the declared tool set — and
+        # therefore the manifest version — depend on whether the skill
+        # loader happened to be on.
         span_tools = getattr(span_data, "tools", None) or []
         for tool_name in span_tools:
             name_str = str(tool_name)
+            if name_str == "load_skill":
+                continue
             if name_str not in acc.seen_tools:
                 acc.seen_tools[name_str] = {"name": name_str}
 
@@ -1109,13 +1697,20 @@ class DecimalTracingProcessor:
                 error_msg = span_error.get("message", "") if isinstance(span_error, dict) else str(span_error)
                 output_dict = {"error": error_msg[:500]}
 
-        if response_obj is not None or span_error:
+        # A failed call has no Response object and so no model name — but
+        # ingest REJECTS an llm_call without one ("llm_calls[0]:
+        # 'model_name' is required"), which threw away the whole trace,
+        # errors included. Fall back to the model the agent declared;
+        # if even that is unknown, keep the error on the span and skip
+        # the record rather than poison the trace with it.
+        call_model = model or acc.declared_model_name
+        if response_obj is not None or (span_error and call_model):
             call = LlmCallRecord(
                 id=uuid4(),
                 span_id=parent_id,
                 agent_name=acc.agent_name or self.default_agent_name,
-                provider=_infer_provider(model),
-                model_name=model,
+                provider=_infer_provider(call_model),
+                model_name=call_model,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 rendered_input=_normalize_messages(raw_input),
@@ -1263,8 +1858,8 @@ class DecimalTracingProcessor:
         agent_name = acc.agent_name or self.default_agent_name or acc.trace_name
         ended_at = datetime.now(timezone.utc)
 
-        # Auto-register manifest from span data (fallback if no Agent was passed)
-        self._maybe_register_manifest(acc, agent_name)
+        # Auto-register manifest from span data + the live Agent object
+        manifest_id = self._maybe_register_manifest(acc, agent_name)
 
         # Auto-detect skill activations from LLM calls
         self._detect_skills(acc)
@@ -1279,16 +1874,34 @@ class DecimalTracingProcessor:
                 entry["hash"] = h
             active_skills_list.append(entry)
 
-        # Drain the Router's instance rails first, unconditionally — see
-        # `_drain_router_rails`. Unconditional because an undrained rail
-        # leaks into the NEXT trace.
-        rail_routing_id, rail_offered, rail_delivered, rail_loaded = _drain_router_rails()
+        # This run's own rail — routing decision, delivered bodies, loads —
+        # keyed by the trace id both the instructions callable and this
+        # method see. Popped, so it can't leak into a later trace.
+        run_rail = _pop_run_rail(acc.trace_id) or {}
+
+        # Drain the Router's process-global rails unconditionally: an
+        # undrained rail leaks into the NEXT trace. When this run recorded
+        # its own, the global copy is DISCARDED rather than merged — under
+        # concurrency it holds a mix of every live run, and merging it is
+        # exactly how one trace used to steal another's routing_id and
+        # offered set.
+        g_routing_id, g_offered, g_delivered, g_loaded = _drain_router_rails()
+        if run_rail:
+            rail_routing_id = run_rail.get("routing_id")
+            rail_offered = _clean_names(run_rail.get("offered"))
+            rail_delivered = _clean_names(run_rail.get("delivered"))
+            rail_loaded = _clean_names(run_rail.get("loaded"))
+        else:
+            rail_routing_id, rail_offered, rail_delivered, rail_loaded = (
+                g_routing_id, g_offered, g_delivered, g_loaded,
+            )
 
         # SkillRouter: consume the routing_id set by the dynamic
         # instructions callable. We read at trace-end (not start)
         # because the instructions callable fires AFTER on_trace_start.
-        # The rail is the fallback: the runner copies the context around
-        # that callable, so its contextvar write never reaches here.
+        # An explicit annotation that DID reach this context wins; the rail
+        # is what covers the normal path, where the runner gathers that
+        # callable in its own Task and the contextvar write never arrives.
         if acc.routing_id is None:
             acc.routing_id = _consume_routing_id() or rail_routing_id
 
@@ -1331,7 +1944,7 @@ class DecimalTracingProcessor:
             spans=acc.spans,
             llm_calls=acc.llm_calls,
             active_skills=active_skills_list,
-            manifest_id=_manifest_id,
+            manifest_id=manifest_id,
             parent_trace_id=get_parent_trace(),
             routing_id=acc.routing_id,
             # Sorted for deterministic output (tests, diffs).
@@ -1381,54 +1994,100 @@ class DecimalTracingProcessor:
 
     def _maybe_register_manifest(
         self, acc: _TraceAccumulator, agent_name: str
-    ) -> None:
-        """Extract and register manifest from accumulated span data.
+    ) -> Optional[str]:
+        """Resolve the manifest id this trace should be ingested under.
 
-        This is the fallback path when no Agent object was passed to instrument().
-        Thread-safe via _manifest_lock.
+        Ingest REQUIRES a manifest_id (``require_manifest_on_ingest``
+        defaults on, and is on in production), so anything that returns
+        None here costs the entire trace: the POST comes back 400 and the
+        run is never recorded. This used to short-circuit on
+        ``if not tools and not models: return``, which is precisely the
+        state of every run that trips an input guardrail or dies before its
+        first model call — the failures you most want to see were the ones
+        systematically dropped.
+
+        Three sources, in descending order of authority:
+
+        1. The live ``Agent`` object, captured by the `get_system_prompt`
+           hook. It carries the declared model and full tool schemas even
+           when the run produced no successful model call.
+        2. Span data — model from the response/generation span, tool names
+           from the agent span.
+        3. Whatever this process already declared for this agent
+           (`_declare` unions 1 and 2 across every trace, so the declared
+           surface only ever grows).
+
+        When all three are structurally empty we do NOT invent a manifest;
+        see `_adopt_existing_manifest` for why an empty one is the
+        expensive answer.
         """
-        global _manifest_id
         from . import _config
 
         if not _config._is_enabled():
-            return
+            return None
 
-        # If manifest was already registered via Agent introspection, skip
-        if _manifest_id is not None:
-            return
+        agent = acc.live_agent
+        if agent is not None:
+            try:
+                data = _introspect_agent(agent)
+                _declare(
+                    agent_name,
+                    tools=data.get("tools"),
+                    models=data.get("models"),
+                    subagents=data.get("subagents"),
+                    prompts=data.get("prompts"),
+                    from_agent=True,
+                )
+            except Exception:
+                logger.debug("live-agent introspection failed", exc_info=True)
 
-        # Need at least tools or model to register
-        tools = list(acc.seen_tools.values()) if acc.seen_tools else None
-        models = {"default": acc.seen_model} if acc.seen_model else None
-        subagents = [{"name": h} for h in acc.seen_handoffs] if acc.seen_handoffs else None
+        declared = _declare(
+            agent_name,
+            tools=list(acc.seen_tools.values()) or None,
+            models={"default": acc.seen_model} if acc.seen_model else None,
+            subagents=[{"name": h} for h in acc.seen_handoffs] or None,
+        )
 
-        if not tools and not models:
-            return
+        # Structural identity is tools + models (MANIFEST_VERSIONING §2.5);
+        # a declaration with neither says nothing about the agent's contract.
+        if not declared["tools"] and not declared["models"]:
+            existing = _manifest_ids.get(agent_name)
+            if existing:
+                return existing
+            adopted = _adopt_existing_manifest(agent_name)
+            if adopted:
+                _manifest_ids[agent_name] = adopted
+                logger.debug(
+                    "Run declared nothing structural; attributing trace to %s's "
+                    "existing manifest %s", agent_name, adopted,
+                )
+                return adopted
+            # Genuinely nothing on file either — this agent's first
+            # observation. A component-less manifest is a supported shape
+            # and it has no predecessor, so it mints no diff and no version
+            # bump; it exists so the trace is kept rather than 400'd.
+            logger.info(
+                "Registering a component-less manifest for %s — this run "
+                "exposed no model or tools (it did not reach a model call). "
+                "Pass instrument(agent=your_agent) to declare the contract "
+                "up front.",
+                agent_name,
+            )
 
         snapshot = extract_from_config(
             agent_name=agent_name,
-            tools=tools,
-            models=models,
-            subagents=subagents,
+            tools=declared["tools"],
+            prompts=declared["prompts"],
+            models=declared["models"],
+            subagents=declared["subagents"],
+            skills=self._skills_registry or None,
         )
-
-        with _manifest_lock:
-            if not _manifest_tracker.check_and_update(snapshot):
-                return  # Same hash — already registered
-
-            try:
-                client = _config._get_client()
-                result = client.register_manifest(snapshot)
-                _manifest_id = result.get("manifest_id", snapshot.id)
-                logger.info(
-                    "Registered manifest %s from span data (hash=%s, components=%d)",
-                    _manifest_id,
-                    snapshot.manifest_hash[:12],
-                    len(snapshot.components),
-                )
-            except Exception:
-                logger.warning("Failed to register manifest from spans", exc_info=True)
-                _manifest_id = snapshot.id
+        registered = _register_snapshot(agent_name, snapshot)
+        if registered:
+            return registered
+        # Registration failed (network blip, auth). Fall back to the last
+        # id we held for this agent so a hiccup doesn't drop the trace too.
+        return _manifest_ids.get(agent_name) or snapshot.id
 
 
 # ── Utilities ──────────────────────────────────────────────
@@ -1490,21 +2149,80 @@ def _response_output_text(response_obj: Any) -> Optional[str]:
 
 
 def _normalize_messages(raw: Any) -> Optional[List[Dict[str, Any]]]:
-    """Normalize message input to the DecimalAI rendered_input format."""
+    """Normalize Responses-API input items to the rendered_input format.
+
+    The default Agents path speaks the Responses API, whose input list is
+    NOT chat-completions messages: a tool-using turn is mostly
+    ``function_call`` / ``function_call_output`` / ``reasoning`` items that
+    carry no ``role`` and no ``content``. Applying the chat shape to them
+    — ``{"role": item.get("role", "user"), "content": str(item.get(
+    "content", ""))}`` — collapsed 6 of 7 recorded messages to
+    ``{"role": "user", "content": ""}``, so the trace showed an agent that
+    apparently said nothing and called nothing, and the backend derived
+    ``user_input_preview`` from the last of those empty rows.
+
+    Each item now keeps its real role, its text flattened out of the parts
+    list, and its item ``type`` where that is the only thing identifying it.
+    """
     if raw is None:
         return None
-    if isinstance(raw, (list, tuple)):
-        result = []
-        for item in raw:
-            if isinstance(item, dict):
-                result.append({
-                    "role": item.get("role", "user"),
-                    "content": str(item.get("content", "")),
-                })
-            else:
+    if isinstance(raw, str):
+        return [{"role": "user", "content": raw}]
+    if not isinstance(raw, (list, tuple)):
+        return [{"role": "user", "content": str(raw)}]
+
+    result: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            # A pydantic Responses item — dump it, else fall back to str().
+            dumped = getattr(item, "model_dump", None)
+            if callable(dumped):
+                try:
+                    item = dumped(exclude_none=True)
+                except Exception:
+                    item = None
+            if not isinstance(item, dict):
                 result.append({"role": "user", "content": str(item)})
-        return result
-    return [{"role": "user", "content": str(raw)}]
+                continue
+
+        itype = _item_type(item)
+        role = _item_role(item)
+
+        if itype == "function_call":
+            result.append({
+                "role": role or "assistant",
+                "type": "function_call",
+                "name": item.get("name"),
+                "content": str(item.get("arguments") or ""),
+            })
+        elif itype == "function_call_output":
+            result.append({
+                "role": role or "tool",
+                "type": "function_call_output",
+                "content": _stringify(item.get("output")),
+            })
+        elif itype == "reasoning":
+            summary = item.get("summary") or []
+            text = "".join(
+                s.get("text", "") if isinstance(s, dict) else str(s) for s in summary
+            ) if isinstance(summary, (list, tuple)) else _stringify(summary)
+            result.append({"role": role or "assistant", "type": "reasoning", "content": text})
+        else:
+            entry: Dict[str, Any] = {
+                "role": role or "user",
+                "content": _item_text(item) or _stringify(item.get("content")),
+            }
+            if itype and itype != "message":
+                entry["type"] = itype
+            result.append(entry)
+    return result
+
+
+def _stringify(value: Any) -> str:
+    """A message body as text — '' for None, verbatim for str."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
 
 
 def _infer_provider(model: Optional[str]) -> Optional[str]:
