@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decimalai"
-version = "0.10.2"
+version = "0.10.3"
 description = "Open source SDK for manifest-aware agent change management"
 readme = "README.md"
 license = {text = "MIT"}

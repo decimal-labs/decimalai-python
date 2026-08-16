@@ -9,8 +9,25 @@ push access; this file documents the process so a contributor can see what a cha
 
 ## How publishing works
 
-`decimalai` publishes **from a maintainer's machine with `twine`**, and tags a GitHub Release afterwards
-as a record of what shipped.
+`decimalai` publishes **from CI, via PyPI Trusted Publishing**, triggered by publishing a GitHub
+Release. There is no token anywhere: the workflow exchanges a short-lived OIDC identity that PyPI
+verifies against a publisher row naming this repo, `publish.yml`, and the `pypi` environment.
+
+> **Inverted 2026-08-16.** This used to publish by `twine` from a maintainer's machine, on the
+> reasoning that *"CI availability must never block a release."* That reasoning came from the period
+> when Actions was billing-blocked on private repos — it is gone: Actions is free and unmetered on
+> public repos, and the OIDC path has now been proven three times (`decimalai-mcp 0.1.3`,
+> `agentversion 0.2.3`, `skillevaluation 0.7.1`, each with a verified attestation).
+>
+> What the local path cost, measured: **0 of 22 published `decimalai` files carry provenance**, and
+> **0.10.1 and 0.10.2 were never tagged** — two shipped versions with no commit marked in the repo,
+> because nothing in a laptop upload forces a tag. The CI path cannot have either problem: the tag
+> *is* the trigger, and the attestation is automatic.
+>
+> The one durable reason for a local step remains and is unchanged — **CI has no provider keys, so
+> the live-LLM gate cannot run there.** That argues for running the gate locally and letting CI do
+> the *upload*; the two are separable. Run `scripts/release.sh`'s gate, see it green, then cut the
+> Release. `twine` stays documented below as the fallback for when PyPI or Actions is unavailable.
 
 It used to work the other way round: a published GitHub Release triggered
 `.github/workflows/publish.yml`, which uploaded via OIDC Trusted Publishing. That made every release
