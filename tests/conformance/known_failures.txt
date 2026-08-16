@@ -56,17 +56,6 @@ anthropic:C6
 anthropic:C8
 anthropic:C9
 
-# Microsoft AutoGen — the weakest rail: no LLM detail captured, contentless
-# previews, one run shatters into many traces. C7 is NEW information, not a
-# regression: in a clean process the adapter registers an empty manifest and
-# then a second one inside a single run, minting two versions for one run —
-# the old shared-process harness masked it.
-autogen-ms:C3
-autogen-ms:C4
-autogen-ms:C6
-autogen-ms:C7
-autogen-ms:C9
-autogen-ms:C10
 
 # CrewAI — instrumentor-derived spans arrive without LLM detail, and a
 # concurrent lane's trace can carry another lane's prompt.

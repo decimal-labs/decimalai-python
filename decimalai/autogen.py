@@ -10,9 +10,13 @@ instruments the agents: the ones that already exist (a sweep — see
 carries the model/token detail and the request/response content.
 
 Microsoft AutoGen v0.4+ (``autogen-agentchat``/``autogen-core``, imported as
-``autogen_core``) routes its runtime tracing through the tracer provider it
-is given, defaulting to the global one — for it the exporter install alone
-is enough, provided the runtime is created after ``init()``.
+``autogen_core``) is a DIFFERENT framework that happens to share the name, and
+it is **not a supported integration**. Its runtime spans do reach the exporter
+via the global tracer provider, but conformance shows what arrives is not worth
+calling an integration: no model, no token counts, and one run split across many
+traces named after internal message-bus plumbing. Upstream has also been silent
+since 2025-09-30. Users on it get the generic OpenTelemetry rail; say so rather
+than implying an adapter exists.
 
 Usage::
 
@@ -207,25 +211,32 @@ def _warn_ag2_not_instrumentable() -> None:
         logger.warning(
             "decimalai.init(autogen=True): this AutoGen/AG2 version has no "
             "autogen.opentelemetry module, so NO traces will be captured — "
-            "AG2 emits no spans without it. Upgrade AG2 (pip install -U ag2) "
-            "to get automatic per-agent instrumentation."
+            "AG2 emits no spans without it. Upgrade with "
+            "`pip install -U 'autogen[openai]'` to get automatic per-agent "
+            "instrumentation. Do NOT `pip install ag2`: ag2 1.x is a different "
+            "package that no longer provides the classic `autogen` API this "
+            "integration traces, so it would leave you with no tracing at all."
         )
     elif importlib.util.find_spec("autogen_core") is not None:
         # Microsoft AutoGen v0.4+ — its runtime traces through the tracer
         # provider it's given, defaulting to the global one the exporter
         # install just set.
-        logger.info(
+        logger.warning(
             "decimalai.init(autogen=True): Microsoft AutoGen detected "
-            "(autogen_core) — runtimes created after init() trace through "
-            "the global tracer provider automatically; pass tracer_provider= "
-            "explicitly if you construct your own."
+            "(autogen_core). This is a DIFFERENT framework from the AutoGen/AG2 "
+            "lineage DecimalAI integrates with, and it is not a supported "
+            "integration: its runtime spans do reach the exporter, but they "
+            "carry no LLM detail (no model, no tokens) and one run arrives as "
+            "many small traces named after internal message-bus plumbing. "
+            "Treat it as generic OpenTelemetry, not as an AutoGen integration."
         )
     else:
         logger.warning(
             "decimalai.init(autogen=True): no AutoGen distribution is "
-            "importable, so NO traces will be captured. Install AG2 "
-            "(pip install ag2) or Microsoft AutoGen (pip install "
-            "autogen-agentchat) and initialize again."
+            "importable, so NO traces will be captured. Install the classic "
+            "AutoGen/AG2 distribution — `pip install 'autogen[openai]'` — and "
+            "initialize again. (`ag2` 1.x and Microsoft's `autogen-agentchat` "
+            "are different packages this integration does not trace.)"
         )
 
 

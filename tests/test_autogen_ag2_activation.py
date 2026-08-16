@@ -153,7 +153,12 @@ def test_warns_loudly_when_no_autogen_installed(monkeypatch, caplog):
         r.getMessage() for r in caplog.records if r.levelname == "WARNING"
     )
     assert "NO traces will be captured" in warning
-    assert "pip install ag2" in warning
+    # The advice must name the distribution that actually provides the classic
+    # `autogen` API this adapter traces. It used to say `pip install ag2`, which
+    # installs AG2 1.x — a different package with no `autogen` module — so a user
+    # who followed it ended up with no tracing and no way to tell why.
+    assert "autogen[openai]" in warning
+    assert "pip install ag2" not in warning
 
 
 def test_module_docstring_no_longer_claims_native_spans():

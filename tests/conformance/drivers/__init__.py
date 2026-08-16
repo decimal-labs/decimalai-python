@@ -290,7 +290,6 @@ DRIVER_MODULES: Tuple[str, ...] = (
     "adk",
     "crewai",
     "ag2",
-    "autogen_ms",
     "generic_otel",
     "claude_agent_sdk",
     # Last on purpose: this one enables the OpenInference Anthropic
