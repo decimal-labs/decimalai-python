@@ -273,8 +273,9 @@ conformance-tests = [
     # crewai[google-genai], which pins google-genai<1.65.0 and is flatly
     # UNSATISFIABLE alongside google-adk>=2.0.0 (which needs >=1.66) — verified
     # with `uv pip compile --universal`. This tier's CrewAI driver reaches its
-    # model through LiteLLM against a local stub, so the google-genai provider
-    # binding is a live-lane need it does not have. The floor is lower than
+    # model through the OPENAI SDK against a local stub (see the instrumentor
+    # note below), so the google-genai provider binding is a live-lane need it
+    # does not have. The floor is lower than
     # crewai-tests' 1.14.6 for the same reason the live lane's is higher: 1.6.1
     # is what co-resolves with google-adk + litellm here, and it is what the
     # tier was verified on.
@@ -283,9 +284,19 @@ conformance-tests = [
     # No AutoGen line, deliberately. Both lineages were retired as integrations
     # (2026-08-16): `init(autogen=True)` is now an alias for the generic OTel
     # exporter that warns, and drivers/generic_otel.py already grades that rail.
-    # drivers/crewai.py reads BOTH instrumentors: CrewAI emits the crew/task spans,
-    # LiteLLM emits the llm ones. The crewai-tests extra carries only the first, so
-    # without this the CrewAI trace arrives with no llm_calls at all.
+    # drivers/crewai.py reads THREE instrumentors, because which one carries the
+    # LLM detail depends on the CrewAI version and the model string:
+    #   * CrewAI's own — the crew/task/tool spans, always;
+    #   * LiteLLM's    — the llm spans up to CrewAI 1.14, when an `openai/…`
+    #                    model went through litellm;
+    #   * OpenAI's     — the llm spans from CrewAI 1.15, where `LLM.__new__`
+    #                    returns crewai.llms.providers.openai.completion.
+    #                    OpenAICompletion and litellm is never imported (checked
+    #                    on 1.15.16: `crewai.llm._litellm_loaded is False`).
+    # The openai one arrives via decimalai[providers-tests] above and is activated
+    # automatically by init(crewai=True), so there is no line for it here — but
+    # on 1.15 it is the load-bearing one, and without it the CrewAI trace arrives
+    # with no llm_calls at all. The crewai-tests extra carries neither.
     "openinference-instrumentation-litellm>=0.1.30",
 ]
 

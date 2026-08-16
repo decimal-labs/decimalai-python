@@ -9,25 +9,40 @@ your tracer provider — its own telemetry runs on a private internal one). Then
 The install set is the documented one, exactly::
 
     pip install decimalai openinference-instrumentation-crewai \\
-                openinference-instrumentation-litellm
+                openinference-instrumentation-litellm \\
+                openinference-instrumentation-openai
 
 **The stub model is an HTTP endpoint, not a Python class** — the shared
 ``_openai_wire.OpenAIWire``. CrewAI's LLM detail (model name, token counts, the
-messages themselves) comes from ``LiteLLMInstrumentor``, so a stub that replaced
-``crewai.LLM`` with a ``BaseLLM`` subclass would bypass LiteLLM entirely and the
-resulting absence of ``llm_calls`` would be an artifact of this driver rather
-than a fact about the adapter. Pointing ``crewai.LLM`` at the local wire keeps
-the whole stack real — CrewAI → LiteLLM → openai SDK → socket — and fakes only
-the inference at the far end.
+messages themselves) comes from whichever provider instrumentor sits under the
+model it was given, so a stub that replaced ``crewai.LLM`` with a ``BaseLLM``
+subclass would bypass that layer entirely and the resulting absence of
+``llm_calls`` would be an artifact of this driver rather than a fact about the
+adapter. Pointing ``crewai.LLM`` at the local wire keeps the whole stack real —
+CrewAI → its provider client → socket — and fakes only the inference at the far
+end.
 
-``decimalai.otel.instrument()`` is used rather than ``decimalai.init(crewai=True)``.
-They do the same two things (build the exporter, then activate the CrewAI
-instrumentor against it), but the returned provider can be handed to the
-instrumentors explicitly. OpenTelemetry honours ``set_tracer_provider`` only
-once per process, so the global form would route CrewAI's spans into whichever
-adapter happened to run first in a multi-driver suite; the SDK documents this
-escape hatch itself ("Callers that need to activate an instrumentor against this
-exact provider should pass it explicitly rather than rely on the global").
+Which provider instrumentor that is has MOVED, and the third package above is
+why. Up to CrewAI 1.14 an ``openai/…`` model went through LiteLLM, so
+``LiteLLMInstrumentor`` carried the LLM detail. From 1.15 ``crewai.LLM.__new__``
+routes it to ``crewai.llms.providers.openai.completion.OpenAICompletion``, which
+calls the ``openai`` SDK directly and never imports litellm — so
+``LiteLLMInstrumentor`` patches a function nothing calls and ``OpenAIInstrumentor``
+is the one emitting the ``ChatCompletion`` spans. Both are activated here
+because both are in the documented install set and either can be the live one
+depending on the model string the user passes.
+
+``decimalai.otel.instrument()`` + ``decimalai._activate_crewai_instrumentation()``
+is used rather than ``decimalai.init(crewai=True)``. That pair is literally what
+``init`` runs (``init`` calls the same two functions, in that order), but the
+returned provider can be handed to the instrumentors explicitly. OpenTelemetry
+honours ``set_tracer_provider`` only once per process, so the global form would
+route CrewAI's spans into whichever adapter happened to run first in a
+multi-driver suite; the SDK documents this escape hatch itself ("Callers that
+need to activate an instrumentor against this exact provider should pass it
+explicitly rather than rely on the global"). Calling ``init``'s own activation
+helper rather than re-listing instrumentors by hand is what keeps this driver
+from grading a rail the documented path does not give a user.
 
 The provider is force-flushed before ``run`` returns: spans reach the exporter
 through a ``BatchSpanProcessor`` whose default schedule delay is five seconds,
@@ -84,16 +99,25 @@ _PROVIDERS_LOCK = threading.Lock()
 
 
 def _instrument(ctx: Ctx) -> Any:
-    """DecimalAI's exporter, then the two OpenInference emitters onto it."""
-    from openinference.instrumentation.crewai import CrewAIInstrumentor
+    """DecimalAI's exporter, then the OpenInference emitters onto it."""
     from openinference.instrumentation.litellm import LiteLLMInstrumentor
 
+    from decimalai import _activate_crewai_instrumentation
     from decimalai.otel import instrument
 
     provider = instrument(agent_name=ctx.agent_name)
     with _PROVIDERS_LOCK:
         _PROVIDERS.append(provider)
-    CrewAIInstrumentor().instrument(tracer_provider=provider)
+    # What `init(crewai=True)` does, called the way `init` calls it. NOT a
+    # hand-written list of instrumentors: `init` activates the CrewAI
+    # instrumentor AND every importable provider SDK's instrumentor, and
+    # re-listing them here would let the driver and the documented path drift
+    # apart in either direction — a driver that activates less grades a rail
+    # thinner than the user's, one that activates more grades a rail no user
+    # gets. Calling the same function is the only version that cannot drift.
+    _activate_crewai_instrumentation(provider)
+    # The one emitter `init(crewai=True)` does NOT activate, and the docs'
+    # snippet does.
     LiteLLMInstrumentor().instrument(tracer_provider=provider)
     return provider
 
@@ -192,9 +216,13 @@ DRIVER = Driver(
         "litellm",
         "openinference.instrumentation.crewai",
         "openinference.instrumentation.litellm",
+        "openinference.instrumentation.openai",
         "opentelemetry.sdk",
     ),
-    entrypoint="decimalai.otel.instrument() + CrewAIInstrumentor / LiteLLMInstrumentor",
+    entrypoint=(
+        "decimalai.otel.instrument() + _activate_crewai_instrumentation() "
+        "(what init(crewai=True) runs) + LiteLLMInstrumentor"
+    ),
     run=run,
     run_concurrent=fanout_threads(run),
     run_error=run_error,

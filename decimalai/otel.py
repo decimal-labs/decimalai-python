@@ -65,6 +65,24 @@ _ALT_PROVIDER_KEYS = (
     "gen_ai.provider.name", "llm.system", "llm.provider", "ai.provider",
 )
 _ALT_INPUT_TOKEN_KEYS = ("llm.usage.prompt_tokens", "llm.token_count.prompt")
+# OpenInference reports the finish reason under its OWN key, not the OTel
+# semantic-convention one. Reading only `gen_ai.response.finish_reasons` meant
+# every OpenInference-instrumented call (CrewAI, raw OpenAI, raw Anthropic) fell
+# through to the STOP default — so a span that plainly said
+# `llm.finish_reason = tool_calls` produced a record claiming the model stopped
+# normally. A default that contradicts its own source is worse than an absent
+# value: downstream it is indistinguishable from a real observation.
+#: Key suffixes that describe content rather than being it. Checked as an
+#: endswith() so `input.value` and `gen_ai.tool.call.arguments` still match.
+_NON_CONTENT_KEY_SUFFIXES = (
+    ".mime_type", ".type", ".encoding", ".format", ".content_type",
+)
+
+_ALT_FINISH_REASON_KEYS = (
+    "llm.finish_reason",
+    "llm.response.finish_reason",
+    "finish_reason",
+)
 _ALT_OUTPUT_TOKEN_KEYS = (
     "llm.usage.completion_tokens",
     "llm.token_count.completion",
@@ -830,6 +848,17 @@ class DecimalSpanExporter:
                 len(group),
                 hex(tid),
             )
+        finally:
+            # This run's rail must not outlive this run, on the FAILURE path
+            # too. The pop above only runs when assembly succeeded AND the run
+            # had a rail, so a run whose assembly raised used to leave its entry
+            # in the process-global _skill_rails store forever. That store is
+            # capped at _SKILL_RAIL_MAX with oldest-first eviction, so the leak
+            # is bounded in memory but NOT harmless: every stranded entry
+            # occupies a slot and pushes a live run's rail out early, which
+            # loses that run's routing_id. Popping again here is free — the pop
+            # above already removed it, so this is a no-op on the happy path.
+            _pop_skill_rail(tid)
 
     def _flush_pending(self) -> None:
         """Finalize every buffered trace, whether or not its root arrived.
@@ -906,6 +935,38 @@ class DecimalSpanExporter:
             sid = _get_span_id(otel_span)
             if sid is not None and sid not in span_uuids:
                 span_uuids[sid] = uuid4()
+
+        # ── One model call, two instrumentors ──
+        # Instrumentors stack. CrewAI <= 1.15 routes through LiteLLM, which
+        # calls the `openai` SDK, and the documented install enables an
+        # instrumentor for BOTH — so a single completion emits an
+        # `openai ChatCompletion` span nested inside a `litellm completion`
+        # span, each carrying the same model and the same token counts. Recorded
+        # naively that is one call reported twice: doubled token counts, doubled
+        # cost, and nothing in the contract catches it because every field on
+        # both records is individually valid.
+        #
+        # A real model call is a LEAF. An LLM span with an LLM span inside it is
+        # a wrapper around that call, so the wrapper is dropped and the
+        # innermost span — the one closest to the wire — is kept. This also
+        # stays correct if a wrapper genuinely issues several calls: it has
+        # several LLM children, and those children are the calls.
+        llm_span_ids: set = set()
+        llm_parent_ids: set = set()
+        for otel_span in otel_spans:
+            _a = dict(getattr(otel_span, "attributes", None) or {})
+            _op = str(_a.get("gen_ai.operation.name") or "").lower()
+            if _op in _NON_LLM_OPERATIONS:
+                continue
+            if not _get_first(_a, _GENAI_MODEL, *_ALT_MODEL_KEYS):
+                continue
+            _sid = _get_span_id(otel_span)
+            if _sid is not None:
+                llm_span_ids.add(_sid)
+            _pid = _get_parent_span_id(otel_span)
+            if _pid is not None:
+                llm_parent_ids.add(_pid)
+        wrapper_llm_span_ids = llm_span_ids & llm_parent_ids
 
         # ── Whose run was this? ──
         # The exporter's own ``default_agent_name`` is fixed when the exporter
@@ -992,6 +1053,13 @@ class DecimalSpanExporter:
             if operation in _NON_LLM_OPERATIONS:
                 model = None
 
+            if model and _get_span_id(otel_span) in wrapper_llm_span_ids:
+                # A wrapper around another LLM span, not a second call to the
+                # model. Skipped so the nested instrumentor pair above counts
+                # once. It is still a span in the waterfall; it just is not an
+                # llm_call.
+                model = None
+
             if model:
                 # This is an LLM call — create LlmCallRecord
                 llm_call = self._make_llm_call(
@@ -1048,8 +1116,17 @@ class DecimalSpanExporter:
                 # Fallback trace-level previews when the root span carried
                 # none: first LLM call's input, last LLM call's output. Root
                 # values (when present) take precedence.
+                #
+                # The ASK is the last USER message of the rendered request, not
+                # the whole request joined and truncated — see
+                # _ask_from_rendered_input. The joined preview stays as the
+                # fallback's fallback, for a span that carries prompt content
+                # but no messages to pick from.
                 if not root_set_input and user_input is None:
-                    user_input = trace_span.input_preview
+                    user_input = (
+                        _ask_from_rendered_input(llm_call.rendered_input)
+                        or trace_span.input_preview
+                    )
                 if not root_set_output:
                     llm_output = trace_span.output_preview
                     if llm_output is not None:
@@ -1185,6 +1262,11 @@ class DecimalSpanExporter:
 
         # Try to extract finish reason from attributes
         finish_reasons = attrs.get(_GENAI_FINISH_REASON)
+        if not finish_reasons:
+            for _k in _ALT_FINISH_REASON_KEYS:
+                if attrs.get(_k):
+                    finish_reasons = attrs[_k]
+                    break
         if finish_reasons:
             if isinstance(finish_reasons, (list, tuple)) and finish_reasons:
                 fr_str = str(finish_reasons[0]).lower()
@@ -1479,7 +1561,16 @@ def _semconv_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
                     args = {"raw": args}
             records.append(
                 ToolCallRecord(
+                    # The outcome is NOT observed here. These records are read
+                    # off the LLM span, which the instrumentor emits when the
+                    # model REQUESTS a tool — before the tool runs, and carrying
+                    # no result. ToolCallRecord defaults to SUCCESS, so leaving
+                    # it produced "this tool ran and succeeded" for a call that
+                    # may never have executed or may have raised. RUNNING is the
+                    # honest state for "requested, outcome unseen"; a rail that
+                    # genuinely observes the result sets SUCCESS or ERROR.
                     tool_name=str(name),
+                    status=Status.RUNNING,
                     args=args if isinstance(args, dict) else {},
                 )
             )
@@ -1512,7 +1603,8 @@ def _extract_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
                 args = {"raw": args}
         if not isinstance(args, dict):
             args = {}
-        records.append(ToolCallRecord(tool_name=name, args=args))
+        # Requested, not observed — see the note on the sibling extractor above.
+        records.append(ToolCallRecord(tool_name=name, status=Status.RUNNING, args=args))
     return records or _semconv_tool_calls(attrs)
 
 
@@ -1714,6 +1806,77 @@ def _rendered_input_from_attrs(
     return [{"role": "user", "content": content}]
 
 
+def _ask_from_rendered_input(
+    rendered_input: Optional[Sequence[Any]], max_len: int = 200
+) -> Optional[str]:
+    """The run's ASK — the LAST USER message, not the whole request joined.
+
+    ``user_input_preview`` is a trace-level field meaning "what was asked", and
+    the fallback that fills it from an LLM span used to take
+    ``_preview_from_attrs(attrs, "input")``: every message joined with newlines
+    and cut at ``max_len``. Two things are wrong with that, and only the second
+    is about the cap:
+
+    * a rendered chat request LEADS with the system preamble, so once that
+      preamble passes the cap the preview is 100% system prompt and 0% user
+      question. Measured on CrewAI: a 167-char preamble puts the ask at index
+      198 of the join, leaving two of its characters inside a 200-char preview;
+    * on turn six of a conversation the join is the entire history, so the
+      current ask is drowned in it however large the cap is.
+
+    The rule here is ported verbatim from :func:`decimalai.openai_agents.
+    _query_from_input_items`, which already made this exact call for this exact
+    field and wrote down why: "The last user message IS the current ask …
+    routing on the concatenation would drown the current ask in history." Its
+    fallback is ported too — the last message with any text, for a request that
+    carries only assistant/tool context and no user turn at all.
+    ``decimalai.langchain`` previews ``call.rendered_input[-1]["content"]`` for
+    the same field. The OTel exporter was the outlier, not these.
+
+    Returns None when there is nothing to read, so the caller can fall back
+    again — to the joined preview, for a span carrying prompt text but no
+    messages to choose between.
+    """
+    entries = [e for e in (rendered_input or []) if isinstance(e, dict)]
+    if not entries:
+        return None
+
+    def _role(i: int) -> str:
+        return str(entries[i].get("role") or "").lower()
+
+    def _text(i: int) -> str:
+        c = entries[i].get("content")
+        return c if isinstance(c, str) else ""
+
+    fallback: Optional[str] = None
+    for i in range(len(entries) - 1, -1, -1):
+        content = _text(i)
+        if not content.strip():
+            continue
+        if _role(i) == "user":
+            # NOT every role=="user" entry is something a person asked. Anthropic
+            # (and anything following its Messages shape) renders a TOOL RESULT
+            # as a user turn, so the last user message in a tool loop is machine
+            # output — taking it blindly put a tool result in a field that means
+            # "what was asked". Measured: it changed user_input_preview on 20
+            # anthropic and 19 pydantic-ai traces.
+            #
+            # The tell is in the turn before it. An assistant message that only
+            # made tool calls is kept with EMPTY content precisely so turn order
+            # survives (see _messages_from_attrs), so a user turn preceded by a
+            # contentless assistant turn is the result coming back — while a
+            # genuine follow-up in a chat is preceded by an assistant turn that
+            # actually said something. That keeps the ask right in all three
+            # shapes: [system, user], the tool loop, and a multi-turn
+            # conversation where the LAST user turn really is the current ask.
+            if i > 0 and _role(i - 1) == "assistant" and not _text(i - 1).strip():
+                continue
+            return content[:max_len]
+        if fallback is None:
+            fallback = content[:max_len]
+    return fallback
+
+
 def _output_message_from_attrs(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The response message for ``LlmCallRecord.output``."""
     messages = _messages_from_attrs(attrs, "output")
@@ -1804,10 +1967,33 @@ def _content_from_attrs(attrs: Dict[str, Any], direction: str) -> Optional[str]:
             # they are counts, not content, and must never become previews.
             if "token" in key_lower or "usage" in key_lower:
                 continue
+            # Metadata ABOUT the content is not the content. The scan matches
+            # key names by substring, so `input.mime_type` matches the "input"
+            # pattern — and once blank attributes are skipped, a span carrying
+            # `input.value=""` alongside `input.mime_type="application/json"`
+            # falls through to the mime type and reports it as the prompt.
+            # A preview reading "application/json" is indistinguishable
+            # downstream from a model that was really shown that string.
+            if key_lower.endswith(_NON_CONTENT_KEY_SUFFIXES):
+                continue
             if _INDEXED_MSG_NAMESPACE_RE.match(key_lower):
                 continue
             if key_pattern in key_lower:
-                return str(val)
+                text = str(val)
+                # A blank attribute is not content, and must not be reported as
+                # if it were. CrewAI's kickoff span carries ``crew_inputs=''``
+                # whenever the crew was started without an inputs dict — the
+                # common shape — and that key matches the "input" pattern. A
+                # bare `return str(val)` therefore answered "" for a span that
+                # simply carries no input, which is a DIFFERENT claim from
+                # "there is none": the empty string is a value, so
+                # _assemble_trace's `if root_input is not None` accepted it,
+                # set the trace preview to "" and suppressed the LLM fallback
+                # that had the real prompt. Keep scanning instead — a later key
+                # (or a later pattern) may hold the actual content.
+                if not text.strip():
+                    continue
+                return text
     return None
 
 

@@ -190,13 +190,39 @@ def test_toolcall_only_output_never_falls_back_to_the_role():
 
 def test_trace_previews_inherit_the_content_fix():
     """Trace-level previews fall back to the LLM spans, so they carry the
-    same content rather than "system"/"assistant"."""
+    same content rather than "system"/"assistant".
+
+    The expected ``user_input_preview`` MOVED on 2026-08-16, and the move is a
+    fix rather than a relaxation, so it is worth stating why. This assertion used
+    to read ``"You are City Analyst" in rt.user_input_preview`` — the SYSTEM
+    preamble — because the trace-level preview was every message joined in index
+    order and cut at 200 chars, which always begins with the system prompt. That
+    made ``user_input_preview`` unable to answer the one question it is named
+    for: on a request longer than the cap it showed 100% preamble and 0% ask
+    (measured on CrewAI, whose 167-char preamble pushed the user's question to
+    index 198), and on a long conversation it showed the whole history.
+
+    ``_ask_from_rendered_input`` now applies the rule ``decimalai.openai_agents.
+    _query_from_input_items`` already applied to this same field — the LAST USER
+    message is the ask — so on this fixture's four-message conversation the
+    preview is the user's turn. The check below is STRICTER than the one it
+    replaces: an exact string rather than a substring, plus the explicit
+    role-word guard this test exists for and the explicit statement that the
+    preamble is no longer what lands here.
+
+    The per-SPAN preview is unchanged and still carries the whole rendered
+    request — see ``test_input_preview_keeps_message_order``, which pins it.
+    """
     rt = _assemble([
         _MockSpan("root", 0xC4, 0x01),
         _MockSpan("ChatCompletion", 0xC4, 0x02, parent_span_id=0x01,
                   attributes=_CREWAI_ANSWER_LLM_ATTRS),
     ])
-    assert "You are City Analyst" in rt.user_input_preview
+    assert rt.user_input_preview == "Use the population_lookup tool for Paris."
+    assert rt.user_input_preview not in ("system", "user", "assistant", "tool")
+    assert "You are City Analyst" not in rt.user_input_preview, (
+        "the run's ask must not be the system preamble"
+    )
     assert rt.final_output_preview == "Paris has a population of 2,148,000."
 
 

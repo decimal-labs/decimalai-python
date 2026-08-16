@@ -26,8 +26,17 @@
 # deterministic across 4 consecutive runs and identical with serial children.
 # Every one is a defect the acceptance grading already reported.
 
-# CrewAI — instrumentor-derived spans arrive without LLM detail, and a
-# concurrent lane's trace can carry another lane's prompt.
-crewai:C3
-crewai:C4
-crewai:C9
+# ── EMPTY, 2026-08-16 ────────────────────────────────────────────────────────
+# The last three lines (crewai:C3, crewai:C4, crewai:C9) came off when the
+# defects behind them were fixed. One correction is worth leaving behind,
+# because the line that recorded them said something the suite never reported:
+# it claimed "a concurrent lane's trace can carry another lane's prompt". It
+# could not, and it never did. C9's message on this column was eight copies of
+# "<lane>'s trace does not carry its OWN prompt" — the foreign-prompt branch
+# never fired — because CrewAI's traces arrived with llm_calls == [] and C9
+# grades text taken only from llm_calls. An empty haystack fails the own-prompt
+# clause and makes the foreign-prompt clause vacuous. So C9 red here was a
+# SYMPTOM of C3/C4, not an isolation defect, and closing C3 closed it.
+#
+# Nothing is listed now. That is the intended end state, not an omission: a
+# failure not named here fails the build.
