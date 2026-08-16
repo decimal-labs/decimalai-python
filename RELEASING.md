@@ -14,9 +14,9 @@ Release. There is no token anywhere: the workflow exchanges a short-lived OIDC i
 verifies against a publisher row naming this repo, `publish.yml`, and the `pypi` environment.
 
 > **Inverted 2026-08-16.** This used to publish by `twine` from a maintainer's machine, on the
-> reasoning that *"CI availability must never block a release."* That reasoning came from the period
-> when Actions was billing-blocked on private repos — it is gone: Actions is free and unmetered on
-> public repos, and the OIDC path has now been proven three times (`decimalai-mcp 0.1.3`,
+> reasoning that *"CI availability must never block a release."* That reasoning came from a period
+> when CI was unavailable here for reasons unrelated to the code — that is no longer the case, and
+> the OIDC path has now been proven three times (`decimalai-mcp 0.1.3`,
 > `agentversion 0.2.3`, `skillevaluation 0.7.1`, each with a verified attestation).
 >
 > What the local path cost, measured: **0 of 22 published `decimalai` files carry provenance**, and
