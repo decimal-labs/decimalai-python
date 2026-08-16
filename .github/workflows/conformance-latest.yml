@@ -6,17 +6,17 @@
 # at. When it goes red the pinned gate stays green and releases keep flowing; you
 # fix the adapter, or record a new baseline if upstream was right.
 #
-# It lives here rather than in the platform repo's nightly canary on purpose. That
-# canary is guarded on GH_PAT + GEMINI_API_KEY and no-ops without them, because it
-# spends real model calls. Tier A conformance needs NEITHER — stub models over a
-# real socket, a local probe server, no provider key and no backend — so gating it
-# behind those secrets would make it a no-op for a reason that does not apply to
-# it. Hermetic is what makes a nightly cheap enough to be honest.
+# It lives here, next to the adapters it checks, on purpose. Nightly jobs that
+# spend real model calls have to be guarded on provider credentials and no-op
+# without them. Tier A conformance needs neither — stub models over a real
+# socket, a local probe server, no provider key and no backend — so gating it
+# behind those secrets would make it a no-op for a reason that does not apply
+# to it. Hermetic is what makes a nightly cheap enough to be honest.
 name: Conformance (latest frameworks)
 
 on:
   schedule:
-    - cron: "0 7 * * *"      # nightly 07:00 UTC, an hour before the platform canary
+    - cron: "0 7 * * *"      # nightly 07:00 UTC
   workflow_dispatch:
 
 permissions:

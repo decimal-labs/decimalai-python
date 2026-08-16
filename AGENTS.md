@@ -92,7 +92,7 @@ gates every push. This repo has no Makefile; the one command is:
 
 ```bash
 pip install -e ".[dev,conformance-tests]"    # the eleven frameworks the drivers drive
-python -m pytest tests/conformance -q -rs    # ~90s; ends with the conformance matrix
+python -m pytest tests/conformance -q -rs -m conformance   # ~90s; ends with the matrix
 ```
 
 `pip install -e ".[dev]"` alone is enough to run `tests/conformance/test_coverage.py`, the guard

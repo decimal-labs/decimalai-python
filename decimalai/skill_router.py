@@ -565,6 +565,13 @@ class SkillRouter:
         # reality behind the `_last_budget` fallback above. Adapters drain
         # this off their router singleton via `consume_loaded_names()`.
         self._loaded_names: List[str] = []
+        # Per-run twin of `_loaded_names`. `load_skill`'s docstring has always
+        # promised "the loaded-names rail [is] kept per scope"; until this
+        # existed, `scope` reached only the turn budget and the rail itself was
+        # one shared list, so a scoped caller asking "what did THIS run load"
+        # got every concurrent run's loads. Bounded LRU, same discipline and
+        # same cap as `_scoped_budgets`.
+        self._scoped_loaded_names: "OrderedDict[str, List[str]]" = OrderedDict()
         # Instance mirror of the routing decision — routing_id + offered +
         # delivered names — for the same reason `_loaded_names` exists, one
         # step earlier in the run: prompt assembly also happens in a copied
@@ -883,6 +890,8 @@ class SkillRouter:
         # there it raises and the load would otherwise go unrecorded.
         if name not in self._loaded_names:
             self._loaded_names.append(name)
+        if scope is not None:
+            self._record_scoped_load(scope, name)
         try:
             from .generic import log_skill_loaded
             log_skill_loaded(name=name)
@@ -916,16 +925,37 @@ class SkillRouter:
         while len(self._scoped_budgets) > self._MAX_SCOPED_BUDGETS:
             self._scoped_budgets.popitem(last=False)
 
-    def consume_loaded_names(self) -> List[str]:
+    def _record_scoped_load(self, scope: str, name: str) -> None:
+        """Note that THIS run loaded a body. Only reached from `load_skill`,
+        and only after the body was actually served — a budget refusal or a
+        not-found returns before here, so the rail never names a skill whose
+        body did not reach the model."""
+        bucket = self._scoped_loaded_names.get(scope)
+        if bucket is None:
+            bucket = []
+            self._scoped_loaded_names[scope] = bucket
+        if name not in bucket:
+            bucket.append(name)
+        self._scoped_loaded_names.move_to_end(scope)
+        while len(self._scoped_loaded_names) > self._MAX_SCOPED_BUDGETS:
+            self._scoped_loaded_names.popitem(last=False)
+
+    def consume_loaded_names(self, scope: Optional[str] = None) -> List[str]:
         """Read + clear the names whose body `load_skill` served since the
         last drain. Adapter trace-send paths call this on their router
         singleton — the same instance whose load_skill tool served the
         bodies — and stamp the names onto ``skills_loaded_by_agent``.
-        Known cost (same as the `_last_budget` fallback): concurrent runs
-        sharing one router drain into whichever trace sends first. Adapters
-        that can name their run (``scope=``, see `load_skill`) should
-        attribute loads per-run instead and treat this as a reset.
+
+        Args:
+            scope: the RUN whose loads to drain — the same key that run passed
+                to `load_skill`. Scoped drains see ONLY that run's loads, which
+                is what a concurrent fanout needs. Omitting it keeps the legacy
+                shared slot, whose known cost is that concurrent runs sharing
+                one router all drain into whichever trace sends first.
         """
+        if scope is not None:
+            drained = self._scoped_loaded_names.pop(scope, None)
+            return list(drained) if drained else []
         if not self._loaded_names:
             return []
         drained = list(self._loaded_names)
@@ -1076,6 +1106,15 @@ class SkillRouter:
             top_k,
             self.strategy,
             bool(effective_inject),  # body-injected vs menu-only must not share a cache slot
+            # Two concurrent runs must not share a cache slot, because sharing
+            # one means sharing its routing_id — one routing decision claimed by
+            # two runs, which double-counts it in the effectiveness join. The
+            # case is real for full-menu adapters: they route with query=None
+            # under one agent name, so without this every concurrent run of that
+            # agent collides on a single key. Unscoped callers pass None -> ""
+            # -> today's key, so their behaviour and routing-call volume are
+            # unchanged.
+            scope or "",
         )
 
         if not bypass_cache:
@@ -2747,7 +2786,7 @@ class SkillRouter:
             query: Search query (e.g. "pdf conversion", "code review security").
             category: Filter by registry category (e.g. "code-review", "testing").
             tags: Filter by tags (e.g. ["python", "security"]).
-            badge: Filter by badge ("verified", "featured", "community", "imported").
+            badge: Filter by badge ("featured", "community", "imported").
             sort: Sort by "effectiveness" (alias of "recommended" — SkillScore
                   v2 ranking: evidence-tiered quality composite, cold-start
                   rows relegated), "popular" (recent activations, installs as

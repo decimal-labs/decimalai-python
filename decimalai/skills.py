@@ -119,9 +119,9 @@ def discover_skills(
     Searches project-level directories by default. Global / personal
     skill directories (``~/.claude/skills`` and friends) are OPT-IN.
     Earlier SDK releases defaulted to ``include_global=True``, and
-    developers running ``decimalai skills sync`` from a project with no
-    local skills accidentally uploaded their personal agent-tool skills
-    (e.g. ``~/.claude/skills/discovery-loop``) into the org's skill
+    running ``decimalai skills sync`` from a project with no local skills
+    could sweep personal agent-tool skills (e.g.
+    ``~/.claude/skills/my-personal-helper``) into the org's skill
     registry. The two concerns are kept separate now: project skills go
     up automatically, personal/global skills are a deliberate opt-in.
 

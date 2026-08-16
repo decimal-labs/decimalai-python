@@ -89,7 +89,7 @@ did not run).
 
 the local CI runner needed no change to pick the job up: it parses each
 repo's workflow YAML and runs the same `run:` blocks, so adding the job was
-enough. Verify with `python3 infra/ci_local.py --list --repos decimalai-python`.
+enough.
 
 The CI job runs the coverage guard **before** installing the frameworks —
 "somebody added a framework and skipped the driver" then fails in seconds rather
@@ -290,29 +290,26 @@ are.
 
 ## Version policy
 
-The **pinned** lane is the gate; the **floating** lane is advisory. Both already
-existed in `platform/release_gate`, and conformance rides them rather than
-growing a parallel copy. Nothing here is a second matrix, a second lockfile or a
+The **pinned** lane is the gate; the **floating** lane is advisory. Both ride the
+release tooling that already existed rather than growing a parallel copy. Nothing here is a second matrix, a second lockfile or a
 second set of assertions.
 
 | | Pinned lane | Floating lane |
 |---|---|---|
-| Entry point | `run_gate.py` (phase **P0**) | `canary.py --latest` |
-| Versions from | `release_gate/constraints.txt` + the SDK's declared floors | newest, resolved live |
-| Which frameworks | the `conformance-tests` extra | the names in `release_gate/frameworks-matrix.txt` |
-| Baseline diffed against | — | `release_gate/frameworks-lock.txt` |
+| Runs in | `ci.yml`, every push and PR | `conformance-latest.yml`, nightly |
+| Versions from | pinned constraints + the SDK's declared floors | newest, resolved live |
+| Which frameworks | the `conformance-tests` extra | the full floating matrix |
 | A red row | **blocks the release** | opens an issue; blocks nothing |
 
-The mechanism is one function. `run_gate.run_conformance()` shells
-`pytest tests/conformance -m conformance` with `cwd=SDK_DIR` against the venv it
-was given. `canary.py --latest` upgrades every name in `frameworks-matrix.txt`
-to newest inside a clean-room wheel venv and then calls **that same
-orchestrator**, so the floating lane is the identical phase with different
-versions underneath. The phase does not know which lane it is in — the advisory/
-blocking distinction is structural (the canary is its own scheduled lane and was
-never a PR check), not a flag the assertions read.
+The mechanism is one command. Both lanes shell
+`pytest tests/conformance -m conformance`; the floating lane simply upgrades
+every framework to newest inside a clean-room wheel venv first, then runs the
+identical phase with different versions underneath. The tests do not know which
+lane they are in — the advisory/blocking distinction is structural (the nightly
+is its own scheduled lane and was never a PR check), not a flag the assertions
+read.
 
-`frameworks-matrix.txt` grew a second block for the frameworks that have a
+The floating matrix grew a second block for the frameworks that have a
 conformance driver but no live-matrix lane (crewai, google-adk, llama-index-core,
 pydantic-ai, anthropic, and the OpenInference instrumentors the OTel-routed
 drivers read). Floating those is cheap precisely
@@ -322,10 +319,11 @@ Two commands worth knowing:
 
 ```bash
 # pinned, ~30s, no key, no backend — "did I break an adapter?"
-make release-gate-conformance
+python -m pytest tests/conformance -q -m conformance
 
 # floating: newest frameworks vs the contract, still no key and no backend
-python release_gate/canary.py --latest --conformance-only
+#   → the nightly `Conformance (latest frameworks)` workflow, or
+#     workflow_dispatch it from the Actions tab
 ```
 
 ### Which versions we support, and why
@@ -367,14 +365,14 @@ Support window, per framework, from the observed release cadence:
 
 1. The floating lane goes red and opens an issue. **The pinned gate stays
    green**, so releases are not blocked. This is the whole point of the split.
-2. Read the canary report's version diff (`changed` / `added` against
-   `frameworks-lock.txt`) to see which upstream release moved.
+2. Read the nightly run's version diff (`changed` / `added` against the
+   recorded baseline) to see which upstream release moved.
 3. Decide which of two things is true:
    - **The adapter is wrong.** Fix `decimalai/<adapter>.py`. The row goes green
      in both lanes and nothing else changes.
    - **The new upstream behaviour is correct and ours was.** Record a new
-     baseline with `python release_gate/canary.py --latest --update-lock`, and
-     raise the floor in `pyproject.toml` if the old version can no longer work.
+     baseline, and raise the floor in `pyproject.toml` if the old version can
+     no longer work.
 4. Never make a red row green by editing the driver. A driver contains no
    assertions, so there is nothing in it to relax; if you find yourself wanting
    to, the change belongs in `contract.py` and applies to every framework.

@@ -243,7 +243,7 @@ providers-tests = [
 ]
 # Every framework the HERMETIC conformance tier drives (tests/conformance, Tier A —
 # stub models + a local probe server, no provider key, no backend). This is the
-# install set for the `conformance` CI job and for `release_gate`'s conformance
+# install set for the `conformance` CI job and for the backend's release-gate
 # phase; it exists so that list lives in ONE place with floors, instead of being
 # retyped in a workflow file.
 #
