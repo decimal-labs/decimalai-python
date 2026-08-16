@@ -173,8 +173,10 @@ class TestSkillsSystemPrompt:
         assert fragment == "## Available Skills\n| code-review | Review a PR |"
         assert routing_id == "rt_42"
         # Full-menu mode (query=None) + agent_name threaded from ctx.agent.name.
+        # scope=None because there is no agent.run span here: outside a run the
+        # adapter scopes to nothing rather than guessing a key.
         fake_router.build_prompt_fragment.assert_called_once_with(
-            query=None, agent_name="shopper"
+            query=None, agent_name="shopper", scope=None
         )
 
     def test_returns_empty_when_router_unavailable(self, fake_pydantic_ai):

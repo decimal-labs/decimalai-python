@@ -589,7 +589,15 @@ class SkillRouter:
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
         # menu. force_refresh still bypasses/refreshes the matching key.
-        self._menu_cache: Dict[Tuple[Optional[str], Optional[str], Optional[str]], Dict[str, Any]] = {}
+        # Bounded + TTL'd, not a plain dict. It holds a per-RUN key (see
+        # get_menu), so an unbounded dict would grow once per run forever in a
+        # long-lived server. It was previously unbounded AND never expired,
+        # which also meant every full-menu run in a process shared the FIRST
+        # run's routing_id for the life of the process.
+        self._menu_cache = _FragmentCache(
+            maxsize=fragment_cache_size,
+            ttl_seconds=fragment_cache_ttl,
+        )
         # `build_prompt_fragment` cache. Keyed by the input
         # tuple so repeat calls within the same turn (multi-LLM-call
         # agent loops) reuse a single routing decision instead of
@@ -688,6 +696,7 @@ class SkillRouter:
         project_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         force_refresh: bool = False,
+        scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fetch the full skill menu from the platform.
 
@@ -699,7 +708,19 @@ class SkillRouter:
         it's a no-op against older backends / when the resolver is off.
         """
         effective_agent = agent_name or self.agent_name
-        cache_key = (category, project_id, effective_agent)
+        # `scope` is the run this menu is for, and it is part of the key because
+        # the cached result carries a `routing_id` — the platform's record of ONE
+        # routing decision. Handing a second run the first run's routing_id makes
+        # two runs claim one decision, which is precisely what the effectiveness
+        # join must not see: offers get undercounted by however many runs shared
+        # the slot. This cache had no TTL either, so on the full-menu path every
+        # run in a process shared the first one's decision indefinitely.
+        #
+        # The cost is real and is the honest price of per-run attribution: on the
+        # full-menu path (query=None) each run now fetches its own menu instead
+        # of reusing a process-wide one. Unscoped callers pass None and keep
+        # exactly today's key and call volume.
+        cache_key = (category, project_id, effective_agent, scope or "")
         if not force_refresh:
             cached = self._menu_cache.get(cache_key)
             if cached is not None:
@@ -722,7 +743,7 @@ class SkillRouter:
             return {"skills": [], "prompt_fragment": "", "strategy": "none"}
 
         if result:
-            self._menu_cache[cache_key] = result
+            self._menu_cache.set(cache_key, result)
         return result or {"skills": [], "prompt_fragment": "", "strategy": "none"}
 
     def smart_route(
@@ -1157,7 +1178,7 @@ class SkillRouter:
                 return "", None
         else:
             try:
-                result = self.get_menu(category=category)
+                result = self.get_menu(category=category, scope=scope)
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment get_menu failed: %s", e)
                 return "", None

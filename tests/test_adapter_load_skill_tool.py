@@ -122,7 +122,10 @@ class TestPydanticAiLoadSkillTool:
         out = tool_fn("x")
 
         assert out == "## Skill: x\n\nbody"
-        fake_router.load_skill.assert_called_once_with("x")
+        # scope=None because this call runs outside any agent run — there is no
+        # trace to attribute the load to, and the adapter must say so rather
+        # than invent a run key.
+        fake_router.load_skill.assert_called_once_with("x", scope=None)
 
     def test_tool_returns_error_string_when_router_unavailable(self, fake_pydantic_ai):
         """The tool must always return a string the model can act on."""

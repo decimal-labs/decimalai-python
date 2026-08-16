@@ -24,7 +24,11 @@ class TestSkillRouter:
         assert router.base_url == "http://localhost:8000"
         assert router.strategy == "auto"
         # The menu cache is keyed by (category, project_id, agent) — starts empty.
-        assert router._menu_cache == {}
+        # Starts empty — asserted through the cache's API rather than by
+        # comparing it to `{}`. It is no longer a plain dict: its key now
+        # includes the run scope, so it needs the bounded TTL+LRU container or
+        # it would grow one entry per run forever in a long-lived server.
+        assert router._menu_cache.get(("any", None, None, "")) is None
 
     def test_headers(self):
         router = SkillRouter(api_key="dai_sk_abc")

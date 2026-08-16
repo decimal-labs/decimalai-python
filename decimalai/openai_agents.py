@@ -238,6 +238,11 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 "loaded": [],
                 "agent": None,
                 "user_input": None,
+                # Every distinct string `Agent.get_system_prompt` resolved on
+                # this run, in turn order. The FALLBACK evidence for what the
+                # model was shown; the server's own echo is preferred when the
+                # Responses API returns one. See `_attach_system_prompts`.
+                "system_prompts": [],
             }
             _run_rails[run_key] = rail
             while len(_run_rails) > _RUN_RAILS_MAX:
@@ -255,6 +260,7 @@ def _record_run_rail(
     loaded: Optional[List[str]] = None,
     agent: Any = None,
     user_input: Optional[str] = None,
+    system_prompt: Optional[str] = None,
 ) -> bool:
     """Stamp routing/loading telemetry onto the CURRENT run's rail.
 
@@ -279,6 +285,13 @@ def _record_run_rail(
         # First turn wins: it carries the run's original ask.
         if user_input and not rail.get("user_input"):
             rail["user_input"] = user_input
+        # Turn order, de-duplicated. A run whose prompt never changes leaves
+        # ONE entry, which is what lets `_attach_system_prompts` give the same
+        # string to every call without guessing at a mapping.
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            prompts = rail.setdefault("system_prompts", [])
+            if system_prompt not in prompts:
+                prompts.append(system_prompt)
     return True
 
 
@@ -696,22 +709,39 @@ def _install_agent_hooks() -> bool:
             )
         except Exception:
             logger.debug("agent observation failed (non-fatal)", exc_info=True)
-        if not _skill_loader_installed:
-            return base
+        # ONE exit, so the string recorded below is the string returned. The
+        # runner hands this exact value to the model as `system_instructions`
+        # (agents/run_internal/run_loop.py -> ModelSettings ->
+        # openai_responses.py `"instructions": system_instructions`), and it is
+        # the half of the prompt no span carries: `ResponseSpanData.__slots__`
+        # is ("response", "input", "usage") — there is no instructions slot, so
+        # without this capture the skills menu is invisible to the tracer.
+        resolved = base
+        if _skill_loader_installed:
+            try:
+                current = getattr(self, "instructions", None)
+                if callable(current) and hasattr(current, _BASE_INSTRUCTIONS_ATTR):
+                    # Built after instrument(): the constructor already wrapped
+                    # `instructions`, and `original_gsp` just called it. Adding
+                    # the fragment again here would inject the skills menu twice.
+                    pass
+                elif callable(current):
+                    pass  # a callable the user wrote — their judgment wins
+                else:
+                    _note_retrofit(self)
+                    resolved = _make_skill_aware_instructions(base or "")(
+                        run_context, self
+                    )
+            except Exception:
+                logger.debug(
+                    "skill-aware prompt retrofit failed (non-fatal)", exc_info=True
+                )
+                resolved = base
         try:
-            current = getattr(self, "instructions", None)
-            if callable(current) and hasattr(current, _BASE_INSTRUCTIONS_ATTR):
-                # Built after instrument(): the constructor already wrapped
-                # `instructions`, and `original_gsp` just called it. Adding
-                # the fragment again here would inject the skills menu twice.
-                return base
-            if callable(current):
-                return base  # a callable the user wrote — their judgment wins
-            _note_retrofit(self)
-            return _make_skill_aware_instructions(base or "")(run_context, self)
+            _record_run_rail(system_prompt=resolved)
         except Exception:
-            logger.debug("skill-aware prompt retrofit failed (non-fatal)", exc_info=True)
-            return base
+            logger.debug("system-prompt observation failed (non-fatal)", exc_info=True)
+        return resolved
 
     setattr(patched_get_system_prompt, _HOOK_MARKER, True)
     Agent.get_system_prompt = patched_get_system_prompt  # type: ignore[method-assign]
@@ -1373,6 +1403,13 @@ class _TraceAccumulator:
         # Bodies that reached the model (Router body injection) —
         # between offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
+        # llm_call id -> the system prompt the SERVER echoed back for that
+        # call (`Response.instructions`). Held OFF `rendered_input` until
+        # after `_detect_skills` has run — the skills menu names every
+        # offered skill, and detection name-matches over system text, so
+        # splicing it in earlier would report every offered skill as
+        # ACTIVATED. Spliced in by `_attach_system_prompts`.
+        self.system_prompt_by_call: Dict[Any, str] = {}
 
     @property
     def live_agent(self) -> Any:
@@ -1784,6 +1821,22 @@ class DecimalTracingProcessor:
         _note_user_input(acc, raw_input)
         output_text = _response_output_text(response_obj) if response_obj else None
 
+        # The system half of the prompt, as the SERVER reports having received
+        # it. `span_data.input` is the input-items list only, so the
+        # instructions — which is where the skills menu lives — are simply not
+        # on the span. `Response.instructions` is the API's own echo of the
+        # value it was sent, which makes this a round-trip receipt rather than
+        # our own hook marking its own homework. Only a plain string counts:
+        # the field also admits a list of input items, and a shape we cannot
+        # render verbatim is one we decline to claim.
+        echoed_instructions = (
+            getattr(response_obj, "instructions", None)
+            if response_obj is not None
+            else None
+        )
+        if not (isinstance(echoed_instructions, str) and echoed_instructions.strip()):
+            echoed_instructions = None
+
         latency_ms = None
         if started_at and ended_at:
             latency_ms = int((ended_at - started_at).total_seconds() * 1000)
@@ -1827,6 +1880,8 @@ class DecimalTracingProcessor:
                 ended_at=ended_at,
             )
             acc.llm_calls.append(call)
+            if echoed_instructions:
+                acc.system_prompt_by_call[call.id] = echoed_instructions
 
         trace_span = TraceSpan(
             id=span_id,
@@ -1981,6 +2036,12 @@ class DecimalTracingProcessor:
         # keyed by the trace id both the instructions callable and this
         # method see. Popped, so it can't leak into a later trace.
         run_rail = _pop_run_rail(acc.trace_id) or {}
+
+        # Put the system half of the prompt back on `rendered_input`. STRICTLY
+        # AFTER `_detect_skills` above: the skills menu names every OFFERED
+        # skill, and `detect_skill_activations` name-matches over system text,
+        # so splicing earlier would report the whole menu as ACTIVATED.
+        _attach_system_prompts(acc, run_rail.get("system_prompts"))
 
         # Drain the Router's process-global rails unconditionally: an
         # undrained rail leaks into the NEXT trace. When this run recorded
@@ -2250,6 +2311,78 @@ def _response_output_text(response_obj: Any) -> Optional[str]:
     except Exception:
         logger.debug("Response output text extraction failed", exc_info=True)
         return None
+
+
+def _attach_system_prompts(
+    acc: "_TraceAccumulator", rail_prompts: Any = None
+) -> None:
+    """Prepend each call's system prompt to its ``rendered_input``.
+
+    ``ResponseSpanData`` carries ``(response, input, usage)`` and nothing else,
+    so ``span_data.input`` is the input-items list ALONE. The instructions —
+    the half of the prompt the skills menu is injected into — never appear on
+    the span, which is why a trace could claim to have offered a skill whose
+    name was nowhere in ``rendered_input``: the claim was true and the record
+    was incomplete.
+
+    Two sources, best evidence first:
+
+    * ``Response.instructions`` — the server's echo of what it received,
+      captured per call in ``_handle_response``. Authoritative, and immune to
+      anything that rewrites instructions after our hook has run (a
+      ``RunConfig.call_model_input_filter`` may legally replace them).
+    * the run rail — the exact return value of ``Agent.get_system_prompt``.
+      Used only for calls the server echoed nothing for.
+
+    Nothing is ever reconstructed or inferred. When the fallback cannot be
+    mapped onto calls without guessing, NOTHING is attached: an incomplete
+    record beats an invented one.
+
+    MUST be called after ``_detect_skills`` — see the call site.
+    """
+    calls = acc.llm_calls
+    if not calls:
+        return
+    resolved: Dict[Any, str] = dict(acc.system_prompt_by_call)
+
+    unmapped = [c for c in calls if c.id not in resolved]
+    prompts = [
+        p for p in (rail_prompts or []) if isinstance(p, str) and p.strip()
+    ]
+    if unmapped and prompts:
+        if len(prompts) == 1:
+            # The run never changed its system prompt: one string, every call.
+            for call in unmapped:
+                resolved[call.id] = prompts[0]
+        elif len(unmapped) == len(calls) and len(prompts) == len(calls):
+            # Distinct prompt per turn, and no call has a server echo to
+            # interleave with. `get_system_prompt` runs once per turn, before
+            # that turn's model call, so rail order is turn order.
+            for call, prompt in zip(calls, prompts):
+                resolved[call.id] = prompt
+        # Otherwise the mapping is a guess. Attach nothing to the unmapped
+        # calls and let the record be visibly incomplete.
+
+    for call in calls:
+        text = resolved.get(call.id)
+        if not text:
+            continue
+        messages = call.rendered_input
+        if messages is None:
+            call.rendered_input = [{"role": "system", "content": text}]
+            continue
+        if not isinstance(messages, list):
+            continue
+        # The chat-completions path (`_handle_generation`) already renders the
+        # system message itself; adding it again would double the prompt.
+        already = "\n".join(
+            str(m.get("content") or "")
+            for m in messages
+            if isinstance(m, dict) and m.get("role") in ("system", "developer")
+        )
+        if text in already:
+            continue
+        messages.insert(0, {"role": "system", "content": text})
 
 
 def _normalize_messages(raw: Any) -> Optional[List[Dict[str, Any]]]:

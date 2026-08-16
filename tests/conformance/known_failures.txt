@@ -16,10 +16,6 @@
 # already reported in the framework audit; the fix belongs in the adapter, not
 # here.
 
-# ── OpenAI Agents ────────────────────────────────────────────────────────────
-# Offered names are claimed but not present in the prompt the model was shown.
-openai-agents:C8
-
 # ── Recorded 2026-08-15, second pass ─────────────────────────────────────────
 # The block above was recorded from a run in which only 4 of 11 frameworks had
 # their libraries installed — the other 7 were skipped and their failures were
@@ -30,26 +26,8 @@ openai-agents:C8
 # deterministic across 4 consecutive runs and identical with serial children.
 # Every one is a defect the acceptance grading already reported.
 
-# raw Anthropic — routing_id never reaches the trace, though the menu does
-# reach the model. The trace-shape defects that used to sit here (C5 one run
-# fragmenting into one trace per messages.create, C6 every trace filed under
-# the first agent, C9 concurrent lanes cross-contaminating) are fixed: the
-# documented snippet now declares its run boundary with
-# decimalai.providers.agent_run(), which a raw-SDK user must do themselves
-# because there is no run object for a library to hook.
-anthropic:C8
-
-
 # CrewAI — instrumentor-derived spans arrive without LLM detail, and a
 # concurrent lane's trace can carry another lane's prompt.
 crewai:C3
 crewai:C4
 crewai:C9
-
-# Pydantic AI — routing_id never reaches the trace. The trace-shape defects
-# that used to sit here (C5 one run fragmenting into N unlinked traces, C6 every
-# trace filed under the first agent, C9 eight lanes arriving as sixteen traces)
-# are fixed: decimalai.pydantic_ai.instrument() now opens an agent.run span
-# around each run, so the run's provider calls nest under one root and the
-# agent's own name travels with them.
-pydantic-ai:C8

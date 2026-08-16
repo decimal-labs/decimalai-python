@@ -66,6 +66,24 @@ def get_current_routing_id() -> Optional[str]:
     return _routing_id_ctx.get()
 
 
+def _scope() -> Optional[str]:
+    """This run's routing scope — the live OTel trace id, or None.
+
+    ``instrument()`` opens an ``agent.run`` span around every run, so inside a
+    run this is stable and unique per run: both the prompt build and the
+    ``load_skill`` tool call land on the same key. Without it, eight concurrent
+    runs of one agent share one fragment-cache slot (they all route with
+    ``query=None`` and the same agent name) and would be handed one routing
+    decision between them.
+    """
+    try:
+        from .otel import current_run_key
+        key = current_run_key()
+    except Exception:
+        return None
+    return None if key is None else f"{key:032x}"
+
+
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
@@ -113,7 +131,23 @@ def _handle_load_skill(name: str) -> str:
     if router is None:
         return "load_skill error: skill router unavailable."
     try:
-        return router.load_skill(name)
+        scope = _scope()
+        body = router.load_skill(name, scope=scope)
+        if scope is not None:
+            # Only names the router actually served a body for reach this rail
+            # — a budget refusal or a not-found never records, so
+            # `skills_loaded_by_agent` means "a body reached the model", not
+            # "the model asked for one".
+            served = router.consume_loaded_names(scope=scope)
+            if served:
+                try:
+                    from .otel import record_skill_rail
+                    record_skill_rail(loaded=served)
+                except Exception:
+                    logger.debug(
+                        "skill rail recording failed (non-fatal)", exc_info=True
+                    )
+        return body
     except Exception:
         logger.debug("load_skill handler failed (non-fatal)", exc_info=True)
         return f"load_skill error: could not load {name!r} (transient error)."
@@ -138,8 +172,19 @@ async def _skills_system_prompt(ctx: Any) -> str:
         if agent_obj is not None:
             agent_name = getattr(agent_obj, "name", None)
         fragment, routing_id = router.build_prompt_fragment(
-            query=None, agent_name=agent_name,
+            query=None, agent_name=agent_name, scope=_scope(),
         )
+        # Drain the per-call contextvar rails NOW, one statement after the
+        # router wrote them and on the same thread, so these are this call's
+        # names. The router's instance rails are not used here on purpose: they
+        # are process-global and clear-on-read, so under concurrent runs the
+        # first drainer takes every lane's names.
+        from .skill_router import (
+            consume_last_delivered_names,
+            consume_last_offered_names,
+        )
+        offered = consume_last_offered_names()
+        delivered = consume_last_delivered_names()
         if routing_id:
             _set_routing_id(routing_id)
         # Tell the model how bodies arrive when the tool exists.
@@ -148,6 +193,19 @@ async def _skills_system_prompt(ctx: Any) -> str:
         if fragment and _load_skill_tool_active:
             from .skill_router import LOAD_SKILL_PROMPT_HINT
             fragment = f"{fragment}\n{LOAD_SKILL_PROMPT_HINT}"
+        if fragment:
+            # Only for a prompt we actually returned. An empty fragment is an
+            # un-routed turn and must claim neither a routing_id nor a name.
+            try:
+                from .otel import record_skill_rail
+                record_skill_rail(
+                    routing_id=routing_id,
+                    offered=offered,
+                    delivered=delivered,
+                    prompt_text=fragment,
+                )
+            except Exception:
+                logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
         return fragment or ""
     except Exception:
         logger.debug("Pydantic AI skill loader failed (non-fatal)", exc_info=True)

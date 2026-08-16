@@ -31,7 +31,7 @@ import logging
 import re
 import threading
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 from uuid import uuid4
@@ -101,6 +101,150 @@ _DECIMAL_AGENT_NAME = "decimal.agent_name"
 _active_agent_name: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "decimalai_otel_active_agent", default=None
 )
+
+
+# ── Skill rail ────────────────────────────────────────────────
+# What the router decided for a run, held until that run's trace is assembled.
+#
+# Keyed by the run's OTel **trace_id**, not by a ContextVar and not by the
+# exporter instance. Both alternatives were rejected for reasons that have
+# already bitten this codebase:
+#
+#   * a ContextVar cannot be read at export time — under BatchSpanProcessor the
+#     trace is assembled on a worker thread that never saw the caller's context,
+#     so the read returns None and the rail silently empties;
+#   * the router's own clear-on-read rails (`consume_offered_names()` et al) are
+#     process-global, so under eight concurrent lanes the first trace to send
+#     takes everyone's names and lanes two through eight get `[]`.
+#
+# The trace_id is the one identifier that is both readable on the calling thread
+# at routing time and carried on the span at export time, so it is the join key.
+#
+# Module level, not an exporter attribute: a process can hold two
+# DecimalSpanExporters (a `providers` pipeline plus `otel.instrument()`), and an
+# instance-owned store would strand every entry written while the other one was
+# the live exporter.
+_SKILL_RAIL_MAX = 256
+_skill_rails: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+_skill_rails_lock = threading.Lock()
+
+
+def current_run_key() -> Optional[int]:
+    """The live OTel trace_id, or None when there is no run to attribute to.
+
+    None is a real answer, not a failure: it means nothing has declared a run
+    boundary here (no ``agent_run``, tracing off, an invalid span context). The
+    caller must then DROP its metadata rather than guess an owner — see
+    :func:`record_skill_rail`.
+    """
+    try:
+        from opentelemetry import trace as trace_api
+    except ImportError:
+        return None
+    try:
+        span_ctx = trace_api.get_current_span().get_span_context()
+    except Exception:
+        return None
+    if not getattr(span_ctx, "is_valid", False):
+        return None
+    tid = getattr(span_ctx, "trace_id", 0)
+    return tid or None
+
+
+def record_skill_rail(
+    *,
+    routing_id: Optional[str] = None,
+    offered: Optional[Sequence[str]] = None,
+    delivered: Optional[Sequence[str]] = None,
+    loaded: Optional[Sequence[str]] = None,
+    prompt_text: Optional[str] = None,
+) -> bool:
+    """Attribute one routing/loading fact to the run whose trace is live NOW.
+
+    Args:
+        routing_id: the ``rt_…`` id the platform minted for this decision.
+            FIRST write wins for a run — the first decision is the one the run
+            is attributed to, and a later turn must not overwrite it.
+        offered: names whose menu row was put in the prompt.
+        delivered: names whose BODY was put in the prompt.
+        loaded: names whose body reached the model as a tool result.
+        prompt_text: the text that was actually injected. When given, ``offered``
+            and ``delivered`` are filtered down to names that genuinely appear
+            in it — the router derives its offered list and its prompt fragment
+            from two different keys of one payload and nothing cross-checks
+            them, so recording the claim unfiltered would import that gap into
+            the trace. A dropped name is logged at WARNING, by name.
+
+    Returns:
+        True when the fact was attributed to a run, False when there was no run
+        to attribute it to and it was therefore dropped. A caller that gets
+        False must not retry against some other slot.
+    """
+    key = current_run_key()
+    if key is None:
+        return False
+
+    def _kept(names: Optional[Sequence[str]], kind: str) -> List[str]:
+        vals = [n for n in (names or []) if isinstance(n, str) and n]
+        if prompt_text is None:
+            return vals
+        keep = []
+        for n in vals:
+            if n in prompt_text:
+                keep.append(n)
+            else:
+                logger.warning(
+                    "skill rail: the router %s %r but the rendered fragment does "
+                    "not contain it — dropping it rather than claiming the model "
+                    "was shown it",
+                    kind, n,
+                )
+        return keep
+
+    kept_offered = _kept(offered, "offered")
+    kept_delivered = _kept(delivered, "delivered")
+    kept_loaded = [n for n in (loaded or []) if isinstance(n, str) and n]
+
+    with _skill_rails_lock:
+        rail = _skill_rails.get(key)
+        if rail is None:
+            rail = {
+                "routing_id": None,
+                "offered": [],
+                "delivered": [],
+                "loaded": [],
+            }
+            _skill_rails[key] = rail
+        if routing_id and not rail["routing_id"]:
+            rail["routing_id"] = routing_id
+        for field, incoming in (
+            ("offered", kept_offered),
+            ("delivered", kept_delivered),
+            ("loaded", kept_loaded),
+        ):
+            bucket = rail[field]
+            for name in incoming:
+                if name not in bucket:
+                    bucket.append(name)
+        # A run whose root span never reaches the exporter would sit here
+        # forever. Same discipline as the pending-span buffer: bounded, oldest
+        # evicted first.
+        while len(_skill_rails) > _SKILL_RAIL_MAX:
+            _skill_rails.popitem(last=False)
+    return True
+
+
+def _pop_skill_rail(tid: int) -> Optional[Dict[str, Any]]:
+    """Take this run's rail, removing it. Pop, never peek — a rail read twice
+    would hand one routing decision to two traces."""
+    with _skill_rails_lock:
+        return _skill_rails.pop(tid, None)
+
+
+def _reset_skill_rails() -> None:
+    """Drop every buffered rail. Test seam only."""
+    with _skill_rails_lock:
+        _skill_rails.clear()
 
 
 class _AgentNameStamper:
@@ -652,6 +796,33 @@ class DecimalSpanExporter:
                 run_trace.manifest_id = self._maybe_register_manifest(
                     agent_name, seen_model, seen_tools, seen_prompts
                 )
+                # The skills rail, if this run had one. Deliberately AFTER the
+                # manifest stamp and outside _assemble_trace: four already
+                # declared fields assigned on a finished object, so nothing
+                # about trace shape, identity or manifest registration can move.
+                rail = _pop_skill_rail(tid)
+                if rail:
+                    # A body the agent pulled with load_skill WAS delivered —
+                    # it reached the model — so `loaded` folds into `delivered`.
+                    #
+                    # It deliberately does NOT fold into `offered`. That field is
+                    # `skills_offered_in_prompt`: a claim that the name appeared
+                    # in the prompt the model was shown, which is why
+                    # record_skill_rail filters offered/delivered against the
+                    # rendered fragment and drops anything absent. `loaded`
+                    # arrives from a tool call and never passes that filter, so
+                    # unioning it in here re-imported through the back door
+                    # exactly the unverified claim the filter exists to reject.
+                    # The ladder loaded ⊆ delivered still holds; loaded ⊆ offered
+                    # does not, and should not — a skill loaded by name we cannot
+                    # find in the fragment is a real signal, not a rounding error.
+                    loaded = set(rail["loaded"])
+                    delivered = set(rail["delivered"]) | loaded
+                    offered = set(rail["offered"]) | set(rail["delivered"])
+                    run_trace.routing_id = rail["routing_id"]
+                    run_trace.skills_offered_in_prompt = sorted(offered)
+                    run_trace.skills_delivered = sorted(delivered)
+                    run_trace.skills_loaded_by_agent = sorted(loaded)
                 self._send(run_trace)
         except Exception:
             logger.exception(

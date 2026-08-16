@@ -152,7 +152,7 @@ class OpenAIWire:
         turn = lane.script[min(_turns_taken(body), len(lane.script) - 1)]
         model = body.get("model") or "conformance-stub"
         if path.endswith("/responses"):
-            return 200, _responses_payload(model, turn)
+            return 200, _responses_payload(model, turn, body)
         if path.endswith("/chat/completions"):
             return 200, _chat_payload(model, turn)
         return 404, _error(f"conformance stub has no route for POST {path}")
@@ -206,8 +206,25 @@ def _turns_taken(body: Any) -> int:
     return count
 
 
-def _responses_payload(model: str, turn: StubTurn) -> Dict[str, Any]:
-    """One ``Response`` — the API ``Agent(model=...)`` uses by default."""
+def _responses_payload(
+    model: str, turn: StubTurn, body: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One ``Response`` — the API ``Agent(model=...)`` uses by default.
+
+    ``instructions`` is echoed back from the request, which is what the real
+    Responses API does: ``Response.instructions`` is a field of the response
+    object ("a system (or developer) message inserted into the model's
+    context"), not something the client fills in. Omitting it here would have
+    made the stub LESS faithful than the endpoint it stands in for, and would
+    have left an adapter no way to observe the instructions at all — the SDK's
+    ``ResponseSpanData`` carries ``(response, input, usage)``, so the request
+    body is not otherwise recoverable.
+
+    Note what this echo does NOT do: it cannot manufacture a passing grade. It
+    returns whatever the caller actually serialised into the HTTP body, so an
+    adapter that never got its skills menu into ``instructions`` gets a string
+    without it back.
+    """
     if turn.tool_call:
         name, args = turn.tool_call
         output: List[Dict[str, Any]] = [{
@@ -229,12 +246,14 @@ def _responses_payload(model: str, turn: StubTurn) -> Dict[str, Any]:
             ],
         }]
     in_tokens, out_tokens = turn.input_tokens, turn.output_tokens
+    instructions = (body or {}).get("instructions")
     return {
         "id": "resp_" + uuid.uuid4().hex,
         "object": "response",
         "created_at": time.time(),
         "model": model,
         "status": "completed",
+        "instructions": instructions if isinstance(instructions, str) else None,
         "output": output,
         "parallel_tool_calls": False,
         "tool_choice": "auto",

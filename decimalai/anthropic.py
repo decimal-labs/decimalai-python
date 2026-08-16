@@ -58,6 +58,21 @@ def get_current_routing_id() -> Optional[str]:
     return _routing_id_ctx.get()
 
 
+def _scope() -> Optional[str]:
+    """This run's routing scope — the live OTel trace id, or None.
+
+    Passed to the Router so two concurrent runs of one agent do not share a
+    fragment-cache slot (and therefore a routing decision). Outside a run there
+    is nothing to scope to, and None keeps the pre-existing behaviour.
+    """
+    try:
+        from .otel import current_run_key
+        key = current_run_key()
+    except Exception:
+        return None
+    return None if key is None else f"{key:032x}"
+
+
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
@@ -139,17 +154,41 @@ def skill_system(
 
     try:
         fragment, routing_id = router.build_prompt_fragment(
-            query=query, agent_name=agent_name,
+            query=query, agent_name=agent_name, scope=_scope(),
         )
     except Exception:
         logger.debug("skill_system build_prompt_fragment failed (non-fatal)", exc_info=True)
         return base if base is not None else ""
 
+    # Claim nothing for a call we inject nothing into. This guard used to sit
+    # BELOW the routing-id stamp, so a call that got an empty fragment still
+    # reported a routing decision — a trace asserting the model was routed when
+    # its prompt was untouched.
+    if not fragment:
+        return base if base is not None else ""
+
     if routing_id:
         _set_routing_id(routing_id)
 
-    if not fragment:
-        return base if base is not None else ""
+    # Record against the run's trace, in the same breath as returning the text
+    # that goes into `system`. The drains below are the per-call CONTEXTVAR
+    # rails, written by build_prompt_fragment one statement ago on this thread —
+    # NOT the router's instance rails, which are process-global clear-on-read
+    # state that under a concurrent fanout hands lane 1 everybody's names.
+    try:
+        from .otel import record_skill_rail
+        from .skill_router import (
+            consume_last_delivered_names,
+            consume_last_offered_names,
+        )
+        record_skill_rail(
+            routing_id=routing_id,
+            offered=consume_last_offered_names(),
+            delivered=consume_last_delivered_names(),
+            prompt_text=fragment,
+        )
+    except Exception:
+        logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
 
     if isinstance(base, list):
         return [{"type": "text", "text": fragment}, *base]
