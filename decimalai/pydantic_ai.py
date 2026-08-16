@@ -18,7 +18,19 @@ function that calls `SkillRouter.build_prompt_fragment()` per turn and
 prepends the result to the base system prompt.
 
 Tracing for Pydantic AI is observed via the underlying provider SDK
-(OpenAI/Anthropic) — install the matching tracing adapter alongside.
+(OpenAI/Anthropic) — install the matching tracing adapter alongside::
+
+    decimalai.init(openai=True)               # carries the spans
+    decimalai.pydantic_ai.instrument()        # carries the run boundary
+
+Both halves are needed. The provider instrumentor sees provider calls and
+nothing else, so on its own it emits one unparented root span — and therefore
+one DecimalAI trace — per call: a single `agent.run_sync()` that asks for a
+tool and then answers arrives as two unrelated one-span traces, both filed
+under whichever agent happened to run first in the process. `instrument()`
+patches `Agent.iter` (the one place `run`/`run_sync`/`run_stream` all funnel
+through) to open an `agent.run` span around each run, which gives those calls a
+real parent to nest under and puts the Agent's own name on the trace.
 """
 
 from __future__ import annotations
@@ -201,13 +213,81 @@ def _install_skill_loader() -> None:
     logger.info("DecimalAI SkillRouter loader installed (Pydantic AI)")
 
 
-def instrument(*, enable_skill_loader: bool = False) -> None:
+# ── run scope ───────────────────────────────────────────────
+_run_scope_installed = False
+
+
+def _install_run_scope() -> None:
+    """Monkey-patch ``Agent.iter`` so one agent run is one span, one trace.
+
+    Pydantic AI emits no spans of its own — the docs say so, and it is the
+    reason this integration's documented setup is *two* calls, the second being
+    a provider pairing like ``decimalai.init(openai=True)``. But a provider
+    instrumentor only sees provider calls. Each one becomes an unparented root
+    span in its own OTel trace, so a single ``agent.run_sync()`` that asks for a
+    tool and then answers arrived as two unrelated one-span DecimalAI traces —
+    no waterfall, no way to tell which calls belonged to the same run, and
+    (because the exporter's agent name is fixed when it is built) every one of
+    them filed under whichever agent ran first.
+
+    ``iter`` is the patch point because it is the one place every entry point
+    funnels through: ``run_sync`` awaits ``run``, ``run``/``run_stream``/
+    ``run_stream_events`` all open ``self.iter(...)``, and an ``AgentRun`` is
+    exactly one run. Patching ``run_sync`` instead would have covered less and
+    cost more — it calls ``self._infer_name(inspect.currentframe())``, so a
+    wrapper frame between it and the caller breaks the name inference this fix
+    depends on.
+
+    The span this opens is the parent that genuinely wraps the run. It does not
+    synthesize the steps Pydantic AI never reported: the tool call it executes
+    in-process emits no span here, and none is invented for it.
+    """
+    global _run_scope_installed
+    if _run_scope_installed:
+        return
+    try:
+        from pydantic_ai import Agent
+    except ImportError:
+        logger.warning(
+            "pydantic-ai is not installed; skipping the DecimalAI run scope. "
+            "Install it with: pip install \"decimalai[pydantic-ai]\""
+        )
+        return
+
+    original_iter = getattr(Agent, "iter", None)
+    if not callable(original_iter):
+        logger.warning(
+            "this pydantic-ai has no Agent.iter, so DecimalAI cannot bracket a "
+            "run — traces will arrive as one per provider call, unparented"
+        )
+        return
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def patched_iter(self, *args, **kwargs):
+        from .providers import agent_run
+
+        # The Agent's own name, per run — not a module global. run()/run_sync()
+        # have already inferred it by the time they open iter().
+        with agent_run(getattr(self, "name", None)):
+            async with original_iter(self, *args, **kwargs) as run:
+                yield run
+
+    Agent.iter = patched_iter  # type: ignore[method-assign]
+    _run_scope_installed = True
+    logger.info("DecimalAI run scope installed (Pydantic AI)")
+
+
+def instrument(*, enable_skill_loader: bool = False, trace_runs: bool = True) -> None:
     """Install DecimalAI integration for Pydantic AI.
 
-    Tracing for Pydantic AI flows through the underlying provider SDK,
-    so this instrument() currently focuses on the skill loader. Pair with
-    `decimalai.openai_agents.instrument()` or `decimalai.anthropic` for
-    full tracing coverage.
+    Pydantic AI does no tracing of its own, so the *content* of a trace still
+    comes from the provider pairing you install alongside
+    (``decimalai.init(openai=True)`` / ``init(anthropic=True)``). What this adds
+    is the run boundary that pairing cannot see: an ``agent.run`` span around
+    each agent run, so the run's provider calls land in ONE trace, nested, under
+    the name of the agent that made them.
 
     Note: this adapter never reads from or writes to disk, so there is
     no ``disk_sync`` parameter. If you're running inside a disk-loading
@@ -218,14 +298,21 @@ def instrument(*, enable_skill_loader: bool = False) -> None:
     Args:
         enable_skill_loader: When True, monkey-patch Agent so new
             instances auto-load skills into the system prompt.
+        trace_runs: When True (the default), wrap every agent run in a parent
+            span. Turn it off only if something else already opens a span around
+            the run — a second one would be a redundant layer in the waterfall,
+            not a wrong one.
     """
     if enable_skill_loader:
         from .skill_router import _warn_if_disk_runtime_detected
         _warn_if_disk_runtime_detected("pydantic_ai")
         _install_skill_loader()
+    if trace_runs:
+        _install_run_scope()
     logger.info(
-        "DecimalAI Pydantic AI integration installed (skill_loader=%s)",
+        "DecimalAI Pydantic AI integration installed (skill_loader=%s, trace_runs=%s)",
         enable_skill_loader,
+        trace_runs,
     )
 
 

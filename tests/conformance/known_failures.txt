@@ -63,9 +63,10 @@ crewai:C3
 crewai:C4
 crewai:C9
 
-# Pydantic AI — one run fragments into N unlinked traces; routing_id never
-# reaches the trace.
-pydantic-ai:C5
-pydantic-ai:C6
+# Pydantic AI — routing_id never reaches the trace. The trace-shape defects
+# that used to sit here (C5 one run fragmenting into N unlinked traces, C6 every
+# trace filed under the first agent, C9 eight lanes arriving as sixteen traces)
+# are fixed: decimalai.pydantic_ai.instrument() now opens an agent.run span
+# around each run, so the run's provider calls nest under one root and the
+# agent's own name travels with them.
 pydantic-ai:C8
-pydantic-ai:C9

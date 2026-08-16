@@ -280,7 +280,10 @@ class TestEnsurePipeline:
 
         assert out is tp
         after = len(getattr(tp, "_active_span_processor")._span_processors)
-        assert after == before + 1  # our SimpleSpanProcessor was attached
+        # Two: the SimpleSpanProcessor carrying our exporter, and the
+        # _AgentNameStamper that writes the run-scoped agent name onto each span
+        # (asserted by type in tests/test_provider_run_scope.py).
+        assert after == before + 2
         assert providers._pipeline_provider is None  # global path not taken
 
 

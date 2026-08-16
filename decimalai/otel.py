@@ -24,6 +24,7 @@ Manual path (custom TracerProvider)::
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -32,7 +33,7 @@ import threading
 import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from uuid import uuid4
 
 from .schema.common import FinishReason, SpanType, Status
@@ -140,6 +141,116 @@ class _AgentNameStamper:
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True
+
+
+# ── the run scope ────────────────────────────────────────────────────────────
+
+#: Name of the span :func:`agent_run` opens. Deliberately generic and stable:
+#: it is the only span DecimalAI itself contributes to a trace, and the UI keys
+#: waterfall grouping off names.
+RUN_SPAN_NAME = "agent.run"
+
+#: GenAI semconv marks an agent-invocation span with this operation name. The
+#: exporter reads it two ways: ``_classify_span`` files the span as an AGENT
+#: span, and ``_NON_LLM_OPERATIONS`` keeps it out of ``llm_calls`` even if some
+#: framework decorates it with a model attribute.
+_GENAI_OPERATION = "gen_ai.operation.name"
+_GENAI_AGENT_NAME = "gen_ai.agent.name"
+_INVOKE_AGENT = "invoke_agent"
+
+
+@contextlib.contextmanager
+def agent_run(
+    agent_name: Optional[str] = None,
+    *,
+    span_name: str = RUN_SPAN_NAME,
+    tracer_provider: Any = None,
+    attributes: Optional[Dict[str, Any]] = None,
+) -> Iterator[Any]:
+    """Wrap one logical agent run in a real parent span, named for its agent.
+
+    This exists because a *provider* instrumentor (OpenInference's openai /
+    anthropic / google-genai) has no idea what a run is. It sees one SDK call,
+    emits one span, and — with nothing above it — that span is a ROOT: its own
+    OTel ``trace_id``, its own DecimalAI trace. So the ordinary tool-use loop,
+    which is at least two provider calls, arrives as N unrelated one-span traces
+    with no key to group them by. Pydantic AI, which does no tracing of its own
+    and rides entirely on the provider instrumentor, was observed fragmenting a
+    single ``agent.run_sync()`` that way.
+
+    Opening a span for the duration of the run fixes both halves at once:
+
+    * **Structure.** The provider spans start inside this span's context, so
+      OTel parents them under it — same ``trace_id``, real ``parent_span_id``.
+      :class:`DecimalSpanExporter` buffers by trace and finalizes when a
+      parentless root arrives, and now there is one. Note what this does NOT
+      do: it adds the parent that genuinely wraps the calls and nothing else.
+      Steps the framework never emitted (a tool span derived from an LLM span's
+      attributes, say) stay absent, because inventing them would put a step in
+      the waterfall that never ran.
+    * **Identity.** ``agent_name`` is published to :data:`_active_agent_name`
+      for the duration, so :class:`_AgentNameStamper` stamps it on every span
+      the run produces and the exporter files the trace under the right agent.
+      A ContextVar, so eight concurrent runs of eight agents each get their own
+      answer — which the exporter's process-wide ``default_agent_name``, fixed
+      when the exporter was built, cannot give.
+
+    Nesting is safe: an inner ``agent_run`` becomes a child span like any other,
+    it does not start a second trace.
+
+    Args:
+        agent_name: Whose run this is. ``None`` leaves the surrounding context's
+            answer (or the exporter's default) in place.
+        span_name: Span name. Defaults to :data:`RUN_SPAN_NAME`.
+        tracer_provider: The ``TracerProvider`` to open the span on. Defaults to
+            the process-global one. Pass the provider the DecimalAI exporter is
+            attached to when it is not the global — otherwise the parent span
+            never reaches the exporter and the children stay orphaned.
+        attributes: Extra span attributes.
+
+    Yields:
+        The OTel span, or ``None`` when the OTel SDK is unavailable (the name is
+        still scoped, so any other rail reading the context still sees it).
+
+    Example::
+
+        import decimalai
+        decimalai.init(anthropic=True)
+
+        with decimalai.providers.agent_run("support-bot"):
+            first = client.messages.create(...)      # one trace,
+            second = client.messages.create(...)     # two nested LLM calls
+    """
+    token = _active_agent_name.set(agent_name) if agent_name else None
+    try:
+        try:
+            from opentelemetry import trace as trace_api
+        except ImportError:  # pragma: no cover - OTel ships as a core dep
+            logger.debug("agent_run(): no OpenTelemetry SDK; scoping the name only")
+            yield None
+            return
+
+        span_attrs: Dict[str, Any] = {_GENAI_OPERATION: _INVOKE_AGENT}
+        if agent_name:
+            # Both spellings on purpose: `gen_ai.agent.name` is the semconv key
+            # other backends read, `decimal.agent_name` is the one THIS exporter
+            # reads (and setting it here means the trace is named correctly even
+            # on a pipeline that has no _AgentNameStamper installed).
+            span_attrs[_GENAI_AGENT_NAME] = agent_name
+            span_attrs[_DECIMAL_AGENT_NAME] = agent_name
+        if attributes:
+            span_attrs.update(attributes)
+
+        provider = tracer_provider or trace_api.get_tracer_provider()
+        tracer = provider.get_tracer("decimalai")
+        # start_as_current_span records the exception and sets ERROR status by
+        # default, which is what C10 ("a failing run produces exactly ONE trace,
+        # marked errored") needs — the raising run still emits its one trace.
+        with tracer.start_as_current_span(span_name, attributes=span_attrs) as span:
+            yield span
+    finally:
+        if token is not None:
+            _active_agent_name.reset(token)
 
 
 def instrument(

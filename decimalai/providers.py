@@ -23,6 +23,27 @@ tool calls — into a :class:`RunTrace` (with manifest auto-detection). So this
 module stays thin: install the exporter pipeline once, then call ``.instrument()``
 on each requested provider.
 
+One run, one trace
+------------------
+``instrument()`` is a process-wide switch, and a process-wide switch cannot know
+where one *run* of your agent starts and stops. A provider instrumentor emits
+one span per SDK call with nothing above it, so each call is an unparented root
+in its own OTel trace — and the ordinary tool-use loop (call, run the tool, call
+again) lands as N unrelated one-span traces with no key to group them by.
+:func:`agent_run` is the other half: a context manager that opens a real parent
+span for the duration of a run, so those calls nest under it and arrive as one
+trace, filed under the agent that made them::
+
+    import decimalai
+    decimalai.init(anthropic=True)
+
+    with decimalai.providers.agent_run("support-bot"):
+        client.messages.create(...)   # asks for a tool
+        client.messages.create(...)   # answers
+
+Without it, tracing still works — you just get one trace per provider call, and
+the agent name is whichever one ``init()`` was given first.
+
 Each provider needs its OpenInference instrumentor installed::
 
     pip install openinference-instrumentation-openai          # openai
@@ -46,7 +67,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
-from typing import Any, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 logger = logging.getLogger("decimalai.providers")
 
@@ -90,6 +111,16 @@ _PROVIDERS: dict[str, _ProviderSpec] = {
 _instrumented: Set[str] = set()
 _pipeline_provider: Any = None
 
+# The TracerProvider a DecimalAI exporter was attached to MOST RECENTLY —
+# including via the explicit ``tracer_provider=`` escape hatch, which
+# deliberately leaves ``_pipeline_provider`` alone. ``agent_run()`` defaults to
+# it, because a run span opened on the process-global provider when the exporter
+# lives on somebody else's would never reach the exporter, and the provider
+# spans nested under it would be orphaned instead of merely unparented — worse
+# than the defect being fixed. Callers running several providers pass
+# ``tracer_provider=`` explicitly.
+_last_provider: Any = None
+
 
 def _sdk_present(sdk_module: str) -> bool:
     """True if the provider's SDK is importable (without importing it)."""
@@ -126,34 +157,44 @@ def _ensure_pipeline(agent_name: Optional[str], tracer_provider: Any = None) -> 
     Uses ``SimpleSpanProcessor``: the exporter hands traces to DecimalAI's
     non-blocking background sender, so synchronous span export stays cheap while
     avoiding the batch-flush timing that drops traces in short scripts.
+
+    An :class:`~decimalai.otel._AgentNameStamper` goes on alongside the
+    exporter. ``agent_name`` here is baked into the exporter when it is BUILT,
+    which on this rail is once per process — so before the stamper, a second
+    agent in the same process had its traces filed under the first agent's name
+    with no way to say otherwise. The stamper reads the run-scoped ContextVar at
+    span START and writes the answer onto the span, where the exporter finds it.
     """
+    global _pipeline_provider, _last_provider
     from opentelemetry import trace as trace_api
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-    from .otel import DecimalSpanExporter
+    from .otel import DecimalSpanExporter, _AgentNameStamper
 
     if tracer_provider is not None:
+        tracer_provider.add_span_processor(_AgentNameStamper())
         tracer_provider.add_span_processor(
             SimpleSpanProcessor(DecimalSpanExporter(agent_name=agent_name))
         )
+        _last_provider = tracer_provider
         return tracer_provider
 
-    global _pipeline_provider
     if _pipeline_provider is not None:
         return _pipeline_provider
 
     processor = SimpleSpanProcessor(DecimalSpanExporter(agent_name=agent_name))
     current = trace_api.get_tracer_provider()
     if hasattr(current, "add_span_processor"):
-        current.add_span_processor(processor)
         provider = current
     else:
         provider = TracerProvider()
-        provider.add_span_processor(processor)
         trace_api.set_tracer_provider(provider)
+    provider.add_span_processor(_AgentNameStamper())
+    provider.add_span_processor(processor)
 
     _pipeline_provider = provider
+    _last_provider = provider
     return provider
 
 
@@ -195,6 +236,16 @@ def instrument(
     explicit_provider = tracer_provider is not None
     requested = {"openai": openai, "anthropic": anthropic, "google": google}
     auto_all = all(v is None for v in requested.values())
+
+    # Publish the name BEFORE the early return below. The instrumentors are
+    # process-wide singletons, so a second call has nothing left to instrument
+    # and used to be a total no-op — including the ``agent_name`` it was handed,
+    # which is the one thing about a second call that is genuinely new. The
+    # ContextVar is where a name can still land after the exporter is built.
+    if agent_name:
+        from .otel import _active_agent_name
+
+        _active_agent_name.set(agent_name)
 
     targets: List[Tuple[str, bool]] = []  # (provider_name, forced)
     for name, flag in requested.items():
@@ -243,3 +294,60 @@ def instrument(
         logger.info("DecimalAI tracing enabled for direct %s SDK calls", name)
 
     return provider
+
+
+def agent_run(
+    agent_name: Optional[str] = None,
+    *,
+    span_name: Optional[str] = None,
+    tracer_provider: Any = None,
+    attributes: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Group one logical run's provider calls into ONE trace, under one parent.
+
+    ``instrument()`` turns the provider's OpenInference instrumentor on and
+    stops there, which is all a *process-wide* switch can do. What it cannot
+    know is where one run of your agent begins and ends — so every provider call
+    it captures is an unparented root span in its own OTel trace, and a two-step
+    tool-use loop lands as two unrelated one-span traces. This is the missing
+    half: the entry point that says "this is one run, and it is this agent's"::
+
+        import decimalai
+        decimalai.init(anthropic=True)
+
+        def answer(question: str) -> str:
+            with decimalai.providers.agent_run("support-bot"):
+                first = client.messages.create(...)     # tool call
+                second = client.messages.create(...)    # final answer
+            return second                               # ONE trace, two calls
+
+    Both calls now nest under a real parent span, so the trace has the shape the
+    run actually had. Nothing else is invented: DecimalAI adds the span that
+    genuinely wraps the calls and no others — the tool you ran between them
+    emitted no span, so the waterfall does not claim one.
+
+    ``agent_name`` is scoped to the ``with`` block rather than fixed at
+    ``init()`` time, so a process running two agents (or eight concurrent runs
+    of eight agents) files each trace under the right one.
+
+    Args:
+        agent_name: Whose run this is. ``None`` keeps the ambient name.
+        span_name: Span name; defaults to ``decimalai.otel.RUN_SPAN_NAME``.
+        tracer_provider: Which ``TracerProvider`` to open the span on. Defaults
+            to the one this module attached the DecimalAI exporter to — which is
+            the process-global provider unless ``instrument(tracer_provider=…)``
+            was used.
+        attributes: Extra span attributes.
+
+    Returns:
+        A context manager yielding the OTel span (``None`` without the OTel SDK).
+    """
+    from .otel import RUN_SPAN_NAME
+    from .otel import agent_run as _agent_run
+
+    return _agent_run(
+        agent_name,
+        span_name=span_name or RUN_SPAN_NAME,
+        tracer_provider=tracer_provider or _last_provider,
+        attributes=attributes,
+    )
