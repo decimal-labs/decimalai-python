@@ -9,50 +9,100 @@ push access; this file documents the process so a contributor can see what a cha
 
 ## How publishing works
 
-`decimalai` publishes **from CI, via PyPI Trusted Publishing**, triggered by publishing a GitHub
-Release. There is no token anywhere: the workflow exchanges a short-lived OIDC identity that PyPI
-verifies against a publisher row naming this repo, `publish.yml`, and the `pypi` environment.
+Publishing from CI via PyPI Trusted Publishing is the **intended end state**, and
+`.github/workflows/publish.yml` already implements it correctly: a published GitHub Release is the
+trigger, the workflow exchanges a short-lived OIDC identity against a publisher row naming this repo,
+`publish.yml`, and the `pypi` environment — no token anywhere — and PyPI records an attestation
+automatically. That path is better than a laptop upload for two reasons that are not matters of taste:
+the tag *is* the trigger (so a shipped version can never be untagged), and provenance is free.
 
-> **Inverted 2026-08-16.** This used to publish by `twine` from a maintainer's machine, on the
-> reasoning that *"CI availability must never block a release."* That reasoning came from a period
-> when CI was unavailable here for reasons unrelated to the code — that is no longer the case, and
-> the OIDC path has now been proven three times (`decimalai-mcp 0.1.3`,
-> `agentversion 0.2.3`, `skillevaluation 0.7.1`, each with a verified attestation).
->
-> What the local path cost, measured: **0 of 22 published `decimalai` files carry provenance**, and
-> **0.10.1 and 0.10.2 were never tagged** — two shipped versions with no commit marked in the repo,
-> because nothing in a laptop upload forces a tag. The CI path cannot have either problem: the tag
-> *is* the trigger, and the attestation is automatic.
->
-> The one durable reason for a local step remains and is unchanged — **CI has no provider keys, so
-> the live-LLM gate cannot run there.** That argues for running the gate locally and letting CI do
-> the *upload*; the two are separable. Run `scripts/release.sh`'s gate, see it green, then cut the
-> Release. `twine` stays documented below as the fallback for when PyPI or Actions is unavailable.
+**It has one precondition: GitHub Actions must actually run for this repo.** Today it does not, so
+**0.10.3 ships from `scripts/release.sh`.** Check which regime you are in before you cut anything
+(see below) — this section is a policy with a switch, not a standing preference.
 
-It used to work the other way round: a published GitHub Release triggered
-`.github/workflows/publish.yml`, which uploaded via OIDC Trusted Publishing. That made every release
-depend on a hosted CI service being available — and when CI was unavailable the release simply could not
-happen, even though every check it ran also runs locally. So the upload moved to the maintainer's
-machine. If CI is healthy it still runs `publish.yml` on the release event; that upload is a harmless
-no-op, because the version already exists. **CI availability must never block a release.** (The sibling
-`agentversion` and `skillevaluation` packages already published this way — this package was the odd one
-out.)
+### The precondition, and why it is currently unmet
 
-> **Diagnostic worth remembering.** A CI job that fails with **zero steps executed and no logs** has not
-> run your tests — the log API returns `BlobNotFound` because nothing ran to produce any. That is an
-> infrastructure failure, not a test failure. Don't spend release attempts debugging a red test that
-> passes in a clean venv on every supported Python.
+Actions jobs on `decimal-labs/decimalai-python` are **not started at all**: billing for this account
+has failed, and this is the last repo in the org that is still **private**. Private repos consume
+billable Actions minutes; public repos get them free. That single difference is why the OIDC path
+succeeded on `decimalai-mcp 0.1.3`, `agentversion 0.2.3`, and `skillevaluation 0.7.1` — all three of
+those repos are **public**. Those releases are real proof that the mechanism works; they are *not*
+evidence that it works here.
 
-That leaves two gates:
+So the precondition is met when **either** of these becomes true:
+
+- this repo is made **public** (free Actions minutes), or
+- **org billing is restored** (a valid payment method on the `decimal-labs` billing settings).
+
+Until then, cutting a GitHub Release for a new version does nothing useful: `publish.yml` fires, its
+`test` job never starts, `publish` (`needs: test`) is therefore skipped, and **nothing reaches PyPI**.
+You are left with a dangling tag and a Release for a version that does not exist.
+
+### Check which regime you are in — before cutting a release
+
+The failure reason is **not** in `gh run list` (which just says `failure`) and **not** in the job logs
+(there are none). It appears only in the check-run *annotations*:
+
+```bash
+run=$(gh run list -R decimal-labs/decimalai-python -w CI -L1 --json databaseId -q '.[0].databaseId')
+job=$(gh api repos/decimal-labs/decimalai-python/actions/runs/$run/jobs -q '.jobs[0].id')
+gh api repos/decimal-labs/decimalai-python/check-runs/$job/annotations -q '.[].message'
+```
+
+- Prints *"The job was not started because recent account payments have failed or your spending limit
+  needs to be increased"* → **precondition unmet.** Publish locally with `scripts/release.sh`, then
+  tag by hand.
+- Prints nothing and jobs run real steps → **precondition met.** Run the local live-LLM gate, then cut
+  the GitHub Release and let CI upload.
+
+> **Diagnostic worth remembering.** A CI job that fails in a few seconds with **zero steps executed and
+> no logs** has not run your tests — `.jobs[].steps` is an empty list, and the log API returns
+> `BlobNotFound` because nothing ran to produce any. That is an infrastructure failure, not a test
+> failure; the annotations command above is what tells you *which* infrastructure failure. Don't spend
+> release attempts debugging a red test that passes in a clean venv on every supported Python.
+
+### What the local path costs
+
+Both costs are real, and both are why this reverts to CI as soon as the precondition is met:
+
+- **No attestation.** A `twine` upload from a laptop cannot produce one. Of 22 published `decimalai`
+  files, only **2** carry provenance — `0.4.0`'s wheel and sdist, published 2026-06-08 through this
+  very workflow. Everything since has none. (That one success is also proof the PyPI publisher row for
+  this repo is configured correctly; Actions availability is the only thing missing.)
+- **Tagging is best-effort and fails quietly.** `scripts/release.sh` attempts `gh release create` as
+  its last step with stderr suppressed, and treats failure as non-fatal because the upload already
+  happened. When it fails you get a shipped, untagged version. The repo has exactly one tag, `v0.10.0`,
+  and two versions in the 0.10 line went out without one:
+  - **0.10.2** — on PyPI (uploaded 2026-08-15), never tagged;
+  - **0.10.1** — never tagged *and never uploaded*; it has a CHANGELOG entry and a "Release 0.10.1"
+    commit but no artifact on PyPI, so the version was skipped entirely.
+
+  **So after a local publish, verify the tag exists and create it yourself if it doesn't.**
+
+### The gates
+
+The live-LLM gate is local in **both** regimes — CI has no provider keys and no backend, so it can
+never make real model calls. Only the *upload* moves.
 
 | Gate | Where | Checks | Blocks the release? |
 |---|---|---|---|
-| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | yes, but only *after* the Release is cut (it runs on the release event). `ci.yml` runs the same tests on every PR, which is where you actually want to see them go green. |
-| **Live-LLM** | **Local — `scripts/release.sh`** | real model calls through a clean-room wheel | yes — the maintainer runs it **before** cutting the Release |
+| **Live-LLM** | **Local — `scripts/release.sh`** | real model calls through a clean-room wheel | yes — always run before publishing, in either regime |
+| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | only when Actions runs. **Today it cannot start, so nothing gates the unit tests automatically.** |
 
-CI has no provider keys and no backend, so it cannot make real model calls. That is the whole reason the
-live gate is a **local required step**: you run it yourself, see it go green, and only then cut the
-GitHub Release.
+> **While Actions is blocked, run the no-model suite yourself — `scripts/release.sh` does not.**
+> The script's step 2 only builds the wheel and smoke-tests it (import, `__version__`, CLI); it never
+> invokes `pytest`. So the unit and contract tests are currently checked by *no one* unless you run
+> them. Do it before publishing:
+>
+> ```bash
+> pytest tests/ -q      # expect: NNNN passed, NN skipped
+> ```
+>
+> Verified 2026-08-16 on Python 3.12: `1414 passed, 23 skipped, 192 deselected in 19.62s`. Note that
+> `uv run --extra dev pytest` currently fails to resolve (the `adk` and `crewai-tests` extras pin
+> incompatible `opentelemetry-api` ranges), so use an environment that already has the test deps.
+> This is one gate CI would give you across 3.10/3.11/3.12 for free — a local run covers only your
+> interpreter.
 
 ## Prerequisites (for the local live gate)
 
@@ -83,6 +133,10 @@ The package is pre-1.0 (`0.x`) while the API settles.
 
 ## Cutting a release
 
+Steps 1–6 are identical in both regimes. Only the last step differs: **today** (Actions blocked) run
+`scripts/release.sh` and then confirm the tag; **once the precondition is met**, run the gate, then cut
+the GitHub Release and let `publish.yml` do the upload.
+
 1. **Pick the next version** (SemVer).
 2. **Bump it in both places**: `pyproject.toml` `version` and `decimalai/__init__.py` `__version__`.
    `tests/test_audit_improvements.py::TestVersion::test_version_matches_pyproject` asserts the two
@@ -100,10 +154,19 @@ The package is pre-1.0 (`0.x`) while the API settles.
      repo's README.
 6. **Commit and push** the release commit. The script refuses to release a commit that is not on the
    remote (otherwise `gh` would tag the wrong revision).
-7. **Run the release script** from the repo root:
-   ```bash
-   ./scripts/release.sh
-   ```
+7. **Publish**, per the regime you confirmed above:
+   - **Actions blocked (today, and the path for 0.10.3)** — run the release script from the repo root,
+     then verify the tag landed:
+     ```bash
+     ./scripts/release.sh
+     ```
+   - **Actions healthy** — use the script for its gates only. It has no gate-only flag: run it, let
+     the live-LLM gate go green, then answer anything other than `yes` at the
+     `Type 'yes' to publish:` prompt, which aborts before the upload (`Aborted — nothing released.`).
+     Then cut the Release, which is the trigger:
+     ```bash
+     gh release create "v$VERSION" --generate-notes   # CI uploads via OIDC and attests
+     ```
 
 ### What the script does
 
@@ -122,6 +185,18 @@ In order — cheap checks first, so a trivial error never wastes model budget:
 
 The `twine upload` is the irreversible step. `twine` itself refuses if the version already exists, so a
 re-run after a partial failure is safe.
+
+**Step 4's tag is the half that silently doesn't stick** (`gh release create` runs with stderr
+suppressed). Always confirm it afterwards, and create it by hand if it's missing:
+
+```bash
+git fetch --tags origin && git tag -l "v$VERSION"          # expect: v<version>
+gh release create "v$VERSION" --generate-notes             # if the tag is absent
+```
+
+Creating that Release also fires `publish.yml`. While Actions is billing-blocked the run fails
+instantly with zero steps — that is cosmetic here, not a failed publish; the package is already live.
+Once Actions works again, the run is a genuine no-op because the version already exists on PyPI.
 
 ## Providers the live gate exercises
 
@@ -178,12 +253,23 @@ A manual upload skips every gate — run `./scripts/release.sh` instead wherever
 
 ## Notes & gotchas
 
-- **Public repo, public package.** Both the GitHub repo and the PyPI package are public, so the README
-  badges, the `examples/` Colab links and the docs-site Colab cards all resolve. If any of them 404, that
-  is a real breakage.
+- **Private repo, public package.** The PyPI package is public but **this GitHub repo is private** — the
+  only one left in `decimal-labs` that is. That asymmetry is what blocks CI publishing (see the
+  precondition above), and it also means any README badge, `examples/` Colab link, or docs-site card
+  that points at `github.com/decimal-labs/decimalai-python` resolves only for signed-in members and
+  **404s for the public**. Check those links against a logged-out browser, not your own.
 - **PyPI cache lag.** The top-level `https://pypi.org/pypi/decimalai/json` can stay cached on the previous
   version for a minute or two after upload; the version-specific `.../<version>/json` endpoint reflects
-  new releases almost immediately.
+  new releases almost immediately. The top-level `releases` map lags much longer — it can omit a version
+  that shipped days ago. For an authoritative version list use the simple index:
+  `curl -H 'Accept: application/vnd.pypi.simple.v1+json' https://pypi.org/simple/decimalai/`.
+- **Checking whether a release got an attestation.** The `provenance` field in the PyPI JSON API is
+  **not** a reliable signal — it reads `null` even for files that demonstrably have one. Use the
+  integrity endpoint, which returns 200 when an attestation exists and 404 when it does not:
+  ```bash
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    https://pypi.org/integrity/decimalai/<version>/decimalai-<version>-py3-none-any.whl/provenance
+  ```
 - **Trusted Publisher setup.** Because the project already existed on PyPI before the workflow did, the
   OIDC publisher has to be attached by hand under PyPI → *Manage* → *Publishing* (workflow `publish.yml`,
   environment `pypi`).
