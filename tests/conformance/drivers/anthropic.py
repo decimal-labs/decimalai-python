@@ -240,7 +240,15 @@ def _run(
     server, base_url = _start_provider(ctx, fail=fail)
     client = _client(base_url)
     try:
-        return _loop(ctx, client, tools=tools, system=system)
+        from decimalai import providers
+
+        # The documented run boundary. A provider instrumentor sees one SDK
+        # call at a time and emits an unparented root span for each, so without
+        # this a two-call tool loop arrives as two unrelated single-span traces.
+        # This is the one thing a raw-SDK user must say themselves: there is no
+        # run object for a library to hook, so the boundary has to be declared.
+        with providers.agent_run(ctx.agent_name):
+            return _loop(ctx, client, tools=tools, system=system)
     finally:
         # Close before the server goes away: a keep-alive socket left to the
         # garbage collector raises a ResourceWarning from whichever phase

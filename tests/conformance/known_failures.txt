@@ -36,15 +36,14 @@ llamaindex:C9
 # deterministic across 4 consecutive runs and identical with serial children.
 # Every one is a defect the acceptance grading already reported.
 
-# raw Anthropic — one run fragments into one trace per messages.create (the
-# instrumentor emits an unparented root span per call, so a multi-step run has
-# no trace with more than one span in it); the driver instruments once per
-# process, so nothing tells the exporter a second agent is running; and
-# routing_id never reaches the trace though the menu does reach the model.
-anthropic:C5
-anthropic:C6
+# raw Anthropic — routing_id never reaches the trace, though the menu does
+# reach the model. The trace-shape defects that used to sit here (C5 one run
+# fragmenting into one trace per messages.create, C6 every trace filed under
+# the first agent, C9 concurrent lanes cross-contaminating) are fixed: the
+# documented snippet now declares its run boundary with
+# decimalai.providers.agent_run(), which a raw-SDK user must do themselves
+# because there is no run object for a library to hook.
 anthropic:C8
-anthropic:C9
 
 
 # CrewAI — instrumentor-derived spans arrive without LLM detail, and a
