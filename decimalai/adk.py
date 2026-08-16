@@ -44,8 +44,18 @@ logger = logging.getLogger("decimalai.adk")
 # ── Module-level manifest state (mirrors langchain.py) ─────────
 # A manifest is registered once per distinct (agent, tools, prompt, model,
 # subagents) shape and reused across traces until that shape changes.
-_manifest_tracker = ManifestTracker()
-_manifest_id: Optional[str] = None
+#
+# Keyed BY AGENT NAME, not process-wide. Two ADK agents in one process very
+# often share a manifest shape — same model, same instruction, same tool
+# names, differing only in the label the traces are filed under — so a single
+# tracker answered "same hash, already registered" for the second agent and
+# handed back the FIRST agent's manifest_id. The trace then pointed at a
+# manifest registered for somebody else, which is a cross-agent identity leak,
+# not a cache hit. Per-agent state keeps the dedup (an agent that runs twice
+# still mints one version) while making the reuse agent-scoped, which is also
+# how the backend itself scopes manifest hashes.
+_manifest_trackers: Dict[str, ManifestTracker] = {}
+_manifest_ids: Dict[str, str] = {}
 _manifest_lock = threading.Lock()
 
 # Set by instrument(); used as the fallback agent_name when a trace can't
@@ -158,7 +168,7 @@ class _RunState:
     __slots__ = (
         "trace_id", "agent_name", "root_agent_name", "started_at", "ended_at",
         "user_input_preview", "final_output_preview",
-        "llm_calls", "spans", "pending_llm", "pending_tools",
+        "llm_calls", "spans", "pending_llm", "pending_tools", "agent_stack",
         "status", "error_code", "error_message", "manifest",
     )
 
@@ -177,10 +187,16 @@ class _RunState:
         self.llm_calls: List[LlmCallRecord] = []
         self.spans: List[TraceSpan] = []
         # before_model pushes; after_model / on_model_error pops (LIFO; calls
-        # are sequential within an invocation, so depth is ~1).
-        self.pending_llm: List[LlmCallRecord] = []
+        # are sequential within an invocation, so depth is ~1). Each entry is
+        # the record AND the LLM span it is attached to, so the two can never
+        # drift apart.
+        self.pending_llm: List[Tuple[LlmCallRecord, TraceSpan]] = []
         # key -> (ToolCallRecord, TraceSpan, started_at)
         self.pending_tools: Dict[str, Tuple[ToolCallRecord, TraceSpan, datetime]] = {}
+        # Open agent spans, outermost first: before_agent pushes, after_agent
+        # pops. ADK nests sub-agents inside their parent's agent callback, so
+        # the top of this stack is the span everything else hangs off.
+        self.agent_stack: List[TraceSpan] = []
         self.status: Status = Status.SUCCESS
         self.error_code: Optional[str] = None
         self.error_message: Optional[str] = None
@@ -231,6 +247,53 @@ def _plugin_class() -> Any:
             with self._lock:
                 return self._runs.pop(invocation_id, None)
 
+        @staticmethod
+        def _parent_id(state: _RunState) -> Optional[UUID]:
+            """The span everything opened right now hangs off: the innermost
+            agent still running, or None when there is no agent span (which is
+            what makes that span the trace root)."""
+            return state.agent_stack[-1].id if state.agent_stack else None
+
+        @staticmethod
+        def _close_span(
+            span: TraceSpan, *, output: Optional[str] = None, error: bool = False
+        ) -> None:
+            """Stamp a span's end. Previews are only set when they carry text —
+            an empty preview reads as "the model said nothing" rather than as
+            "there was nothing to preview"."""
+            if span.ended_at is None:
+                span.ended_at = _now()
+            if error:
+                span.status = Status.ERROR
+            if output and span.output_preview is None:
+                span.output_preview = output[:500]
+
+        def _close_open_spans(self, state: _RunState) -> None:
+            """Ship the spans of an invocation that ended abnormally.
+
+            A run that raises out of the model never reaches ``after_agent``, so
+            its agent span (and any in-flight generation) is still open. Ingest
+            rejects the WHOLE trace over one span with no ``ended_at``, so these
+            are closed here — they did end, abnormally, now.
+            """
+            error = state.status == Status.ERROR
+            while state.pending_llm:
+                _, span = state.pending_llm.pop()
+                self._close_span(span, output=state.error_message, error=error)
+                state.spans.append(span)
+            for _, span, _started in list(state.pending_tools.values()):
+                self._close_span(span, output=state.error_message, error=error)
+                state.spans.append(span)
+            state.pending_tools.clear()
+            while state.agent_stack:
+                span = state.agent_stack.pop()
+                self._close_span(
+                    span,
+                    output=state.error_message if error else state.final_output_preview,
+                    error=error,
+                )
+                state.spans.append(span)
+
         # ── run boundary ───────────────────────────────────
         async def before_run_callback(self, *, invocation_context: Any):  # noqa: ANN001
             from . import _config
@@ -263,6 +326,7 @@ def _plugin_class() -> Any:
             if state is None:
                 return
             state.ended_at = _now()
+            self._close_open_spans(state)
             # Finalize off the event loop: manifest registration is a sync
             # network round-trip, and the trace ingest is queued there too.
             try:
@@ -270,6 +334,51 @@ def _plugin_class() -> Any:
                 await loop.run_in_executor(None, self._finalize, state)
             except RuntimeError:
                 self._finalize(state)
+
+        # ── agent boundary ─────────────────────────────────
+        async def before_agent_callback(self, *, agent: Any, callback_context: Any):  # noqa: ANN001
+            # The agent span is the spine of the trace: without it every model
+            # turn and every tool call is a root, so an invocation arrives as a
+            # flat list the UI cannot lay out as a waterfall — and an agent that
+            # calls no tools arrives as an EMPTY timeline, because tool spans
+            # used to be the only spans this plugin ever built.
+            state = self._get_run(getattr(callback_context, "invocation_id", None))
+            if state is None:
+                return None
+            span = TraceSpan(
+                parent_span_id=self._parent_id(state),
+                span_type=SpanType.AGENT,
+                name=str(getattr(agent, "name", None) or state.agent_name or "agent"),
+                started_at=_now(),
+                input_preview=(state.user_input_preview or None),
+            )
+            state.agent_stack.append(span)
+            return None
+
+        def _close_agent_span(
+            self, state: _RunState, agent: Any, *, error: Optional[Exception] = None
+        ) -> None:
+            """Pop this agent's span off the stack and record it.
+
+            Matched by name from the top of the stack rather than blindly
+            popping: a callback that never fired (an agent ADK abandoned) must
+            not close somebody else's span.
+            """
+            name = getattr(agent, "name", None)
+            span = None
+            for candidate in reversed(state.agent_stack):
+                if name is None or candidate.name == str(name):
+                    span = candidate
+                    break
+            if span is None:
+                return
+            state.agent_stack.remove(span)
+            self._close_span(
+                span,
+                output=str(error)[:500] if error else state.final_output_preview,
+                error=error is not None,
+            )
+            state.spans.append(span)
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any):  # noqa: ANN001
             # Primary end-of-invocation signal. ADK 2.x runs an LlmAgent root
@@ -283,11 +392,24 @@ def _plugin_class() -> Any:
             state = self._get_run(inv_id)
             if state is None:
                 return None
+            # Close the span BEFORE finalizing: _complete builds the trace from
+            # state.spans, and a root span appended afterwards would be lost.
+            self._close_agent_span(state, agent)
             if state.root_agent_name is not None and (
                 getattr(agent, "name", None) != state.root_agent_name
             ):
                 return None  # a sub-agent finished, not the root
             await self._complete(inv_id)
+            return None
+
+        async def on_agent_error_callback(self, *, agent: Any, callback_context: Any, error: Exception):  # noqa: ANN001
+            state = self._get_run(getattr(callback_context, "invocation_id", None))
+            if state is None:
+                return None
+            self._close_agent_span(state, agent, error=error)
+            state.status = Status.ERROR
+            if not state.error_message:
+                state.error_message = str(error)
             return None
 
         async def after_run_callback(self, *, invocation_context: Any):  # noqa: ANN001
@@ -326,23 +448,38 @@ def _plugin_class() -> Any:
                 txt = _content_to_text(c)
                 if txt:
                     rendered_input.append({"role": getattr(c, "role", "user"), "content": txt})
+            started = _now()
+            # One span per generation, parented to the agent that asked for it.
+            # `LlmCallRecord.span_id` used to be a fresh uuid4 that named no
+            # span at all, so the call record could not be joined back to the
+            # timeline it belonged to.
+            span = TraceSpan(
+                parent_span_id=self._parent_id(state),
+                span_type=SpanType.LLM,
+                name=str(model) if model else "llm",
+                started_at=started,
+                input_preview=(
+                    "\n".join(e["content"] for e in rendered_input)[:500] or None
+                    if rendered_input else None
+                ),
+            )
             rec = LlmCallRecord(
-                span_id=uuid4(),
+                span_id=span.id,
                 agent_name=getattr(callback_context, "agent_name", None) or state.agent_name,
                 call_role=CallRole.OTHER,
                 provider=_provider_for_model(str(model) if model else None),
                 model_name=str(model) if model else None,
                 rendered_input=rendered_input or None,
-                started_at=_now(),
+                started_at=started,
             )
-            state.pending_llm.append(rec)
+            state.pending_llm.append((rec, span))
             return None
 
         async def after_model_callback(self, *, callback_context: Any, llm_response: Any):  # noqa: ANN001
             state = self._get_run(getattr(callback_context, "invocation_id", None))
             if state is None or not state.pending_llm:
                 return None
-            rec = state.pending_llm.pop()
+            rec, span = state.pending_llm.pop()
             rec.ended_at = _now()
             content = getattr(llm_response, "content", None)
             text = _content_to_text(content)
@@ -364,6 +501,16 @@ def _plugin_class() -> Any:
             if err_msg:
                 rec.status = Status.ERROR
             state.llm_calls.append(rec)
+            # A pure tool-call turn answers with no text, so `text` is empty;
+            # name what the model DID ask for instead of previewing "".
+            self._close_span(
+                span,
+                output=text or (
+                    "→ " + ", ".join(name for name, _ in fcs) if fcs else None
+                ),
+                error=bool(err_msg),
+            )
+            state.spans.append(span)
             return None
 
         async def on_model_error_callback(self, *, callback_context: Any, llm_request: Any, error: Exception):  # noqa: ANN001
@@ -371,11 +518,13 @@ def _plugin_class() -> Any:
             if state is None:
                 return None
             if state.pending_llm:
-                rec = state.pending_llm.pop()
+                rec, span = state.pending_llm.pop()
                 rec.ended_at = _now()
                 rec.status = Status.ERROR
                 rec.finish_reason = FinishReason.ERROR
                 state.llm_calls.append(rec)
+                self._close_span(span, output=str(error), error=True)
+                state.spans.append(span)
             state.status = Status.ERROR
             state.error_message = str(error)
             return None
@@ -396,6 +545,7 @@ def _plugin_class() -> Any:
                 args=dict(tool_args) if isinstance(tool_args, dict) else {},
             )
             span = TraceSpan(
+                parent_span_id=self._parent_id(state),
                 span_type=SpanType.TOOL,
                 name=str(tool_name),
                 started_at=started,
@@ -482,11 +632,17 @@ def _plugin_class() -> Any:
                 logger.exception("Failed to queue ADK trace %s", state.trace_id)
 
         def _maybe_register_manifest(self, state: _RunState) -> Optional[str]:
-            """Register the root agent's manifest if its shape is new."""
-            global _manifest_id
+            """Register the root agent's manifest if its shape is new.
+
+            Every lookup and every write is scoped to ``state.agent_name``: the
+            manifest this trace carries must belong to the agent this trace
+            names, and a second agent's identical shape is a different agent's
+            manifest, not a cache hit.
+            """
             from . import _config
+            agent = state.agent_name or "unknown"
             if not _config._is_enabled():
-                return _manifest_id
+                return _manifest_ids.get(agent)
 
             man = state.manifest or {}
             tools = man.get("tools")
@@ -494,30 +650,40 @@ def _plugin_class() -> Any:
             model = man.get("model")
             subagents = man.get("subagents")
             if not (tools or prompts or model or subagents):
-                return _manifest_id
+                # Nothing to declare — ride whatever THIS agent already has
+                # rather than re-declaring a shape we did not observe.
+                return _manifest_ids.get(agent)
 
             snapshot = extract_from_config(
-                agent_name=state.agent_name or "unknown",
+                agent_name=agent,
                 tools=tools,
                 prompts=prompts,
                 models={"default": model} if model else None,
                 subagents=subagents,
             )
             with _manifest_lock:
-                if not _manifest_tracker.check_and_update(snapshot):
-                    return _manifest_id  # same hash, already registered
+                tracker = _manifest_trackers.get(agent)
+                if tracker is None:
+                    tracker = _manifest_trackers[agent] = ManifestTracker()
+                if not tracker.check_and_update(snapshot):
+                    return _manifest_ids.get(agent)  # same hash, already registered
                 try:
                     client = _config._get_client()
                     result = client.register_manifest(snapshot)
-                    _manifest_id = result.get("manifest_id", snapshot.id)
+                    _manifest_ids[agent] = result.get("manifest_id", snapshot.id)
                     logger.info(
-                        "Registered ADK manifest %s (hash=%s, components=%d)",
-                        _manifest_id, snapshot.manifest_hash[:12], len(snapshot.components),
+                        "Registered ADK manifest %s for %s (hash=%s, components=%d)",
+                        _manifest_ids[agent], agent, snapshot.manifest_hash[:12],
+                        len(snapshot.components),
                     )
                 except Exception:
                     logger.warning("Failed to register ADK manifest, continuing", exc_info=True)
-                    _manifest_id = snapshot.id
-            return _manifest_id
+                    _manifest_ids[agent] = snapshot.id
+                    # The hash is already committed to this agent's tracker;
+                    # without the reset every later run short-circuits on it and
+                    # registration is never retried.
+                    tracker.reset()
+            return _manifest_ids.get(agent)
 
     _PluginClass = _DecimalaiPlugin
     return _PluginClass

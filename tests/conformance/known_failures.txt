@@ -16,42 +16,18 @@
 # already reported in the framework audit; the fix belongs in the adapter, not
 # here.
 
-# ── LangChain ────────────────────────────────────────────────────────────────
-# llm_calls[0].output.content is a repr of the ChatGeneration object rather than
-# the completion text (extract_output_text's str(gen) last resort fires on every
-# tool-calling turn, where both .text and .message.content are empty).
-langchain:C4
-# agent_name is auto-detected once and sticks for the life of the process, so a
-# second agent in the same process is filed under the first agent's name.
-langchain:C6
-# Under concurrency the skills rail reports offered names the prompt never
-# contained — the router rails are drained per-process, not per-run.
-langchain:C8
-
 # ── OpenAI Agents ────────────────────────────────────────────────────────────
-# user_input_preview is null on every trace.
-openai-agents:C4
 # Offered names are claimed but not present in the prompt the model was shown.
 openai-agents:C8
-# Trace status is hardcoded success, so an errored run is recorded as a success —
-# worse than recording nothing.
-openai-agents:C10
 # The documented one-liner writes .agents/skills/ into the user's working
 # directory (disk_sync defaults on when the loader is off).
 openai-agents:C11
 
 # ── LlamaIndex ───────────────────────────────────────────────────────────────
-# rendered_input and output are null on every LlmCallRecord, so no trace carries
-# the prompt.
-llamaindex:C4
 # Manifest/agent identity leaks across agents via module-global state.
 llamaindex:C6
 # Concurrent runs cross-contaminate.
 llamaindex:C9
-
-# ── Generic OTel ─────────────────────────────────────────────────────────────
-# Spans arrive flat — parent_span_id is hardcoded None in the exporter.
-generic-otel:C5
 
 # ── Recorded 2026-08-15, second pass ─────────────────────────────────────────
 # The block above was recorded from a run in which only 4 of 11 frameworks had
@@ -63,17 +39,18 @@ generic-otel:C5
 # deterministic across 4 consecutive runs and identical with serial children.
 # Every one is a defect the acceptance grading already reported.
 
-# Google ADK — flat span tree; manifest/agent identity leaks via module globals.
-adk:C5
-adk:C6
-
-# AG2 — same two, plus concurrent runs cross-contaminate.
-ag2:C5
+# AG2 — agent identity leaks across agents in one process, and concurrent runs
+# cross-contaminate. Both because decimalai.autogen.instrument() binds the agent
+# name to an exporter built on the FIRST call: OTel honours set_tracer_provider
+# once, so a later call's provider never sees a span.
 ag2:C6
 ag2:C9
 
-# raw Anthropic — exporter hardcodes parent_span_id=None; routing_id never
-# reaches the trace though the menu does reach the model.
+# raw Anthropic — one run fragments into one trace per messages.create (the
+# instrumentor emits an unparented root span per call, so a multi-step run has
+# no trace with more than one span in it); the driver instruments once per
+# process, so nothing tells the exporter a second agent is running; and
+# routing_id never reaches the trace though the menu does reach the model.
 anthropic:C5
 anthropic:C6
 anthropic:C8
@@ -86,24 +63,15 @@ anthropic:C9
 # the old shared-process harness masked it.
 autogen-ms:C3
 autogen-ms:C4
-autogen-ms:C5
 autogen-ms:C6
 autogen-ms:C7
 autogen-ms:C9
 autogen-ms:C10
 
-# Claude Agent SDK — call count inflated per streamed block; flat spans.
-claude-agent-sdk:C3
-claude-agent-sdk:C4
-claude-agent-sdk:C5
-claude-agent-sdk:C6
-claude-agent-sdk:C9
-
-# CrewAI — instrumentor-derived spans arrive flat and without LLM detail.
+# CrewAI — instrumentor-derived spans arrive without LLM detail, and a
+# concurrent lane's trace can carry another lane's prompt.
 crewai:C3
 crewai:C4
-crewai:C5
-crewai:C6
 crewai:C9
 
 # Pydantic AI — one run fragments into N unlinked traces; routing_id never

@@ -211,6 +211,11 @@ class DecimalSpanHandler:
             "output_tokens": None,
             "temperature": None,
             "is_llm_call": False,
+            # The exact request/response text, for LlmCallRecord. Distinct from
+            # the previews above: a preview is truncated for a human, these two
+            # are what an SFT/replay consumer reads back as the turn itself.
+            "rendered_input": None,
+            "output_text": None,
         }
 
         # Extract LLM metadata only for true chat/completion spans. Key off the
@@ -231,6 +236,13 @@ class DecimalSpanHandler:
                     pass
             span_data["temperature"] = getattr(instance, "temperature", None)
             span_data["provider"] = _detect_provider(instance)
+            # The traced call's own arguments are the ONLY place the fully
+            # rendered prompt exists: LlamaIndex assembles template + retrieved
+            # context + query into one string on the way in, and that string is
+            # nowhere on the response. Without it every LlamaIndex trace shipped
+            # with rendered_input=null — the run was recorded, the prompt was
+            # not, and nothing downstream could replay or grade the turn.
+            span_data["rendered_input"] = _rendered_input_from_bound_args(bound_args)
 
         self._spans[id_] = span_data
         self._parents[id_] = parent_span_id
@@ -459,6 +471,12 @@ class DecimalSpanHandler:
             if value is not None and span_data.get(field) is None:
                 span_data[field] = value
 
+        # What the model actually said. Read before anything else so a streamed
+        # call — whose only complete response arrives on the LLM end event,
+        # after the span already exited with a bare generator — still records
+        # its completion.
+        _fill("output_text", _response_text(result))
+
         # ChatResponse / CompletionResponse — the provider's own object under
         # `.raw` (openai.ChatCompletion, anthropic.Message, …).
         raw = getattr(result, "raw", None)
@@ -594,6 +612,11 @@ class DecimalSpanHandler:
                 # span_data, which stays None) so nothing declares "unknown".
                 model_name=sd.get("model_name") or "unknown",
                 provider=sd.get("provider"),
+                rendered_input=sd.get("rendered_input"),
+                output=(
+                    {"role": "assistant", "content": sd["output_text"]}
+                    if sd.get("output_text") else None
+                ),
                 input_tokens=sd.get("input_tokens"),
                 output_tokens=sd.get("output_tokens"),
                 temperature=sd.get("temperature"),
@@ -806,7 +829,8 @@ def _merge_llm_spans(group: List[Dict[str, Any]]) -> Dict[str, Any]:
     a multi-second stream.
     """
     merged = dict(group[0])
-    for field in ("model_name", "provider", "input_tokens", "output_tokens", "temperature"):
+    for field in ("model_name", "provider", "input_tokens", "output_tokens",
+                  "temperature", "rendered_input", "output_text"):
         if merged.get(field) is None:
             for sd in group[1:]:
                 if sd.get(field) is not None:
@@ -1011,6 +1035,48 @@ def _truncate(text: str, max_len: int = _PREVIEW_MAX) -> Optional[str]:
     return text if text else None
 
 
+#: Values ``str()`` renders as themselves. Anything else in a sequence is an
+#: object whose ``str()`` is a constructor repr, not content.
+_PRIMITIVES = (str, int, float, bool, bytes)
+
+
+def _message_text(message: Any) -> Optional[str]:
+    """The text of one chat message, without stringifying the object.
+
+    ``str(ChatMessage(...))`` is ``"user: Please look up …"`` on some versions
+    and a full pydantic repr on others; neither is the message, and the second
+    is what a consumer reading ``rendered_input[i].content`` would be shown.
+    """
+    content = getattr(message, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    chunks: List[str] = []
+    for block in getattr(message, "blocks", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text:
+            chunks.append(text)
+    joined = "\n".join(chunks)
+    return joined or None
+
+
+def _node_text(obj: Any) -> Optional[str]:
+    """The text of a LlamaIndex node (``TextNode``, ``NodeWithScore``, …).
+
+    Every node type in the retrieval path implements ``get_content()``. Without
+    this a retriever span's preview is ``[NodeWithScore(node=TextNode(id_='…',
+    embedding=None, …`` — a pydantic repr of the retrieved chunk, in the one
+    field a reader opens to see WHAT was retrieved.
+    """
+    getter = getattr(obj, "get_content", None)
+    if not callable(getter):
+        return None
+    try:
+        text = getter()
+    except Exception:  # pragma: no cover - node types with required kwargs
+        return None
+    return text if isinstance(text, str) and text.strip() else None
+
+
 def _is_exhaustible(obj: Any) -> bool:
     """True for one-shot iterators — reading them once destroys them."""
     if isinstance(obj, (str, bytes, bytearray)):
@@ -1155,6 +1221,78 @@ class _AsyncStreamTee(_StreamTee):
         self._finish()
 
 
+def _rendered_input_from_bound_args(bound_args: Any) -> Optional[List[Dict[str, Any]]]:
+    """The messages the model was shown, taken off the traced call's arguments.
+
+    Handles both LLM shapes LlamaIndex traces:
+
+    * ``chat(messages=[ChatMessage, …])`` — recorded role by role;
+    * ``complete(prompt, formatted=True)`` — one rendered string. The
+      ``llm_completion_callback`` wrapper binds it as ``args[0]`` rather than
+      ``prompt``, so both are looked at.
+
+    A non-string ``prompt`` (the ``predict`` wrapper is handed an unrendered
+    ``PromptTemplate``) is deliberately skipped: the inner ``complete`` /
+    ``chat`` span in the same group carries the rendered text, and
+    ``_merge_llm_spans`` takes the first member that has it. Recording the
+    template instead would put ``SelectorPromptTemplate(metadata={…}`` in the
+    field a consumer reads as the prompt.
+    """
+    args = getattr(bound_args, "arguments", None)
+    if not isinstance(args, dict):
+        return None
+
+    messages = args.get("messages")
+    if messages is not None and not isinstance(messages, (str, bytes)):
+        out: List[Dict[str, Any]] = []
+        try:
+            for message in messages:
+                text = _message_text(message)
+                if not text:
+                    continue
+                role = getattr(message, "role", None)
+                role = getattr(role, "value", role)
+                out.append({"role": str(role or "user"), "content": text})
+        except TypeError:  # pragma: no cover - not iterable after all
+            out = []
+        if out:
+            return out
+
+    candidates: List[Any] = [args.get("prompt")]
+    positional = args.get("args")
+    if isinstance(positional, (list, tuple)):
+        candidates.extend(positional)
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return [{"role": "user", "content": value}]
+    return None
+
+
+def _response_text(result: Any) -> Optional[str]:
+    """The completion text of an LLM response — never by consuming a stream.
+
+    ``str(CompletionResponse(...))`` happens to be the text on some versions and
+    a full repr on others, and ``str()`` on a streaming response DRAINS it, so
+    every shape is read field by field.
+    """
+    if result is None or _is_exhaustible(result):
+        return None
+    if isinstance(result, str):
+        return result or None
+    text = _message_text(getattr(result, "message", None))
+    if text:
+        return text
+    text = getattr(result, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    if isinstance(result, dict):
+        for key in ("text", "content", "output_text"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
 def _safe_preview(obj: Any, max_len: int = _PREVIEW_MAX, *, _depth: int = 0) -> Optional[str]:
     """Convert an object to a string preview, truncating if needed.
 
@@ -1179,6 +1317,22 @@ def _safe_preview(obj: Any, max_len: int = _PREVIEW_MAX, *, _depth: int = 0) -> 
                 if value:
                     return _truncate(str(value), max_len)
             return None
+
+        # A retrieved node, or a list of them (what every retriever returns).
+        # These must be rendered as their CONTENT: str() on a node is a
+        # pydantic constructor repr, which is the thing C4 calls junk.
+        node = _node_text(obj)
+        if node is not None:
+            return _truncate(node, max_len)
+        if isinstance(obj, (list, tuple)) and any(
+            not isinstance(item, _PRIMITIVES) for item in obj
+        ):
+            rendered = [
+                piece for piece in (
+                    _safe_preview(item, max_len, _depth=_depth + 1) for item in obj[:20]
+                ) if piece
+            ]
+            return _truncate("\n".join(rendered), max_len)
 
         # Handle LlamaIndex QueryBundle
         if hasattr(obj, "query_str"):

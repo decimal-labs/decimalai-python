@@ -40,6 +40,7 @@ Requires: ``pip install "decimalai[claude-agent-sdk]"``
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import warnings
@@ -53,12 +54,23 @@ from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
 
 logger = logging.getLogger("decimalai.claude_agent_sdk")
 
-# ── Module-level manifest state (mirrors adk.py) ───────────────────
+# ── Module-level manifest state (mirrors openai_agents.py) ─────────
 # A manifest is registered once per distinct (agent, tools, prompt, model,
 # subagents) shape and reused across traces until that shape changes.
 _manifest_tracker = ManifestTracker()
 _manifest_id: Optional[str] = None
 _manifest_lock = threading.Lock()
+
+# Per-agent manifest id + hash. `_manifest_id` alone is a single process-global
+# slot, and `ManifestTracker` is a single slot whose stored hash does NOT
+# include the agent name — so in a process running two differently-named agents
+# the second agent deduped against the first and its traces were stamped with
+# the FIRST agent's manifest id. The manifest→trace join then attributes one
+# agent's runs to another agent's contract. Key both by agent_name;
+# `_manifest_id` is kept as the last-registered value for back-compat with
+# callers (and tests) that read it.
+_manifest_ids: Dict[str, str] = {}
+_manifest_hashes: Dict[str, str] = {}
 
 # Set by instrument(); the fallback agent_name when a wrapped stream supplies none.
 _install_agent_name: Optional[str] = None
@@ -81,6 +93,70 @@ def _preview(obj: Any, max_len: int = 500) -> Optional[str]:
     if not text:
         return None
     return (text[:max_len] + "…") if len(text) > max_len else text
+
+
+def _text_content(value: Any) -> str:
+    """Flatten a message/block payload down to the TEXT the model saw.
+
+    ``str(value)`` is the wrong last resort here: a list of SDK block objects
+    stringifies to ``[TextBlock(text='…')]``, and a consumer reading
+    ``rendered_input[i].content`` to show the conversation would get a Python
+    repr instead of the prompt. Walk the shapes the Claude wire format actually
+    uses (str, block dicts, lists of either, objects carrying ``.text``) and
+    only fall back to ``str`` for a genuine scalar.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "thinking"):
+            if key in value:
+                nested = _text_content(value[key])
+                if nested:
+                    return nested
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [_text_content(v) for v in value]
+        return "\n".join(p for p in parts if p)
+    for attr in ("text", "content", "thinking"):
+        if hasattr(value, attr):
+            nested = _text_content(getattr(value, attr))
+            if nested:
+                return nested
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _display(value: Any) -> Any:
+    """The most readable form of ``value`` that is still not a Python repr.
+
+    Text if there is text; otherwise a JSON dump (structured content still
+    carries the information, and a consumer can read it); otherwise the value
+    itself for ``_preview`` to stringify.
+    """
+    text = _text_content(value)
+    if text:
+        return text
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            # `default` never emits `<pkg.Class object at 0x…>`: a repr in a
+            # preview is exactly what the contract calls junk.
+            return json.dumps(value, default=lambda o: type(o).__name__)
+        except Exception:
+            return None
+    return value
+
+
+def _transcript_text(messages: List[Dict[str, Any]], max_len: int = 500) -> Optional[str]:
+    """A ``role: text`` preview of the conversation as rendered to the model."""
+    lines: List[str] = []
+    for entry in messages:
+        text = _text_content(entry.get("content"))
+        if text:
+            lines.append(f"{entry.get('role', 'user')}: {text}")
+    return _preview("\n".join(lines), max_len)
 
 
 def _opt(options: Any, name: str) -> Any:
@@ -125,7 +201,8 @@ class _RunState:
     __slots__ = (
         "trace_id", "agent_name", "project", "parent_trace_id",
         "started_at", "ended_at", "user_input_preview", "final_output_preview",
-        "llm_calls", "spans", "pending_tools",
+        "llm_calls", "spans", "pending_tools", "transcript", "root_span",
+        "saw_turn_usage",
         "status", "error_message", "session_id", "init_data", "options", "finalized",
     )
 
@@ -151,6 +228,27 @@ class _RunState:
         # tool_use_id -> (ToolCallRecord, TraceSpan, started_at); closed by the
         # matching ToolResultBlock in the following UserMessage.
         self.pending_tools: Dict[str, Tuple[ToolCallRecord, TraceSpan, datetime]] = {}
+        # The conversation AS RENDERED to the model, grown message by message.
+        # Snapshotted onto each LlmCallRecord.rendered_input, so a trace carries
+        # the prompt the turn actually saw rather than nothing at all.
+        self.transcript: List[Dict[str, Any]] = []
+        system_prompt = _opt(options, "system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            self.transcript.append({"role": "system", "content": system_prompt})
+        if isinstance(user_input, str) and user_input.strip():
+            self.transcript.append({"role": "user", "content": user_input})
+        # The run's root span. Every LLM turn hangs off it, and every tool span
+        # hangs off the turn that asked for the tool, so the waterfall shows the
+        # shape of the run instead of a flat list of tool calls.
+        self.root_span = TraceSpan(
+            span_type=SpanType.AGENT,
+            name="claude_agent_sdk.query",
+            started_at=self.started_at,
+            input_preview=self.user_input_preview,
+        )
+        # True once any AssistantMessage reported its own per-turn usage, which
+        # makes the ResultMessage's CUMULATIVE totals a double count.
+        self.saw_turn_usage = False
         self.status: Status = Status.SUCCESS
         self.error_message: Optional[str] = None
         self.session_id: Optional[str] = None
@@ -218,27 +316,58 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
         # ThinkingBlock and other block types carry no trace-relevant fields.
 
     text_joined = "\n".join(text_parts).strip()
+    started = _now()
+    # What this turn was shown: everything on the transcript BEFORE it.
+    rendered_input = [dict(entry) for entry in state.transcript]
+    # Per-turn usage. The CLI reports usage on every assistant frame, so each
+    # model turn can carry its own token counts; ResultMessage.usage is the
+    # run TOTAL and is only a fallback (see _ingest_result).
+    turn_in, turn_out = _extract_usage(getattr(message, "usage", None))
+    if turn_in is not None or turn_out is not None:
+        state.saw_turn_usage = True
+
+    # One span per model turn, hung off the run root, sharing the LLM call's
+    # span_id so the call and the span are the same node in the waterfall.
+    llm_span = TraceSpan(
+        parent_span_id=state.root_span.id,
+        span_type=SpanType.LLM,
+        name=str(model) if model else "llm",
+        started_at=started,
+        ended_at=started,
+        input_preview=_transcript_text(rendered_input),
+        output_preview=_preview(text_joined) if text_joined else None,
+    )
     rec = LlmCallRecord(
-        span_id=uuid4(),
+        span_id=llm_span.id,
         agent_name=state.agent_name,
         # A turn that asks for tools is planning; a pure-text turn is responding.
         call_role=CallRole.PLANNER if tool_uses else CallRole.RESPONDER,
         provider="anthropic",
         model_name=str(model) if model else None,
+        rendered_input=rendered_input or None,
         output={"role": "assistant", "content": text_joined} if text_joined else None,
         finish_reason=FinishReason.TOOL_CALLS if tool_uses else FinishReason.STOP,
-        started_at=_now(),
-        ended_at=_now(),
+        input_tokens=turn_in,
+        output_tokens=turn_out,
+        started_at=started,
+        ended_at=started,
     )
     if text_joined:
         # Last assistant text seen so far; ResultMessage.result overrides at finalize.
         state.final_output_preview = text_joined[:500]
 
+    turn_entry: Dict[str, Any] = {"role": "assistant", "content": text_joined}
     for tid, tname, tinput in tool_uses:
         name = str(tname) if tname else "tool"
         tc = ToolCallRecord(tool_name=name, args=tinput if isinstance(tinput, dict) else {})
         rec.tool_calls.append(tc)
+        turn_entry.setdefault("tool_calls", []).append(
+            {"id": tid, "name": name, "arguments": tinput if isinstance(tinput, dict) else {}}
+        )
         span = TraceSpan(
+            # The tool was requested BY this model turn — parent it there, not
+            # at the root, so a multi-turn run reads as a tree.
+            parent_span_id=llm_span.id,
             span_type=SpanType.TOOL,
             name=name,
             started_at=_now(),
@@ -251,6 +380,8 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
             span.ended_at = _now()
             state.spans.append(span)
 
+    state.transcript.append(turn_entry)
+    state.spans.append(llm_span)
     state.llm_calls.append(rec)
 
 
@@ -273,13 +404,29 @@ def _ingest_user(state: _RunState, message: Any) -> None:
         tc.result = result_content
         tc.latency_ms = int((ended - started).total_seconds() * 1000)
         span.ended_at = ended
-        span.output_preview = _preview(result_content)
+        span.output_preview = _preview(_display(result_content))
         # A tool's is_error marks that tool/span ERROR, but does NOT fail the run:
         # the agent may recover and still succeed. ResultMessage.is_error is the
         # authoritative run status.
-        if getattr(block, "is_error", False):
+        is_error = bool(getattr(block, "is_error", False))
+        if is_error:
             tc.status = Status.ERROR
             span.status = Status.ERROR
+        # The requesting model turn owns this tool, so its span has to cover it —
+        # otherwise the child outlives the parent in the waterfall.
+        for candidate in state.spans:
+            if candidate.id == span.parent_span_id:
+                if candidate.ended_at is None or candidate.ended_at < ended:
+                    candidate.ended_at = ended
+                break
+        # The result goes back to the model as a user turn (Anthropic wire
+        # shape), so the NEXT turn's rendered_input must contain it.
+        state.transcript.append({
+            "role": "user",
+            "content": _text_content(result_content),
+            "tool_use_id": tuid,
+            **({"is_error": True} if is_error else {}),
+        })
         state.spans.append(span)
 
 
@@ -292,18 +439,57 @@ def _ingest_result(state: _RunState, message: Any) -> None:
         state.final_output_preview = result_text[:500]
     if getattr(message, "is_error", False):
         state.status = Status.ERROR
-    # Usage + cost are cumulative for the whole run (per-turn usage isn't exposed
-    # in the stream), so attach the totals to the final LLM call.
-    if state.llm_calls:
+    if not state.llm_calls:
+        return
+
+    inp, out = _extract_usage(getattr(message, "usage", None))
+    cost = getattr(message, "total_cost_usd", None)
+
+    if not state.saw_turn_usage:
+        # Nothing reported per-turn usage, so the run totals are all there is:
+        # attach them to the final LLM call, as this adapter always has.
         last = state.llm_calls[-1]
-        inp, out = _extract_usage(getattr(message, "usage", None))
         if inp is not None:
             last.input_tokens = inp
         if out is not None:
             last.output_tokens = out
-        cost = getattr(message, "total_cost_usd", None)
         if cost is not None:
             last.cost_usd = cost
+        return
+
+    # Per-turn usage IS present (the CLI reports usage on every assistant
+    # frame), and ResultMessage.usage is the run TOTAL — adding it to the last
+    # call on top of that call's own tokens would count the run twice. Keep the
+    # per-turn numbers, and only fill a turn the CLI left blank with whatever
+    # the totals have not already accounted for.
+    known_in = sum(c.input_tokens or 0 for c in state.llm_calls)
+    known_out = sum(c.output_tokens or 0 for c in state.llm_calls)
+    for call in state.llm_calls:
+        if call.input_tokens is None and inp is not None and inp > known_in:
+            call.input_tokens = inp - known_in
+            known_in = inp
+        if call.output_tokens is None and out is not None and out > known_out:
+            call.output_tokens = out - known_out
+            known_out = out
+
+    # ``total_cost_usd`` is also a run total. Splitting it across the turns by
+    # their token share keeps per-call cost consistent with per-call tokens;
+    # parking the whole run's cost on the last call (what this adapter used to
+    # do) reads as one enormous final turn in any cost-by-call view.
+    if cost is None:
+        return
+    weights = [(c.input_tokens or 0) + (c.output_tokens or 0) for c in state.llm_calls]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        state.llm_calls[-1].cost_usd = cost
+        return
+    assigned = 0.0
+    for call, weight in zip(state.llm_calls[:-1], weights[:-1]):
+        share = cost * weight / total_weight
+        call.cost_usd = share
+        assigned += share
+    # The remainder, so the parts always add back up to the reported total.
+    state.llm_calls[-1].cost_usd = cost - assigned
 
 
 # ── Manifest + finalize ─────────────────────────────────────────────
@@ -336,40 +522,92 @@ def _build_manifest(state: _RunState) -> Dict[str, Any]:
 
 
 def _maybe_register_manifest(state: _RunState) -> Optional[str]:
-    """Register the agent's manifest if its shape is new."""
+    """Register the agent's manifest if its shape is new.
+
+    Dedup is keyed by (agent_name, manifest_hash). ``ManifestTracker`` is a
+    single slot and the hash it stores does not include the agent name, so two
+    agents with the same shape in one process used to dedup against each other:
+    the second agent registered nothing and its traces went out stamped with the
+    FIRST agent's manifest id.
+    """
     global _manifest_id
     from . import _config
+
+    agent = state.agent_name or "unknown"
+    with _manifest_lock:
+        # A caller (notably a test fixture) that swapped in a fresh
+        # ManifestTracker is asking for registration state to be forgotten;
+        # honour that for the per-agent maps too, or the reset is a no-op.
+        # In a live process this is dead after the first registration, because
+        # the tracker only has a null hash while nothing has been registered.
+        if _manifest_tracker.last_hash is None and _manifest_hashes:
+            _manifest_hashes.clear()
+            _manifest_ids.clear()
+
     if not _config._is_enabled():
-        return _manifest_id
+        return _manifest_ids.get(agent)
 
     man = _build_manifest(state)
     if not (man.get("tools") or man.get("prompts") or man.get("model") or man.get("subagents")):
-        return _manifest_id
+        # Nothing structural to declare — point at whatever this agent is
+        # already registered under rather than at another agent's manifest.
+        return _manifest_ids.get(agent)
 
     snapshot = extract_from_config(
-        agent_name=state.agent_name or "unknown",
+        agent_name=agent,
         tools=man.get("tools"),
         prompts=man.get("prompts"),
         models={"default": man["model"]} if man.get("model") else None,
         subagents=man.get("subagents"),
     )
     with _manifest_lock:
-        if not _manifest_tracker.check_and_update(snapshot):
-            return _manifest_id  # same hash, already registered
+        known = _manifest_ids.get(agent)
+        if known and _manifest_hashes.get(agent) == snapshot.manifest_hash:
+            return known  # same agent, same shape — already registered
+        _manifest_tracker.check_and_update(snapshot)
         try:
             client = _config._get_client()
             result = client.register_manifest(snapshot)
-            _manifest_id = result.get("manifest_id", snapshot.id)
-            logger.info(
-                "Registered Claude Agent SDK manifest %s (hash=%s, components=%d)",
-                _manifest_id, snapshot.manifest_hash[:12], len(snapshot.components),
-            )
+            manifest_id = result.get("manifest_id", snapshot.id)
         except Exception:
+            # Leave this agent's hash unset so the next trace retries; a
+            # transient blip must not permanently stop it declaring a manifest.
             logger.warning(
-                "Failed to register Claude Agent SDK manifest, continuing", exc_info=True
+                "Failed to register Claude Agent SDK manifest for %s, continuing",
+                agent, exc_info=True,
             )
-            _manifest_id = snapshot.id
-    return _manifest_id
+            return _manifest_ids.get(agent)
+        _manifest_ids[agent] = manifest_id
+        _manifest_hashes[agent] = snapshot.manifest_hash
+        _manifest_id = manifest_id
+        logger.info(
+            "Registered Claude Agent SDK manifest %s for %s (hash=%s, components=%d)",
+            manifest_id, agent, snapshot.manifest_hash[:12], len(snapshot.components),
+        )
+        return manifest_id
+
+
+def _closed_spans(state: _RunState) -> List[TraceSpan]:
+    """The run's spans, root first, with anything still open closed at run end.
+
+    A tool whose result never arrived (the CLI died mid-stream, the consumer
+    broke out early) leaves its span open; a span with no ``ended_at`` renders
+    as a zero-width bar, which reads as "this step never happened" rather than
+    "this step never finished".
+    """
+    ended = state.ended_at or _now()
+    root = state.root_span
+    root.ended_at = ended
+    root.status = state.status
+    if root.output_preview is None:
+        root.output_preview = _preview(state.final_output_preview)
+    spans = [root, *state.spans]
+    for span in spans:
+        if span.ended_at is None:
+            span.ended_at = ended
+        if span.started_at is None:
+            span.started_at = state.started_at
+    return spans
 
 
 def _finalize(state: _RunState) -> None:
@@ -387,6 +625,7 @@ def _finalize(state: _RunState) -> None:
     try:
         client = _config._get_client()
         config = _config._get_config()
+        spans = _closed_spans(state)
         trace = RunTrace(
             id=state.trace_id,
             project=state.project or (config.project if config else None),
@@ -400,7 +639,7 @@ def _finalize(state: _RunState) -> None:
             user_input_preview=state.user_input_preview,
             final_output_preview=state.final_output_preview,
             error_message=state.error_message,
-            spans=list(state.spans),
+            spans=spans,
             llm_calls=list(state.llm_calls),
             manifest_id=manifest_id,
         )

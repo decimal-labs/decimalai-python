@@ -68,12 +68,16 @@ def _reset_sdk(monkeypatch):
     # built against the stub never leaks into other tests.
     import decimalai.adk as adk
 
-    saved = (adk._PluginClass, adk._manifest_id, adk._manifest_tracker)
+    # `_manifest_ids` is a per-agent dict, not a single module global: the
+    # single-global form filed a second agent's traces under the first agent's
+    # manifest, which conformance C6 caught. Copy it so a mutation here cannot
+    # leak, and restore the original object.
+    saved = (adk._PluginClass, dict(adk._manifest_ids), dict(adk._manifest_trackers))
     adk._PluginClass = None
-    adk._manifest_id = None
-    adk._manifest_tracker = ManifestTracker()
+    adk._manifest_ids = {}
+    adk._manifest_trackers = {}
     yield
-    adk._PluginClass, adk._manifest_id, adk._manifest_tracker = saved
+    adk._PluginClass, adk._manifest_ids, adk._manifest_trackers = saved
 
 
 # ── Synthetic ADK objects (plugin reads them via getattr) ───

@@ -174,8 +174,28 @@ class DecimalSpanExporter:
         seen_tools: Dict[str, Dict[str, Any]] = {}
         seen_prompts: Dict[str, str] = {}
 
+        # ── Keep the shape the framework emitted ──
+        # OTel names a span's parent by a 64-bit id; a TraceSpan is identified
+        # by a UUID we mint. So every span's UUID has to exist BEFORE any span
+        # is built — children are routinely exported ahead of their parents
+        # (they end first) and a link resolved lazily would simply be dropped.
+        # Without this every span went out with parent_span_id unset and the
+        # whole trace arrived as a flat list of same-level roots. Same fix, and
+        # same reason, as in :mod:`decimalai.otel`.
+        span_uuids: Dict[int, Any] = {}
+        for span in spans:
+            sid = _span_id_of(span)
+            if sid is not None and sid not in span_uuids:
+                span_uuids[sid] = uuid4()
+
         for span in spans:
             attrs = dict(span.attributes or {})
+            # This span's identity, and its parent's — the latter only when the
+            # parent is one of the spans in this trace. A parent that never
+            # reached this exporter stays unset rather than becoming a dangling
+            # pointer.
+            span_uuid = span_uuids.get(_span_id_of(span)) or uuid4()
+            parent_uuid = span_uuids.get(_parent_span_id_of(span))
 
             # Detect agent name from span attributes.
             # Priority: decimal.agent_name > gen_ai.agent.name
@@ -234,6 +254,9 @@ class DecimalSpanExporter:
                 cost_usd = attrs.get(DECIMAL_COST_USD)
 
                 llm_calls.append(LlmCallRecord(
+                    # Which span this call happened in, so a consumer can put
+                    # it back in the waterfall instead of guessing by timestamp.
+                    span_id=span_uuid,
                     model_name=str(model_name) if model_name else None,
                     provider=str(attrs.get(OTEL_GEN_AI_SYSTEM, "")),
                     # The FULL rendered request/response — the previews below
@@ -290,6 +313,8 @@ class DecimalSpanExporter:
                 tool_output = _extract_preview(attrs, "output") or ""
 
                 trace_spans.append(TraceSpan(
+                    id=span_uuid,
+                    parent_span_id=parent_uuid,
                     span_type=SpanType.TOOL,
                     name=resolved_name,
                     status=status,
@@ -327,6 +352,8 @@ class DecimalSpanExporter:
                 span_output = _extract_preview(attrs, "output")
 
                 trace_spans.append(TraceSpan(
+                    id=span_uuid,
+                    parent_span_id=parent_uuid,
                     span_type=span_type,
                     name=span.name or "unknown",
                     status=status,
@@ -495,6 +522,21 @@ def _output_message_from_attrs(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]
     if content is None:
         return None
     return {"role": "assistant", "content": content}
+
+
+def _span_id_of(span: Any) -> Optional[int]:
+    """The span's own 64-bit OTel id, or None if it has no context."""
+    ctx = getattr(span, "context", None)
+    return getattr(ctx, "span_id", None) if ctx else None
+
+
+def _parent_span_id_of(span: Any) -> Optional[int]:
+    """The id of the span's parent, or None for a root span."""
+    parent = getattr(span, "parent", None)
+    if not parent:
+        return None
+    sid = getattr(parent, "span_id", None)
+    return sid if sid else None  # 0 is "no parent", same as absent
 
 
 def _ns_to_datetime(ns: int) -> datetime:

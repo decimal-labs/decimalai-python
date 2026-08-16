@@ -94,8 +94,18 @@ _installed = False
 
 # Global manifest state — shared across all handler instances
 _manifest_tracker = ManifestTracker()
-_manifest_id: Optional[str] = None  # Set after first successful registration
+_manifest_id: Optional[str] = None  # Most recent successful registration
 _manifest_lock = threading.Lock()  # Thread safety for manifest registration
+
+# Per-AGENT manifest state. `_manifest_id` alone is a single process-global
+# slot, and `_manifest_tracker` a single hash slot whose hash does NOT
+# include the agent name — so in a process running two agents, the second
+# agent's traces were stamped with the FIRST agent's manifest, and two agents
+# with the same structure deduped against each other so the second never
+# registered at all. Both are keyed by agent_name here; `_manifest_id` is kept
+# as the last-registered value for callers (and tests) that read it.
+_manifest_ids: Dict[str, str] = {}
+_manifest_hashes: Dict[str, str] = {}
 _explicit_manifest_config: Optional[Dict[str, Any]] = None  # From instrument() kwargs
 # Agent names we have already asked the platform about on the
 # "nothing to declare" path (see `_adopt_active_manifest`). One probe per
@@ -177,6 +187,42 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+def _open_call_rails() -> tuple:
+    """Start ONE model call's skills rails, and return the reset tokens.
+
+    Every rail above is a ContextVar the injection writes and the handler
+    reads back inside the same model call (see
+    `CallbackHandler._capture_call_rails`). Scoping them to the call — set on
+    the way in, `reset()` on the way out — is what makes the read
+    attributable rather than merely recent:
+
+      * nothing can be READ IN from an earlier call that happened to run on
+        this thread (a pooled worker keeps its Context between tasks), and
+      * nothing LEAKS OUT to whatever runs next, so a later trace cannot pick
+        up a routing decision that was never made for it.
+
+    Both directions were real: the rails were previously drained off the
+    Router singleton at trace-build time, which is process-global state, and
+    concurrent runs took each other's.
+    """
+    return (
+        _routing_id_ctx.set(None),
+        _skills_offered_ctx.set(None),
+        _skills_delivered_ctx.set(None),
+    )
+
+
+def _close_call_rails(tokens: tuple) -> None:
+    """End the model call started by `_open_call_rails`."""
+    for var, token in zip(
+        (_routing_id_ctx, _skills_offered_ctx, _skills_delivered_ctx), tokens
+    ):
+        try:
+            var.reset(token)
+        except ValueError:  # pragma: no cover - token from another Context
+            var.set(None)
+
+
 def _registered_manifest_id(result: Any, snapshot: Any) -> str:
     """The id to stamp on traces after a register call.
 
@@ -191,6 +237,65 @@ def _registered_manifest_id(result: Any, snapshot: Any) -> str:
     if isinstance(manifest_id, str) and manifest_id:
         return manifest_id
     return str(snapshot.id)
+
+
+def _forget_manifests_if_tracker_reset() -> None:
+    """Honour a caller that swapped in a fresh ``ManifestTracker``.
+
+    Resetting the tracker is how a test fixture (and `reset()`) says "forget
+    what this process has registered". The per-agent maps have to hear it too,
+    or the reset is a no-op for every agent already in them. Caller holds
+    ``_manifest_lock``.
+    """
+    if _manifest_tracker.last_hash is None and (_manifest_ids or _manifest_hashes):
+        _manifest_ids.clear()
+        _manifest_hashes.clear()
+
+
+def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
+    """Register one agent's manifest snapshot, returning the id to stamp.
+
+    Dedup is keyed by (agent, hash), never by hash alone: two agents in one
+    process routinely have the SAME structure (same model, same tools, a
+    different name), and a single-slot tracker made the second one's snapshot
+    look like a repeat — it was never registered, so its traces had no
+    manifest of their own to carry.
+    """
+    global _manifest_id
+
+    from . import _config
+
+    with _manifest_lock:
+        _forget_manifests_if_tracker_reset()
+        known = _manifest_ids.get(agent_name)
+        if known and _manifest_hashes.get(agent_name) == snapshot.manifest_hash:
+            return known  # Same agent, same structure — already registered.
+        # Keep the legacy single slot warm: it is this module's public-ish
+        # "what did we last register" surface, and `reset()` on it is what
+        # `_forget_manifests_if_tracker_reset` listens for.
+        _manifest_tracker.check_and_update(snapshot)
+        try:
+            client = _config._get_client()
+            result = client.register_manifest(snapshot)
+            manifest_id = _registered_manifest_id(result, snapshot)
+            logger.info(
+                "Registered manifest %s for %s (hash=%s, components=%d)",
+                manifest_id,
+                agent_name,
+                snapshot.manifest_hash[:12],
+                len(snapshot.components),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to register manifest for %s, continuing without",
+                agent_name, exc_info=True,
+            )
+            # Still tag traces with the local id rather than shipping none.
+            manifest_id = str(snapshot.id)
+        _manifest_ids[agent_name] = manifest_id
+        _manifest_hashes[agent_name] = snapshot.manifest_hash
+        _manifest_id = manifest_id
+        return manifest_id
 
 
 def _adopt_active_manifest(agent_name: str) -> Optional[str]:
@@ -422,18 +527,26 @@ def _install_skill_loader() -> None:
     original_ainvoke = BaseChatModel.ainvoke
 
     def patched_invoke(self, input, config=None, *, stop=None, **kwargs):
+        tokens = _open_call_rails()
         try:
-            input = _inject_skills_into_input(input)
-        except Exception:
-            logger.debug("Skill injection failed (non-fatal)", exc_info=True)
-        return original_invoke(self, input, config=config, stop=stop, **kwargs)
+            try:
+                input = _inject_skills_into_input(input)
+            except Exception:
+                logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+            return original_invoke(self, input, config=config, stop=stop, **kwargs)
+        finally:
+            _close_call_rails(tokens)
 
     async def patched_ainvoke(self, input, config=None, *, stop=None, **kwargs):
+        tokens = _open_call_rails()
         try:
-            input = _inject_skills_into_input(input)
-        except Exception:
-            logger.debug("Skill injection failed (non-fatal)", exc_info=True)
-        return await original_ainvoke(self, input, config=config, stop=stop, **kwargs)
+            try:
+                input = _inject_skills_into_input(input)
+            except Exception:
+                logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+            return await original_ainvoke(self, input, config=config, stop=stop, **kwargs)
+        finally:
+            _close_call_rails(tokens)
 
     BaseChatModel.invoke = patched_invoke  # type: ignore[method-assign]
     BaseChatModel.ainvoke = patched_ainvoke  # type: ignore[method-assign]
@@ -809,11 +922,13 @@ class _RunState:
 
     __slots__ = (
         "root_run_id", "member_ids", "opened_at", "is_leaf_root", "agent_hint",
-        "trace_id", "spans", "llm_calls", "tool_calls", "tool_requests",
+        "detected_agent_name", "trace_id", "spans", "llm_calls", "tool_calls",
+        "tool_requests",
         "span_stack", "trace_started_at", "user_input_preview",
         "final_output_preview", "seen_tools", "seen_model", "seen_prompts",
         "seen_output_contract", "streaming_buffers", "active_skills",
         "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
+        "routing_id",
     )
 
     def __init__(
@@ -832,6 +947,14 @@ class _RunState:
         # else will ever close or send this run.
         self.is_leaf_root = is_leaf_root
         self.agent_hint: Optional[str] = None
+        # The name auto-detected from THIS run's root chain. Per-run because
+        # the detection used to be written back onto `handler.agent_name`,
+        # where it stuck for the life of the process: `instrument()` publishes
+        # ONE handler, so in a process serving several agents every run after
+        # the first was filed under the first agent's name — three
+        # differently-named parallel chains all landed on one agent and the
+        # other two had no traces at all.
+        self.detected_agent_name: Optional[str] = None
 
         self.trace_id: UUID = uuid4()
         self.spans: Dict[UUID, TraceSpan] = {}
@@ -862,6 +985,14 @@ class _RunState:
         # Bodies that reached the model (Router body injection) — between
         # offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
+        # The routing decision THIS run was given, captured off the
+        # BaseChatModel patch's contextvar inside the model call it belongs
+        # to (see `_capture_call_rails`). Per-run because the Router
+        # singleton's instance rail is process-wide: eight concurrent lanes
+        # drained whichever decision the router had minted last, so a trace
+        # reported a routing_id the router had made for somebody else's
+        # prompt — and two traces reported the same one.
+        self.routing_id: Optional[str] = None
 
 
 def _bind_current_run_fields(cls: type) -> type:
@@ -944,7 +1075,7 @@ class CallbackHandler(_CallbackBase):
                 manifest, which lets the backend resolve `is_subagent=True`
                 on the child agents.
         """
-        self.agent_name = agent_name
+        self._explicit_agent_name: Optional[str] = agent_name
         self.auto_send = auto_send
         self.session_id = session_id
         self.project = project
@@ -960,6 +1091,31 @@ class CallbackHandler(_CallbackBase):
         self._root_of: Dict[UUID, UUID] = {}
         self._state_lock = threading.RLock()
         self._reset_state()
+
+    # ── Agent name ─────────────────────────────────────────
+
+    @property
+    def agent_name(self) -> Optional[str]:
+        """The name this handler is filing under right now.
+
+        Reads the name given at construction (or by ``instrument()``), and
+        falls back to the one auto-detected from the CURRENT run's root
+        chain. The auto-detected half is a read-through rather than a stored
+        value, which is the fix for the identity defect: it used to be
+        assigned onto the handler by `on_chain_start`, and `instrument()`
+        publishes exactly ONE handler process-wide, so the first chain's name
+        became every later chain's name — a process serving three
+        differently-named agents filed all three under the first one, and the
+        other two had no traces of their own on the platform at all.
+        """
+        if self._explicit_agent_name is not None:
+            return self._explicit_agent_name
+        state = getattr(self, "_current", None)
+        return state.detected_agent_name if state is not None else None
+
+    @agent_name.setter
+    def agent_name(self, value: Optional[str]) -> None:
+        self._explicit_agent_name = value
 
     # ── Per-run state ──────────────────────────────────────
     #
@@ -1043,6 +1199,35 @@ class CallbackHandler(_CallbackBase):
         "seen_output_contract", "streaming_buffers", "active_skills",
         "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
     )
+
+    def _capture_call_rails(self, state: _RunState) -> None:
+        """Attach the skills rails of the model call that is starting NOW.
+
+        Called from `on_llm_start` / `on_chat_model_start`, which LangChain
+        dispatches from INSIDE the patched `BaseChatModel.invoke` — the same
+        Context the injection wrote its rails into, and the only place where
+        "this routing decision" and "this run" are provably the same thing.
+
+        The rails are read, not consumed: `_close_call_rails` clears them
+        when the model call returns, so a value cannot outlive the call it
+        describes. Reading them here is what replaced draining the Router
+        singleton at trace-build time — that drain ran long after the call,
+        against state every concurrent run shared, and handed traces routing
+        decisions made for other runs' prompts.
+        """
+        routing_id = _routing_id_ctx.get()
+        if routing_id and state.routing_id is None:
+            # First decision of the run wins: a multi-turn run routes once
+            # per model call against the same query, and the trace carries
+            # one routing_id.
+            state.routing_id = routing_id
+        for name in _skills_offered_ctx.get() or ():
+            if isinstance(name, str) and name.strip():
+                state.skills_offered_in_prompt.add(name.strip())
+        for name in _skills_delivered_ctx.get() or ():
+            if isinstance(name, str) and name.strip():
+                state.skills_delivered.add(name.strip())
+                state.skills_offered_in_prompt.add(name.strip())
 
     def log_skill_offered(self, *, names: List[str]) -> None:
         """Manually record skills that were offered in the system prompt."""
@@ -1139,11 +1324,15 @@ class CallbackHandler(_CallbackBase):
             state.trace_started_at = span.started_at
             state.user_input_preview = _preview(inputs)
 
-        # Auto-detect agent_name from root chain if not explicitly set
-        if self.agent_name is None and (parent_run_id is None or is_new_root):
+        # Auto-detect agent_name from root chain if not explicitly set.
+        # Recorded on the RUN, never written back onto `self.agent_name`:
+        # one handler serves the whole process, so a name learned here used
+        # to become every later run's name too.
+        if self._explicit_agent_name is None and (parent_run_id is None or is_new_root):
             detected = str(name)
             if detected and detected not in ('chain', 'unknown'):
-                self.agent_name = detected
+                if state.detected_agent_name is None:
+                    state.detected_agent_name = detected
 
     def on_chain_end(
         self,
@@ -1224,8 +1413,8 @@ class CallbackHandler(_CallbackBase):
 
     # ── Sub-agent resolution ───────────────────────────────
 
-    def _agent_name_or_default(self) -> str:
-        """The name this handler's records ship under — never None.
+    def _agent_name_or_default(self, state: Optional[_RunState] = None) -> str:
+        """The name ONE RUN's records ship under — never None.
 
         `on_chain_start`'s auto-detection cannot fire when the root
         runnable is one of `_SKIP_CHAIN_TYPES` — `prompt | llm` is a
@@ -1235,11 +1424,20 @@ class CallbackHandler(_CallbackBase):
         payload, and the ingest API rejects that: every LCEL trace from
         `init(langchain=True)` was dropped with TRACE_VALIDATION_FAILED.
 
-        Resolution is deliberately NOT written back to `self.agent_name`:
-        that field staying None is what lets a later root chain with a real
-        name still be auto-detected.
+        Resolution is deliberately NOT written back to `self.agent_name`,
+        and the auto-detected name lives on the RUN rather than on the
+        handler: that is what lets the next root chain be named on its own
+        merits instead of inheriting the first one's name for the life of
+        the process.
         """
-        return self.agent_name or _install_agent_name or DEFAULT_AGENT_NAME
+        state = state if state is not None else self._current
+        detected = state.detected_agent_name if state is not None else None
+        return (
+            self._explicit_agent_name
+            or detected
+            or _install_agent_name
+            or DEFAULT_AGENT_NAME
+        )
 
     def _resolve_agent_name(
         self,
@@ -1272,7 +1470,7 @@ class CallbackHandler(_CallbackBase):
             if span.span_type == SpanType.AGENT and span.name:
                 return span.name
             span_id = span.parent_span_id
-        return self._agent_name_or_default()
+        return self._agent_name_or_default(state)
 
     # ── LLM / tool run routing ─────────────────────────────
 
@@ -1331,6 +1529,7 @@ class CallbackHandler(_CallbackBase):
         call_id = run_id or uuid4()
         params = invocation_params or {}
         state = self._state_for_leaf(call_id, parent_run_id)
+        self._capture_call_rails(state)
 
         rendered_input = [{"role": "user", "content": p} for p in prompts]
 
@@ -1376,6 +1575,7 @@ class CallbackHandler(_CallbackBase):
         call_id = run_id or uuid4()
         params = invocation_params or {}
         state = self._state_for_leaf(call_id, parent_run_id)
+        self._capture_call_rails(state)
 
         rendered_input = []
         for msg_list in messages:
@@ -1715,38 +1915,51 @@ class CallbackHandler(_CallbackBase):
                 entry["hash"] = h
             active_skills_list.append(entry)
 
-        # Drain the Router's instance rails first, unconditionally — see
-        # `_drain_router_rails`. Unconditional because an undrained rail
-        # leaks into the NEXT trace.
+        # ── the skills rails ────────────────────────────────
+        # Everything this RUN captured for itself comes first, and wins.
+        # `_capture_call_rails` reads the routing decision inside the model
+        # call it was made for, so it is attributable by construction.
+        #
+        # The Router singleton's instance rails are drained here too, but
+        # they are a LAST RESORT, used per field only when this run captured
+        # nothing of its own — they are process-wide state shared by every
+        # concurrent run, so unioning them unconditionally is what put
+        # another lane's routing_id (and, in one measured trace, 34 offered
+        # names against a prompt that offered one) onto a trace. The drain
+        # itself stays unconditional: an undrained rail leaks forward into
+        # the NEXT trace instead.
         rail_routing_id, rail_offered, rail_delivered, rail_loaded = _drain_router_rails()
 
-        # Drain the offered-names contextvar populated by the
-        # BaseChatModel patch; merge with any direct log_skill_offered calls.
-        drained_offered = _consume_skills_offered()
-        if drained_offered:
-            for n in drained_offered:
-                state.skills_offered_in_prompt.add(n)
-        for n in rail_offered:
+        # Drain the contextvars too — a `log_skill_*` call or an injection
+        # that happened outside the patched invoke lands there, and an
+        # undrained contextvar leaks into the next trace in this context.
+        for n in _consume_skills_offered():
             state.skills_offered_in_prompt.add(n)
-
-        # Drain the delivered-names contextvar (Router body injection).
-        drained_delivered = _consume_skills_delivered()
-        if drained_delivered:
-            for n in drained_delivered:
-                state.skills_delivered.add(n)
-                state.skills_offered_in_prompt.add(n)  # delivered implies offered
-        for n in rail_delivered:
+        for n in _consume_skills_delivered():
             state.skills_delivered.add(n)
-            state.skills_offered_in_prompt.add(n)
+            state.skills_offered_in_prompt.add(n)  # delivered implies offered
+        ctx_routing_id = _consume_routing_id()
+
+        if not state.skills_offered_in_prompt:
+            for n in rail_offered:
+                state.skills_offered_in_prompt.add(n)
+        if not state.skills_delivered:
+            for n in rail_delivered:
+                state.skills_delivered.add(n)
+                state.skills_offered_in_prompt.add(n)
 
         # Bodies served by the singleton's `load_skill(...)` — this adapter
         # registers no native load_skill tool, but a user-supplied tool
         # that calls it still lands its serves here.
-        for n in rail_loaded:
-            if isinstance(n, str) and n.strip():
-                state.skills_loaded_by_agent.add(n.strip())
-                state.skills_offered_in_prompt.add(n.strip())
-                state.skills_delivered.add(n.strip())
+        if not state.skills_loaded_by_agent:
+            for n in rail_loaded:
+                if isinstance(n, str) and n.strip():
+                    state.skills_loaded_by_agent.add(n.strip())
+                    state.skills_offered_in_prompt.add(n.strip())
+                    state.skills_delivered.add(n.strip())
+
+        routing_id = state.routing_id or ctx_routing_id or rail_routing_id
+        agent_name = self._agent_name_or_default(state)
 
         # Derive trace status from collected spans/LLM calls: if any errored,
         # the run errored. on_chain_error/on_llm_error mark these ERROR.
@@ -1759,7 +1972,7 @@ class CallbackHandler(_CallbackBase):
         return RunTrace(
             id=state.trace_id,
             project=config.project if config else None,
-            agent_name=self._agent_name_or_default(),
+            agent_name=agent_name,
             session_id=self.session_id,
             parent_trace_id=self.parent_trace_id,
             status=trace_status,
@@ -1771,13 +1984,14 @@ class CallbackHandler(_CallbackBase):
             spans=list(state.spans.values()),
             llm_calls=list(state.llm_calls.values()),
             active_skills=active_skills_list,
-            manifest_id=_manifest_id,
-            # SkillRouter: stamp the routing_id set by the BaseChatModel
-            # monkey-patch so the offered-vs-activated join can close. The
-            # rail is the fallback: LangChain runs callbacks under
-            # `copy_context()`, so the patch's contextvar write never
-            # reaches this build.
-            routing_id=_consume_routing_id() or rail_routing_id,
+            # THIS agent's manifest. A single process-global slot stamped
+            # whichever agent registered most recently onto everybody's
+            # traces, so the manifest a trace pointed at could belong to a
+            # different agent entirely.
+            manifest_id=_manifest_ids.get(agent_name),
+            # SkillRouter: the routing_id this run was actually given, so the
+            # offered-vs-activated join can close on the right decision.
+            routing_id=routing_id,
             # Skill Rater discovery telemetry. Sorted for
             # deterministic output (tests, diffs).
             skills_offered_in_prompt=sorted(state.skills_offered_in_prompt),
@@ -1969,69 +2183,53 @@ class CallbackHandler(_CallbackBase):
                 "Skill auto-detection from prompts failed",
             )
 
-    def _resolve_manifest_for_empty_run(self) -> None:
+    def _resolve_manifest_for_empty_run(self, agent_name: str) -> None:
         """Give a run with nothing to declare a manifest_id to ship under.
 
         See the long note in `_maybe_register_manifest`. Order: keep what
-        this process already has → adopt the agent's active manifest from
-        the platform → register a zero-component placeholder.
+        this process already has FOR THIS AGENT → adopt that agent's active
+        manifest from the platform → register a zero-component placeholder.
+
+        Per-agent throughout: a process-global "do we have one yet?" answered
+        yes on behalf of an agent that had never registered anything, and its
+        traces then carried another agent's manifest id.
         """
         global _manifest_id
 
-        from . import _config
-
-        if _manifest_id is not None:
-            return  # Already have one — never regress it to an empty manifest.
-
-        agent_name = self._agent_name_or_default()
-
+        adopted: Optional[str] = None
         with _manifest_lock:
-            if _manifest_id is not None:
-                return
-            if agent_name not in _manifest_adoption_probed:
+            _forget_manifests_if_tracker_reset()
+            if _manifest_ids.get(agent_name):
+                return  # Already have one — never regress it to an empty manifest.
+            probe = agent_name not in _manifest_adoption_probed
+            if probe:
                 _manifest_adoption_probed.add(agent_name)
-                adopted = _adopt_active_manifest(agent_name)
-                if adopted:
-                    _manifest_id = adopted
-                    logger.debug(
-                        "Adopted the platform's active manifest %s for %s "
-                        "(this run had nothing to declare)",
-                        adopted, agent_name,
-                    )
-                    return
+        if probe:
+            adopted = _adopt_active_manifest(agent_name)
+        if adopted:
+            with _manifest_lock:
+                _manifest_ids.setdefault(agent_name, adopted)
+                _manifest_id = adopted
+            logger.debug(
+                "Adopted the platform's active manifest %s for %s "
+                "(this run had nothing to declare)",
+                adopted, agent_name,
+            )
+            return
 
-            # No manifest anywhere for this agent — register the placeholder.
-            # Zero components on purpose: a fake `{"provider": "unknown"}`
-            # model would both lie and still diff as major later. Zero
-            # components hash to a per-agent constant, so repeat
-            # registrations dedup onto the same v1 instead of minting
-            # versions.
-            snapshot = extract_from_config(agent_name=agent_name)
-            if not _manifest_tracker.check_and_update(snapshot):
-                return
-            try:
-                client = _config._get_client()
-                result = client.register_manifest(snapshot)
-                _manifest_id = _registered_manifest_id(result, snapshot)
-                logger.info(
-                    "Registered placeholder manifest %s for %s — this run "
-                    "declared no tools, prompts or models",
-                    _manifest_id, agent_name,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to register placeholder manifest, continuing without",
-                    exc_info=True,
-                )
-                _manifest_id = snapshot.id
+        # No manifest anywhere for this agent — register the placeholder.
+        # Zero components on purpose: a fake `{"provider": "unknown"}`
+        # model would both lie and still diff as major later. Zero
+        # components hash to a per-agent constant, so repeat
+        # registrations dedup onto the same v1 instead of minting
+        # versions.
+        _register_snapshot(agent_name, extract_from_config(agent_name=agent_name))
 
     def _maybe_register_manifest(self, state: Optional[_RunState] = None) -> None:
-        """Extract and register manifest if not already done.
+        """Extract and register this RUN's manifest if not already done.
 
-        Thread-safe via _manifest_lock.
+        Thread-safe via _manifest_lock (held inside `_register_snapshot`).
         """
-        global _manifest_id
-
         from . import _config
         if not _config._is_enabled():
             return
@@ -2093,13 +2291,14 @@ class CallbackHandler(_CallbackBase):
         # The forward transition (placeholder → first real declaration) is
         # left as a real version bump: it says a model was declared where
         # none had been, which is true, and it deletes nothing.
-        if not tools and not prompts and not models and not skills and not subagents:
-            self._resolve_manifest_for_empty_run()
-            return
-
         # Same label the trace ships under, or the manifest lands on a
         # different agent than the traces that reference its manifest_id.
-        agent_name = self._agent_name_or_default()
+        agent_name = self._agent_name_or_default(state)
+
+        if not tools and not prompts and not models and not skills and not subagents:
+            self._resolve_manifest_for_empty_run(agent_name)
+            return
+
         snapshot = extract_from_config(
             agent_name=agent_name,
             tools=tools,
@@ -2110,26 +2309,8 @@ class CallbackHandler(_CallbackBase):
             skills=skills,
         )
 
-        # Thread-safe manifest registration
-        with _manifest_lock:
-            # Check if manifest changed
-            if not _manifest_tracker.check_and_update(snapshot):
-                return  # Same hash — already registered
-
-            try:
-                client = _config._get_client()
-                result = client.register_manifest(snapshot)
-                _manifest_id = _registered_manifest_id(result, snapshot)
-                logger.info(
-                    "Registered manifest %s (hash=%s, components=%d)",
-                    _manifest_id,
-                    snapshot.manifest_hash[:12],
-                    len(snapshot.components),
-                )
-            except Exception:
-                logger.warning("Failed to register manifest, continuing without", exc_info=True)
-                # Still use local ID so traces get tagged
-                _manifest_id = snapshot.id
+        # Thread-safe, and keyed by (agent, hash) — see `_register_snapshot`.
+        _register_snapshot(agent_name, snapshot)
 
     # ── Backwards compatibility ────────────────────────────
 

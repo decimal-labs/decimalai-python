@@ -24,6 +24,7 @@ Manual path (custom TracerProvider)::
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -80,6 +81,65 @@ _NON_LLM_OPERATIONS = frozenset(
 # tool and no prompt. See _ManifestRegistry for why it is labelled rather than
 # left to the backend's v1/v2/v3 auto-increment.
 _UNDECLARED_LABEL = "undeclared"
+
+# The span attribute that names the agent a span belongs to. Callers may set it
+# themselves on any span; :class:`_AgentNameStamper` sets it automatically from
+# the agent active in the current context. The older
+# ``decimalai.integrations.otel`` exporter has always honoured this key — this
+# one did not, so a user who followed that documented escape hatch got their
+# name silently dropped.
+_DECIMAL_AGENT_NAME = "decimal.agent_name"
+
+# The agent whose run is executing in THIS context (thread, or asyncio task
+# descended from it). A ContextVar rather than a module global on purpose: eight
+# concurrent runs of eight different agents in one process each need their own
+# answer, and a plain global would hand all eight whichever name was written
+# last. Unset outside any instrumented context, in which case the exporter falls
+# back to the name it was constructed with — the old behaviour, unchanged for
+# the single-agent process that is the common case.
+_active_agent_name: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "decimalai_otel_active_agent", default=None
+)
+
+
+class _AgentNameStamper:
+    """A span processor that records, at span START, whose agent the span is.
+
+    Start, not export: by export time the span is sitting on the
+    ``BatchSpanProcessor`` worker thread, which has no idea which run produced
+    it. At start we are still on the caller's thread, so the context can answer.
+
+    Implements the OTel ``SpanProcessor`` protocol by duck typing, the same way
+    :class:`DecimalSpanExporter` implements ``SpanExporter`` — so this module
+    still imports with no OTel SDK present, and so the SDK can stay mocked in
+    tests. That means implementing the protocol **in full**, private hooks
+    included: the SDK calls ``_on_ending`` from inside ``span.end()``, and a
+    stand-in missing it raises there, killing the span and every span above it.
+    """
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        try:
+            name = _active_agent_name.get()
+            if not name:
+                return
+            existing = getattr(span, "attributes", None) or {}
+            if existing.get(_DECIMAL_AGENT_NAME):
+                return  # an explicit name on the span outranks the context
+            span.set_attribute(_DECIMAL_AGENT_NAME, name)
+        except Exception:  # pragma: no cover - stamping must never break a span
+            logger.debug("Could not stamp the agent name onto a span", exc_info=True)
+
+    def _on_ending(self, span: Any) -> None:
+        return None
+
+    def on_end(self, span: Any) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
 
 
 def instrument(
@@ -158,6 +218,17 @@ def instrument(
     exporter = DecimalSpanExporter(
         agent_name=agent_name, skills=resolved_skills, prompts=prompts
     )
+    # Whose run is this? Recorded in the CONTEXT, not just on the exporter,
+    # because only the first call in a process gets to own the pipeline: OTel
+    # honours ``set_tracer_provider`` once, and an instrumentor binds its tracer
+    # the first time it is enabled. So the provider built by a SECOND
+    # instrument() call never sees a span, and before this the second agent's
+    # traces were silently filed under the first agent's name. The stamper below
+    # goes onto THIS provider; the one already installed on the first provider
+    # reads the same ContextVar, so it picks the new name up too.
+    if agent_name:
+        _active_agent_name.set(agent_name)
+    provider.add_span_processor(_AgentNameStamper())
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace_api.set_tracer_provider(provider)
     _register_flush_atexit(provider)
@@ -533,6 +604,51 @@ class DecimalSpanExporter:
         # Skill tracking — merge from OTEL span attributes + auto-detection
         active_skills: Dict[str, Optional[str]] = {}
 
+        # ── Preserve the shape the framework actually emitted ──
+        # A TraceSpan is identified by a UUID we mint, while OTel identifies a
+        # span by a 64-bit id and names its parent by that id. So the parent
+        # link can only be carried across if every span's UUID is known BEFORE
+        # any span is built — a child is frequently exported ahead of its
+        # parent (children end first, and BatchSpanProcessor preserves that
+        # order), so resolving lazily during the loop would drop exactly the
+        # links that matter. Mint the whole id map up front, then translate.
+        #
+        # This used to be `parent_span_id=None` on every span, which flattened
+        # every trace on the OTel rail — CrewAI, AG2, Microsoft AutoGen,
+        # raw-provider instrumentors and hand-rolled OTel alike — into a list
+        # of same-level siblings. The waterfall then showed an 8-span agent run
+        # as eight unrelated roots: no nesting, no "this LLM call happened
+        # inside that tool", and no way to tell a retry from a sub-agent.
+        span_uuids: Dict[str, Any] = {}
+        for otel_span in otel_spans:
+            sid = _get_span_id(otel_span)
+            if sid is not None and sid not in span_uuids:
+                span_uuids[sid] = uuid4()
+
+        # ── Whose run was this? ──
+        # The exporter's own ``default_agent_name`` is fixed when the exporter
+        # is BUILT, and on this rail that is once per process: OTel honours
+        # ``set_tracer_provider`` once, and every instrumentor binds its tracer
+        # the first time it is enabled. So a second ``instrument(agent_name=B)``
+        # in the same process changes nothing — B's spans still reach A's
+        # exporter and every one of B's traces is filed under A. The name has to
+        # travel WITH the span, which is what ``decimal.agent_name`` is for
+        # (set by the caller directly, or stamped at span start by
+        # :class:`_AgentNameStamper` from the agent active in that context).
+        # The root span's answer wins; any span's beats the process-wide guess.
+        root_declared: Optional[str] = None
+        any_declared: Optional[str] = None
+        for otel_span in otel_spans:
+            declared = _get_attributes(otel_span).get(_DECIMAL_AGENT_NAME)
+            if not isinstance(declared, str) or not declared:
+                continue
+            if any_declared is None:
+                any_declared = declared
+            if root_declared is None and _get_parent_span_id(otel_span) is None:
+                root_declared = declared
+        if root_declared or any_declared:
+            agent_name = root_declared or any_declared
+
         for otel_span in otel_spans:
             attrs = _get_attributes(otel_span)
             name = _get_span_name(otel_span)
@@ -540,6 +656,15 @@ class DecimalSpanExporter:
             span_id_str = _get_span_id(otel_span)
             started_at = _ns_to_datetime(getattr(otel_span, "start_time", None))
             ended_at = _ns_to_datetime(getattr(otel_span, "end_time", None))
+            # This span's identity, and its parent's — but only when the parent
+            # is one of the spans in this trace. A parent that never reached
+            # this exporter (owned by another tracer, sampled out, or dropped
+            # from an over-full buffer) stays unset rather than becoming a
+            # dangling pointer the UI cannot resolve.
+            span_uuid = span_uuids.get(span_id_str) if span_id_str else None
+            if span_uuid is None:
+                span_uuid = uuid4()
+            parent_uuid = span_uuids.get(parent_id) if parent_id else None
 
             # Track root span timing
             if parent_id is None:
@@ -588,7 +713,8 @@ class DecimalSpanExporter:
             if model:
                 # This is an LLM call — create LlmCallRecord
                 llm_call = self._make_llm_call(
-                    attrs, name, model, started_at, ended_at, otel_span
+                    attrs, name, model, started_at, ended_at, otel_span,
+                    span_uuid=span_uuid, agent_name=agent_name,
                 )
                 llm_calls.append(llm_call)
 
@@ -625,8 +751,8 @@ class DecimalSpanExporter:
 
                 # Also create a wrapper TraceSpan
                 trace_span = TraceSpan(
-                    id=uuid4(),
-                    parent_span_id=None,
+                    id=span_uuid,
+                    parent_span_id=parent_uuid,
                     span_type=SpanType.LLM,
                     name=f"llm:{model}",
                     status=llm_call.status,
@@ -666,8 +792,8 @@ class DecimalSpanExporter:
                     seen_tools.setdefault(tool_name, {"name": tool_name})
 
                 trace_span = TraceSpan(
-                    id=uuid4(),
-                    parent_span_id=None,
+                    id=span_uuid,
+                    parent_span_id=parent_uuid,
                     span_type=span_type,
                     name=name,
                     status=span_status,
@@ -738,8 +864,17 @@ class DecimalSpanExporter:
         started_at: Optional[datetime],
         ended_at: Optional[datetime],
         otel_span: Any,
+        span_uuid: Optional[Any] = None,
+        agent_name: Optional[str] = None,
     ) -> LlmCallRecord:
-        """Build an LlmCallRecord from OTEL span attributes."""
+        """Build an LlmCallRecord from OTEL span attributes.
+
+        ``span_uuid`` is the id of the :class:`TraceSpan` this call is the
+        wrapper for, so a consumer can put the call back where it happened in
+        the waterfall instead of guessing by timestamp. ``agent_name`` is the
+        name the enclosing trace resolved to, so a call cannot claim a
+        different agent than the trace it is part of.
+        """
         provider = _get_first(attrs, _GENAI_SYSTEM, *_ALT_PROVIDER_KEYS)
         if not provider:
             provider = _infer_provider(model)
@@ -782,8 +917,8 @@ class DecimalSpanExporter:
 
         return LlmCallRecord(
             id=uuid4(),
-            span_id=None,
-            agent_name=self.default_agent_name,
+            span_id=span_uuid,
+            agent_name=agent_name or self.default_agent_name,
             provider=provider,
             model_name=model,
             temperature=temperature,

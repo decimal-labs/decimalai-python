@@ -237,6 +237,7 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 "delivered": [],
                 "loaded": [],
                 "agent": None,
+                "user_input": None,
             }
             _run_rails[run_key] = rail
             while len(_run_rails) > _RUN_RAILS_MAX:
@@ -253,6 +254,7 @@ def _record_run_rail(
     delivered: Optional[List[str]] = None,
     loaded: Optional[List[str]] = None,
     agent: Any = None,
+    user_input: Optional[str] = None,
 ) -> bool:
     """Stamp routing/loading telemetry onto the CURRENT run's rail.
 
@@ -274,6 +276,9 @@ def _record_run_rail(
                     rail[key].append(name)
         if agent is not None:
             rail["agent"] = agent
+        # First turn wins: it carries the run's original ask.
+        if user_input and not rail.get("user_input"):
+            rail["user_input"] = user_input
     return True
 
 
@@ -457,6 +462,30 @@ def _extract_query(ctx: Any) -> Optional[str]:
             if isinstance(val, str) and val.strip():
                 return val
     return None
+
+
+def _note_user_input(acc: Any, raw: Any) -> None:
+    """Record the run's ORIGINAL ask as ``user_input_preview``, once.
+
+    Nothing used to populate this field, so every trace this adapter sent
+    carried ``user_input_preview: null`` — a trace list in which no row shows
+    what was asked, and a backend that cannot derive one either.
+
+    The turn's input items ARE the conversation the runner handed the model, so
+    the user message is right there; ``_query_from_input_items`` already knows
+    how to pull it out (skipping ``function_call`` / ``function_call_output`` /
+    ``reasoning`` items, which carry no role and no text). First writer wins:
+    later turns of the same run replay the same conversation plus tool traffic,
+    and the field is the run's ask, not the latest turn's.
+    """
+    if getattr(acc, "user_input_preview", None) is not None:
+        return
+    try:
+        text = _query_from_input_items(raw)
+    except Exception:  # pragma: no cover - a preview must never break a run
+        return
+    if text:
+        acc.user_input_preview = _preview(text)
 
 
 def _load_skill_tool_enabled() -> bool:
@@ -656,8 +685,15 @@ def _install_agent_hooks() -> bool:
             # Hand the live agent to the trace processor. This is the ONLY
             # path on which a run that trips a guardrail or fails its first
             # model call can still declare a manifest — the spans such a run
-            # emits carry no model and an empty tool list.
-            _record_run_rail(agent=self)
+            # emits carry no model and an empty tool list. The turn's input
+            # rides along for the same reason: such a run emits no model span
+            # either, so this is the only place its prompt is visible.
+            _record_run_rail(
+                agent=self,
+                user_input=_query_from_input_items(
+                    getattr(run_context, "turn_input", None)
+                ),
+            )
         except Exception:
             logger.debug("agent observation failed (non-fatal)", exc_info=True)
         if not _skill_loader_installed:
@@ -1283,6 +1319,11 @@ def _register_manifest_from_agent(
         logger.warning("Failed to register manifest from Agent introspection", exc_info=True)
 
 
+#: Span types whose ``error`` does NOT mean the run failed. See
+#: ``DecimalTracingProcessor._note_span_error`` for why each one is here.
+_RECOVERABLE_SPAN_TYPES = frozenset({"function", "custom"})
+
+
 class _TraceAccumulator:
     """Per-trace state that accumulates spans as they complete."""
 
@@ -1402,6 +1443,8 @@ class DecimalTracingProcessor:
         span_data = getattr(span, "span_data", None)
         span_type = getattr(span_data, "type", None) if span_data else None
 
+        self._note_span_error(span, span_type, acc)
+
         if span_type == "generation":
             self._handle_generation(span, span_data, acc)
         elif span_type == "function":
@@ -1419,6 +1462,49 @@ class DecimalTracingProcessor:
         else:
             # Unknown span type — create a generic TraceSpan
             self._handle_generic(span, span_data, acc)
+
+    def _note_span_error(self, span: Any, span_type: Optional[str], acc: _TraceAccumulator) -> None:
+        """Fail the RUN when a span reports an error.
+
+        ``acc.status`` used to be ``Status.SUCCESS`` from construction to send,
+        with nothing anywhere able to change it — so a run that raised (a bad
+        model id, an unreachable endpoint, a guardrail tripwire) was ingested as
+        a SUCCESS. Every error-rate figure derived from these traces read zero,
+        which is worse than having no trace at all: it is a confident wrong
+        answer to "is this agent healthy?".
+
+        The Agents SDK already carries the signal — ``Span.error`` is set by the
+        runner via ``set_error()``. Two span types are deliberately EXCLUDED:
+
+        * ``function`` — a tool that raises is handed back to the model as an
+          error string by the SDK's default tool-error handler, and the agent
+          routinely recovers and answers. The tool's own span and
+          ``ToolCallRecord`` still carry ERROR (``_handle_function``); the run
+          does not.
+        * ``custom`` — ``custom_span(...).set_error()`` is the caller's own
+          annotation, with the caller's own meaning. Reading it as "the run
+          failed" would put this adapter's interpretation on their span.
+
+        Everything else (agent, turn, response, generation, handoff, guardrail,
+        and any span type a future SDK adds) does fail the run, because on this
+        contract the expensive mistake is silence about a failure, not an
+        over-loud error.
+        """
+        error = getattr(span, "error", None)
+        if not error or span_type in _RECOVERABLE_SPAN_TYPES:
+            return
+        message = error.get("message") if isinstance(error, dict) else None
+        if not isinstance(message, str) or not message:
+            message = str(error)
+        data = error.get("data") if isinstance(error, dict) else None
+        if isinstance(data, dict) and data.get("error"):
+            message = f"{message}: {_stringify(data['error'])}"
+        with self._lock:
+            acc.status = Status.ERROR
+            # First error wins — it is the one that ended the run; the ones
+            # after it are that failure unwinding through the enclosing spans.
+            if acc.error_message is None:
+                acc.error_message = message[:2000]
 
     def shutdown(self) -> None:
         """Flush any remaining traces and clean up."""
@@ -1461,6 +1547,8 @@ class DecimalTracingProcessor:
         # Extract input/output
         raw_input = getattr(span_data, "input", None)
         raw_output = getattr(span_data, "output", None)
+
+        _note_user_input(acc, raw_input)
 
         # Convert input to rendered_input format
         rendered_input = None
@@ -1679,6 +1767,7 @@ class DecimalTracingProcessor:
             }
 
         raw_input = getattr(span_data, "input", None)
+        _note_user_input(acc, raw_input)
         output_text = _response_output_text(response_obj) if response_obj else None
 
         latency_ms = None
@@ -1939,8 +2028,9 @@ class DecimalTracingProcessor:
             source_type="production",
             started_at=acc.started_at or ended_at,
             ended_at=ended_at,
-            user_input_preview=acc.user_input_preview,
+            user_input_preview=acc.user_input_preview or _preview(run_rail.get("user_input")),
             final_output_preview=acc.final_output_preview,
+            error_message=acc.error_message,
             spans=acc.spans,
             llm_calls=acc.llm_calls,
             active_skills=active_skills_list,

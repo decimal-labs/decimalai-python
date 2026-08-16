@@ -314,6 +314,16 @@ def extract_output_text(response: Any) -> Optional[str]:
     Handles:
         - generation.text (all versions)
         - generation.message.content (all versions)
+
+    Returns None when the turn produced no text at all — which is the normal
+    shape of a tool-calling turn, where providers answer with an empty
+    ``content`` and the tool calls carry the meaning. It used to answer
+    ``str(gen)`` there, and that last resort fired on EVERY tool-calling turn:
+    ``llm_calls[0].output.content`` reached the platform as
+    ``message=AIMessage(content='', additional_kwargs={}, …)`` — a Python repr
+    of the framework's response object where a consumer reads "what the model
+    said". A turn with nothing to say says nothing; see `extract_output_dict`
+    for what is recorded instead.
     """
     gen = _get_first_generation(response)
     if gen is None:
@@ -324,22 +334,41 @@ def extract_output_text(response: Any) -> Optional[str]:
     if text:
         return str(text)
 
-    # Fallback: .message.content
+    # Fallback: .message.content. Guarded on the message actually carrying a
+    # content field, because `extract_message_content` falls back to
+    # `str(message)` — the same repr, one frame further down.
     msg = getattr(gen, "message", None)
-    if msg:
+    if msg is not None and (hasattr(msg, "content") or isinstance(msg, dict)):
         content = extract_message_content(msg)
         if content:
             return content
 
-    return str(gen)
+    return None
 
 
 def extract_output_dict(response: Any) -> Optional[Dict[str, Any]]:
-    """Extract a structured output dict from an LLM response."""
-    text = extract_output_text(response)
-    if text is None:
+    """Extract a structured output dict from an LLM response.
+
+    ``content`` is the completion TEXT and nothing else. On a tool-calling
+    turn there is no text, so the record carries an empty ``content`` plus the
+    ``tool_calls`` the model actually asked for — the honest answer to "what
+    did the model produce here", and one a dashboard can render.
+    """
+    gen = _get_first_generation(response)
+    if gen is None:
         return None
-    return {"content": text}
+
+    text = extract_output_text(response)
+    msg = getattr(gen, "message", None)
+    tool_calls = extract_tool_calls(msg) if msg is not None else []
+
+    if text is None and not tool_calls:
+        return None
+
+    output: Dict[str, Any] = {"content": text if text is not None else ""}
+    if tool_calls:
+        output["tool_calls"] = tool_calls
+    return output
 
 
 # ── Internal Helpers ───────────────────────────────────────────
