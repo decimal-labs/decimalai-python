@@ -108,8 +108,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 1.3.0 is the declared floor (pyproject.toml `langchain` extra); `latest` is the ceiling.
-        langchain-core: ["1.3.0", "latest"]
+        # 1.3.3 is the declared floor (pyproject.toml `langchain` extra); `latest` is the ceiling.
+        # A test asserts these agree — raising the floor without touching this
+        # matrix means CI stops testing the version we claim to support.
+        langchain-core: ["1.3.3", "latest"]
     steps:
       - uses: actions/checkout@v6
 

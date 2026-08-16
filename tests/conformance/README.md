@@ -44,7 +44,7 @@ There is no Makefile in this repo. The one command is:
 
 ```bash
 pip install -e ".[dev,conformance-tests]"    # the eleven frameworks the drivers drive
-python -m pytest tests/conformance -q -rs -m conformance   # ~90s; -rs prints every N/A reason
+python -m pytest tests/conformance -q -rs -m conformance   # ~30s; -rs prints every N/A reason
 # -m conformance is required — the marker is deselected by default so this suite
 # never shares a process with the unit suite (it mutates adapter globals on purpose).
 ```
@@ -142,11 +142,48 @@ anything reaching its model through the `openai` SDK reuses
 If a framework seems to need a special assertion, **the contract is wrong**.
 Fix `contract.py` so every framework gets the fix.
 
+## One driver, one process
+
+Every adapter installs **process-global** instrumentation: module ContextVars,
+langchain-core's global configure-hook list, an OTel global `TracerProvider`
+that can only be set once, monkeypatched `__init__`s that cannot be undone. Run
+every driver's phases in one process and whichever goes first decides what the
+ones after it are allowed to observe — which produced *false* results in
+both directions: a framework that emits fine graded as emitting nothing, a
+known-red item graded green, and one driver's `manifest_id` stamped on another
+driver's traces (a C2 rejection blamed on the wrong adapter).
+
+So `isolation.py` runs each driver's phases in a **child process** — one per
+driver, `sys.executable` with `PYTHONPATH` inherited — and brings only the
+capture back as JSON. The probe lives in the child, because that is the process
+the SDK's HTTP calls come out of. The parent imports no framework and runs no
+driver code; it deserialises and grades, so `contract.py` stays the single place
+assertions live.
+
+Consequences worth knowing:
+
+- Children run a few at a time (`DECIMAL_CONFORMANCE_JOBS`, default 4). Each has
+  its own probe on its own port, so they cannot interfere; the cap keeps the
+  timing-sensitive items (C8, C9) off a saturated machine.
+- Only the drivers whose items were collected are run. `-k langchain` is one
+  child and ~6s, not the whole matrix.
+- A child that crashes or times out (`DECIMAL_CONFORMANCE_DRIVER_TIMEOUT`,
+  default 900s) makes **every** item for that driver a hard error naming the
+  driver, and the matrix prints `NOT GRADED — the driver process died`. It is
+  never a skip: an ungraded driver reported as passed or skipped is the failure
+  mode this tier exists to remove.
+- What crosses the boundary is exactly what the contract reads: every phase's
+  recorded requests (bodies verbatim), plus the probe state C6 and C8 query.
+  `isolation.dump_payload` re-parses its own JSON and compares before shipping,
+  so a field that does not survive the round-trip crashes the child instead of
+  being graded.
+
 ## The phases
 
-Run in order, in one process, each in its own temp cwd. Adapter module globals
-are deliberately **not** reset between them — running two agents back to back is
-exactly where process-global state bites.
+Run in order, in one process — the driver's OWN process — each in its own temp
+cwd. Adapter module globals are deliberately **not** reset between them: running
+two agents back to back is exactly where process-global state bites, and that is
+a property of one driver's run, not something another framework may inject.
 
 | Phase | What it is | Feeds |
 |---|---|---|
@@ -275,7 +312,7 @@ because Tier A is hermetic — no model spend, no backend.
 Two commands worth knowing:
 
 ```bash
-# pinned, ~90s, no key, no backend — "did I break an adapter?"
+# pinned, ~30s, no key, no backend — "did I break an adapter?"
 make release-gate-conformance
 
 # floating: newest frameworks vs the contract, still no key and no backend
@@ -393,12 +430,10 @@ Stated so nobody mistakes a green cell for a guarantee.
   LangChain it is currently `{"input": "{'query': '…'}"}` — the dict
   stringified under an invented key. Worth a C13; deliberately out of v1 scope.
 - **Exact token counts, cost, latency.** Tier B's job.
-- **Cross-driver isolation within one process.** Every driver's phases run in
-  one process, in registration order, and several adapters install
-  process-global instrumentors that cannot be uninstalled. A late-arriving trace
-  from an earlier driver can therefore land in a later driver's probe — visible
-  today as foreign `agent_name`s in some C6/C9 failures. That is a real property
-  of those adapters, but it means a C6/C9 failure late in the run may name a
-  driver that is not the culprit. Read the whole matrix, not one cell.
+- **Cross-driver isolation.** Fixed: each driver's phases now run in their own
+  process (see [One driver, one process](#one-driver-one-process)), so a late
+  trace or a global instrumentor from one adapter can no longer reach another's
+  probe. What remains is isolation *within* one driver's process, which is
+  deliberate — C6, C7 and C9 exist to grade it.
 - **This README does not carry the result matrix.** It would be stale within a
   week. Run the suite; the matrix it prints is the only authoritative one.

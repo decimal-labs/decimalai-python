@@ -52,3 +52,63 @@ llamaindex:C9
 # ── Generic OTel ─────────────────────────────────────────────────────────────
 # Spans arrive flat — parent_span_id is hardcoded None in the exporter.
 generic-otel:C5
+
+# ── Recorded 2026-08-15, second pass ─────────────────────────────────────────
+# The block above was recorded from a run in which only 4 of 11 frameworks had
+# their libraries installed — the other 7 were skipped and their failures were
+# never seen. That is the same "a partial matrix reads as coverage" mistake the
+# CI job's REQUIRE_ALL flag exists to prevent, made while writing the ledger.
+#
+# These are the rest, from a full matrix with every framework present, verified
+# deterministic across 4 consecutive runs and identical with serial children.
+# Every one is a defect the acceptance grading already reported.
+
+# Google ADK — flat span tree; manifest/agent identity leaks via module globals.
+adk:C5
+adk:C6
+
+# AG2 — same two, plus concurrent runs cross-contaminate.
+ag2:C5
+ag2:C6
+ag2:C9
+
+# raw Anthropic — exporter hardcodes parent_span_id=None; routing_id never
+# reaches the trace though the menu does reach the model.
+anthropic:C5
+anthropic:C6
+anthropic:C8
+anthropic:C9
+
+# Microsoft AutoGen — the weakest rail: no LLM detail captured, contentless
+# previews, one run shatters into many traces. C7 is NEW information, not a
+# regression: in a clean process the adapter registers an empty manifest and
+# then a second one inside a single run, minting two versions for one run —
+# the old shared-process harness masked it.
+autogen-ms:C3
+autogen-ms:C4
+autogen-ms:C5
+autogen-ms:C6
+autogen-ms:C7
+autogen-ms:C9
+autogen-ms:C10
+
+# Claude Agent SDK — call count inflated per streamed block; flat spans.
+claude-agent-sdk:C3
+claude-agent-sdk:C4
+claude-agent-sdk:C5
+claude-agent-sdk:C6
+claude-agent-sdk:C9
+
+# CrewAI — instrumentor-derived spans arrive flat and without LLM detail.
+crewai:C3
+crewai:C4
+crewai:C5
+crewai:C6
+crewai:C9
+
+# Pydantic AI — one run fragments into N unlinked traces; routing_id never
+# reaches the trace.
+pydantic-ai:C5
+pydantic-ai:C6
+pydantic-ai:C8
+pydantic-ai:C9
