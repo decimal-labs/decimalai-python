@@ -17,6 +17,18 @@ Usage::
     index = VectorStoreIndex.from_documents(documents)
     response = index.as_query_engine().query("What is the revenue?")
 
+Serving more than one agent from one process — ``instrument()`` installs ONE
+handler on LlamaIndex's root dispatcher and installing again double-traces, so
+name the RUN rather than re-installing::
+
+    from decimalai.providers import agent_run
+
+    with agent_run("billing-rag"):
+        response = billing_engine.query("Why was I charged twice?")
+
+The name is read when the run's first span opens, off the caller's own context,
+so threads and asyncio tasks each keep their own — as does each run's manifest.
+
 Alternative — if you prefer the OTEL path (requires more packages)::
 
     pip install openinference-instrumentation-llama-index
@@ -66,6 +78,10 @@ class DecimalSpanHandler:
 
         from .schema.manifest import ManifestTracker
 
+        # The name to file a run under when nothing named it — see
+        # `_resolve_agent_name`. NOT the answer for every run: `instrument()`
+        # publishes ONE handler process-wide, so treating this as the answer
+        # filed every agent's traffic under whoever installed first.
         self.agent_name = agent_name or "llamaindex-agent"
         # span_id → span data dict
         self._spans: Dict[str, Dict[str, Any]] = {}
@@ -73,28 +89,93 @@ class DecimalSpanHandler:
         self._trees: Dict[str, List[str]] = {}
         # span_id → parent_span_id
         self._parents: Dict[str, Optional[str]] = {}
+        # root_span_id → the agent this tree belongs to, resolved when the
+        # tree OPENED. Read at flush time, never re-resolved there: three of
+        # the four flush paths run outside the caller's context (the stream
+        # tee, `close()` at dispatcher shutdown, and the dispatcher's own
+        # asyncio done-callback, which runs in a COPIED context), so a
+        # flush-time read is right by luck on the sync path and wrong on the
+        # rest. Popped by `_cleanup_tree` alongside `_trees`.
+        self._tree_agents: Dict[str, str] = {}
         # Manifest auto-detection state: version the model config
         # so manifest diff / compat gating engages for LlamaIndex (RAG) agents.
-        self._manifest_tracker = ManifestTracker()
-        self._manifest_id: Optional[str] = None
+        #
+        # Every slot below is keyed by AGENT NAME — the same shape
+        # `decimalai/adk.py` and `decimalai/langchain.py` already use. They
+        # used to be single slots, which is survivable only in a one-agent
+        # process: the manifest hash does not include the agent name (see
+        # `schema.manifest._compute_overall_hash`), so a second agent with the
+        # same structure deduped against the first, never registered, and had
+        # the first agent's manifest_id stamped on its traces.
+        self._manifest_trackers: Dict[str, ManifestTracker] = {}
+        self._manifest_ids: Dict[str, str] = {}
+        self._manifest_id: Optional[str] = None  # last registration, any agent
         self._manifest_lock = threading.Lock()
-        # The model config seen on ANY tree so far. Sticky: index construction
-        # and bare retrieval have no model, and letting the manifest drop back
-        # to model-less between two query trees would churn the manifest
-        # version on every such tree without any real config change.
-        self._seen_model: Optional[Dict[str, Any]] = None
-        # True once this process holds a manifest_id the backend acknowledged
-        # (registered or adopted). Distinct from `_manifest_id`, which is also
-        # set to the client-side id when registration FAILED — that case must
-        # keep retrying.
-        self._manifest_confirmed = False
-        self._adoption_attempted = False
+        # agent → the model config seen on ANY of its trees so far. Sticky:
+        # index construction and bare retrieval have no model, and letting the
+        # manifest drop back to model-less between two query trees would churn
+        # the manifest version on every such tree without any real config
+        # change. Per-agent, or agent B inherits agent A's model and declares
+        # a config it never ran.
+        self._seen_models: Dict[str, Dict[str, Any]] = {}
+        # Agents holding a manifest_id the backend acknowledged (registered or
+        # adopted). Distinct from `_manifest_ids`, which also holds the
+        # client-side id from a FAILED registration — that case must keep
+        # retrying.
+        self._manifest_confirmed: set[str] = set()
+        # Agents already asked the platform "do you have a manifest for me?"
+        # on the nothing-to-declare path. One probe per agent per process.
+        self._adoption_probed: set[str] = set()
         # Roots whose flush is waiting on a streamed response to be delivered.
         self._deferred_roots: set[str] = set()
 
     def class_name(self) -> str:
         """Return the class name for LlamaIndex's handler registry."""
         return "DecimalSpanHandler"
+
+    # ── Run identity ─────────────────────────────────────────────
+
+    def _resolve_agent_name(self, tags: Optional[Dict[str, Any]] = None) -> str:
+        """Whose run is starting HERE — asked once, when the tree opens.
+
+        ``instrument()`` installs one handler on LlamaIndex's ROOT dispatcher
+        and the dispatcher never gives it back, so the install-time name cannot
+        be the answer for a process that serves more than one agent: every run
+        after the first was filed under the first agent's name, and eight
+        concurrent lanes arrived as one agent's history. Re-installing is not
+        an escape hatch either — handlers are additive, so a second install
+        makes one query post two traces.
+
+        Two per-run channels are consulted, both of which are read on the
+        CALLER's context at span-enter, so both survive threads and asyncio
+        tasks (context propagates parent → child, the only direction used):
+
+        1. LlamaIndex's own ``instrument_tags({"agent_name": ...})``, which the
+           dispatcher snapshots and hands to ``span_enter(tags=...)``;
+        2. :func:`decimalai.providers.agent_run`, the SDK-wide run scope — the
+           same ContextVar the raw-provider and Pydantic AI rails read.
+
+        Falling back, in order, to ``instrument(agent_name=...)`` and the
+        default. A process that names nothing keeps exactly its old behaviour.
+        """
+        if isinstance(tags, dict):
+            for key in ("agent_name", "decimal_agent_name"):
+                tagged = tags.get(key)
+                if isinstance(tagged, str) and tagged.strip():
+                    return tagged
+        try:
+            from .otel import _active_agent_name
+
+            scoped = _active_agent_name.get()
+        except Exception:  # pragma: no cover - otel is a core dep
+            scoped = None
+        if isinstance(scoped, str) and scoped.strip():
+            return scoped
+        return self.agent_name
+
+    def _agent_for(self, root_id: str) -> str:
+        """The agent a buffered tree belongs to, or the install-time default."""
+        return self._tree_agents.get(root_id) or self.agent_name
 
     # ── Dispatcher-facing interface ──────────────────────────────
     #
@@ -250,6 +331,18 @@ class DecimalSpanHandler:
         # Track tree
         root_id = self._find_root(id_)
         self._trees.setdefault(root_id, []).append(id_)
+        # Whose run is this? Answered once, on the first span of the tree,
+        # while we are still on the caller's thread/task. Guarded on its own:
+        # the dispatcher wraps every handler call in `except BaseException:
+        # pass`, so anything that raises here would silently drop the ENTIRE
+        # trace with no log line at all.
+        if root_id not in self._tree_agents:
+            try:
+                self._tree_agents[root_id] = self._resolve_agent_name(tags)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Could not resolve the agent for tree %s", root_id,
+                             exc_info=True)
+                self._tree_agents[root_id] = self.agent_name
 
         return id_
 
@@ -509,27 +602,38 @@ class DecimalSpanHandler:
             _fill("model_name", result.get("model"))
 
     def _flush_tree(self, root_id: str) -> None:
-        """Assemble spans into a RunTrace and send to the backend."""
+        """Assemble spans into a RunTrace and send to the backend.
+
+        The buffers are released in a ``finally`` so a tree that dies on the
+        way to the wire — a payload the schema rejects, a sender that raises —
+        still stops occupying memory. These adapters run inside long-lived web
+        servers, where "the run ended by raising" is a leak of a whole span
+        tree per request, not a one-off.
+        """
+        try:
+            self._build_and_send(root_id)
+        finally:
+            self._cleanup_tree(root_id)
+
+    def _build_and_send(self, root_id: str) -> None:
+        """Assemble one buffered tree into a RunTrace and hand it to the sender."""
         from . import _config
         from .schema.common import SpanType, Status
         from .schema.trace import LlmCallRecord, RunTrace, TraceSpan
 
         if not _config._is_enabled():
-            self._cleanup_tree(root_id)
             return
 
         try:
             client = _config._get_client()
         except Exception:
             logger.debug("SDK not initialized, skipping LlamaIndex trace flush")
-            self._cleanup_tree(root_id)
             return
 
         span_ids = self._trees.get(root_id, [root_id])
         spans_data = [self._spans[sid] for sid in span_ids if sid in self._spans]
 
         if not spans_data:
-            self._cleanup_tree(root_id)
             return
 
         if _is_setup_tree(spans_data):
@@ -537,7 +641,6 @@ class DecimalSpanHandler:
                 "Skipping LlamaIndex setup tree %s (%d spans, no query/retrieval/model)",
                 root_id, len(spans_data),
             )
-            self._cleanup_tree(root_id)
             return
 
         # A span the backend can store has to have ended. `dispatcher.shutdown()`
@@ -653,12 +756,16 @@ class DecimalSpanHandler:
         has_error = any(sd["status"] == "error" for sd in spans_data)
 
         # Register/version the manifest before building the trace so the trace
-        # carries the resulting manifest_id.
-        self._maybe_register_manifest(seen_model)
+        # carries the resulting manifest_id. The id comes back as a RETURN
+        # VALUE rather than off an instance slot: two lanes flushing at once
+        # both wrote that slot, and the second overwrote the first between its
+        # own write and its read, so a trace shipped another agent's manifest.
+        agent_name = self._agent_for(root_id)
+        manifest_id = self._maybe_register_manifest(seen_model, agent_name)
 
         trace = RunTrace(
             id=uuid4(),
-            agent_name=self.agent_name,
+            agent_name=agent_name,
             status=Status.ERROR if has_error else Status.SUCCESS,
             source_type="production",
             started_at=root_data.get("started_at"),
@@ -667,7 +774,7 @@ class DecimalSpanHandler:
             final_output_preview=root_data.get("output_preview"),
             spans=trace_spans,
             llm_calls=llm_calls,
-            manifest_id=self._manifest_id,
+            manifest_id=manifest_id,
         )
 
         # Send via background sender
@@ -677,9 +784,9 @@ class DecimalSpanHandler:
             str(trace.id)[:8], len(trace_spans), len(llm_calls),
         )
 
-        self._cleanup_tree(root_id)
-
-    def _maybe_register_manifest(self, seen_model: Optional[Dict[str, Any]]) -> None:
+    def _maybe_register_manifest(
+        self, seen_model: Optional[Dict[str, Any]], agent_name: str,
+    ) -> Optional[str]:
         """Give this run a manifest_id — without inventing a model change.
 
         LlamaIndex span handlers surface model/retriever spans (not a single
@@ -708,42 +815,63 @@ class DecimalSpanHandler:
              no model, registers the minimal manifest — the honest floor, and
              the backend's own completeness_warnings already names it.
 
+        Every decision above is per-AGENT, not per-handler. The manifest hash
+        does not include the agent name, so with one shared hash slot a second
+        agent's structurally identical snapshot looked like a repeat: it never
+        registered, and its traces carried the FIRST agent's manifest_id.
+
         Thread-safe; only calls the backend when the manifest hash changes.
+
+        Returns:
+            The manifest id to stamp on this run's trace, or None when tracing
+            is off. Returned rather than stashed on ``self`` because two lanes
+            flush concurrently and the second would overwrite the first's id
+            between its own write and its read.
         """
         from . import _config
 
         if not _config._is_enabled():
-            return
+            return None
 
-        from .schema.manifest import extract_from_config
+        from .schema.manifest import ManifestTracker, extract_from_config
 
         with self._manifest_lock:
             if seen_model and seen_model.get("model"):
-                self._seen_model = seen_model
+                self._seen_models[agent_name] = seen_model
 
-            if self._seen_model is None:
+            known_model = self._seen_models.get(agent_name)
+            if known_model is None:
                 # Nothing to declare — reuse, never re-declare.
-                if self._manifest_confirmed:
-                    return
-                if self._adopt_existing_manifest():
-                    return
+                if agent_name in self._manifest_confirmed:
+                    return self._manifest_ids.get(agent_name)
+                adopted = self._adopt_existing_manifest(agent_name)
+                if adopted:
+                    return adopted
 
-            models = {"default": self._seen_model} if self._seen_model else None
-            snapshot = extract_from_config(agent_name=self.agent_name, models=models)
-            if not self._manifest_tracker.check_and_update(snapshot):
-                return  # Same hash — already registered.
+            models = {"default": known_model} if known_model else None
+            snapshot = extract_from_config(agent_name=agent_name, models=models)
+            tracker = self._manifest_trackers.get(agent_name)
+            if tracker is None:
+                tracker = self._manifest_trackers[agent_name] = ManifestTracker()
+            if not tracker.check_and_update(snapshot):
+                # Same agent, same structure — already registered.
+                return self._manifest_ids.get(agent_name)
             try:
                 client = _config._get_client()
                 result = client.register_manifest(snapshot)
-                self._manifest_id = result.get("manifest_id", snapshot.id)
-                self._manifest_confirmed = True
+                manifest_id = result.get("manifest_id", snapshot.id)
+                self._manifest_ids[agent_name] = manifest_id
+                self._manifest_confirmed.add(agent_name)
+                self._manifest_id = manifest_id
                 logger.info(
-                    "Registered LlamaIndex manifest %s (hash=%s)",
-                    self._manifest_id, snapshot.manifest_hash[:12],
+                    "Registered LlamaIndex manifest %s for %s (hash=%s)",
+                    manifest_id, agent_name, snapshot.manifest_hash[:12],
                 )
+                return manifest_id
             except Exception as exc:
                 logger.warning(
-                    "Failed to register LlamaIndex manifest, continuing", exc_info=True
+                    "Failed to register LlamaIndex manifest for %s, continuing",
+                    agent_name, exc_info=True,
                 )
                 # Surface the real cause on export_status(), where the trace
                 # POST is about to fail with a confusingly different error
@@ -752,34 +880,40 @@ class DecimalSpanHandler:
                     _config._sender.record_manifest_error(exc)
                 except Exception:
                     pass
-                # check_and_update already committed this hash; without the
-                # reset every later tree short-circuits on it and registration
-                # is never retried, so one blip poisons the whole process.
-                self._manifest_tracker.reset()
+                # check_and_update already committed this hash to THIS agent's
+                # tracker; without the reset every later tree short-circuits on
+                # it and registration is never retried, so one blip poisons the
+                # whole process.
+                tracker.reset()
+                self._manifest_ids[agent_name] = snapshot.id
                 self._manifest_id = snapshot.id
+                return snapshot.id
 
-    def _adopt_existing_manifest(self) -> bool:
+    def _adopt_existing_manifest(self, agent_name: str) -> Optional[str]:
         """Ride the agent's current manifest instead of declaring a new one.
 
-        Called only when this process has observed no model at all. Registering
-        a model-less manifest here would hash-match the agent's OWN earlier
-        model-less version, which the backend treats as a revert: it reactivates
-        that version and supersedes the live one — then the first query in the
-        same process flips it straight back. Every fresh process did that
-        round trip, and each flip counts as a detected change.
+        Called only when this process has observed no model for this agent.
+        Registering a model-less manifest here would hash-match the agent's OWN
+        earlier model-less version, which the backend treats as a revert: it
+        reactivates that version and supersedes the live one — then the first
+        query in the same process flips it straight back. Every fresh process
+        did that round trip, and each flip counts as a detected change.
 
-        One attempt per handler, best-effort: on any failure we fall through to
-        registering, which is still better than losing the trace.
+        One attempt per AGENT per handler, best-effort: on any failure we fall
+        through to registering, which is still better than losing the trace.
+
+        Returns:
+            The adopted manifest id, or None if there was nothing to adopt.
         """
-        if self._adoption_attempted:
-            return False
-        self._adoption_attempted = True
+        if agent_name in self._adoption_probed:
+            return None
+        self._adoption_probed.add(agent_name)
 
         from . import _config
 
         try:
             client = _config._get_client()
-            listing = client.list_manifests(agent_name=self.agent_name, limit=20)
+            listing = client.list_manifests(agent_name=agent_name, limit=20)
             active = next(
                 (m for m in (listing.get("manifests") or []) if m.get("status") == "active"),
                 None,
@@ -788,24 +922,32 @@ class DecimalSpanHandler:
         except Exception:
             logger.debug(
                 "Could not look up an existing manifest for %s; registering one",
-                self.agent_name, exc_info=True,
+                agent_name, exc_info=True,
             )
-            return False
+            return None
 
         if not manifest_id:
-            return False
+            return None
 
+        self._manifest_ids[agent_name] = manifest_id
+        self._manifest_confirmed.add(agent_name)
         self._manifest_id = manifest_id
-        self._manifest_confirmed = True
         logger.info(
             "Reusing existing manifest %s for %s (this run declared no model)",
-            manifest_id, self.agent_name,
+            manifest_id, agent_name,
         )
-        return True
+        return manifest_id
 
     def _cleanup_tree(self, root_id: str) -> None:
-        """Remove all spans belonging to a tree."""
+        """Remove all spans belonging to a tree.
+
+        Pops ``_tree_agents`` in lockstep with ``_trees``: run identity that
+        outlived the run would be one dict entry leaked per request, and these
+        adapters run inside long-lived web servers.
+        """
         span_ids = self._trees.pop(root_id, [])
+        self._tree_agents.pop(root_id, None)
+        self._deferred_roots.discard(root_id)
         for sid in span_ids:
             self._spans.pop(sid, None)
             self._parents.pop(sid, None)
@@ -1373,9 +1515,14 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
     releases either lack the instrumentation dispatcher entirely or call
     span handlers with an incompatible pre-0.10.30 signature.)
 
+    Call it once. LlamaIndex's dispatcher takes span handlers additively and
+    never gives them back, so a second install double-traces every query from
+    then on — it is not the way to run a second agent. To serve more than one
+    agent from one process, name each RUN instead (see below).
+
     Args:
-        agent_name: Name for the agent in DecimalAI. Defaults to
-            ``"llamaindex-agent"``.
+        agent_name: The name runs are filed under when nothing names them.
+            Defaults to ``"llamaindex-agent"``.
 
     Returns:
         The ``DecimalSpanHandler`` instance.
@@ -1395,6 +1542,21 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
         from llama_index.core import VectorStoreIndex
         index = VectorStoreIndex.from_documents(docs)
         response = index.as_query_engine().query("What is X?")
+
+    Several agents in one process — name the run, not the install::
+
+        from decimalai.providers import agent_run
+
+        with agent_run("support-rag"):
+            support_engine.query("...")     # filed under support-rag
+
+        with agent_run("billing-rag"):
+            billing_engine.query("...")     # filed under billing-rag
+
+    The scope is per-context, so concurrent runs in threads or asyncio tasks
+    each keep their own name and their own manifest. LlamaIndex's native
+    ``instrument_tags({"agent_name": ...})`` works the same way and wins over
+    the run scope when both are set.
     """
     try:
         from llama_index.core.instrumentation import get_dispatcher

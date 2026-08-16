@@ -9,21 +9,19 @@ network, exactly like the LangChain reference driver.
 Three things about this adapter shape the driver, and all three are stated here
 rather than being quietly worked around:
 
-**The span handler is process-wide and its agent name is fixed at install
-time.** ``instrument()`` appends a ``DecimalSpanHandler`` to LlamaIndex's ROOT
-dispatcher; there is no per-call handler and no way to rename the agent
-afterwards. So the driver installs exactly once, on the first ``run``, as a user
-following the docs would. Calling it again is not a way out: ``instrument()`` is
-not idempotent, and after a second call ONE query engine call posts TWO traces,
-one under each agent name (measured, not assumed). The consequence is that every
-phase's traces carry the FIRST agent name, which is what C6 (``second_agent``)
-and C9 (per-lane names) report. That is a real limitation of the adapter's
-surface, not a driver shortcut, and it is left visible instead of being declared
-N/A — with one caveat worth knowing when reading a red C9 here: because every
-lane's trace reports the same agent, C9's *other* clauses (whose prompt is in
-whose trace, whose span id is in whose trace) have no lane key to work with and
-grade nothing. C9 red on this adapter means "cannot label lanes", not
-"lanes leaked".
+**The span handler is process-wide, so a second agent is named per RUN, not per
+install.** ``instrument()`` appends a ``DecimalSpanHandler`` to LlamaIndex's
+ROOT dispatcher; there is no per-call handler. So the driver installs exactly
+once, on the first ``run``, as a user following the docs would. Calling it again
+is not a way out and never was: ``instrument()`` is not idempotent, and after a
+second call ONE query engine call posts TWO traces, one under each agent name
+(measured, not assumed). The documented way to name a second agent is
+``decimalai.providers.agent_run(...)`` — the same run scope the raw-provider and
+Pydantic AI rails use, documented for LlamaIndex at
+``decimalai-docs/sdk/python/frameworks/llamaindex.mdx`` under "Several agents in
+one process". Every phase wraps its run in that scope with its own ctx's agent
+name, which is exactly what a service handling two tenants' traffic would do,
+and it is what C6 (``second_agent``) and C9 (per-lane names) grade.
 
 **Streaming is the interesting path.** ``query(..., streaming=True)`` returns
 while the answer is still arriving, so the adapter defers the flush and swaps a
@@ -151,6 +149,18 @@ def _instrument_once(ctx: Ctx) -> Any:
     return _HANDLER
 
 
+def _run_scope(ctx: Ctx) -> Any:
+    """The documented per-run scope: ``with agent_run("..."):``.
+
+    One process, one installed handler, one name per run — the shape the docs
+    give for serving several agents (or several concurrent requests) from one
+    LlamaIndex process.
+    """
+    from decimalai.providers import agent_run
+
+    return agent_run(ctx.agent_name)
+
+
 def _index(ctx: Ctx) -> Any:
     """A one-document ``VectorStoreIndex``. Embeddings mocked — no key, no network.
 
@@ -173,9 +183,10 @@ def _query(ctx: Ctx, index: Any, *, streaming: bool = False, fail: bool = False)
 
 
 def _plain_query(ctx: Ctx) -> Any:
-    """One documented query-engine call — one trace."""
+    """One documented query-engine call, under its own run scope — one trace."""
     _instrument_once(ctx)
-    return _query(ctx, _index(ctx))
+    with _run_scope(ctx):
+        return _query(ctx, _index(ctx))
 
 
 def run(ctx: Ctx) -> Any:
@@ -187,22 +198,25 @@ def run(ctx: Ctx) -> Any:
     exercised at all.
     """
     _instrument_once(ctx)
-    index = _index(ctx)
+    with _run_scope(ctx):
+        index = _index(ctx)
 
-    plain = _query(ctx, index)
+        plain = _query(ctx, index)
 
-    streamed = _query(ctx, index, streaming=True)
-    # Drain it the way an app does. If the tracer consumed the generator instead
-    # of teeing it, this comes back empty while the trace still looks complete —
-    # which is exactly why the note above says the wire cannot see that case.
-    delivered = "".join(chunk for chunk in streamed.response_gen)
+        streamed = _query(ctx, index, streaming=True)
+        # Drain it the way an app does. If the tracer consumed the generator
+        # instead of teeing it, this comes back empty while the trace still
+        # looks complete — which is exactly why the note above says the wire
+        # cannot see that case.
+        delivered = "".join(chunk for chunk in streamed.response_gen)
     return plain, delivered
 
 
 def run_error(ctx: Ctx) -> Any:
     """The same query engine, with the synthesis model raising."""
     _instrument_once(ctx)
-    return _query(ctx, _index(ctx), fail=True)
+    with _run_scope(ctx):
+        return _query(ctx, _index(ctx), fail=True)
 
 
 def run_degenerate(ctx: Ctx) -> Any:
@@ -216,9 +230,10 @@ def run_degenerate(ctx: Ctx) -> Any:
     having been deleted.
     """
     _instrument_once(ctx)
-    index = _index(ctx)  # setup tree — expected to reach the wire as nothing
-    retriever = index.as_retriever(similarity_top_k=1)
-    return retriever.retrieve(user_message(ctx))
+    with _run_scope(ctx):
+        index = _index(ctx)  # setup tree — expected to reach the wire as nothing
+        retriever = index.as_retriever(similarity_top_k=1)
+        return retriever.retrieve(user_message(ctx))
 
 
 DRIVER = Driver(

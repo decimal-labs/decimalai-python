@@ -20,12 +20,6 @@
 # Offered names are claimed but not present in the prompt the model was shown.
 openai-agents:C8
 
-# ── LlamaIndex ───────────────────────────────────────────────────────────────
-# Manifest/agent identity leaks across agents via module-global state.
-llamaindex:C6
-# Concurrent runs cross-contaminate.
-llamaindex:C9
-
 # ── Recorded 2026-08-15, second pass ─────────────────────────────────────────
 # The block above was recorded from a run in which only 4 of 11 frameworks had
 # their libraries installed — the other 7 were skipped and their failures were
