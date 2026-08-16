@@ -75,5 +75,5 @@ jobs:
         # Pinned to a commit SHA rather than the mutable @release/v1 branch ref. This job
         # holds OIDC id-token:write → PyPI publish authority, so a mutable ref would run
         # whatever HEAD of that branch is at publish time. Dependabot maintains the pin.
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2 — Twine 7, accepts Metadata-Version 2.5 (v1.14.0 rejects it pre-upload)  # release/v1
         # No API token needed — uses Trusted Publisher (OIDC)
