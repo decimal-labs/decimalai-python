@@ -44,10 +44,13 @@ WHAT IT CHECKS
     discovered broken at the moment it is needed is not a spare.
 7.  THE DISCLOSURE FIGURES (`--disclosure`, the daily run). A number about how
     much evidence we withhold is exactly the number that must not go stale.
-    measured_public_skills and graded_cases are recomputed exactly from the
-    listing; the three withheld percentages are estimated from a per-source
-    sample, with a jackknife 95% margin added to the tolerance so sampling noise
-    can never be reported as drift.
+    measured_public_skills and graded_cases are recomputed from the listing —
+    exactly WHEN THE WALK REACHES THE END OF IT, and reported as floors ("at
+    least N") when it does not, because a page cap, a registry-side depth limit
+    or a looping cursor all leave a count that is short by an unknown amount.
+    The three withheld percentages are estimated from a per-source sample, with
+    a jackknife 95% margin added to the tolerance so sampling noise can never be
+    reported as drift.
 
     BE HONEST ABOUT THE SAMPLE. Withholding is near all-or-nothing within a run,
     so 25 skills of the ~57%-withheld platform arm carry a margin around ±13 pts:
@@ -96,6 +99,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "examples" / "measure-a-skill" / "manifest.yaml"
@@ -580,11 +584,65 @@ def check_demo_extras(manifest, slug, run, *, pace):
 # Disclosure figures
 # ──────────────────────────────────────────────────────────────────────
 
-def walk_measured(pace, max_pages=60):
+class MeasuredWalk(NamedTuple):
+    """The measured-skill listing, INSEPARABLE from whether it finished.
+
+    Two values that used to be a bare `(rows, complete)` tuple, and the reason
+    they are one type now: `measure_disclosure` took the rows alone, so
+    `complete` died at the call site as a printed note and the paste block
+    stamped `# exact` on a count the walk had never finished reading. A number
+    labelled exact that is really a floor is the one failure this whole file
+    exists to prevent — so the counts and the bit that says whether they are
+    exact now travel as a single value that cannot be taken apart by accident.
+
+    `reason` is None exactly when `complete` is True; it says WHICH stop fired,
+    because "the corpus outgrew the cap", "the registry capped the walk" and
+    "the walk is looping" want three different responses from a human.
+    """
+
+    rows: list
+    complete: bool
+    reason: str | None = None
+
+
+# One page is `limit=100` (the endpoint's maximum), so this is 100,000 measured
+# skills — above the whole ~57k-row registry, not merely above the ~1.4k
+# measured subset the walk reads today (~14 pages). The old cap was 60 pages /
+# 6,000 skills; it was never a considered ceiling for the corpus, it was
+# containment against a walk that could not terminate.
+#
+# Raising it is only safe because termination no longer rests on it. The
+# registry-side bug that made this cap fire (a cursor whose fingerprint omitted
+# `measured`, so every page decoded as page 1 and `has_next` stayed true
+# forever — fixed platform-side 2026-08-12) is now caught after ONE repeat by
+# the repeated-cursor guard below, which stops in bounded time no matter how
+# large this number is. What is left for the cap to do is bound wall time on a
+# daily cron: at the paced >=3s per page, 1,000 pages is hours, and a walk that
+# deep means something upstream is wrong, not that the catalogue grew.
+MEASURED_WALK_MAX_PAGES = 1000
+
+
+def walk_measured(pace, max_pages=MEASURED_WALK_MAX_PAGES):
     """Every measured public skill, as (slug, source_type, total_cases).
 
-    Cursor-paginated; `total_hint` comes back null on this listing, so the count
-    is only exact by walking it.
+    Returns a `MeasuredWalk` — the rows AND whether they are all of them. Read
+    `.complete` before calling any count off these rows exact; `total_hint`
+    comes back null on this listing, so walking it is the only way to know.
+
+    Three ways this stops short, all of them reported rather than smoothed over:
+      * the page cap (`MEASURED_WALK_MAX_PAGES`);
+      * `truncated: true` in the body — the registry itself refusing to page
+        deeper on this ordering (`DECIMAL_BROWSE_MAX_OFFSET`). It arrives
+        alongside `has_next: false` and no cursor, i.e. shaped EXACTLY like a
+        genuinely exhausted walk, which is why it has to be read explicitly;
+      * a cursor the walk has already used, which is a server-side loop and not
+        an end.
+
+    Rows are de-duplicated by `url_slug`, which is globally unique in the
+    registry (partial unique index `uq_skill_url_slug`), so this can never
+    undercount a distinct skill. It exists because "at least N" has to be TRUE:
+    a walk that restarts mid-flight re-serves rows it already counted, and a
+    floor that is above the real total is the same lie in the other direction.
 
     Paced and retried harder than everything else in this file. Measured
     2026-08-10: the second page of the walk was 429'd through four backoffs
@@ -593,6 +651,8 @@ def walk_measured(pace, max_pages=60):
     a daily cron; abandoning the whole disclosure recompute is not.
     """
     rows, cursor, pages = [], None, 0
+    seen_cursors, seen_slugs = set(), set()
+    unkeyed = 0
     while pages < max_pages:
         params = {"measured": "only", "limit": 100}
         if cursor:
@@ -600,19 +660,59 @@ def walk_measured(pace, max_pages=60):
         page, _ = fetch(f"{API}/registry/skills", params, pace=max(pace, 3.0), retries=6)
         page = page or {}
         for item in page.get("items") or []:
+            slug = item.get("url_slug")
+            # De-dup on the row's own identity. `url_slug` is globally unique;
+            # `id` is the fallback for a payload shape that omits it. A row with
+            # NEITHER cannot be told apart from a repeat, so the count stops
+            # being a lower bound — a looping registry would inflate it, which is
+            # "at least N" lying in the other direction. Record that and let the
+            # walk report itself incomplete rather than quietly counting twice.
+            key = slug or item.get("id")
+            if key:
+                if key in seen_slugs:
+                    continue
+                seen_slugs.add(key)
+            else:
+                unkeyed += 1
             b = item.get("benchmark_summary") or {}
             rows.append(
                 (
-                    item.get("url_slug"),
+                    slug,
                     item.get("source_type") or "unknown",
                     int(b.get("total_cases") or 0),
                 )
             )
         pages += 1
+        if page.get("truncated"):
+            return MeasuredWalk(
+                rows,
+                False,
+                f"the registry truncated the listing after {pages} page(s) — its own depth "
+                "limit for this ordering, not the end of the results",
+            )
         cursor = page.get("next_cursor")
         if not page.get("has_next") or not cursor:
-            return rows, True
-    return rows, False  # hit the page cap — counts are a floor, not exact
+            if unkeyed:
+                return MeasuredWalk(
+                    rows,
+                    False,
+                    f"{unkeyed} row(s) carried neither url_slug nor id, so repeats "
+                    "could not be detected and the total may double-count",
+                )
+            return MeasuredWalk(rows, True)
+        if cursor in seen_cursors:
+            return MeasuredWalk(
+                rows,
+                False,
+                f"the registry handed back a cursor already used, after {pages} page(s) — "
+                "the walk is looping, not advancing",
+            )
+        seen_cursors.add(cursor)
+    return MeasuredWalk(
+        rows,
+        False,
+        f"hit the {max_pages}-page cap ({max_pages * 100:,} skills) with a cursor still open",
+    )
 
 
 def jackknife_rate(samples):
@@ -660,14 +760,21 @@ def stratum_margin(censused, se, n):
     return max(1.96 * (se or 0.0), 3.0 / n)
 
 
-def measure_disclosure(rows, *, sample_per_source, seed, pace, full):
+def measure_disclosure(walk, *, sample_per_source, seed, pace, full):
     """Recompute the registry_disclosure figures from the live registry.
 
-    Exact for the two counts (they come straight off the listing). Sampled for
-    the three percentages, because the only place a withheld prompt is visible
-    is the per-skill /benchmark payload (~50KB each) and there are ~1,400 of
-    them behind an anonymous edge rate limit.
+    Takes the `MeasuredWalk`, NOT its rows. That is the whole guard: the two
+    counts are exact only if the walk finished, so there is no signature here
+    that lets a caller hand over the rows and leave the completeness bit
+    behind. `counts_complete` rides in the returned figures for the same
+    reason — `paste_block` and `compare_disclosure` read it out of the dict
+    they already read, rather than from a second argument someone can forget.
+
+    Sampled for the three percentages, because the only place a withheld prompt
+    is visible is the per-skill /benchmark payload (~50KB each) and there are
+    ~1,400 of them behind an anonymous edge rate limit.
     """
+    rows = walk.rows
     by_source = {}
     for slug, source, cases in rows:
         by_source.setdefault(source, []).append((slug, cases))
@@ -719,6 +826,12 @@ def measure_disclosure(rows, *, sample_per_source, seed, pace, full):
     return {
         "measured_public_skills": len(rows),
         "graded_cases": total_cases,
+        # Whether the two counts above are the whole registry or a FLOOR. Not a
+        # nicety: they are the only figures in this block a reader takes as
+        # census rather than estimate, so every consumer of them below reads
+        # this key before choosing a word for them.
+        "counts_complete": walk.complete,
+        "counts_incomplete_reason": walk.reason,
         "coverage_pct": 100.0 * measured_cases / total_cases if total_cases else 0.0,
         "strata": strata,
         "overall_rate": overall,
@@ -730,6 +843,16 @@ def compare_disclosure(declared, live, tolerance):
     """Drift messages. Sampling margin is added to the tolerance, never hidden."""
     problems, notes = [], []
     tol_pct = float(tolerance["counts_drift_pct"])
+    # An unfinished walk reports a FLOOR, so `live` sits below the truth by an
+    # unknown amount and the percentage next to it is not a drift measurement.
+    # It is still printed and still gated — a floor already over tolerance is a
+    # real finding, and suppressing it would trade one silence for another —
+    # but it is labelled, so nobody reads "-33%" as "the registry shrank".
+    # Indexed, not `.get(..., True)`: the default would be "the walk finished",
+    # which is the flattering answer and the one that was wrong. A figures dict
+    # without this key should crash here, not quietly claim a census.
+    counts_are_floor = not live["counts_complete"]
+    floor = " ≥" if counts_are_floor else " "
     for key, live_val in (
         ("measured_public_skills", live["measured_public_skills"]),
         ("graded_cases", live["graded_cases"]),
@@ -739,7 +862,11 @@ def compare_disclosure(declared, live, tolerance):
             problems.append(f"registry_disclosure.{key}: missing from manifest.yaml")
             continue
         signed = 100.0 * (live_val - old) / old  # signed for the human, absolute for the gate
-        line = f"registry_disclosure.{key}: manifest {old:,} · live {live_val:,} ({signed:+.1f}%)"
+        line = (
+            f"registry_disclosure.{key}: manifest {old:,} · live{floor}{live_val:,} "
+            f"({signed:+.1f}%)"
+            + (" — a FLOOR, the walk did not finish" if counts_are_floor else "")
+        )
         (problems if abs(signed) > tol_pct else notes).append(
             line + (f" — over the {tol_pct:.0f}% tolerance" if abs(signed) > tol_pct else "")
         )
@@ -771,9 +898,18 @@ def compare_disclosure(declared, live, tolerance):
         live_pct = 100.0 * rate
         margin = 100.0 * (margin_rate or 0.0)
         drift = abs(live_pct - (old if old is not None else 0.0))
+        # Same rule as paste_block: --disclosure-full removes the SAMPLING
+        # error, not the incompleteness of the listing it sampled from. Calling
+        # a rate "censused" over a walk that stopped early is the same defect as
+        # stamping `# exact` on a truncated count.
+        if margin:
+            qual = f" ±{margin:.1f}"
+        elif not live["counts_complete"]:
+            qual = " (over an INCOMPLETE listing)"
+        else:
+            qual = " (censused, exact)"
         line = (
-            f"registry_disclosure.{key}: manifest {old} · live {live_pct:.1f}"
-            f"{f' ±{margin:.1f}' if margin else ' (censused, exact)'} pts"
+            f"registry_disclosure.{key}: manifest {old} · live {live_pct:.1f}{qual} pts"
         )
         if old is None:
             problems.append(f"registry_disclosure.{key}: missing from manifest.yaml — live {live_pct:.1f}")
@@ -788,13 +924,32 @@ def compare_disclosure(declared, live, tolerance):
 
 
 def paste_block(declared, live, today):
-    """The YAML to paste, so a failure is a copy, not an investigation."""
+    """The YAML to paste, so a failure is a copy, not an investigation.
+
+    THE WORD "exact" IS EARNED HERE, NEVER ASSUMED. The two counts are a census
+    only when `walk_measured` actually reached the end of the listing; when it
+    stopped early they are floors, and this block says so instead of stamping
+    `# exact` on a number that is merely the largest one the walk happened to
+    see. Indexed off `live["counts_complete"]`, which `measure_disclosure` can
+    only produce from the walk itself — there is no path to this function that
+    carries the counts without the bit.
+    """
     strata = live["strata"]
-    lines = [
-        "registry_disclosure:",
-        f"  measured_public_skills: {live['measured_public_skills']}   # exact",
-        f"  graded_cases: {live['graded_cases']}   # exact",
-    ]
+    # Indexed for the same reason as in compare_disclosure: absent must not
+    # default to the flattering answer.
+    counts_exact = live["counts_complete"]
+    lines = ["registry_disclosure:"]
+    if counts_exact:
+        lines += [
+            f"  measured_public_skills: {live['measured_public_skills']}   # exact",
+            f"  graded_cases: {live['graded_cases']}   # exact",
+        ]
+    else:
+        lines += [
+            f"  measured_public_skills: {live['measured_public_skills']}   "
+            "# AT LEAST this many — NOT exact",
+            f"  graded_cases: {live['graded_cases']}   # AT LEAST this many — NOT exact",
+        ]
     sampled = False
     for key, source in (
         ("cases_withheld_pct", None),
@@ -810,6 +965,14 @@ def paste_block(declared, live, today):
         if margin:
             sampled = True
             note = f"   # ±{100.0 * margin:.1f} pts, sampled"
+        elif not counts_exact:
+            # --disclosure-full removes the SAMPLING error, which is the only
+            # thing "censused" claims. It cannot make a census out of a listing
+            # the walk never finished reading: the rate is exact over the rows
+            # we saw, and those rows are a prefix of the registry. Saying
+            # "censused" here is the same defect as stamping `# exact` on a
+            # truncated count, one field over.
+            note = "   # over an INCOMPLETE listing — not a census"
         else:
             note = "   # exact (censused)"
         lines.append(f"  {key}: {100.0 * rate:.1f}{note}")
@@ -818,6 +981,13 @@ def paste_block(declared, live, today):
         lines.append(
             "  # ^ the ±-marked figures are ESTIMATES from a sample. Re-run with "
             "--disclosure-full before pasting them."
+        )
+    if not counts_exact:
+        lines.append(
+            "  # ⚠ DO NOT PASTE THE TWO COUNTS. The measured listing did not finish — "
+            f"{live['counts_incomplete_reason']} — so they are lower bounds on a registry "
+            "this run never finished reading, and these keys are declared as a census. "
+            "Fix the walk and re-run before touching them."
         )
     return "\n".join(lines)
 
@@ -1035,11 +1205,17 @@ def main(argv=None):
 
         # 5 ─ the disclosure figures (daily run only).
         if args.disclosure:
-            rows, complete = walk_measured(args.pace)
-            if not complete:
-                notes.append("measured listing hit the page cap — counts below are a floor")
+            walk = walk_measured(args.pace)
+            if not walk.complete:
+                # A NOTE ONLY BECAUSE THE FIGURES NOW CARRY IT THEMSELVES. This
+                # line used to be the sole trace of an unfinished walk, and it
+                # sat next to a paste block claiming `# exact`.
+                notes.append(
+                    f"⚠ the measured listing did not finish — {walk.reason}. "
+                    "measured_public_skills and graded_cases below are FLOORS."
+                )
             live = measure_disclosure(
-                rows,
+                walk,
                 sample_per_source=args.sample or int(tolerance["disclosure_sample_per_source"]),
                 seed=seed,
                 pace=args.pace,
@@ -1098,7 +1274,11 @@ def main(argv=None):
                     f"  (sample seed {seed} — reproduce with --seed {seed})\n"
                 )
                 online_problems += d_problems
-            ledger.done(c_disclosure, f"{len(rows)} measured skills walked")
+            ledger.done(
+                c_disclosure,
+                f"{len(walk.rows)} measured skills walked"
+                + ("" if walk.complete else " (INCOMPLETE — counts are floors)"),
+            )
     except Unreachable as e:
         # Caught, NOT returned on. Whatever is already in the two piles was
         # established before the registry went quiet and is still true; the
