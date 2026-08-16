@@ -496,6 +496,51 @@ def test_no_driver_is_silently_unavailable() -> None:
     )
 
 
+def test_every_baseline_line_names_something_real() -> None:
+    """A ledger line for a driver or item that no longer exists grades nothing.
+
+    ``known_failures.txt`` is self-cleaning in one direction only: a listed item
+    that starts passing fails the build. The other direction is silent — delete
+    a driver, and its lines stop matching any test at all, so they sit in the
+    ledger forever reading like known debt while documenting a defect that can
+    no longer occur. That is how a ledger stops being a ledger: the honest count
+    of what is red drifts above the real one, and nobody trusts it enough to
+    shrink it.
+
+    This is not hypothetical. Retiring the AG2 driver left ``ag2:C6`` and
+    ``ag2:C9`` behind, and the matrix stayed green with two orphans in the file.
+    """
+    from .test_conformance import BASELINE, BASELINE_PATH
+    from . import contract
+
+    # Driver NAMES, not module names — the matrix keys on `driver.name`, and the
+    # two differ wherever a distribution has a hyphen in it (module
+    # ``pydantic_ai`` → driver ``pydantic-ai``). Comparing against
+    # DRIVER_MODULES here reads correct and quietly flags every hyphenated
+    # driver as an orphan.
+    known_drivers = {d.name for d in all_drivers()}
+    known_items = set(contract.ITEMS)
+
+    orphans: List[str] = []
+    for key in sorted(BASELINE):
+        driver, _, item = key.partition(":")
+        if driver not in known_drivers:
+            orphans.append(
+                f"  {key}: no driver named {driver!r} — was it retired? "
+                f"Delete the line."
+            )
+        elif item not in known_items:
+            orphans.append(
+                f"  {key}: {item!r} is not a contract item. "
+                f"Known items: {', '.join(sorted(known_items))}"
+            )
+
+    assert not orphans, (
+        f"{BASELINE_PATH.name} has line(s) that match no test, so they can "
+        f"never go green and never fail:\n" + "\n".join(orphans)
+    )
+
+
 def test_recorded_provider_gaps_are_visible(record_property) -> None:
     """Print the raw-provider rails that have no driver, rather than hiding them.
 

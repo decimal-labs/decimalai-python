@@ -707,6 +707,9 @@ def instrument(
     # — router-authoritative installs (loader active) default to NOT mirroring
     # skills to disk, so a native skill-loading runtime can't also load them and
     # double-inject. An explicit disk_sync=... always wins.
+    # Captured before the derivation below overwrites it: `disk_sync=True`
+    # passed by hand is a request, the derived default is only a guess.
+    _disk_sync_explicit = disk_sync is True
     if disk_sync is None:
         try:
             from ._config import _get_config
@@ -844,6 +847,17 @@ def instrument(
                     # else export_to_disk raises "Unknown agent" on every
                     # install whose agent has a custom name.
                     target_agent = agent_name if agent_name in AGENT_PATHS else "universal"
+                    # Reading and uploading local skills is free; WRITING them
+                    # creates a directory in the user's repo. Only mirror when
+                    # something will actually read the files back.
+                    from .skill_router import should_auto_pull_to_disk
+                    allowed, why = should_auto_pull_to_disk(
+                        target_agent, explicitly_requested=_disk_sync_explicit
+                    )
+                    if not allowed:
+                        logger.debug("Skipping skill pull to disk: %s", why)
+                        return
+                    logger.debug("Pulling skills to disk: %s", why)
                     result = router.pull_missing(
                         local_skill_names=local_names,
                         agents=[target_agent],

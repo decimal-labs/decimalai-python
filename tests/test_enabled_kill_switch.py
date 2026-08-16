@@ -15,6 +15,15 @@ so they observe the two effects a user actually cares about:
 * ``test_enabled_*`` — the control. It proves the gate is conditional, not a
   blanket off-switch: with ``enabled=True`` the same call still syncs and still
   writes.
+
+The control asks for disk mirroring explicitly (``skill_authority="harness"``).
+It did not have to when this file was written, because writing to the caller's
+working tree was the unconditional default — the very default that turned out to
+be the bug in ``tests/test_disk_mirror_consent.py``: instrumenting an agent
+created ``.agents/skills/`` in whatever directory the user ran from, and with no
+disk-loading runtime in the process nothing read those files back. Consent is
+now required, so the control states it. What this file tests is unchanged:
+``enabled`` gates the adapter, and nothing else about it moved.
 """
 from __future__ import annotations
 
@@ -139,6 +148,9 @@ def test_enabled_langchain_still_syncs_and_writes(platform, fresh_sdk):
         base_url="http://localhost:9",
         enabled=True,
         langchain=True,
+        # Opt in to disk mirroring: writing is no longer implicit, so without
+        # this the control would prove nothing about `enabled`.
+        skill_authority="harness",
     )
 
     assert any("/skills/hashes" in c for c in platform.calls), (

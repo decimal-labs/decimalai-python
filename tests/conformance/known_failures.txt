@@ -19,9 +19,6 @@
 # ── OpenAI Agents ────────────────────────────────────────────────────────────
 # Offered names are claimed but not present in the prompt the model was shown.
 openai-agents:C8
-# The documented one-liner writes .agents/skills/ into the user's working
-# directory (disk_sync defaults on when the loader is off).
-openai-agents:C11
 
 # ── LlamaIndex ───────────────────────────────────────────────────────────────
 # Manifest/agent identity leaks across agents via module-global state.
@@ -38,13 +35,6 @@ llamaindex:C9
 # These are the rest, from a full matrix with every framework present, verified
 # deterministic across 4 consecutive runs and identical with serial children.
 # Every one is a defect the acceptance grading already reported.
-
-# AG2 — agent identity leaks across agents in one process, and concurrent runs
-# cross-contaminate. Both because decimalai.autogen.instrument() binds the agent
-# name to an exporter built on the FIRST call: OTel honours set_tracer_provider
-# once, so a later call's provider never sees a span.
-ag2:C6
-ag2:C9
 
 # raw Anthropic — one run fragments into one trace per messages.create (the
 # instrumentor emits an unparented root span per call, so a multi-step run has

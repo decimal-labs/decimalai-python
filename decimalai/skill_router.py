@@ -24,6 +24,7 @@ import time
 import warnings
 from collections import OrderedDict
 from contextvars import ContextVar
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -310,6 +311,103 @@ def _detect_disk_runtime() -> Optional[str]:
         if os.environ.get(env_var):
             return label
     return None
+
+
+def should_auto_pull_to_disk(
+    target_agent: str, explicitly_requested: bool = False
+) -> tuple[bool, str]:
+    """Whether instrument() may mirror platform skills into the working directory.
+
+    ``disk_sync`` answers "is disk a channel for skills at all", and it governs
+    reading local SKILL.md files and uploading them — neither of which creates
+    anything. Writing is different in kind: pulling platform skills down creates
+    ``.agents/skills/`` (or ``.claude/skills/``) inside whatever directory the
+    user happened to run from. A single documented one-liner, in a plain Python
+    script, was leaving a tree of files in the user's repo — and with no
+    disk-loading runtime in the process, nothing ever read them back. Litter, in
+    exchange for nothing.
+
+    The distinction that matters is **explicit versus derived**. ``disk_sync``
+    is a tri-state: passed as ``True`` it is the user asking for exactly this,
+    and it is honoured without further argument. Left as ``None`` it is derived
+    from ``skill_authority``, and the derived default lands on ``True`` whenever
+    the router's skill loader is off — which is most first runs. Nobody chose
+    that, and it is the branch that was writing to people's repos.
+
+    The rule is that we may keep a directory the user already has up to date, but
+    we may not create one they never asked for. Three things count as asking:
+
+    * ``disk_sync=True`` passed explicitly to ``install()``;
+    * ``skill_authority="harness"`` was set explicitly — an unambiguous "disk is
+      my channel", which must work on the first run in a fresh checkout, before
+      any directory exists to detect;
+    * the target directory already exists — the user works in a checkout that
+      uses it, so leaving it stale is the surprise, not updating it.
+
+    Detecting a disk-loading runtime is deliberately **not** on that list, though
+    it is the tempting third entry. Being inside Claude Code says the editor
+    would read these files if they existed; it does not say the user wants a
+    Python script they ran in that terminal to create them. Running a script is
+    not a request to sync skills. It earns a one-time hint instead — enough to
+    find the feature, not enough to write to the repo uninvited.
+
+    Returns the decision and a short reason, so the skip is explainable in logs
+    rather than looking like the pull silently failed.
+    """
+    if explicitly_requested:
+        return True, "disk_sync=True was passed explicitly"
+
+    try:
+        from ._config import _get_config
+
+        if (_get_config().skill_authority or "").strip().lower() == "harness":
+            return True, "skill_authority='harness' was set explicitly"
+    except Exception:
+        pass
+
+    try:
+        from .disk_export import AGENT_PATHS
+
+        project_dir = AGENT_PATHS.get(target_agent, {}).get("project")
+        if project_dir and Path(project_dir).is_dir():
+            return True, f"{project_dir} already exists"
+    except Exception:
+        pass
+
+    runtime = _detect_disk_runtime()
+    if runtime:
+        _hint_disk_mirror_available(runtime, target_agent)
+    return False, (
+        "no existing skills directory and skill_authority is not 'harness' — "
+        "the router already delivers skills to the model, so writing them to "
+        "disk would leave files in the user's repo that nothing reads"
+    )
+
+
+_disk_mirror_hinted = False
+
+
+def _hint_disk_mirror_available(runtime: str, target_agent: str) -> None:
+    """Tell a harness user once that disk mirroring exists and is off.
+
+    Only fires where the offer is meaningful: a runtime that reads skills from
+    disk is present, but no directory exists yet, so we declined to make one.
+    Once per process — an agent instrumented in a loop must not narrate this on
+    every call.
+    """
+    global _disk_mirror_hinted
+    if _disk_mirror_hinted or os.environ.get("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING"):
+        return
+    _disk_mirror_hinted = True
+    logger.info(
+        "%s reads skills from disk, but DecimalAI is not mirroring them there: "
+        "no skills directory exists yet and creating one unasked would put files "
+        "in your repo. Skills still reach the model through the router. To mirror "
+        "them for %s as well, set skill_authority='harness' in decimalai.init() "
+        "(or create the directory yourself). "
+        "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING=1 silences this.",
+        runtime, runtime,
+    )
 
 
 def _warn_if_disk_runtime_detected(framework: str) -> None:
