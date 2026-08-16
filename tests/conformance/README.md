@@ -57,11 +57,20 @@ pytest tests/conformance -k langchain -m conformance       # one framework's who
 pytest -m 'not conformance'                  # everything else, without this
 ```
 
-A bare `pytest` from the repo root **does** collect Tier A (the default
-`addopts` excludes `integration`, `live_llm` and `conformance_live`, but not
-`conformance`). Only the GitHub `test` job passes `--ignore=tests/conformance`,
-and only because `.[dev]` installs three of the eleven frameworks — a partial
-matrix reads as coverage and is not.
+A bare `pytest` from the repo root does **not** collect Tier A: the default
+`addopts` deselects `conformance` along with `integration`, `live_llm` and
+`conformance_live`. That is why every command above passes `-m conformance`,
+and why the CI job does too — without the marker, `pytest tests/conformance`
+selects zero tests and exits green.
+
+The deselection is not the "exists but never runs" trap that let an adapter
+ship emitting nothing. This suite runs as its own required CI job on every
+push and PR, and nightly against newest frameworks. It is deselected from the
+unit run for a specific reason: it deliberately does not reset adapter globals
+between phases — sticky process-global state is a defect it exists to catch —
+and those globals leak into the unit suite, turning 11 pre-existing failures
+into 18. Each driver already runs in its own child process so drivers cannot
+contaminate *each other*; the remaining boundary is with the unit suite.
 
 Every run ends with the conformance matrix: item × driver, PASS / FAIL / N/A,
 each with the reason. Set `DECIMAL_CONFORMANCE_REPORT_JSON=<path>` to also get

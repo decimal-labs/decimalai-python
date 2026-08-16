@@ -1,0 +1,113 @@
+# The FLOATING conformance lane: the contract vs the NEWEST frameworks.
+#
+# The pinned lane runs in ci.yml on every push and PR and gates. This one floats
+# every framework to latest and is ADVISORY — it answers "did an upstream release
+# break one of our adapters?", which is a question a version range can only guess
+# at. When it goes red the pinned gate stays green and releases keep flowing; you
+# fix the adapter, or record a new baseline if upstream was right.
+#
+# It lives here rather than in the platform repo's nightly canary on purpose. That
+# canary is guarded on GH_PAT + GEMINI_API_KEY and no-ops without them, because it
+# spends real model calls. Tier A conformance needs NEITHER — stub models over a
+# real socket, a local probe server, no provider key and no backend — so gating it
+# behind those secrets would make it a no-op for a reason that does not apply to
+# it. Hermetic is what makes a nightly cheap enough to be honest.
+name: Conformance (latest frameworks)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"      # nightly 07:00 UTC, an hour before the platform canary
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write              # to open the advisory issue on red
+
+concurrency:
+  group: conformance-latest
+  cancel-in-progress: true
+
+jobs:
+  latest:
+    name: Contract vs newest frameworks
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the SDK and every framework, floated to newest
+        # --upgrade is the whole point: the `conformance-tests` extra carries
+        # floors, and this lane deliberately ignores the ceiling those floors
+        # imply by taking whatever is newest today.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,conformance-tests]"
+          pip install --upgrade $(python - <<'PY'
+          import tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          extra = d["project"]["optional-dependencies"]["conformance-tests"]
+          # Names only — drop the floors so pip resolves newest.
+          import re
+          print(" ".join(sorted({re.split(r"[<>=!~\[;]", s.strip())[0] for s in extra})))
+          PY
+          )
+
+      - name: Record what we actually resolved
+        # The version diff is the first thing a human wants when this goes red.
+        run: pip freeze | sort > resolved-versions.txt && cat resolved-versions.txt
+
+      - name: Run the conformance matrix against newest
+        id: matrix
+        # REQUIRE_ALL because a driver that cannot import its framework must be a
+        # failure here, not a skip: on a floating lane, "the new release broke the
+        # import" is exactly the finding we are looking for.
+        env:
+          DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
+        run: python -m pytest tests/conformance -q -rs -m conformance
+
+      - name: Upload the resolved versions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-latest-versions
+          path: resolved-versions.txt
+
+      - name: Open an advisory issue on red
+        # Advisory, not blocking: this lane never gates a release. One open issue
+        # at a time — re-running nightly must not spam.
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Conformance: an upstream framework release broke a contract row";
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: ["conformance-latest"],
+            });
+            const body = [
+              "The floating conformance lane went red. The pinned gate is unaffected, so releases are not blocked.",
+              "",
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Next steps are in `tests/conformance/README.md` under *When a new framework version breaks a row*:",
+              "download the `conformance-latest-versions` artifact to see which upstream release moved, then either",
+              "fix the adapter, or — if the new upstream behaviour is correct and ours was not — record a new baseline",
+              "and raise the floor.",
+              "",
+              "Do not make the row green by editing a driver or by adding a line to `known_failures.txt`.",
+            ].join("\n");
+            if (existing.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ["conformance-latest"],
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            }
