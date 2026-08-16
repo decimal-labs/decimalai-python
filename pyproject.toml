@@ -64,13 +64,17 @@ dependencies = [
 # Framework/provider adapters are extras, not core deps (since 2026-07-23).
 # Every framework import in the package is function-local and guarded with an
 # ImportError naming its extra, so a core-only install stays importable.
-# langchain-core is floored at 1.3.0: the lowest that co-installs with the modern
-# framework set (the floor lane verifies this), and CVE-clean — the 1.2.x
-# branch (1.2.0–1.2.27) shipped CVE-2026-40087 + CVE-2026-44843 unpatched;
-# 1.3.x+ is clean. (Was >=0.3.84,!=1.2.*; 0.3.x can't co-install with the
-# current framework set, so that floor was unreachable.)
+# langchain-core floored at 1.3.3, and the number is the CVE fix, not the
+# co-install minimum. The adapter itself works far lower — conformance grades
+# identically from 0.3.67 through 1.5.5 — so what sets this floor is
+# CVE-2026-44843 (High; unsafe deserialization through an over-broad load()
+# allowlist), which affects 1.0.0–1.3.2 and is fixed in 1.3.3 / 0.3.85. The
+# previous comment claimed ">=1.3.0 is CVE-clean"; it was not, by three patch
+# releases. CVE-2026-40087 (Moderate) is fixed earlier, in 1.2.28 / 0.3.84.
+# 0.3.x is deliberately out of support even though it works: it cannot pair
+# with a current langgraph, which requires langchain-core>=1.4.7.
 langchain = [
-    "langchain-core>=1.3.0,<2",  # Cap the major: a future langchain-core 2.x could break installs; imports are try/except-guarded. Verify by installing at the floor and importing.
+    "langchain-core>=1.3.3,<2",  # Cap the major. Redundant while langgraph pins <2 itself, but bites for langchain-without-langgraph installs. Review the cap when 2.0 is announced — do not let it outlive its reason the way openai<3 did.
 ]
 # 2.26.0 is the effective floor (lowest that co-resolves with the modern
 # set). Resolve-verified; live-verify pending an OpenAI run (key quota-blocked).
@@ -78,9 +82,23 @@ langchain = [
 # `pip install "decimalai[openai]"` co-installs the provider SDK the
 # init(openai=True) one-liner instruments.
 openai = [
-    "openai>=2.26.0,<3",  # Cap the major: a future openai 3.x could break installs.
+    # NO major cap, deliberately. The old `<3` was defensive boilerplate and it
+    # did real damage: openai-agents 0.21.0 requires openai>=3.0.0,<4, so with
+    # the cap in place `pip install "decimalai[all]"` resolved openai-agents
+    # back to 0.20.0 — users were held a minor behind by OUR pin, not upstream's.
+    # Verified with `uv pip compile` before and after. openai 3.1.0 passes
+    # conformance at baseline. The conformance job is the control here, not a
+    # version range: a cap only ever guesses at breakage, and this one guessed
+    # wrong for six weeks. If a future major does break us, the job says so.
+    "openai>=2.26.0",
 ]
-openai-agents = ["openai-agents>=0.17.2"]
+# 0.18.1, not 0.17.2. The old floor was a CONDITIONAL fiction — the same shape
+# as the llamaindex >=0.10.20 floor: 0.17.2 genuinely works, but only against an
+# `openai` version this package's own extra would not select, so the pair could
+# resolve into a window where the adapter is broken. Floors on two packages in
+# two different extras can falsify each other; only a resolve-then-run check
+# catches it, which is what conformance now does.
+openai-agents = ["openai-agents>=0.18.1"]
 # Runtime extra for the native Claude Agent SDK integration
 # (decimalai.init(claude_agent_sdk=True)). Floor mirrors claude-agent-sdk-tests;
 # NOT yet verified at the floor — refine by installing at the floor and importing.
