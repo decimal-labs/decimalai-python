@@ -1,0 +1,276 @@
+# Does the release a user can actually `pip install` still do what the docs say?
+#
+# ⚠ THIS CANNOT RUN YET. GitHub Actions is blocked for this org at the ACCOUNT
+#   level by billing — every run on every repo here dies in ~2s with steps=0, and
+#   the reason is visible only via `gh api /repos/{o}/{r}/check-runs/{id}/annotations`.
+#   The fix is a valid credit card on org billing, not a change to this file (a
+#   public-repo flip does NOT clear it — the same lock hits Free-plan public
+#   repos). Until that is resolved this workflow is written, validated and
+#   dormant: treat a missing run here as "no signal", never as "green".
+#
+# ── why this exists ──────────────────────────────────────────────────────────
+# The release gate's clean-room step (scripts/release.sh) proves exactly two
+# things about the wheel: `import decimalai` works and `decimalai --help` exits
+# 0. Both of those survive a quickstart that has stopped producing a single
+# trace. So "the docs teach an API the wheel doesn't have", "the wheel predates
+# its tag" and "the documented flow silently sends nothing" can all ship, across
+# several releases, with every gate green — because nothing ties a user-facing
+# claim to the artifact a user can actually get.
+#
+# This lane installs decimalai FROM PYPI (never the checkout — installing the
+# source is what makes a smoke test itself instead of the release) and runs the
+# published quickstart end to end:
+#
+#   docs quickstart §1  `decimalai --version` prints a version
+#   docs quickstart §2  `decimalai init` — "✓ Test trace sent successfully"
+#   docs quickstart §4  the "No framework" snippet: @decimalai.trace +
+#                       SkillRouter.build_prompt_fragment + log_llm_call
+#
+# and then asserts on the WIRE, not on stdout. That distinction is the whole
+# point: `decimalai init` prints its "✓ Test trace sent successfully" line from
+# inside a try/except whose body only *queues* the trace, so the CLI says it
+# worked whether or not anything lands. Verified locally against decimalai
+# 0.10.2 from PyPI: with an ingest that refuses every trace, `decimalai init`
+# still exits 0 and still prints all three checkmarks, while this smoke goes red.
+#
+# ── no secrets, by construction ──────────────────────────────────────────────
+# A smoke gated on secrets silently no-ops, which is the same failure mode as
+# having no smoke at all. Both ends of the run are local HTTP servers, exactly
+# as tests/conformance already does it:
+#   * ingest → tests/conformance/probe.py, whose validate_trace_payload is a
+#     fingerprinted port of the backend's own trace validator, so "accepted"
+#     means "production would have stored this row";
+#   * the model → a stub OpenAI Chat Completions service on 127.0.0.1 that the
+#     REAL openai client is pointed at with base_url=.
+# No provider key, no DecimalAI backend, no `secrets.*` reference anywhere.
+#
+# Deliberately out of scope: the docs' keyless `decimalai skills pull <slug>`
+# claim. Proving that needs the live registry, and a release smoke that fails
+# when prod hiccups teaches people to ignore it.
+name: Post-publish smoke (PyPI artifact vs the docs)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "PyPI version to smoke (default: whatever PyPI serves as latest)"
+        required: false
+        default: ""
+      ref:
+        description: "Checkout to take the conformance probe from (default: this ref)"
+        required: false
+        default: ""
+
+# Read-only by default; the reporting job below asks for `issues: write` on its
+# own. Never workflow-wide — same rule publish.yml states for id-token.
+permissions:
+  contents: read
+
+concurrency:
+  # Per release, and NOT cancel-in-progress: a second release should not silently
+  # discard the first one's only post-publish evidence.
+  group: post-publish-smoke-${{ github.event.release.tag_name || inputs.version || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Documented quickstart from PyPI (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor the docs promise and the newest supported. A quickstart that
+        # only works on one of them is a defect users hit on the other.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Resolve which release to smoke
+        id: target
+        # Inputs go through env, never straight into the script body: a
+        # `${{ inputs.* }}` expansion inside `run:` is string-substituted before
+        # bash sees it, which is how workflow command injection starts.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          DEFAULT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${RELEASE_TAG#v}"
+            REF="$RELEASE_TAG"
+          else
+            VERSION="${INPUT_VERSION#v}"
+            if [ -z "$VERSION" ]; then
+              VERSION="$(curl -fsSL https://pypi.org/pypi/decimalai/json \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')"
+            fi
+            REF="${INPUT_REF:-$DEFAULT_REF}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not work out which version to smoke"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Smoking decimalai $VERSION, probe from $REF"
+
+      - uses: actions/checkout@v6
+        with:
+          # The tag being smoked, so the probe and the documented snippet come
+          # from the revision that was released — not from whatever main is now.
+          ref: ${{ steps.target.outputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          # No pip cache on purpose: this job's entire job is to exercise the
+          # artifact PyPI is serving right now.
+
+      - name: Wait for PyPI to serve the release
+        # A release event fires before the file is installable everywhere. Without
+        # this the smoke's first red would be a CDN race, and a flaky smoke gets
+        # ignored, which is how we got here.
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://pypi.org/pypi/decimalai/$VERSION/json" || echo 000)"
+            if [ "$code" = "200" ]; then
+              echo "PyPI is serving decimalai $VERSION (attempt $attempt)"; exit 0
+            fi
+            echo "attempt $attempt: PyPI says $code for $VERSION — waiting 10s"
+            sleep 10
+          done
+          echo "::error::PyPI never served decimalai $VERSION (30 attempts, ~5 minutes)"; exit 1
+
+      - name: Assert the artifact backs the documented Python floor
+        # The docs say "requires Python 3.10+" and warn that pip silently installs
+        # an outdated release on 3.9. That promise is kept by ONE field on the
+        # uploaded files, so read it off the artifact rather than provisioning a
+        # dead interpreter to discover it.
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://pypi.org/pypi/decimalai/$VERSION/json" > release.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open("release.json"))
+          files = data["urls"]
+          assert files, "the release has no files on PyPI at all"
+          kinds = {f["packagetype"] for f in files}
+          assert "bdist_wheel" in kinds, f"no wheel published, only {sorted(kinds)}"
+          floors = {f.get("requires_python") for f in files}
+          assert floors == {">=3.10"}, (
+              "docs promise Python 3.10+, but the uploaded files declare "
+              f"requires_python={sorted(str(f) for f in floors)}"
+          )
+          print(f"OK: {sorted(kinds)} published, requires_python={floors.pop()}")
+          PY
+
+      - name: Build a clean environment and install FROM PYPI
+        # Outside $GITHUB_WORKSPACE, so nothing here can accidentally reach the
+        # checkout. Note what is absent and must stay absent: `pip install -e .`,
+        # `pip install .`, and any requirements file from the repo. `openai` is
+        # installed because the documented snippet imports it — it is the
+        # provider SDK a reader of that page already has.
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/smoke-venv"
+          "$RUNNER_TEMP/smoke-venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/smoke-venv/bin/pip" install --no-cache-dir "decimalai==$VERSION" openai
+          "$RUNNER_TEMP/smoke-venv/bin/pip" freeze | sort > "$RUNNER_TEMP/installed.txt"
+          cat "$RUNNER_TEMP/installed.txt"
+
+      - name: Run the documented quickstart against the released wheel
+        # cwd is a temp dir and PYTHONPATH is unset: with the repo root on
+        # either, `import decimalai` picks the checkout and every assertion below
+        # becomes vacuous. The script hard-aborts if that happens anyway
+        # (exit 2), so this is belt-and-braces, not the only guard.
+        # `unset`, not `env: PYTHONPATH: ""` — an EMPTY PYTHONPATH is not an
+        # absent one: CPython reads it as a single empty entry, i.e. cwd.
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          unset PYTHONPATH
+          mkdir -p "$RUNNER_TEMP/smoke-run"
+          cd "$RUNNER_TEMP/smoke-run"
+          PATH="$RUNNER_TEMP/smoke-venv/bin:$PATH" \
+            "$RUNNER_TEMP/smoke-venv/bin/python" \
+              "$GITHUB_WORKSPACE/scripts/pypi_smoke.py" \
+              --expect-version "$VERSION" \
+              --repo-root "$GITHUB_WORKSPACE" \
+            2>&1 | tee "$RUNNER_TEMP/smoke-${{ matrix.python-version }}.log"
+
+      - name: Upload the smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-publish-smoke-${{ steps.target.outputs.version }}-py${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}/smoke-${{ matrix.python-version }}.log
+            ${{ runner.temp }}/installed.txt
+          if-no-files-found: warn
+
+  report:
+    name: Escalate a broken release
+    needs: [smoke]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open an issue — the published release does not keep a documented claim
+        # This lane runs AFTER the upload, so it can't block anything; the only
+        # useful response to red is a loud, deduplicated issue and a fix release.
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version =
+              (context.payload.release && context.payload.release.tag_name) ||
+              (context.payload.inputs && context.payload.inputs.version) || "latest";
+            const title = `Post-publish smoke failed for ${version} — the released artifact breaks a documented claim`;
+            const body = [
+              `The wheel on PyPI (\`${version}\`) does not do what the docs say it does.`,
+              "It is already published and PyPI is append-only, so the fix is a follow-up release,",
+              "not a re-run.",
+              "",
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "The failing check names its own claim. Read the run log (or the",
+              "`post-publish-smoke-*` artifact) and start from the first FAIL line:",
+              "",
+              "- a version check → the wheel and its tag disagree;",
+              "- a `decimalai init` / snippet check → the documented flow itself broke;",
+              "- a *REACHED the ingest wire* check → the flow still exits 0 and still prints",
+              "  its checkmarks, but no trace lands. That is the defect class this lane exists for.",
+              "",
+              "Do not make it green by relaxing `scripts/pypi_smoke.py`.",
+            ].join("\n");
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: ["post-publish-smoke"],
+            });
+            const match = existing.data.find((i) => i.title === title);
+            if (match) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: match.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ["post-publish-smoke"],
+              });
+            }
