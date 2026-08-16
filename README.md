@@ -338,7 +338,6 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` |
-| AutoGen / AG2 | ✅ | `init(autogen=True)` |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |
 | OpenTelemetry | ✅ | `init(otel=True)` |
 

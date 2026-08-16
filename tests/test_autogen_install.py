@@ -1,9 +1,17 @@
-"""Tests for the AutoGen / AG2 adapter (decimalai.autogen).
+"""Tests for what is LEFT of decimalai.autogen after the retirement.
 
-AutoGen emits standard OpenTelemetry GenAI spans, so the adapter has no
-dedicated handler — ``install()`` wires the manifest-capable
-``decimalai.otel.DecimalSpanExporter`` onto a real ``TracerProvider`` via a
-``BatchSpanProcessor``.
+AutoGen / AG2 stopped being a supported integration on 2026-08-16, but
+``init(autogen=True)`` and ``decimalai.autogen.instrument()`` are public API
+and still run. Two things must hold, and this file holds them:
+
+1. **Tracing does not go dark.** The call still wires the manifest-capable
+   ``decimalai.otel.DecimalSpanExporter`` onto a real ``TracerProvider`` via a
+   ``BatchSpanProcessor`` — anything the user instruments themselves reaches
+   DecimalAI exactly as before.
+2. **Nobody is left believing an adapter is doing more than that.** Every entry
+   point warns that AutoGen/AG2 is not supported and names the AG2 one-liners
+   that make AG2 emit spans at all. A silent exporter-only install is the
+   failure mode being prevented, so the warning is asserted, not assumed.
 
 These tests use the REAL opentelemetry-sdk (a hard dependency of this
 package, so always present in PR CI) — no AutoGen install needed. They
@@ -19,6 +27,7 @@ from unittest.mock import MagicMock
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
 
+import decimalai.autogen as da
 from decimalai.autogen import install
 from decimalai.otel import DecimalSpanExporter
 
@@ -121,3 +130,54 @@ class TestAutogenInstall:
         # the AutoGen GenAI span and stamps it on the trace.
         cfg._client.register_manifest.assert_called()
         assert run_trace.manifest_id == "m1"
+
+
+class TestRetirementIsHonest:
+    """The warning is the whole product of the retirement — assert it exists."""
+
+    def test_instrument_says_autogen_is_not_supported(self, caplog):
+        with caplog.at_level("WARNING", logger="decimalai.autogen"):
+            da.instrument(agent_name="x", provider=TracerProvider())
+
+        warning = "\n".join(
+            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+        )
+        assert "NO LONGER a supported" in warning
+        # It must name the rail the user is actually on...
+        assert "OpenTelemetry" in warning
+        # ...and the one-liners that make AG2 emit anything, because AG2 emits
+        # zero spans on its own and "exporter installed, no traces" is the
+        # silent outcome this whole message exists to prevent.
+        assert "instrument_agent" in warning
+        assert "instrument_llm_wrapper" in warning
+
+    def test_init_autogen_flag_warns_and_still_installs_the_exporter(self, caplog):
+        """The flag is public API: it keeps working, and it keeps warning."""
+        import decimalai
+
+        provider = TracerProvider()
+        with caplog.at_level("WARNING", logger="decimalai.autogen"):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(
+                    "decimalai.otel.instrument",
+                    lambda **kw: provider,
+                )
+                decimalai.init(
+                    api_key="dai_sk_test", autogen=True, verify=False
+                )
+
+        warning = "\n".join(
+            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+        )
+        assert "NO LONGER a supported" in warning
+
+    def test_no_ag2_auto_instrumentation_surface_remains(self):
+        """The retired machinery is gone, not merely unused.
+
+        A leftover ``_activate_ag2_instrumentation`` would be an integration
+        anyone could re-wire by accident, and the module docstring is what the
+        next reader trusts — so both are checked.
+        """
+        assert not hasattr(da, "_activate_ag2_instrumentation")
+        assert not hasattr(da, "_sweep_existing_agents")
+        assert "RETIRED" in (da.__doc__ or "")

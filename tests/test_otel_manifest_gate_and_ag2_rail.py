@@ -1,6 +1,6 @@
 """Regression tests for the OTel / community rail.
 
-Four defects, all reproduced against a live backend before being fixed here:
+Three defects, all reproduced against a live backend before being fixed here:
 
 1. **The manifest gate dropped whole traces.** ``_maybe_register_manifest``
    returned early unless the trace happened to expose a model, tool or prompt,
@@ -15,23 +15,23 @@ Four defects, all reproduced against a live backend before being fixed here:
    ``tool_registry breaking/major "search removed"`` with a ``replay``
    decision. Fabricated breaking changes are worse than no versioning.
 
-3. **Patching the constructor could not reach existing agents.** An AG2 agent
-   built before ``init()`` went untraced, silently. AG2's ``instrument_agent``
-   mutates the instance in place, so the live ones can simply be swept.
+3. **AG2 content never arrived.** AG2's GenAI-semconv message shape (one JSON
+   attribute, not indexed keys) was not read — so previews were raw JSON blobs
+   and ``rendered_input``/``output`` were ``None``.
 
-4. **AG2 content never arrived.** ``instrument_llm_wrapper`` takes
-   ``capture_messages=False`` by default and the SDK never opted in, and AG2's
-   GenAI-semconv message shape (one JSON attribute, not indexed keys) was not
-   read — so previews were raw JSON blobs and ``rendered_input``/``output``
-   were ``None``.
+The AG2-shaped spans below are FIXTURES for the generic exporter, not an
+integration: AutoGen/AG2 was retired as an adapter on 2026-08-16 and the SDK no
+longer instruments agents for anyone. They stay because the wire shape they
+capture is real, and it is the shape an AG2 user's own ``instrument_agent()``
+calls still put on the generic OTel rail. The tests that graded the retired
+auto-instrumentation (the ``ConversableAgent.__init__`` hook and the
+already-built-agent sweep) were deleted with it.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import threading
-import types
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -384,120 +384,6 @@ def test_semconv_tool_calls_are_extracted(_sdk):
     ])}
     calls = _extract_tool_calls(attrs)
     assert [(c.tool_name, c.args) for c in calls] == [("get_weather", {"city": "SF"})]
-
-
-# ── 3. The AG2 sweep ─────────────────────────────────────────
-
-
-def _fake_ag2(monkeypatch):
-    class ConversableAgent:
-        def __init__(self, name="agent"):
-            self.name = name
-
-    instrument_agent = MagicMock(side_effect=lambda agent, *, tracer_provider: agent)
-    instrument_llm_wrapper = MagicMock()
-
-    autogen_mod = types.ModuleType("autogen")
-    autogen_mod.ConversableAgent = ConversableAgent
-    otel_mod = types.ModuleType("autogen.opentelemetry")
-    otel_mod.instrument_agent = instrument_agent
-    otel_mod.instrument_llm_wrapper = instrument_llm_wrapper
-    autogen_mod.opentelemetry = otel_mod
-    monkeypatch.setitem(sys.modules, "autogen", autogen_mod)
-    monkeypatch.setitem(sys.modules, "autogen.opentelemetry", otel_mod)
-    return ConversableAgent, instrument_agent, instrument_llm_wrapper
-
-
-def test_agents_built_before_activation_are_swept_in(monkeypatch):
-    """Rebinding ``__init__`` can only reach objects built after the call, so
-    an agent constructed before init() was untraced with no warning."""
-    import decimalai.autogen as da
-    from opentelemetry.sdk.trace import TracerProvider
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    ConversableAgent, instrument_agent, _ = _fake_ag2(monkeypatch)
-
-    early = ConversableAgent(name="built-first")
-    provider = TracerProvider()
-    da._activate_ag2_instrumentation(provider)
-
-    instrument_agent.assert_called_once_with(early, tracer_provider=provider)
-    assert early._decimalai_ag2_instrumented is True
-
-
-def test_the_sweep_does_not_double_instrument(monkeypatch):
-    import decimalai.autogen as da
-    from opentelemetry.sdk.trace import TracerProvider
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    ConversableAgent, instrument_agent, _ = _fake_ag2(monkeypatch)
-
-    early = ConversableAgent(name="built-first")
-    da._activate_ag2_instrumentation(TracerProvider())
-    da._activate_ag2_instrumentation(TracerProvider())
-
-    assert instrument_agent.call_count == 1
-    assert early._decimalai_ag2_instrumented is True
-
-
-def test_a_failing_sweep_warns_with_the_manual_one_liner(monkeypatch, caplog):
-    import decimalai.autogen as da
-    from opentelemetry.sdk.trace import TracerProvider
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    ConversableAgent, instrument_agent, _ = _fake_ag2(monkeypatch)
-    instrument_agent.side_effect = RuntimeError("nope")
-    early = ConversableAgent(name="built-first")  # kept alive for the sweep
-
-    with caplog.at_level("WARNING", logger="decimalai.autogen"):
-        da._activate_ag2_instrumentation(TracerProvider())
-
-    warning = "\n".join(r.getMessage() for r in caplog.records
-                        if r.levelname == "WARNING")
-    assert "instrument_agent" in warning
-    assert getattr(early, "_decimalai_ag2_instrumented", False) is False
-
-
-def test_message_capture_is_on_by_default_and_can_be_turned_off(monkeypatch):
-    import decimalai.autogen as da
-    from opentelemetry.sdk.trace import TracerProvider
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    _, _, instrument_llm_wrapper = _fake_ag2(monkeypatch)
-    provider = TracerProvider()
-    da._activate_ag2_instrumentation(provider)
-    instrument_llm_wrapper.assert_called_once_with(
-        tracer_provider=provider, capture_messages=True
-    )
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    _, _, wrapper2 = _fake_ag2(monkeypatch)
-    da._activate_ag2_instrumentation(provider, capture_messages=False)
-    wrapper2.assert_called_once_with(
-        tracer_provider=provider, capture_messages=False
-    )
-
-
-def test_ag2_predating_capture_messages_still_gets_wired(monkeypatch):
-    """An older AG2 whose instrument_llm_wrapper has no capture_messages kwarg
-    must still be instrumented, not left silent."""
-    import decimalai.autogen as da
-    from opentelemetry.sdk.trace import TracerProvider
-
-    monkeypatch.setattr(da, "_ag2_hook_installed", False)
-    _, _, wrapper = _fake_ag2(monkeypatch)
-    calls = []
-
-    def _old_signature(*, tracer_provider, **kwargs):
-        if kwargs:
-            raise TypeError("unexpected keyword argument")
-        calls.append(tracer_provider)
-
-    wrapper.side_effect = _old_signature
-    provider = TracerProvider()
-    da._activate_ag2_instrumentation(provider)
-
-    assert calls == [provider]
 
 
 # ── The exit flush ───────────────────────────────────────────

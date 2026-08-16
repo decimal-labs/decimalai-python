@@ -314,8 +314,8 @@ never a PR check), not a flag the assertions read.
 
 `frameworks-matrix.txt` grew a second block for the frameworks that have a
 conformance driver but no live-matrix lane (crewai, google-adk, llama-index-core,
-both AutoGen lineages, pydantic-ai, anthropic, and the OpenInference
-instrumentors the OTel-routed drivers read). Floating those is cheap precisely
+pydantic-ai, anthropic, and the OpenInference instrumentors the OTel-routed
+drivers read). Floating those is cheap precisely
 because Tier A is hermetic — no model spend, no backend.
 
 Two commands worth knowing:
@@ -361,8 +361,6 @@ Support window, per framework, from the observed release cadence:
 | llama-index-core | `>=0.12.0` | none | Verified at the floor after the previous one proved fictional. |
 | google-adk | `>=2.0.0` | none | 2.x is young; watch it. |
 | crewai | `>=1.15.3` for the test set | `<2` | Below 1.15 the conformance set silently resolved crewai back to 1.6.1 in an OTel fight with google-adk — so the job was grading a 2025 build users never see. Breaks in PATCH releases, so a major cap protects little. |
-| autogen (classic) | `>=0.11.0` | `<1` | The `autogen` name is frozen at 0.14.1 forever — upstream moved to `ag2` 1.x and did not republish. The cap is load-bearing, not boilerplate. |
-| autogen-core/agentchat | — | — | Microsoft's lineage: last release 10.5 months ago, fails 7 of 13 items. Recommend reclassifying as generic-OTel-only rather than an advertised integration. |
 | pydantic-ai, claude-agent-sdk | `>=0.1.0` | none | Both floors are unverified `>=0.1.0` — the shape of a floor nobody has run. Verify before claiming them. |
 
 ### When a new framework version breaks a row

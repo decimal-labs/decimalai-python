@@ -74,7 +74,7 @@ and [docs.decimal.ai/sdk/python](https://docs.decimal.ai/sdk/python).
 
 ## Coming Soon
 
-- **Framework Guides** — LlamaIndex, CrewAI, AutoGen integration notebooks
+- **Framework Guides** — LlamaIndex and CrewAI integration notebooks
 
 ## Requirements
 

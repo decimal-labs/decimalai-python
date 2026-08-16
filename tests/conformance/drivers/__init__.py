@@ -289,7 +289,6 @@ DRIVER_MODULES: Tuple[str, ...] = (
     "llamaindex",
     "adk",
     "crewai",
-    "ag2",
     "generic_otel",
     "claude_agent_sdk",
     # Last on purpose: this one enables the OpenInference Anthropic
@@ -324,7 +323,6 @@ ADVERTISED_SNAPSHOT: frozenset = frozenset({
     "pydantic-ai",
     "google-adk",
     "llamaindex",
-    "autogen", "ag2",
     "crewai",
     "generic-otel",
 })

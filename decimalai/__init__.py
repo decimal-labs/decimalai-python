@@ -453,8 +453,11 @@ def init(
         decimalai.init(llamaindex=True)      # LlamaIndex
         decimalai.init(claude_agent_sdk=True)  # Anthropic Claude Agent SDK
         decimalai.init(crewai=True)          # CrewAI
-        decimalai.init(autogen=True)         # AutoGen / AG2
         decimalai.init(otel=True)            # Any OpenTelemetry framework
+
+    ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
+    a supported integration: the flag is now an alias for ``otel=True`` that
+    warns. See :mod:`decimalai.autogen`.
 
     No-framework direct provider-SDK calls (the one-liner for raw
     ``openai`` / ``anthropic`` / ``google.genai`` usage with no agent
@@ -492,10 +495,11 @@ def init(
             (plus provider instrumentors for importable LLM SDKs); if
             ``openinference-instrumentation-crewai`` isn't installed, a
             warning explains that no traces will be captured.
-        autogen: If ``True``, instrument AutoGen / AG2. On AG2, agents
-            constructed after ``init()`` are auto-instrumented via
-            ``autogen.opentelemetry``; see :mod:`decimalai.autogen` for
-            agents created earlier.
+        autogen: RETIRED. AutoGen / AG2 is no longer a supported integration —
+            this flag now installs the generic OpenTelemetry exporter (exactly
+            what ``otel=True`` does) and warns. Kept so existing code keeps
+            running; see :mod:`decimalai.autogen` for why, and for the AG2
+            one-liners that make AG2 emit spans onto that exporter.
         otel: If ``True``, install a generic OpenTelemetry exporter.
             Use this for any OTEL-compatible framework not listed above.
         openai: If ``True``, auto-trace direct OpenAI SDK calls (no
@@ -704,22 +708,24 @@ def init(
 
         # Auto-install OTEL exporter for CrewAI, AutoGen, or generic OTEL.
         # The exporter is shared, but the exporter alone only *receives* spans —
-        # neither CrewAI nor AG2 emits any to the global TracerProvider by
-        # default, so the named flags must also activate the matching
-        # instrumentation or they are silent no-ops (zero traces).
+        # CrewAI emits none to the global TracerProvider by default, so that flag
+        # must also activate the matching instrumentation or it is a silent no-op
+        # (zero traces). `autogen` no longer activates anything: AutoGen/AG2 is
+        # not an integration any more, so the flag installs the exporter and
+        # warns that the user is on the generic OTel rail.
         if otel or crewai or autogen:
             # Use the manifest-capable exporter (decimalai.otel) — it buffers spans
             # by root span (no per-batch fragmentation) AND registers a manifest
             # from the captured model/tools/prompt, so manifest versioning works
-            # for CrewAI/AutoGen/generic-OTel. (The older integrations.otel exporter
+            # for CrewAI/generic-OTel. (The older integrations.otel exporter
             # did neither.)
             from .otel import instrument as _otel_install
             _otel_provider = _otel_install(agent_name=agent_name)
             if crewai:
                 _activate_crewai_instrumentation(_otel_provider)
             if autogen:
-                from .autogen import _activate_ag2_instrumentation
-                _activate_ag2_instrumentation(_otel_provider)
+                from .autogen import _warn_autogen_not_supported
+                _warn_autogen_not_supported()
 
     # Auto-trace direct provider-SDK calls (no framework) if requested.
     # Each flag enables the matching provider's OpenInference instrumentor,

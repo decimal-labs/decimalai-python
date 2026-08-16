@@ -252,11 +252,11 @@ providers-tests = [
 # this suite exists to remove (a green suite that proved nothing). Install with:
 #   pip install -e ".[dev,conformance-tests]"
 #
-# Versions are resolve-verified together on 2026-08-15 (ag2/autogen 0.14.1,
-# autogen-core 0.7.5, crewai 1.6.1, google-adk 2.7.0, llama-index-core 0.14.23,
-# claude-agent-sdk 0.2.139, pydantic-ai 2.31.0, openai 2.54.0, langchain-core
-# 1.5.5): all eleven drivers import and run in one venv. The floors below are NOT
-# floor-verified — refine by installing at the floor and running the tier.
+# Versions are resolve-verified together on 2026-08-15 (crewai 1.6.1, google-adk
+# 2.7.0, llama-index-core 0.14.23, claude-agent-sdk 0.2.139, pydantic-ai 2.31.0,
+# openai 2.54.0, langchain-core 1.5.5): all nine drivers import and run in one
+# venv. The floors below are NOT floor-verified — refine by installing at the
+# floor and running the tier.
 conformance-tests = [
     # Every runtime framework extra in one line: langchain, langgraph, openai,
     # openai-agents, claude-agent-sdk, pydantic-ai, adk, llamaindex, evals
@@ -280,18 +280,9 @@ conformance-tests = [
     # tier was verified on.
     "crewai>=1.6.1",
     "openinference-instrumentation-crewai>=1.1.8",
-    # AG2 / classic AutoGen. The distribution to install is `autogen`, NOT `ag2`:
-    # ag2 1.x publishes only an `ag2` top-level package, and tests/conformance/
-    # drivers/ag2.py imports `autogen` and `autogen.opentelemetry`. Verified the
-    # hard way — with ag2 1.0.2 installed and nothing else, `import autogen`
-    # raises ModuleNotFoundError and the driver is silently skipped.
-    "autogen[openai]>=0.14.0,<1",
-    # Microsoft AutoGen — the OTHER lineage, and a genuinely different adapter path
-    # (drivers/autogen_ms.py drives SingleThreadedAgentRuntime with an explicit
-    # tracer_provider). Co-installs with the line above: different top-level
-    # packages (`autogen_core` / `autogen_agentchat` vs `autogen`).
-    "autogen-core>=0.7.0",
-    "autogen-agentchat>=0.7.0",
+    # No AutoGen line, deliberately. Both lineages were retired as integrations
+    # (2026-08-16): `init(autogen=True)` is now an alias for the generic OTel
+    # exporter that warns, and drivers/generic_otel.py already grades that rail.
     # drivers/crewai.py reads BOTH instrumentors: CrewAI emits the crew/task spans,
     # LiteLLM emits the llm ones. The crewai-tests extra carries only the first, so
     # without this the CrewAI trace arrives with no llm_calls at all.
@@ -355,7 +346,7 @@ markers = [
     "streaming: live_llm sub-marker — streamed agent events",
     "parallel_tools: live_llm sub-marker — multiple tool calls in a single LLM step",
     "manifest_drift: live_llm sub-marker — prompt change triggers new manifest + regression-check",
-    "otel: live_llm sub-marker — OpenTelemetry SpanExporter ingest path (CrewAI/AutoGen/etc.)",
+    "otel: live_llm sub-marker — OpenTelemetry SpanExporter ingest path (CrewAI/Haystack/etc.)",
     "crewai: live_llm sub-marker — real CrewAI Crew on Gemini through the OTEL exporter",
     "adk: live_llm sub-marker — real Google ADK agent on Gemini through the native plugin",
     "llamaindex: live_llm sub-marker — real LlamaIndex RAG query engine through the native span handler + the OTEL exporter",

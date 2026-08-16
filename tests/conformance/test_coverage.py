@@ -119,7 +119,13 @@ FLAG_SLUGS: Dict[str, Set[str]] = {
     "llamaindex": {"llamaindex"},
     "claude_agent_sdk": {"claude-agent-sdk", "claude-code"},
     "crewai": {"crewai"},
-    "autogen": {"autogen", "ag2"},
+    # AutoGen / AG2 is retired as an integration, but `init(autogen=True)` is
+    # public API and still runs: it installs the generic OTel exporter and warns.
+    # So it maps to the generic-otel slug, which drivers/generic_otel.py drives —
+    # the flag IS that rail now, and grading it there is the honest reading, not
+    # an exemption. If the flag ever regains framework-specific behaviour it
+    # needs its own slug, its own docs row, and its own driver again.
+    "autogen": {"generic-otel"},
     "otel": {"generic-otel"},
 }
 
