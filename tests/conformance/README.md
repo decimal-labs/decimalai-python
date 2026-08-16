@@ -282,6 +282,43 @@ make release-gate-conformance
 python release_gate/canary.py --latest --conformance-only
 ```
 
+### Which versions we support, and why
+
+Floors are claims we have RUN, not numbers we picked. Three in this repo were
+fiction before anyone checked: `llama-index-core>=0.10.20` (the module the
+adapter imports does not exist there), `openai-agents>=0.17.2` (true alone,
+false against an `openai` our own extra would select), and
+`langchain-core>=1.3.0` (documented "CVE-clean" while admitting three patch
+releases that carry CVE-2026-44843). Verify a floor by installing at it and
+running that framework's driver — the suite makes this cheap.
+
+Two traps a version range cannot express, both found by resolving and then
+running:
+
+- **A floor on one package can be falsified by a floor on another**, in a
+  different extra. Always check what `decimalai[<extra>]` and `decimalai[all]`
+  actually resolve to, not what the line says.
+- **A cap is a guess about breakage that has not happened yet.** `openai<3`
+  held users a minor behind on openai-agents for six weeks: openai-agents
+  0.21.0 requires `openai>=3`, so our cap made it unreachable. Keep a cap only
+  where you can name what it protects and when to review it. The conformance
+  job is the better control, because it tests the thing the cap is guessing at.
+
+Support window, per framework, from the observed release cadence:
+
+| Framework | Floor | Cap | Note |
+|---|---|---|---|
+| langchain-core | `>=1.3.3` | `<2` | Floor is the CVE fix, not compatibility — the adapter grades identically from 0.3.67 to 1.5.5. New minor every 6-7 weeks. |
+| langgraph | `>=0.6.0` | none | Never imported by the SDK; the floor is a statement about what we test. langgraph `>=1.2` forces langchain-core `>=1.4.7` — a pairing rule our floors cannot express. |
+| openai | `>=2.26.0` | none | Cap removed; see above. A new minor almost weekly. |
+| openai-agents | `>=0.18.1` | none | Minors are the breaking unit, every ~2.5 weeks; a meaningful cap would need editing fortnightly. Hold the line with conformance. |
+| llama-index-core | `>=0.12.0` | none | Verified at the floor after the previous one proved fictional. |
+| google-adk | `>=2.0.0` | none | 2.x is young; watch it. |
+| crewai | `>=1.15.3` for the test set | `<2` | Below 1.15 the conformance set silently resolved crewai back to 1.6.1 in an OTel fight with google-adk — so the job was grading a 2025 build users never see. Breaks in PATCH releases, so a major cap protects little. |
+| autogen (classic) | `>=0.11.0` | `<1` | The `autogen` name is frozen at 0.14.1 forever — upstream moved to `ag2` 1.x and did not republish. The cap is load-bearing, not boilerplate. |
+| autogen-core/agentchat | — | — | Microsoft's lineage: last release 10.5 months ago, fails 7 of 13 items. Recommend reclassifying as generic-OTel-only rather than an advertised integration. |
+| pydantic-ai, claude-agent-sdk | `>=0.1.0` | none | Both floors are unverified `>=0.1.0` — the shape of a floor nobody has run. Verify before claiming them. |
+
 ### When a new framework version breaks a row
 
 1. The floating lane goes red and opens an issue. **The pinned gate stays
