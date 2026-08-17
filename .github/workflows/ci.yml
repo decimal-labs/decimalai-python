@@ -158,6 +158,19 @@ jobs:
         # F841: unused locals — out of scope for this lint pass.
         run: ruff check decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841
 
+      # Advisory for now. mypy has never run on this package: 36 errors at default
+      # settings, 348 under the --strict the sibling repos use. Making it required
+      # today would mean a red main on every commit, and a gate that is red by
+      # default is one people learn to ignore. It reports, it does not block; the
+      # count is meant to ratchet down until it can be promoted.
+      - name: Types (advisory)
+        continue-on-error: true
+        run: |
+          pip install 'mypy>=1.14,<2'
+          mypy decimalai/ --ignore-missing-imports --no-error-summary || true
+          echo "---"
+          mypy decimalai/ --ignore-missing-imports 2>&1 | tail -1
+
       - name: Guard against legacy package name
         # Package was renamed to `decimalai` at v0.3.0 (install == import). Fail if the
         # legacy `decimal[-_]ai` form reappears anywhere. Pattern is bracketed, so this
@@ -169,3 +182,57 @@ jobs:
             echo "::error::Legacy package name reintroduced — use 'decimalai' (no separator)."
             exit 1
           fi
+
+  floors:
+    # The version floors in pyproject.toml are claims. This job is what makes them
+    # true: it installs the LOWEST version of every direct dependency and runs the
+    # suite against it. Added 2026-08-17 after `click>=8.0` turned out to be false —
+    # a bare invocation exits 0 before click 8.2, so the start hint never fired.
+    # Advisory until it has been green for a week, then promote to required.
+    name: Floors resolve and pass
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install at the lowest declared versions
+        run: uv pip install --system --resolution lowest-direct ".[dev]"
+
+      - name: Show what resolved
+        run: uv pip list --system
+
+      - name: The floors are claims — run them
+        run: >-
+          python -m pytest tests -q
+          -m "not live_llm and not conformance and not integration"
+
+  audit:
+    # Known-advisory check against the resolved dependency set. The pyproject
+    # already tracks specific CVEs in hand-written comments; this is the same job
+    # done by a tool that does not forget. Clean as of 2026-08-17 ("No known
+    # vulnerabilities found"), so it starts from a green baseline — but advisory,
+    # because a new advisory lands on someone else's schedule and should not turn
+    # main red before it has been read.
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package and auditor
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit .
+
+      - name: Audit
+        run: pip-audit --progress-spinner off

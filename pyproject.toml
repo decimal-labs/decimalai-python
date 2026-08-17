@@ -41,7 +41,10 @@ classifiers = [
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.28.1",
-    "click>=8.0",
+    # 8.2 is the floor a bare `decimalai` invocation actually needs: before it,
+    # a no-args group exits 0 instead of 2, so the start hint never fires.
+    # Bisected 2026-08-17 — 8.0/8.1 fail, 8.2/8.3 pass.
+    "click>=8.2",
     # Floored at 1.28.0 — the lowest opentelemetry at which the OpenInference
     # instrumentor stack (the spans this SDK exists to route) actually *works*,
     # not just co-installs. Below it the floor lane installs but fails at import:
