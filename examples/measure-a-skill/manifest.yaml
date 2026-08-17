@@ -89,12 +89,12 @@ fallback_source_type: platform
 # ITSELF (cell 0.6). Recomputed by the cron, because a number about how much
 # evidence we withhold is exactly the number that must not go stale.
 registry_disclosure:
-  measured_public_skills: 1429
-  graded_cases: 30506
+  measured_public_skills: 29825
+  graded_cases: 666467
   cases_withheld_pct: 12.6
   platform_cases_withheld_pct: 56.6
   github_import_cases_withheld_pct: 0.7
-  as_of: "2026-08-10"
+  as_of: "2026-08-17"
 
   # How far these may drift before the cron calls it. The two counts are
   # recomputed EXACTLY from the listing and only ever grow, so their tolerance is
