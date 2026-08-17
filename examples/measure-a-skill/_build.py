@@ -141,8 +141,8 @@ cells = [
         "                   \"contested_case\": \"case-01\"},\n"
         "    \"gates\": {\"min_delta_pts\": 20, \"min_cases\": 20,\n"
         "              \"require_grading_method\": \"judged\",\n"
-        # Not optional. While the repo is private the raw.github fetch above 404s,
-        # so EVERY reader lands on this dict — a fallback missing this key silently
+        # Not optional. Any reader whose raw.github fetch above fails lands on this
+        # dict — a fallback missing this key silently
         # turns the evidence gate off for all of them and leaves the cell printing
         # only the arithmetic it was written to stop being sufficient.
         "              \"require_all_prompts_served\": True},\n"

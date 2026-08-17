@@ -3,7 +3,7 @@ once traces from the adapter actually started reaching the backend.
 
 Each test names a defect that was live against the local dev backend:
 
-  1. P0 — `_safe_preview` fell through to `str(obj)` on a `StreamingResponse`,
+  1. `_safe_preview` fell through to `str(obj)` on a `StreamingResponse`,
      whose `__str__` DRAINS `response_gen`. Tracing ate the user's stream and
      the app received nothing.
   2. `_classify_span` decided "is this an LLM?" from substrings of the class

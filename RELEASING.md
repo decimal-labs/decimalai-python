@@ -253,11 +253,9 @@ A manual upload skips every gate — run `./scripts/release.sh` instead wherever
 
 ## Notes & gotchas
 
-- **Private repo, public package.** The PyPI package is public but **this GitHub repo is private** — the
-  only one left in `decimal-labs` that is. That asymmetry is what blocks CI publishing (see the
-  precondition above), and it also means any README badge, `examples/` Colab link, or docs-site card
-  that points at `github.com/decimal-labs/decimalai-python` resolves only for signed-in members and
-  **404s for the public**. Check those links against a logged-out browser, not your own.
+- **Check links logged out.** README badges, `examples/` Colab links and docs-site cards that point
+  at `github.com/decimal-labs/decimalai-python` should be verified in a signed-out browser, not your
+  own — a link that resolves for you can still be broken for everyone else.
 - **PyPI cache lag.** The top-level `https://pypi.org/pypi/decimalai/json` can stay cached on the previous
   version for a minute or two after upload; the version-specific `.../<version>/json` endpoint reflects
   new releases almost immediately. The top-level `releases` map lags much longer — it can omit a version
