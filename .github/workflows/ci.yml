@@ -158,11 +158,12 @@ jobs:
         # F841: unused locals — out of scope for this lint pass.
         run: ruff check decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841
 
-      # Advisory for now. mypy has never run on this package: 36 errors at default
-      # settings, 348 under the --strict the sibling repos use. Making it required
-      # today would mean a red main on every commit, and a gate that is red by
-      # default is one people learn to ignore. It reports, it does not block; the
-      # count is meant to ratchet down until it can be promoted.
+      # Still advisory, and alone in that now — floors and audit were promoted to
+      # blocking on 2026-08-18 once they had run green. This one cannot follow
+      # them yet: 37 errors at default settings, 348 under the --strict the
+      # sibling repos use. Requiring it today would red main on every commit, and
+      # a gate that is red by default is one people learn to ignore. Promote it
+      # when the count reaches zero, not before.
       - name: Types (advisory)
         continue-on-error: true
         run: |
@@ -191,7 +192,6 @@ jobs:
     # Advisory until it has been green for a week, then promote to required.
     name: Floors resolve and pass
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
@@ -221,7 +221,6 @@ jobs:
     # main red before it has been read.
     name: Dependency audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
