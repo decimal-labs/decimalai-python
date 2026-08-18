@@ -203,7 +203,13 @@ DRIVER = Driver(
                 "capability table records '—' for it, decimalai.otel.instrument() "
                 "takes skills only as a list to MATCH against spans somebody else "
                 "already rendered, and there is no framework here to inject a "
-                "prompt fragment into. Nothing offers, so nothing can be routed."
+                "prompt fragment into. Nothing offers, so nothing can be routed. "
+                "C13/C13b are silenced for a sharper reason: the only activation "
+                "channel here is the decimal.active_skills span attribute the USER "
+                "writes, which decimalai.otel reads back — a driver that set it would "
+                "be feeding the suite its own answer and grading itself. N/A is the "
+                "only honest verdict, and it stays N/A even though making this cell "
+                "'green' would be one line."
             ),
         },
     ),

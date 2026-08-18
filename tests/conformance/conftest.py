@@ -2,7 +2,7 @@
 
 One full set of driver phases per session — the runs are the expensive part, the
 grading is not, so every contract item reads the SAME capture rather than
-re-running the framework thirteen times.
+re-running the framework fifteen times.
 
 Each driver's phases run in their OWN process (``isolation.py``), because every
 adapter installs process-global instrumentation that whichever driver went first
@@ -54,7 +54,7 @@ class _Observations(Dict[str, Optional[Observation]]):
     """The captures, with a crashed driver kept LOUD.
 
     A driver whose process died has no capture. Returning ``None`` for it would
-    make every one of its items skip — thirteen quiet skips reading as "not
+    make every one of its items skip — fifteen quiet skips reading as "not
     installed" — so the lookup raises instead, and the driver's name is in the
     message.
     """

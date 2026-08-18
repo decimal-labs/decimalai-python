@@ -466,7 +466,7 @@ def test_no_driver_is_silently_unavailable() -> None:
 
     This closes the one way the hermetic tier can be green and prove nothing. A
     driver whose imports are absent is recorded ``NOT RUN`` in the matrix and its
-    thirteen items SKIP — so a CI job that forgot half the framework installs is
+    fifteen items SKIP — so a CI job that forgot half the framework installs is
     indistinguishable, at the exit code, from one where every adapter passed.
 
     Opt-in, via ``DECIMAL_CONFORMANCE_REQUIRE_ALL=1``, because the honest answer

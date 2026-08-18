@@ -339,7 +339,11 @@ DRIVER = Driver(
                 "the adapter has no skills rail — the docs page says so in words "
                 "(\"No skills rail on this adapter yet\") and the capability table "
                 "records ADK's skills-rail column as '—'. Skills reach an ADK agent "
-                "only by hand, via SkillRouter.build_prompt_fragment()"
+                "only by hand, via SkillRouter.build_prompt_fragment(). This silences "
+                "the activation items (C13/C13b) as well as C8: with nothing offered "
+                "and no loader tool, there is no model action that could constitute an "
+                "activation, and recording one from prompt presence would be a "
+                "fabrication."
             ),
         },
     ),

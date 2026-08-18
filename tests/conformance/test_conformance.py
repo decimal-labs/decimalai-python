@@ -1,7 +1,7 @@
 """contract items × drivers, plus the guards that keep the suite honest.
 
 The parametrisation is the whole design in one line: every framework is graded
-by the SAME thirteen functions. Nothing here knows what a framework is.
+by the SAME fifteen functions. Nothing here knows what a framework is.
 
 The *coverage* guards — "does every framework the product advertises have a
 driver at all?" — live next door in ``test_coverage.py``, because they answer a

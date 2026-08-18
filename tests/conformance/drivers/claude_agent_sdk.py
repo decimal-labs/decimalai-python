@@ -285,7 +285,12 @@ DRIVER = Driver(
                 "prompt-assembly time, so there is no routing_id and no offered set for a "
                 "trace to carry — the rail C8 grades does not exist here. The install side "
                 "(SkillRouter.install(agents=['claude-code']) writing SKILL.md) is a "
-                "filesystem operation this adapter never sees."
+                "filesystem operation this adapter never sees. It silences the "
+                "activation items (C13/C13b) for the same reason the docs give: a disk "
+                "skill produces no offered set, so nothing here could be joined to a "
+                "routing decision, and the adapter maps no Skill tool use onto an "
+                "activation today — recording one from prompt presence would be a "
+                "fabrication."
             ),
         },
     ),

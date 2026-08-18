@@ -28,18 +28,26 @@ C9          N concurrent runs produce N uncontaminated traces
 C10         a failing run produces exactly ONE trace, marked errored
 C11         a run writes nothing into the working directory
 C12         when the adapter cannot do what was asked, it says so
+C13         nothing is recorded as activated that the model did not ask for
+C13b        a body the model DID pull is not silently dropped
 ==========  ==========================================================
 
 C7b is the second clause of C7 ("a degenerate run does not fabricate a breaking
 change") split into its own function so a framework that has no degenerate form
 can declare that one clause N/A without silencing the first.
+
+C13b is the mirror of C13 rather than a clause of it, for the same reason: a
+prompt-injection rail genuinely has no model-initiated body pull to record, and
+must be able to declare that one half N/A without silencing the half that
+forbids fabricating an activation — which applies to every rail there is.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .harness import Observation, Phase
 
@@ -108,6 +116,83 @@ def _rendered_text(trace: Dict[str, Any]) -> str:
     out: List[str] = []
     for call in trace.get("llm_calls") or []:
         _strings(call.get("rendered_input"), out)
+    return "\n".join(out)
+
+
+#: Role stamped on a message that arrived as a bare string, so it carries no
+#: role of its own. Deliberately a name no provider uses, so it can never
+#: collide with a real role and never satisfy a role-scoped clause (C13's
+#: clause 2 in particular: text with no attributable speaker is not evidence
+#: that the MODEL asked for anything).
+UNSTRUCTURED_ROLE = "<unstructured>"
+
+
+def _rendered_messages(trace: Dict[str, Any]) -> List[Any]:
+    """Every message object the model was shown, in order, across all llm_calls.
+
+    Unlike :func:`_rendered_text` this keeps the message boundaries, because
+    "which SPEAKER said this" is the whole difference between a skill being
+    pasted into the system prompt and the model asking for it.
+    """
+    out: List[Any] = []
+    for call in trace.get("llm_calls") or []:
+        rendered = call.get("rendered_input")
+        if isinstance(rendered, (list, tuple)):
+            out.extend(rendered)
+        elif rendered is not None:
+            out.append(rendered)
+    return out
+
+
+def _role_messages(trace: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(role, text)`` per message. ``_rendered_text`` discards the role.
+
+    ``text`` is every string reachable inside the message, joined — so a
+    provider that nests content as ``[{"type": "text", "text": …}]`` is covered,
+    and so is the openai-agents ``{"role": "assistant", "type": "function_call",
+    "name": "load_skill", "content": "{…}"}`` shape.
+
+    A ``rendered_input`` that is a bare string yields ``UNSTRUCTURED_ROLE``: it
+    carries no role, so it can never satisfy a clause that asks who spoke. That
+    is correct, not a gap — an adapter that flattens its prompt to one string
+    has destroyed the evidence, and inferring a role from flattened text is
+    exactly the guess C13 exists to forbid.
+    """
+    out: List[Tuple[str, str]] = []
+    for msg in _rendered_messages(trace):
+        parts: List[str] = []
+        _strings(msg, parts)
+        text = "\n".join(parts)
+        role = (
+            str(msg.get("role", "")).lower() if isinstance(msg, dict)
+            else UNSTRUCTURED_ROLE
+        )
+        out.append((role or UNSTRUCTURED_ROLE, text))
+    return out
+
+
+def _tool_call_entries(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every ``llm_calls[].tool_calls[]`` entry — the model's own tool requests."""
+    out: List[Dict[str, Any]] = []
+    for call in trace.get("llm_calls") or []:
+        for entry in call.get("tool_calls") or []:
+            if isinstance(entry, dict):
+                out.append(entry)
+    return out
+
+
+def _tool_spans(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Spans recording a tool execution."""
+    return [
+        s for s in (trace.get("spans") or [])
+        if isinstance(s, dict) and s.get("span_type") == "tool"
+    ]
+
+
+def _flat(value: Any) -> str:
+    """Every string inside ``value``, joined — for searching a nested preview."""
+    out: List[str] = []
+    _strings(value, out)
     return "\n".join(out)
 
 
@@ -616,6 +701,307 @@ def c12_loud_failure(obs: Observation) -> Result:
     return _pass(item, title, "no silent no-ops")
 
 
+# ── activation (C13, C13b) ───────────────────────────────────────────────────
+#
+# The three rungs of the skills ladder are OFFERED (the menu row was in the
+# prompt), DELIVERED (the body reached the model) and ACTIVATED (the model
+# actually asked for it). C8 grades the first two. These two grade the third,
+# from opposite sides: C13 forbids recording an activation the model never
+# asked for, C13b forbids dropping one it did.
+#
+# Asymmetry is deliberate. A fabricated activation is strictly worse than a
+# missing one: it is indistinguishable downstream from a real one, it becomes a
+# TraceSkillActivation row, it feeds router_activated_count and the activation
+# rate the product reports, and it is blended back into ranking — so a skill
+# that was merely pasted into a prompt gets PROMOTED over one that was used.
+# An omission only under-reports. When only one of the two can hold, C13 wins.
+#
+# The ceiling is stated rather than hidden: the strongest thing any of this
+# proves is that the MODEL ASKED FOR THE BODY. A model can pull a body and
+# ignore it. Neither item claims the skill changed the output.
+
+#: Roles whose text is never evidence of activation. A body in a system or
+#: developer message is the router DELIVERING it; a name in a user message is
+#: the user typing it. Counting either promotes a rung the model never climbed.
+_NOT_EVIDENCE_ROLES = ("system", "developer", "user", "human")
+
+#: Roles a tool RESULT arrives under. This message exists only because
+#: something asked for it, which is why it counts where a system message does not.
+_TOOL_RESULT_ROLES = ("tool", "function")
+
+
+def _activated_names(trace: Dict[str, Any]) -> set:
+    """The activation set the platform will actually persist for this trace.
+
+    Both wire fields, unioned and deduped by name — which is precisely what the
+    backend does before writing ``TraceSkillActivation`` rows. Grading
+    ``active_skills`` alone would grade a field; this grades the number.
+    """
+    names = {
+        (e.get("name") if isinstance(e, dict) else e)
+        for e in (trace.get("active_skills") or [])
+    }
+    names |= set(trace.get("skills_loaded_by_agent") or [])
+    return {n for n in names if isinstance(n, str) and n.strip()}
+
+
+def _body_signature(body: str) -> str:
+    """A short string that appears in this skill's body and in no menu row.
+
+    The longest line, capped. Menu rows carry the NAME and the description; only
+    a delivered or loaded body carries the prose. Using the name alone would
+    make a menu row look like a body, which is the exact confusion these items
+    exist to prevent.
+    """
+    lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
+    return max(lines, key=len)[:40] if lines else ""
+
+
+def _activation_evidence(trace: Dict[str, Any], name: str, sig: str) -> List[str]:
+    """Every model-initiated channel in THIS trace that asked for ``name``.
+
+    Per-trace on purpose. C8's delivered check is phase-level, so a rail that
+    leaked a loaded name between two concurrent runs still satisfies it; here
+    the corroboration has to live in the same payload as the claim.
+
+    Four accepted forms, strongest last-resort first:
+
+    * a tool/function-role message carrying the body signature — the tool RESULT
+      coming back. The only form present on every tool loop, which is why it is
+      accepted at all;
+    * a tool span that names the skill on the way IN and returns the body on the
+      way OUT;
+    * a ``tool_calls`` entry whose arguments name the skill — the model's own output;
+    * an assistant ``function_call`` message naming it — likewise.
+
+    NOT evidence, ever: the name or the body appearing in a system, developer or
+    user message. That is the router delivering, or the user typing. Several
+    channels are accepted rather than one because they differ per framework
+    (openai-agents has the span and the function_call but no ``tool_calls``;
+    pydantic-ai has ``tool_calls`` but no tool span), and because an item that
+    hardcodes one channel breaks the day an adapter legitimately changes it.
+    """
+    found: List[str] = []
+    if sig and any(
+        role in _TOOL_RESULT_ROLES and sig in text
+        for role, text in _role_messages(trace)
+    ):
+        found.append("tool-role body")
+    for span in _tool_spans(trace):
+        if not sig:
+            break
+        if name in _flat(span.get("input_preview")) and sig in _flat(
+            span.get("output_preview")
+        ):
+            found.append(f"{span.get('name') or 'tool'} span input+output")
+            break
+    for entry in _tool_call_entries(trace):
+        args = entry.get("args") if "args" in entry else entry.get("arguments")
+        if name in _flat(args):
+            found.append("model tool_call args")
+            break
+    for msg in _rendered_messages(trace):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "assistant":
+            continue
+        if str(msg.get("type", "")).lower() != "function_call":
+            continue
+        if name in _flat(msg):
+            found.append("assistant function_call")
+            break
+    return found
+
+
+def _served_bodies(phase: Phase) -> set:
+    """Skills whose body the probe's router actually handed over on this rail."""
+    return {
+        r.path.rsplit("/", 2)[-2]
+        for r in phase.requests
+        if r.method == "GET" and r.path.endswith("/body") and r.accepted
+    }
+
+
+def c13_skills_activation(obs: Observation) -> Result:
+    """Nothing is recorded as activated that the model did not itself ask for."""
+    item, title = "C13", "skills_activation"
+    phase = obs.phase("skills")
+    traces = phase.attempted
+    if not traces:
+        return _fail(
+            item, title,
+            "the skills-rail run produced no trace at all — activation cannot be "
+            "graded because nothing reached the wire",
+        )
+    bodies = {s["name"]: s.get("body", "") for s in obs.probe.skills}
+    offered_by_probe = set(bodies)
+    sigs = {n: _body_signature(b) for n, b in bodies.items()}
+    served = _served_bodies(phase)
+    never_served = offered_by_probe - served
+
+    problems: List[str] = []
+    activated_total: set = set()
+    per_trace: List[int] = []
+    forms: List[str] = []
+
+    for t in traces:
+        activated = _activated_names(t)
+        per_trace.append(len(activated))
+        activated_total |= activated
+        recorded_offered = set(t.get("skills_offered_in_prompt") or [])
+        roles = _role_messages(t)
+
+        for name in sorted(activated):
+            # ── clause 1: offered first ──────────────────────
+            if name not in recorded_offered:
+                problems.append(
+                    f"{name} is recorded as activated but is not in this trace's "
+                    f"skills_offered_in_prompt ({sorted(recorded_offered)}) — an "
+                    f"activation the router never offered can never join a "
+                    f"routing_decision, so it inflates the activated numerator "
+                    f"against an offered denominator that does not contain it"
+                )
+            if name not in offered_by_probe:
+                problems.append(
+                    f"{name} is recorded as activated but the router never offered it "
+                    f"at all — it offered {sorted(offered_by_probe)}"
+                )
+
+            # ── clause 2: model-initiated evidence, in THIS trace ──
+            sig = sigs.get(name, "")
+            found = _activation_evidence(t, name, sig)
+            if found:
+                forms.extend(found)
+                continue
+            where = sorted(
+                {
+                    role for role, text in roles
+                    if name in text or (sig and sig in text)
+                }
+            )
+            if where:
+                seen = (
+                    f"the only place it appears in this trace is a "
+                    f"{'/'.join(where)}-role message: that is "
+                    f"{'DELIVERED' if any(r in _NOT_EVIDENCE_ROLES for r in where) else 'PRESENT'}"
+                    f", not activated"
+                )
+            else:
+                seen = "it appears nowhere in this trace's messages at all"
+            problems.append(
+                f"{name} is recorded as activated but nothing in this trace shows the "
+                f"MODEL asking for it — no tool-role message carrying its body, no tool "
+                f"span naming it, no tool_call argument, no assistant function_call; "
+                f"{seen}"
+            )
+
+        # ── clause 4: hash fidelity ──────────────────────────
+        for entry in t.get("active_skills") or []:
+            if not isinstance(entry, dict):
+                continue
+            name, digest = entry.get("name"), entry.get("hash")
+            if not name or not digest or name not in served:
+                continue
+            expected = hashlib.sha256(
+                (bodies.get(name) or "").encode("utf-8")
+            ).hexdigest()
+            got = str(digest)
+            # The prefix is an encoding detail the SDK normalises in both
+            # directions; the DIGEST is the thing that resolves a version.
+            got_bare = got[len("sha256:"):] if got.startswith("sha256:") else got
+            if got_bare != expected:
+                problems.append(
+                    f"{name} is recorded as activated with hash {got!r}, but the body "
+                    f"the router served hashes to sha256:{expected} — a wrong hash "
+                    f"resolves the activation to a skill VERSION that never ran, "
+                    f"silently misattributing per-version effectiveness"
+                )
+
+    # ── clause 3: never-served control ───────────────────────
+    # conformance-skill-beta is offered on every lane and its body is served on
+    # none, so any offered→activated promotion shows up here with no fixture change.
+    fabricated = sorted(activated_total & never_served)
+    if fabricated:
+        problems.append(
+            f"{fabricated} recorded as activated although the router never served a "
+            f"body for them on this rail (offered {sorted(offered_by_probe)}, served "
+            f"{sorted(served)}) — an offered menu row promoted to an activation"
+        )
+
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    if not activated_total:
+        return _pass(
+            item, title,
+            f"{len(traces)} rail run(s) recorded NO activation; correct for a "
+            f"prompt-injection rail, where the strongest observable rung is delivered",
+        )
+    counts = set(per_trace)
+    shape = (
+        f"{counts.pop()} activation each" if len(counts) == 1
+        else f"{sum(per_trace)} activations across the phase"
+    )
+    return _pass(
+        item, title,
+        f"{len(traces)} run(s), {shape} ({sorted(activated_total)}), corroborated by "
+        f"{' + '.join(sorted(set(forms)))}",
+    )
+
+
+def c13b_skills_activation_recorded(obs: Observation) -> Result:
+    """The mirror of C13: a body the model DID pull is not silently dropped.
+
+    C13 stops a rung being invented. This stops one being lost. A model-initiated
+    body pull that never reaches ``active_skills`` / ``skills_loaded_by_agent``
+    biases effectiveness the other way — a skill that was genuinely used scores
+    as though it were never touched.
+    """
+    item, title = "C13b", "skills_activation_recorded"
+    phase = obs.phase("skills")
+    traces = phase.attempted
+    if not traces:
+        return _fail(
+            item, title,
+            "the skills-rail run produced no trace at all — a dropped activation "
+            "cannot be graded because nothing reached the wire",
+        )
+    bodies = {s["name"]: s.get("body", "") for s in obs.probe.skills}
+    sigs = {n: _body_signature(b) for n, b in bodies.items()}
+
+    problems: List[str] = []
+    pulled_total: set = set()
+    for t in traces:
+        activated = _activated_names(t)
+        pulled = {
+            name
+            for role, text in _role_messages(t)
+            if role in _TOOL_RESULT_ROLES
+            for name, sig in sigs.items()
+            if sig and sig in text
+        }
+        pulled_total |= pulled
+        missing = sorted(pulled - activated)
+        if missing:
+            problems.append(
+                f"the model pulled the body of {missing} into this run — it comes back "
+                f"in a tool-role message — but the trace records "
+                f"{sorted(activated) or 'nothing'} as activated; a real activation "
+                f"dropped on the floor under-reports the skill that was actually used"
+            )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    if not pulled_total:
+        return _pass(
+            item, title,
+            f"{len(traces)} rail run(s), no model-initiated body pull to record",
+        )
+    return _pass(
+        item, title,
+        f"{len(traces)} rail run(s): every body the model pulled "
+        f"({sorted(pulled_total)}) is recorded as activated",
+    )
+
+
 # ── registry ─────────────────────────────────────────────────────────────────
 
 ITEMS: Dict[str, Callable[[Observation], Result]] = {
@@ -632,6 +1018,8 @@ ITEMS: Dict[str, Callable[[Observation], Result]] = {
     "C10": c10_error_path,
     "C11": c11_no_side_effects,
     "C12": c12_loud_failure,
+    "C13": c13_skills_activation,
+    "C13b": c13b_skills_activation_recorded,
 }
 
 #: Display order — dict order is insertion order, but be explicit.

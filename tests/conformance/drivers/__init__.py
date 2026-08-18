@@ -142,10 +142,14 @@ STUB_MODEL_NAME = "conformance-stub-1"
 #: driver author sees the cost of turning a flag off: the items it silences.
 CAPABILITY_ITEMS: Mapping[str, Tuple[str, ...]] = {
     "has_tools": ("C5",),
-    "has_skills_rail": ("C8",),
+    "has_skills_rail": ("C8", "C13", "C13b"),
     "supports_concurrency": ("C9",),
     "supports_error_path": ("C10",),
     "supports_degenerate": ("C7b",),
+    # Ordered AFTER has_skills_rail on purpose: na_reason() returns the FIRST
+    # False flag that gates the item, so a framework with no rail at all keeps
+    # printing its rail reason for C13b instead of needing a second one.
+    "model_can_load_skill_bodies": ("C13b",),
 }
 
 
@@ -164,6 +168,13 @@ class Capabilities:
     # explicit, reasoned act rather than something you get by not typing it.
     has_tools: bool = True
     has_skills_rail: bool = True
+    #: Whether the MODEL can ask this adapter for a skill body mid-turn (the
+    #: native ``load_skill`` tool). False on a prompt-injection-only rail, where
+    #: the strongest observable rung is *delivered* and there is no model action
+    #: for C13b to find. It does NOT silence C13: forbidding a fabricated
+    #: activation applies to every rail, and a rail with no loader is exactly
+    #: where a delivered body is most likely to be promoted to an activation.
+    model_can_load_skill_bodies: bool = True
     supports_concurrency: bool = True
     supports_error_path: bool = True
     supports_degenerate: bool = True

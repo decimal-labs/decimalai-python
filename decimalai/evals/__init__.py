@@ -613,6 +613,20 @@ def trace_to_trace_data(trace: Any) -> TraceData:
         agent_name=d.get("agent_name", ""),
         manifest_id=str(d["manifest_id"]) if d.get("manifest_id") else None,
         metadata=d.get("metadata") or {},
+        # Declared on TraceData and documented for custom evaluators to read,
+        # but never assigned here — so every evaluator that read it got [] and
+        # silently graded as though no skill had ever been active. Faithful to
+        # the payload and nothing more: entries may be {"name": …, "hash": …}
+        # or bare strings, and only `active_skills` is mirrored. Names the model
+        # PULLED live in `skills_loaded_by_agent`, which TraceData has no view
+        # of; folding them in here would make a field called "active" mean two
+        # different things across SDK versions and destroy the property that an
+        # entry in it is an explicit assertion rather than an inference.
+        active_skills=[
+            e.get("name") if isinstance(e, dict) else e
+            for e in (d.get("active_skills") or [])
+            if (e.get("name") if isinstance(e, dict) else e)
+        ],
     )
 
 

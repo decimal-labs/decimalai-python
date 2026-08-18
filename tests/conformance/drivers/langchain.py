@@ -185,8 +185,25 @@ DRIVER = Driver(
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,
+        model_can_load_skill_bodies=False,
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=True,
+        reasons={
+            "model_can_load_skill_bodies": (
+                "this rail is prompt-injection only. enable_load_skill_tool is accepted "
+                "but DORMANT on this adapter — decimalai/langchain.py logs "
+                "'enable_load_skill_tool is not supported on the langchain adapter "
+                "(invoke-layer patch, no tool loop); staying on prompt injection. Use "
+                "openai_agents or pydantic_ai for the native load_skill tool' — because "
+                "an invoke-layer patch cannot route a tool result back mid-turn. The "
+                "model therefore has no way to ASK for a body, so the strongest rung "
+                "observable here is DELIVERED, and delivery is not activation. "
+                "snippets/silent-noops.mdx already says it: 'activation isn't measurable "
+                "for bare prompt-injection usage.' C13 still applies and is graded: with "
+                "no loader, a delivered body is exactly what is most likely to be "
+                "promoted to a fabricated activation."
+            ),
+        },
     ),
 )

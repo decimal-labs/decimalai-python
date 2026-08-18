@@ -264,9 +264,22 @@ run*.
 | C10 `error_path` | a failing run produces exactly one trace, marked errored |
 | C11 `no_side_effects` | nothing written into the working directory |
 | C12 `loud_failure` | a phase that emits nothing, or a trace the backend refuses, is never silent |
+| C13 `skills_activation` | nothing is recorded as activated that the model did not itself ask for |
+| C13b `skills_activation_recorded` | a body the model *did* pull is not silently dropped |
 
 C7b is the second clause of C7, split out so a framework with no degenerate form
 can declare that one clause N/A without silencing the first.
+
+C13 and C13b grade the third rung of the skills ladder — *offered*, *delivered*,
+*activated* — from opposite sides, and the asymmetry is deliberate. A fabricated
+activation is strictly worse than a missing one: downstream it is
+indistinguishable from a real one, it becomes a `TraceSkillActivation` row, and
+it is blended back into ranking, so a skill that was merely pasted into a prompt
+gets promoted over one that was used. C13 therefore applies to every rail; C13b
+is declared N/A on a prompt-injection-only rail, where the model has no way to
+ask for a body at all. Neither claims more than it measures: the strongest thing
+either proves is that the model **asked for the body**, not that the skill
+changed the output.
 
 Exact token counts are **not** asserted here — a stub model's numbers are
 arbitrary. Presence and plausibility are Tier A's job; exact counts are Tier B's.
@@ -433,7 +446,8 @@ Stated so nobody mistakes a green cell for a guarantee.
 - **Tool-call argument fidelity.** Nothing asserts that
   `llm_calls[].tool_calls[].args` is the argument dict the model produced. On
   LangChain it is currently `{"input": "{'query': '…'}"}` — the dict
-  stringified under an invented key. Worth a C13; deliberately out of v1 scope.
+  stringified under an invented key. Worth a C14; deliberately out of v1 scope.
+  (Renumbered from "C13", which now names the activation item above.)
 - **Exact token counts, cost, latency.** Tier B's job.
 - **Cross-driver isolation.** Fixed: each driver's phases now run in their own
   process (see [One driver, one process](#one-driver-one-process)), so a late

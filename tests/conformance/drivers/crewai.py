@@ -235,7 +235,10 @@ DRIVER = Driver(
                 "records '—' for it, there is no loader tool and no prompt-fragment "
                 "injection point, and the OTel exporter underneath can only MATCH skill "
                 "text somebody else already rendered into the prompt. Nothing offers, so "
-                "no routing_id can exist."
+                "no routing_id can exist — and with no loader tool there is no model "
+                "action that could constitute an activation either, so C13/C13b are "
+                "silenced too. Matching text somebody else rendered and calling the "
+                "result an activation would be a fabrication."
             ),
             "supports_degenerate": (
                 "CrewAI has no model-less run to make. Agent requires an llm, executing a "
