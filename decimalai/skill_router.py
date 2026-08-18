@@ -231,6 +231,61 @@ _body_budget_ctx: ContextVar[Optional[_BodyLoadBudget]] = ContextVar(
 )
 
 
+# ── ambient run scope ───────────────────────────────────────
+#
+# An adapter that OWNS the load_skill tool names its run at the call site —
+# `pydantic_ai` passes `scope=` straight into `load_skill`/`consume_loaded_names`,
+# and that stays the most precise answer available. LangChain cannot: it
+# registers no native load_skill tool, so the call comes from arbitrary
+# user-supplied tool code with no `scope=` to pass, and the trace-send path
+# runs under `copy_context()` where a ContextVar the tool wrote is invisible.
+#
+# A resolver closes that gap without the Router importing any framework: the
+# adapter registers a callable that answers "which run is executing right
+# now?" using the framework's OWN run identity (LangChain reads the run id off
+# `var_child_runnable_config`), and the Router files its per-run rails under
+# that key. Every resolver must be cheap, must never raise, and must answer
+# None when no run of its framework is on the stack — None simply means "no
+# scoped rail", which is exactly today's behaviour.
+_ambient_scope_resolvers: List[Any] = []
+_ambient_scope_lock = Lock()
+
+
+def register_ambient_scope_resolver(resolver: Any) -> None:
+    """Register a callable that names the run currently executing, or None.
+
+    Idempotent per callable, so an adapter can call it from module import
+    and from `instrument()` without stacking duplicates.
+    """
+    if not callable(resolver):
+        return
+    with _ambient_scope_lock:
+        if resolver not in _ambient_scope_resolvers:
+            _ambient_scope_resolvers.append(resolver)
+
+
+def _ambient_scope() -> Optional[str]:
+    """The scope key of the run executing right now, or None.
+
+    First non-None answer wins. A resolver that raises is skipped rather
+    than allowed to break a routing call or a body load — rail bookkeeping
+    must never be able to fail a user's model call.
+    """
+    # Read without the lock: this runs on every routing call and every body
+    # load, registration happens once at adapter import, and a list append is
+    # atomic — the worst a race can do is miss a resolver that is being
+    # registered at this instant, which reads as "no scope" for one call.
+    for resolver in _ambient_scope_resolvers:
+        try:
+            scope = resolver()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("ambient scope resolver failed (non-fatal)", exc_info=True)
+            continue
+        if isinstance(scope, str) and scope:
+            return scope
+    return None
+
+
 # In-process LRU cache for `build_prompt_fragment` results.
 # Bounded size so a chat session running many distinct queries can't
 # blow memory; TTL short so a freshly-published skill shows up in the
@@ -585,6 +640,29 @@ class SkillRouter:
         self._routing_id_rail: Optional[str] = None
         self._offered_names_rail: List[str] = []
         self._delivered_names_rail: List[str] = []
+        # Per-run twin of the three rails above, the same shape and the same
+        # discipline as `_scoped_loaded_names`. Without it a scoped adapter
+        # could keep its LOADS apart from a concurrent run's but not its
+        # ROUTING DECISION, and a run that captured nothing of its own still
+        # claimed whichever routing_id and offered set were lying on the
+        # shared slot — measured: a LangChain trace with zero LLM calls
+        # reporting another run's routing_id and its full offered set.
+        # scope -> {"routing_id": str|None, "offered": [...], "delivered": [...]}
+        self._scoped_routing_rails: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Provenance for the UNSCOPED rails above: which runs wrote the
+        # content sitting on them right now. The rails themselves carry none —
+        # that IS the defect they are known for — so a reader had no way to
+        # tell "my own names, written from a context that could not reach me"
+        # apart from "somebody else's names". With this it can: an adapter
+        # asks `unscoped_rail_owners()` and drops the values if any owner is
+        # not one of its own scopes. Cleared automatically the moment all four
+        # unscoped rails are empty, so it describes only undrained content.
+        self._unscoped_rail_owners: "OrderedDict[str, None]" = OrderedDict()
+        # One lock for every per-scope store. `otel._skill_rails` and
+        # `openai_agents._run_rails` both take one; these did not, and the
+        # `get` -> `move_to_end` -> `popitem` sequences below are not atomic.
+        # Never held across a network call or a resolver callback.
+        self._rail_lock = Lock()
         # Full-menu cache (single slot, force-refresh to invalidate).
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
@@ -911,10 +989,22 @@ class SkillRouter:
         # trace-send); the generic call below only reaches a native
         # @decimalai.trace context, which is absent under the adapters —
         # there it raises and the load would otherwise go unrecorded.
-        if name not in self._loaded_names:
-            self._loaded_names.append(name)
-        if scope is not None:
-            self._record_scoped_load(scope, name)
+        with self._rail_lock:
+            if name not in self._loaded_names:
+                self._loaded_names.append(name)
+        # An explicit `scope=` wins; failing that, ask the adapters which run
+        # is executing. LangChain registers no load_skill tool of its own, so
+        # its loads arrive from user tool code that has no scope to pass —
+        # without the ambient answer the load lands ONLY on the shared slot,
+        # and whichever concurrent trace sends first takes it. The BUDGET
+        # deliberately does not consult the resolver: budgets are per TURN and
+        # keyed by the caller's own run key, while a resolver answers with the
+        # framework's finest-grained live run id, so charging against it would
+        # silently reset the per-turn caps mid-run.
+        rail_scope = scope if scope is not None else _ambient_scope()
+        self._note_unscoped_writer(rail_scope)
+        if rail_scope is not None:
+            self._record_scoped_load(rail_scope, name)
         try:
             from .generic import log_skill_loaded
             log_skill_loaded(name=name)
@@ -926,14 +1016,43 @@ class SkillRouter:
     # Cap on how many concurrent runs keep their own turn budget. Runs are
     # short; anything past this is a leak, so evict oldest-first.
     _MAX_SCOPED_BUDGETS = 64
+    # Separate, larger cap for the per-scope RAILS. A budget key is minted
+    # once per turn by an adapter that names its own run, so 64 keys is 64
+    # concurrent runs. A rail key can be finer: LangChain scopes by the
+    # LangChain run id visible where the write happens, and one graph run
+    # writes under several of them (the agent node routes, the tools node
+    # loads). Sized to match `otel._SKILL_RAIL_MAX` so an eviction here means
+    # the same thing it means there.
+    # 4096, not 256. One RUN holds one rail scope per node that writes, so a
+    # graph that loads from several tool nodes multiplies keys per run — 256
+    # was reachable by a few dozen concurrent runs, and eviction here drops a
+    # TRUE activation from a run still in flight. These entries are a handful of
+    # short strings each; the memory is not the constraint, and losing a real
+    # observation is much more expensive than holding it.
+    #
+    # Eviction is still possible, so it is no longer SILENT: _evict_rail_overflow
+    # warns. A skills rail that quietly empties under load is exactly the failure
+    # this rung was rebuilt to remove.
+    _MAX_SCOPED_RAILS = 4096
+
+    def _evict_rail_overflow(self, store: Any, what: str) -> None:
+        """Drop the oldest entry and say so. Callers hold ``_rail_lock``."""
+        scope, _ = store.popitem(last=False)
+        logger.warning(
+            "skill rail overflow: evicted the %s rail for scope %r after %d live "
+            "scopes. A run still in flight loses its recorded skill activity. "
+            "Raise SkillRouter._MAX_SCOPED_RAILS if this recurs.",
+            what, scope, self._MAX_SCOPED_RAILS,
+        )
 
     def _budget_for(self, scope: Optional[str]) -> Optional[_BodyLoadBudget]:
         """This run's turn budget, or the legacy single slot when unscoped."""
         if scope is None:
             return self._last_budget
-        budget = self._scoped_budgets.get(scope)
-        if budget is not None:
-            self._scoped_budgets.move_to_end(scope)
+        with self._rail_lock:
+            budget = self._scoped_budgets.get(scope)
+            if budget is not None:
+                self._scoped_budgets.move_to_end(scope)
         return budget
 
     def _remember_budget(
@@ -943,25 +1062,27 @@ class SkillRouter:
         self._last_budget = budget
         if scope is None:
             return
-        self._scoped_budgets[scope] = budget
-        self._scoped_budgets.move_to_end(scope)
-        while len(self._scoped_budgets) > self._MAX_SCOPED_BUDGETS:
-            self._scoped_budgets.popitem(last=False)
+        with self._rail_lock:
+            self._scoped_budgets[scope] = budget
+            self._scoped_budgets.move_to_end(scope)
+            while len(self._scoped_budgets) > self._MAX_SCOPED_BUDGETS:
+                self._scoped_budgets.popitem(last=False)
 
     def _record_scoped_load(self, scope: str, name: str) -> None:
         """Note that THIS run loaded a body. Only reached from `load_skill`,
         and only after the body was actually served — a budget refusal or a
         not-found returns before here, so the rail never names a skill whose
         body did not reach the model."""
-        bucket = self._scoped_loaded_names.get(scope)
-        if bucket is None:
-            bucket = []
-            self._scoped_loaded_names[scope] = bucket
-        if name not in bucket:
-            bucket.append(name)
-        self._scoped_loaded_names.move_to_end(scope)
-        while len(self._scoped_loaded_names) > self._MAX_SCOPED_BUDGETS:
-            self._scoped_loaded_names.popitem(last=False)
+        with self._rail_lock:
+            bucket = self._scoped_loaded_names.get(scope)
+            if bucket is None:
+                bucket = []
+                self._scoped_loaded_names[scope] = bucket
+            if name not in bucket:
+                bucket.append(name)
+            self._scoped_loaded_names.move_to_end(scope)
+            while len(self._scoped_loaded_names) > self._MAX_SCOPED_RAILS:
+                self._evict_rail_overflow(self._scoped_loaded_names, "loaded")
 
     def consume_loaded_names(self, scope: Optional[str] = None) -> List[str]:
         """Read + clear the names whose body `load_skill` served since the
@@ -971,25 +1092,148 @@ class SkillRouter:
 
         Args:
             scope: the RUN whose loads to drain — the same key that run passed
-                to `load_skill`. Scoped drains see ONLY that run's loads, which
-                is what a concurrent fanout needs. Omitting it keeps the legacy
+                to `load_skill`, or that an ambient resolver answered with on
+                its behalf. Scoped drains see ONLY that run's loads, which is
+                what a concurrent fanout needs. Omitting it keeps the legacy
                 shared slot, whose known cost is that concurrent runs sharing
                 one router all drain into whichever trace sends first.
         """
         if scope is not None:
-            drained = self._scoped_loaded_names.pop(scope, None)
+            with self._rail_lock:
+                drained = self._scoped_loaded_names.pop(scope, None)
             return list(drained) if drained else []
-        if not self._loaded_names:
-            return []
-        drained = list(self._loaded_names)
-        self._loaded_names.clear()
+        with self._rail_lock:
+            drained = list(self._loaded_names)
+            self._loaded_names.clear()
+        self._forget_unscoped_owners_if_drained()
         return drained
+
+    def _note_unscoped_writer(self, scope: Optional[str]) -> None:
+        """Record who just wrote the unscoped rails. Takes `_rail_lock`.
+
+        A write with no ambient scope records no owner: it came from outside
+        any run the adapters can name, so it belongs to nobody in particular
+        and stays claimable by whoever drains — the pre-scope behaviour, kept
+        deliberately because there is no better answer available for it.
+        """
+        if scope is None:
+            return
+        with self._rail_lock:
+            self._unscoped_rail_owners[scope] = None
+            self._unscoped_rail_owners.move_to_end(scope)
+            # Only reachable if nothing ever drains the unscoped rails; evict
+            # oldest-first rather than grow. An evicted owner reads as
+            # "unowned", which is the pre-scope behaviour for that entry.
+            while len(self._unscoped_rail_owners) > self._MAX_SCOPED_RAILS:
+                self._unscoped_rail_owners.popitem(last=False)  # provenance only, not data
+
+    def _forget_unscoped_owners_if_drained(self) -> None:
+        """Drop the provenance once the content it describes is gone.
+
+        Self-maintaining: no adapter has to remember to clear it, and it can
+        never describe rails that have already been handed to a trace.
+        """
+        with self._rail_lock:
+            if not (
+                self._loaded_names
+                or self._offered_names_rail
+                or self._delivered_names_rail
+                or self._routing_id_rail
+            ):
+                self._unscoped_rail_owners.clear()
+
+    def drain_unscoped_rails_for(
+        self, scopes: Any
+    ) -> Tuple[Optional[str], List[str], List[str], List[str]]:
+        """Take the unscoped rails ONLY if every writer is one of ``scopes``.
+
+        Replaces a peek-then-drain pair that had two defects, both of which put
+        one run's data on another run's trace — the thing the scoped rails exist
+        to stop.
+
+        * NOT ATOMIC. The caller asked who wrote the rails, then drained them in
+          separate lock round-trips. A write landing in that window was taken by
+          the draining trace while the ownership snapshot still said "clear".
+        * UNOWNED READ AS OWNED. The check was ``owners - scopes``, which is
+          empty both when every writer is ours AND when there is NO writer at
+          all. A ``load_skill`` issued from a plain thread — outside any run the
+          resolver can name — records no owner, so the next trace to drain
+          claimed it as its own activation.
+
+        Ownership is now REQUIRED, not merely un-contradicted: no owner means no
+        claim. And when the rails are not ours they are LEFT IN PLACE rather
+        than drained-and-discarded, because discarding is how the original bug
+        lost the true activation from the run that earned it.
+        """
+        wanted = set(scopes or ())
+        with self._rail_lock:
+            owners = set(self._unscoped_rail_owners)
+            # UNOWNED rails are still claimable, and that is a deliberate
+            # trade rather than an oversight. Requiring an owner was tried and
+            # reverted: the documented "assemble the fragment yourself, then
+            # invoke" pattern calls build_prompt_fragment OUTSIDE any runnable,
+            # so no resolver can name a run for it, and four regression tests —
+            # guarding a real reported failure where the trace shipped a NULL
+            # routing_id — went red.
+            #
+            # The residual is narrow and worth stating: a load_skill issued from
+            # a plain thread, concurrent with a run, is unowned and the run may
+            # claim it. Closing that means giving the outside-a-run pattern an
+            # owner of its own, which is the real fix and is not this change.
+            # Breaking a documented path to close a narrow race is the worse
+            # trade.
+            if owners - wanted:
+                return None, [], [], []
+            routing_id = self._routing_id_rail
+            offered = list(self._offered_names_rail or [])
+            delivered = list(self._delivered_names_rail or [])
+            loaded = list(self._loaded_names or [])
+            self._routing_id_rail = None
+            if self._offered_names_rail:
+                self._offered_names_rail.clear()
+            if self._delivered_names_rail:
+                self._delivered_names_rail.clear()
+            self._loaded_names.clear()
+            self._unscoped_rail_owners.clear()
+        return routing_id, offered, delivered, loaded
+
+    def unscoped_rail_owners(self) -> List[str]:
+        """The scopes that wrote whatever is currently on the unscoped rails.
+
+        A PEEK, not a drain — the caller reads it to decide whether the
+        unscoped values are safe to use, and the answer must survive until it
+        has actually drained them.
+        """
+        with self._rail_lock:
+            return list(self._unscoped_rail_owners)
+
+    def _scoped_rail(self, scope: str) -> Dict[str, Any]:
+        """This run's routing-rail bucket, created on first write.
+        Caller holds `_rail_lock`."""
+        bucket = self._scoped_routing_rails.get(scope)
+        if bucket is None:
+            bucket = {"routing_id": None, "offered": [], "delivered": []}
+            self._scoped_routing_rails[scope] = bucket
+        self._scoped_routing_rails.move_to_end(scope)
+        while len(self._scoped_routing_rails) > self._MAX_SCOPED_RAILS:
+            self._evict_rail_overflow(self._scoped_routing_rails, "routing")
+        return bucket
+
+    def _drop_scoped_rail_if_spent(self, scope: str) -> None:
+        """Forget a run's routing rail once all three fields are drained.
+        Caller holds `_rail_lock`. Without this a run whose routing_id was
+        read but whose (empty) name lists never were would keep its entry
+        forever, which is a per-run leak in a long-lived server."""
+        bucket = self._scoped_routing_rails.get(scope)
+        if bucket is not None and not any(bucket.values()):
+            self._scoped_routing_rails.pop(scope, None)
 
     def _record_routing_rails(
         self,
         routing_id: Optional[str],
         offered_names: Optional[List[str]],
         delivered_names: Optional[List[str]],
+        scope: Optional[str] = None,
     ) -> None:
         """Mirror one routing decision onto the instance rails.
 
@@ -997,6 +1241,12 @@ class SkillRouter:
         multi-LLM-call turn routes more than once and the adapter drains
         only at trace-send; `routing_id` is last-write-wins, matching the
         contextvar rails the adapters set per call.
+
+        Written twice: once onto the process-wide slot every existing
+        adapter drains, and — when the run can be named — once more under
+        that run's own scope. The scoped copy is what lets a concurrent
+        adapter answer "what did THIS run route" instead of "what did the
+        singleton see most recently".
         """
         if routing_id:
             self._routing_id_rail = routing_id
@@ -1007,35 +1257,87 @@ class SkillRouter:
             if name not in self._delivered_names_rail:
                 self._delivered_names_rail.append(name)
 
-    def consume_routing_id(self) -> Optional[str]:
+        # Resolve OUTSIDE the lock: a resolver is adapter code.
+        rail_scope = scope if scope is not None else _ambient_scope()
+        if routing_id or offered_names or delivered_names:
+            # Only a write earns an owner — a routing call that surfaced
+            # nothing put nothing on the unscoped rails to be claimed.
+            self._note_unscoped_writer(rail_scope)
+        if rail_scope is None:
+            return
+        with self._rail_lock:
+            bucket = self._scoped_rail(rail_scope)
+            if routing_id:
+                bucket["routing_id"] = routing_id
+            for name in offered_names or ():
+                if name not in bucket["offered"]:
+                    bucket["offered"].append(name)
+            for name in delivered_names or ():
+                if name not in bucket["delivered"]:
+                    bucket["delivered"].append(name)
+
+    def consume_routing_id(self, scope: Optional[str] = None) -> Optional[str]:
         """Read + clear the most recent routing id minted since the last
         drain. Adapters fall back to this when their own routing-id
         contextvar comes back empty because prompt assembly ran in a
-        copied context. Same concurrency cost as `consume_loaded_names`.
+        copied context.
+
+        Args:
+            scope: the RUN whose decision to drain. Unscoped keeps the legacy
+                shared slot and its concurrency cost — the first drainer takes
+                it, whoever minted it.
         """
+        if scope is not None:
+            with self._rail_lock:
+                bucket = self._scoped_routing_rails.get(scope)
+                if bucket is None:
+                    return None
+                rid = bucket["routing_id"]
+                bucket["routing_id"] = None
+                self._drop_scoped_rail_if_spent(scope)
+            return rid
         rid = self._routing_id_rail
         self._routing_id_rail = None
+        self._forget_unscoped_owners_if_drained()
         return rid
 
-    def consume_offered_names(self) -> List[str]:
+    def consume_offered_names(self, scope: Optional[str] = None) -> List[str]:
         """Read + clear the names offered (menu rows) since the last drain.
-        The instance-state twin of `consume_last_offered_names`.
+        The instance-state twin of `consume_last_offered_names`. See
+        `consume_routing_id` for what `scope` buys.
         """
-        if not self._offered_names_rail:
-            return []
+        if scope is not None:
+            with self._rail_lock:
+                bucket = self._scoped_routing_rails.get(scope)
+                if bucket is None:
+                    return []
+                drained = list(bucket["offered"])
+                bucket["offered"] = []
+                self._drop_scoped_rail_if_spent(scope)
+            return drained
         drained = list(self._offered_names_rail)
         self._offered_names_rail.clear()
+        self._forget_unscoped_owners_if_drained()
         return drained
 
-    def consume_delivered_names(self) -> List[str]:
+    def consume_delivered_names(self, scope: Optional[str] = None) -> List[str]:
         """Read + clear the names whose BODY the prompt fragment carried
         since the last drain. The instance-state twin of
-        `consume_last_delivered_names`.
+        `consume_last_delivered_names`. See `consume_routing_id` for what
+        `scope` buys.
         """
-        if not self._delivered_names_rail:
-            return []
+        if scope is not None:
+            with self._rail_lock:
+                bucket = self._scoped_routing_rails.get(scope)
+                if bucket is None:
+                    return []
+                drained = list(bucket["delivered"])
+                bucket["delivered"] = []
+                self._drop_scoped_rail_if_spent(scope)
+            return drained
         drained = list(self._delivered_names_rail)
         self._delivered_names_rail.clear()
+        self._forget_unscoped_owners_if_drained()
         return drained
 
     def get_menu_prompt(
@@ -1156,7 +1458,9 @@ class SkillRouter:
                 _last_delivered_names_ctx.set(
                     list(delivered_names) if delivered_names else None
                 )
-                self._record_routing_rails(routing_id, offered_names, delivered_names)
+                self._record_routing_rails(
+                    routing_id, offered_names, delivered_names, scope=scope,
+                )
                 _stamp_active_trace(routing_id, offered_names, delivered_names)
                 return fragment, routing_id
 
@@ -1249,7 +1553,9 @@ class SkillRouter:
         # Mirror onto the instance rails before stamping — the adapters
         # whose contextvars never reach trace-send read the routing
         # telemetry off the router itself.
-        self._record_routing_rails(routing_id, offered_names, delivered_names)
+        self._record_routing_rails(
+            routing_id, offered_names, delivered_names, scope=scope,
+        )
 
         # Stamp the active generic trace (raw-loop quickstart) —
         # adapter paths stamp their own trace objects, so this is a no-op

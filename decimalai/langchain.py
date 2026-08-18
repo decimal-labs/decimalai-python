@@ -187,6 +187,20 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+# One model call's identity, as a Router rail scope key. Minted by
+# `_open_call_rails` and read back by `_capture_call_rails` in the same
+# Context, so it names the call rather than merely being recent.
+#
+# It exists for the one case LangChain's own run ids cannot cover: a bare
+# `llm.invoke()` injects its skills BEFORE the callback manager has minted a
+# run id, so `_ambient_run_scope` has nothing else to answer with, and a
+# routing decision filed under no owner at all is one a concurrent run could
+# claim.
+_call_scope_ctx: ContextVar[Optional[str]] = ContextVar(
+    "decimalai_skill_router_call_scope_langchain", default=None,
+)
+
+
 def _open_call_rails() -> tuple:
     """Start ONE model call's skills rails, and return the reset tokens.
 
@@ -209,13 +223,16 @@ def _open_call_rails() -> tuple:
         _routing_id_ctx.set(None),
         _skills_offered_ctx.set(None),
         _skills_delivered_ctx.set(None),
+        _call_scope_ctx.set(uuid4().hex),
     )
 
 
 def _close_call_rails(tokens: tuple) -> None:
     """End the model call started by `_open_call_rails`."""
     for var, token in zip(
-        (_routing_id_ctx, _skills_offered_ctx, _skills_delivered_ctx), tokens
+        (_routing_id_ctx, _skills_offered_ctx, _skills_delivered_ctx,
+         _call_scope_ctx),
+        tokens,
     ):
         try:
             var.reset(token)
@@ -335,8 +352,100 @@ def _clean_names(names: Any) -> List[str]:
     return [n for n in names if isinstance(n, str) and n.strip()]
 
 
+# Resolved once. `_ambient_run_scope` runs on every routing call and every
+# body load, so the import lookup does not belong inside it. `False` means
+# "looked and it isn't there" — distinct from `None`, which is the unresolved
+# state.
+_lc_config_var_cache: Any = None
+
+
+def _lc_config_var() -> Any:
+    """LangChain's own per-runnable config ContextVar, or None."""
+    global _lc_config_var_cache
+    if _lc_config_var_cache is None:
+        try:
+            from langchain_core.runnables.config import var_child_runnable_config
+            _lc_config_var_cache = var_child_runnable_config
+        except Exception:  # pragma: no cover - langchain-core not installed
+            _lc_config_var_cache = False
+    return _lc_config_var_cache or None
+
+
+def _ambient_run_scope() -> Optional[str]:
+    """The LangChain run executing right now, as a Router rail scope key.
+
+    This is the write half of the per-run fix. The Router calls it (see
+    ``skill_router.register_ambient_scope_resolver``) whenever it is about
+    to file a routing decision or a body load and the caller passed no
+    ``scope=`` of its own — which on this adapter is always, because
+    LangChain registers no native ``load_skill`` tool and the call arrives
+    from arbitrary user tool code.
+
+    The key is LangChain's OWN run identity, read off the config ContextVar
+    LangChain itself maintains for the currently-executing runnable. That
+    matters twice over: it is set inside the runnable's context, which is
+    exactly where the injection and the tool body run, and every id it can
+    answer with is one this handler has already seen as a callback ``run_id``
+    or ``parent_run_id`` — so ``_drain_scoped_router_rails`` can recognise it
+    as a member of THIS run rather than having to trust that nobody else was
+    writing at the same time.
+
+    It is deliberately NOT the root run id: resolving a root would need a
+    registry of live handlers to look the id up in, and there isn't one. The
+    reader closes that gap instead, by draining every member id it owns.
+
+    When LangChain has no run id yet — a bare ``llm.invoke()`` injects before
+    the callback manager mints one — the per-call token `_open_call_rails`
+    put in this Context answers instead, and `_capture_call_rails` records it
+    on the run it belongs to. Preferring the LangChain id where one exists is
+    deliberate: it is the identity the handler indexes runs by, so it needs
+    no second bookkeeping step to be recognised.
+
+    None means "no LangChain run and no model call on the stack" — Router
+    traffic from outside a run entirely, which no trace can honestly claim.
+    """
+    config_var = _lc_config_var()
+    if config_var is not None:
+        config = config_var.get()
+        if isinstance(config, dict):
+            parent_run_id = getattr(config.get("callbacks"), "parent_run_id", None)
+            if parent_run_id is not None:
+                return str(parent_run_id)
+    return _call_scope_ctx.get()
+
+
+try:  # pragma: no cover - exercised by every scoped-rail test
+    from .skill_router import register_ambient_scope_resolver as _register_scope_resolver
+
+    _register_scope_resolver(_ambient_run_scope)
+except Exception:  # noqa: BLE001 - a Router-less install still traces fine
+    logger.debug("could not register the LangChain ambient scope resolver",
+                 exc_info=True)
+
+
+def _drain_unscoped_rails_for(
+    scopes: "set[str]",
+) -> tuple[Optional[str], List[str], List[str], List[str]]:
+    """Atomic, ownership-required version of :func:`_drain_router_rails`.
+
+    Falls back to the old unconditional drain only for a router object from an
+    older SDK that has no such method — there is no ownership record to consult
+    there, so the pre-existing behaviour is all that is available.
+    """
+    if _skill_router_singleton is None:
+        return None, [], [], []
+    owned = getattr(_skill_router_singleton, "drain_unscoped_rails_for", None)
+    if owned is None:
+        return _drain_router_rails()
+    try:
+        return owned(scopes)
+    except Exception:
+        logger.debug("Ownership-checked rail drain failed", exc_info=True)
+        return None, [], [], []
+
+
 def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
-    """Drain the Router singleton's instance rails —
+    """Drain the Router singleton's UNSCOPED instance rails —
     ``(routing_id, offered, delivered, loaded)``.
 
     The contextvars above stay authoritative wherever they propagate, but
@@ -344,9 +453,16 @@ def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str
     the runnable's context, and LangChain dispatches this handler's
     callbacks under `copy_context()`, so every rail came back empty on a
     run that demonstrably injected a menu. The Router carries the same
-    values as instance state; `build_trace` unions both. Known cost (same
-    as `consume_loaded_names`): concurrent runs sharing one router
-    singleton drain into whichever trace sends first.
+    values as instance state, which is why this drain exists at all.
+
+    These rails are process-wide and clear-on-read, so what comes back here
+    is NOT attributable on its own: under concurrency it is a mix of every
+    live run, and the first trace to drain took every lane's names. Callers
+    must therefore treat the return value as a last resort behind
+    `_drain_scoped_router_rails`, AND must first ask
+    `_unscoped_rail_owners()` whether anything on it was written by a run
+    other than theirs. The drain itself stays unconditional either way — an
+    undrained rail leaks forward into the NEXT trace instead.
     """
     if _skill_router_singleton is None:
         return None, [], [], []
@@ -367,6 +483,116 @@ def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str
         _clean_names(delivered),
         _clean_names(loaded),
     )
+
+
+def _run_scopes(state: "_RunState") -> "set[str]":
+    """Every Router rail scope this run owns.
+
+    Two kinds, and both are provable rather than inferred: the LangChain run
+    ids the handler itself indexed (``member_ids``), and the per-model-call
+    tokens `_capture_call_rails` recorded from inside the call (``rail_scopes``).
+    """
+    return {str(m) for m in state.member_ids} | set(state.rail_scopes)
+
+
+def _drain_scoped_router_rails(
+    scopes: "set[str]",
+) -> tuple[Optional[str], List[str], List[str], List[str]]:
+    """Drain the Router rails filed under THIS run's scopes.
+
+    ``_ambient_run_scope`` files each write under whichever LangChain run was
+    executing — the agent node for a routing decision, the tools node for a
+    body load — and every id it can answer with reaches this handler as a
+    callback ``run_id`` or ``parent_run_id``. Draining the whole set is
+    therefore a complete read of this run and, by construction, of nothing
+    else: another run's writes are filed under scopes this run never owned.
+
+    Pop, never peek — the same rule `otel._pop_skill_rail` states: a rail read
+    twice would hand one routing decision to two traces.
+
+    Returns empty on a router that predates the scoped rails (or a caller's
+    stand-in), so the unscoped path below still answers for it.
+    """
+    router = _skill_router_singleton
+    if router is None or not scopes:
+        return None, [], [], []
+    routing_id: Optional[str] = None
+    offered: List[str] = []
+    delivered: List[str] = []
+    loaded: List[str] = []
+    for scope in scopes:
+        try:
+            rid = router.consume_routing_id(scope=scope)
+            offered.extend(_clean_names(router.consume_offered_names(scope=scope)))
+            delivered.extend(_clean_names(router.consume_delivered_names(scope=scope)))
+            loaded.extend(_clean_names(router.consume_loaded_names(scope=scope)))
+        except TypeError:
+            # A router from an older SDK takes no `scope` at all. Nothing is
+            # scoped on it, so there is nothing here to drain.
+            return None, [], [], []
+        except Exception:
+            logger.debug("scoped router-rail drain failed (non-fatal)", exc_info=True)
+            continue
+        if routing_id is None and isinstance(rid, str) and rid:
+            routing_id = rid
+    return routing_id, offered, delivered, loaded
+
+
+def _discard_scoped_router_rails(state: "_RunState") -> None:
+    """Release the Router rails of a run that will never build a trace.
+
+    Reached from the eviction path, `_reset_state`, and the `finally` in
+    `_close_run` (so an errored run is covered too). Without it a run whose
+    end callback never arrived would leave its entries on the process-wide
+    singleton until the LRU pushed them out — one dict entry per abandoned
+    run, which is the shape of a slow leak in a long-lived server.
+    """
+    router = _skill_router_singleton
+    if router is None:
+        return
+    for scope in _run_scopes(state):
+        try:
+            router.consume_routing_id(scope=scope)
+            router.consume_offered_names(scope=scope)
+            router.consume_delivered_names(scope=scope)
+            router.consume_loaded_names(scope=scope)
+        except Exception:
+            return  # an older router keeps nothing scoped to release
+
+
+def _unscoped_rail_owners() -> Optional["set[str]"]:
+    """Which runs wrote the Router's currently-undrained UNSCOPED content.
+
+    This is what makes keeping the unscoped fallback safe rather than merely
+    convenient. The rails themselves carry no provenance — that is the whole
+    defect — but the Router now records the ambient scope of every unscoped
+    write, so a reader can ask "is any of this somebody else's?" instead of
+    guessing.
+
+    Returns None when the router cannot answer (an older SDK, or a caller's
+    stand-in): those carry no scoped rails either, so there is no information
+    to do better with and the caller keeps the pre-scope behaviour.
+
+    A write with no ambient scope at all contributes no owner. That case is
+    Router traffic from outside any LangChain model call or runnable — the
+    generic tracer, another adapter, a `load_skill` at import time — and it
+    stays claimable exactly as it is today, because no run identity exists to
+    prefer over any other.
+    """
+    router = _skill_router_singleton
+    if router is None:
+        return set()
+    peek = getattr(router, "unscoped_rail_owners", None)
+    if not callable(peek):
+        return None
+    try:
+        owners = peek()
+    except Exception:
+        logger.debug("unscoped rail-owner peek failed (non-fatal)", exc_info=True)
+        return None
+    if not isinstance(owners, (list, tuple, set)):
+        return None
+    return {o for o in owners if isinstance(o, str) and o}
 
 
 # ── SkillRouter dynamic loader ──────────────────────────────
@@ -935,7 +1161,8 @@ class _RunState:
     """
 
     __slots__ = (
-        "root_run_id", "member_ids", "opened_at", "is_leaf_root", "agent_hint",
+        "root_run_id", "member_ids", "rail_scopes", "opened_at", "is_leaf_root",
+        "agent_hint",
         "detected_agent_name", "trace_id", "spans", "llm_calls", "tool_calls",
         "tool_requests",
         "span_stack", "trace_started_at", "user_input_preview",
@@ -955,6 +1182,13 @@ class _RunState:
         # Every run_id (root, nested chain, LLM call, tool) that belongs to
         # this run, so the reverse `_root_of` index can be pruned on close.
         self.member_ids: set[UUID] = {root_run_id} if root_run_id else set()
+        # Router rail scopes this run owns that are NOT LangChain run ids: the
+        # per-model-call token `_open_call_rails` mints. A bare `llm.invoke()`
+        # injects skills before LangChain has minted any run id at all, so
+        # without this its routing decision would be filed under no owner and
+        # a concurrent run could claim it. Recorded by `_capture_call_rails`,
+        # which runs inside that same model call's Context.
+        self.rail_scopes: set[str] = set()
         self.opened_at: datetime = datetime.now(timezone.utc)
         # True when the root IS a leaf callback (a model call or a tool) —
         # a bare `llm.invoke()` emits no chain callbacks at all, so nothing
@@ -1142,13 +1376,20 @@ class CallbackHandler(_CallbackBase):
     def _reset_state(self) -> None:
         """Drop every in-flight run and start from one fresh, detached state."""
         with self._state_lock:
+            dropped = list(self._runs.values())
             self._runs.clear()
             self._root_of.clear()
             self._current: _RunState = _RunState()
+        # A discarded run never builds a trace, so nothing else will ever
+        # drain the Router rails filed under its ids. Release them here or
+        # they sit on the singleton until the LRU pushes them out.
+        for state in dropped:
+            _discard_scoped_router_rails(state)
 
     def _new_run_state(self, root_run_id: UUID, *, is_leaf_root: bool = False) -> _RunState:
         """Open a state for a new root run and make it the current one."""
         state = _RunState(root_run_id, is_leaf_root=is_leaf_root)
+        evicted: Optional[_RunState] = None
         with self._state_lock:
             if len(self._runs) >= _MAX_LIVE_RUNS:
                 # A root whose end callback never arrived (a hard kill inside
@@ -1157,6 +1398,7 @@ class CallbackHandler(_CallbackBase):
                 # process cannot grow without bound.
                 oldest = min(self._runs.values(), key=lambda s: s.opened_at)
                 self._forget_run(oldest)
+                evicted = oldest
                 _warn_once_then_debug(
                     "run_state_evicted",
                     f"Dropping the oldest of {_MAX_LIVE_RUNS} in-flight LangChain "
@@ -1167,6 +1409,10 @@ class CallbackHandler(_CallbackBase):
             self._root_of[root_run_id] = root_run_id
             state.member_ids.add(root_run_id)
             self._current = state
+        if evicted is not None:
+            # Same reasoning as `_reset_state`: an evicted run's trace is
+            # already lost, so its Router rails have no reader left.
+            _discard_scoped_router_rails(evicted)
         return state
 
     def _forget_run(self, state: _RunState) -> None:
@@ -1229,6 +1475,15 @@ class CallbackHandler(_CallbackBase):
         against state every concurrent run shared, and handed traces routing
         decisions made for other runs' prompts.
         """
+        # Claim this model call's rail scope for the run. `_ambient_run_scope`
+        # falls back to this token when LangChain has no run id to give (a
+        # bare `llm.invoke()` injects before one exists), and recording it
+        # here — inside the call, in the Context that minted it — is what lets
+        # `_drain_scoped_router_rails` recognise the resulting write as ours.
+        call_scope = _call_scope_ctx.get()
+        if call_scope:
+            state.rail_scopes.add(call_scope)
+
         routing_id = _routing_id_ctx.get()
         if routing_id and state.routing_id is None:
             # First decision of the run wins: a multi-turn run routes once
@@ -1422,8 +1677,23 @@ class CallbackHandler(_CallbackBase):
         """Retire one root run: stop routing callbacks to it, then send it."""
         with self._state_lock:
             self._forget_run(state)
-        if self.auto_send and (state.spans or state.llm_calls):
-            self._auto_send(state)
+        try:
+            if self.auto_send and (state.spans or state.llm_calls):
+                self._auto_send(state)
+        finally:
+            # `build_trace` is what drains this run's Router rails, and on an
+            # auto-sending handler it is the ONLY reader this run will ever
+            # get — so any path that reaches here without building a trace
+            # (tracing switched off, a run with nothing to send, `_auto_send`
+            # failing before it assembles, `on_chain_error` routing here)
+            # leaves a per-run entry behind on the process-wide singleton.
+            # Idempotent: after a build there is nothing left to release.
+            #
+            # Guarded on `auto_send` because a manual (`auto_send=False`)
+            # caller builds the trace HERSELF, after the chain returns —
+            # releasing the rails here would take them away before she asks.
+            if self.auto_send:
+                _discard_scoped_router_rails(state)
 
     # ── Sub-agent resolution ───────────────────────────────
 
@@ -1934,19 +2204,49 @@ class CallbackHandler(_CallbackBase):
             active_skills_list.append(entry)
 
         # ── the skills rails ────────────────────────────────
-        # Everything this RUN captured for itself comes first, and wins.
-        # `_capture_call_rails` reads the routing decision inside the model
-        # call it was made for, so it is attributable by construction.
+        # Three sources, in strict precedence order, and every one of them is
+        # drained whether or not it is used — an undrained rail leaks forward
+        # into the NEXT trace instead of merely being missing from this one.
         #
-        # The Router singleton's instance rails are drained here too, but
-        # they are a LAST RESORT, used per field only when this run captured
-        # nothing of its own — they are process-wide state shared by every
-        # concurrent run, so unioning them unconditionally is what put
-        # another lane's routing_id (and, in one measured trace, 34 offered
-        # names against a prompt that offered one) onto a trace. The drain
-        # itself stays unconditional: an undrained rail leaks forward into
-        # the NEXT trace instead.
-        rail_routing_id, rail_offered, rail_delivered, rail_loaded = _drain_router_rails()
+        # 1. What this RUN captured for itself. `_capture_call_rails` reads
+        #    the routing decision inside the model call it was made for, so it
+        #    is attributable by construction.
+        # 2. The Router rails filed under THIS run's scopes. A load from a
+        #    user-supplied tool cannot reach (1) — LangChain dispatches
+        #    callbacks under `copy_context()`, so the tool's ContextVar writes
+        #    are invisible here — but it CAN be filed under the LangChain run
+        #    id that was executing, which is one of ours. See
+        #    `_drain_scoped_router_rails`.
+        # 3. The Router's UNSCOPED rails, and only once their provenance has
+        #    been checked. They are process-wide and clear-on-read: unioning
+        #    them unconditionally is what let one run's `load_skill` be
+        #    reported as ANOTHER run's activation, and what put a concurrent
+        #    lane's routing_id (and, in one measured trace, 34 offered names
+        #    against a prompt that offered one) onto a trace. If any of the
+        #    content was written by a run that is not this one, the values are
+        #    dropped on the floor: a number that might belong to somebody else
+        #    is worse than no number, and activation is the rung the product
+        #    claim rests on.
+        scopes = _run_scopes(state)
+        (
+            scoped_routing_id, scoped_offered, scoped_delivered, scoped_loaded,
+        ) = _drain_scoped_router_rails(scopes)
+
+        # One atomic ask-and-take. The previous peek-then-drain pair had two
+        # ways of putting another run's data on this trace: a write landing
+        # between the two calls was taken while the snapshot still said clear,
+        # and an UNOWNED write (a `load_skill` from a plain thread, outside any
+        # run the resolver can name) produced an empty owner set, which
+        # `owners - scopes` reads as "nothing contradicts me" rather than
+        # "nobody vouches for this". Ownership is required now, and rails that
+        # are not ours are left in place for the run that earned them instead of
+        # being drained and thrown away.
+        (
+            rail_routing_id,
+            rail_offered,
+            rail_delivered,
+            rail_loaded,
+        ) = _drain_unscoped_rails_for(scopes)
 
         # Drain the contextvars too — a `log_skill_*` call or an injection
         # that happened outside the patched invoke lands there, and an
@@ -1959,10 +2259,10 @@ class CallbackHandler(_CallbackBase):
         ctx_routing_id = _consume_routing_id()
 
         if not state.skills_offered_in_prompt:
-            for n in rail_offered:
+            for n in scoped_offered or rail_offered:
                 state.skills_offered_in_prompt.add(n)
         if not state.skills_delivered:
-            for n in rail_delivered:
+            for n in scoped_delivered or rail_delivered:
                 state.skills_delivered.add(n)
                 state.skills_offered_in_prompt.add(n)
 
@@ -1970,7 +2270,7 @@ class CallbackHandler(_CallbackBase):
         # registers no native load_skill tool, but a user-supplied tool
         # that calls it still lands its serves here.
         if not state.skills_loaded_by_agent:
-            for n in rail_loaded:
+            for n in scoped_loaded or rail_loaded:
                 if isinstance(n, str) and n.strip():
                     state.skills_loaded_by_agent.add(n.strip())
                     state.skills_offered_in_prompt.add(n.strip())
@@ -1981,7 +2281,9 @@ class CallbackHandler(_CallbackBase):
         # this run's complete router-accounted set.
         self._infer_skill_rungs_from_prompts(state)
 
-        routing_id = state.routing_id or ctx_routing_id or rail_routing_id
+        routing_id = (
+            state.routing_id or ctx_routing_id or scoped_routing_id or rail_routing_id
+        )
         agent_name = self._agent_name_or_default(state)
 
         # Derive trace status from collected spans/LLM calls: if any errored,
