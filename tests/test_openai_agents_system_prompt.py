@@ -373,20 +373,36 @@ class TestRailFallback:
 class TestMenuIsNotAnActivation:
     """The prompt-presence detector name-matches over SYSTEM text.
 
-    So the splice must happen AFTER the inference runs, or the menu — which
-    names every skill that was merely OFFERED — would have its whole contents
-    promoted a rung. Before the rewiring that rung was ACTIVATED and the
-    offered→activated join would have read 100% every time; now the inference
-    writes offered/delivered, so a mis-ordered splice would inflate DELIVERED
-    instead. A smaller lie, the same kind, and the ordering still costs
-    nothing.
+    This class used to pin the splice as running AFTER the inference, on the
+    grounds that the menu names every merely-OFFERED skill and would have its
+    whole contents promoted a rung. That ordering has been REVERSED, and the
+    reason it could be is that the rung the promotion would land on shrank
+    twice. It was ACTIVATED, which made the offered→activated join read 100%
+    every time. Then the rewiring moved the inference to offered/delivered.
+    Now the splice runs first — because on the Responses path it is the ONLY
+    way the instructions reach ``rendered_input``, and holding it back made a
+    skill carried in the agent instructions invisible to the inference on the
+    SDK's default path.
 
-    Measured caveat, so nobody over-claims what this guard buys: the router's
+    What replaced the ordering as the guard is the PRECEDENCE rule, which is
+    strictly stronger: ``infer_prompt_rungs`` subtracts every name this run's
+    router rails already accounted for, so the router's own menu cannot be
+    re-read as evidence no matter which half of the prompt it sits in. The
+    ordering only ever protected the half that arrived late; precedence
+    protects both. The tests below now pin THAT, plus the invariant neither
+    ordering can breach: nothing reachable from prompt text writes
+    ``active_skills`` or ``skills_loaded_by_agent``.
+
+    Measured caveat, so nobody over-claims what these guards buy: the router's
     CURRENT fragment format (``- name: description``) does not match the
-    detector's Tier-1 patterns, so today the bug would not fire. The formats
-    below (``[name]``, ``## name``) DO match, they are a server-side rendering
-    choice that can change without an SDK release. This test pins the
-    ordering, not a live incident.
+    detector's Tier-1 patterns, so today the bug would not fire on the live
+    format. The formats below (``[name]``, ``## name``) DO match, and they are
+    a server-side rendering choice that can change without an SDK release.
+    These tests pin the rule, not a live incident.
+
+    The behavioural counterpart — that a DISK skill in the instructions now
+    does land on offered/delivered — lives in
+    ``tests/test_openai_agents_instructions_inference.py``.
     """
 
     REGISTRY = [
@@ -403,32 +419,91 @@ class TestMenuIsNotAnActivation:
         "Always quote the original order identifier in the reply."
     )
 
-    def test_bracketed_menu_names_are_offered_not_activated(self):
+    MENU = "Available skills:\n[refund-policy] how refunds work\n[tone-guide] style"
+
+    def test_the_routers_own_menu_is_not_re_inferred(self, monkeypatch):
+        """RETARGETED, and the retarget is the point of the whole change.
+
+        Was ``test_bracketed_menu_names_are_offered_not_activated``, and it
+        asserted ``skills_offered_in_prompt == []`` on a fixture that recorded
+        NO RAIL. Its stated reason was that ``_attach_system_prompts``
+        "RECONSTRUCTS the prompt from the rail, so inferring rungs from it is
+        the SDK reading its own bookkeeping" — but with no rail there was no
+        bookkeeping to re-read. The menu was, as far as the tracer could tell,
+        a harness's own menu, and reading it is what the tracer is FOR. The old
+        assertion was pinning the ordering fence's side effect, not the rule.
+
+        So the rail is recorded here, which makes the fixture mean what the
+        assertion always claimed: these ARE the router's own names, and they
+        must come from its own observation rather than from a name-match over
+        text it wrote itself.
+        """
+        import decimalai.openai_agents as oai
         from decimalai.openai_agents import DecimalTracingProcessor
 
         processor = DecimalTracingProcessor(
             agent_name="a", skills_registry=self.REGISTRY
         )
         tid = f"trace_{uuid4().hex[:16]}"
-        menu = "Available skills:\n[refund-policy] how refunds work\n[tone-guide] style"
-        trace = _drive(processor, [_response_span(tid, instructions=menu)], tid)
+        # The router OFFERED both and served no body — recorded on this run's
+        # rail the way the instructions callable records it.
+        monkeypatch.setattr(oai, "_current_run_key", lambda: tid)
+        oai._record_run_rail(
+            routing_id="rt_menu01", offered=["refund-policy", "tone-guide"]
+        )
+        trace = _drive(processor, [_response_span(tid, instructions=self.MENU)], tid)
 
         assert trace.active_skills == [], (
-            "an offered-but-unused skill was recorded as ACTIVATED — the menu "
-            "was spliced into rendered_input before the inference ran"
+            "an offered-but-unused skill was recorded as ACTIVATED. Nothing "
+            "reachable from prompt text may write this field"
         )
         assert trace.skills_delivered == [], (
             "a menu row was recorded as DELIVERED — no body appears anywhere "
             "in this prompt, so nothing observed one reaching the model"
         )
-        assert trace.skills_offered_in_prompt == [], (
-            "the menu was re-read back off the record. `_attach_system_prompts` "
-            "RECONSTRUCTS the prompt from the rail, so inferring rungs from it "
-            "is the SDK reading its own bookkeeping and calling it evidence — "
-            "the router already reported offered directly through the rail"
+        assert trace.skills_offered_in_prompt == ["refund-policy", "tone-guide"], (
+            "offered must be the ROUTER's own rail observation. The precedence "
+            "rule subtracts these names from the inference, so the inference "
+            "contributes nothing here — if it starts contributing, the router's "
+            "menu is being counted as evidence of itself"
         )
         # ...and the menu is still on the record, which is the other half.
         assert "refund-policy" in _system_text(trace)
+
+    def test_an_unattributed_menu_is_offered_and_still_never_activated(self):
+        """The same menu with NO rail: offered is inferred, and stops there.
+
+        This is the half the old ordering suppressed. With no rail the tracer
+        cannot tell this menu from one a harness wrote, and the names really
+        are in the system text the model was shown — which is exactly what
+        ``skills_offered_in_prompt`` asserts. Inferring it is correct.
+
+        The rung that must stay empty either way is the activation one, and
+        this case is the honest test of that: the precedence rule is inactive
+        here, so nothing but the wiring itself is holding the line.
+        """
+        from decimalai.openai_agents import DecimalTracingProcessor
+
+        processor = DecimalTracingProcessor(
+            agent_name="a", skills_registry=self.REGISTRY
+        )
+        tid = f"trace_{uuid4().hex[:16]}"
+        trace = _drive(processor, [_response_span(tid, instructions=self.MENU)], tid)
+
+        assert trace.skills_offered_in_prompt == ["refund-policy", "tone-guide"]
+        assert trace.skills_delivered == [], (
+            "a menu row was recorded as DELIVERED — these fixtures' bodies are "
+            "one character, so no prompt can demonstrate a body reaching the "
+            "model"
+        )
+        assert trace.active_skills == [], (
+            "prompt text reached the ACTIVATION rung with no precedence rule "
+            "in the way — only a direct selection event may write it"
+        )
+        assert trace.skills_loaded_by_agent == [], (
+            "prompt text reached skills_loaded_by_agent, which C13b grades as "
+            "an activation"
+        )
 
     def test_a_delivered_body_lands_on_delivered_not_activated(self):
         """A body the router injected is DELIVERED. It is not an activation.
@@ -495,7 +570,7 @@ class TestMenuIsNotAnActivation:
         routing decision's offered denominator.
 
         Ordering matters as much as the rule: run the inference before the
-        rail merge (where ``_detect_skills`` used to sit) and the
+        rail merge — where it used to sit, under an earlier name — and the
         router-accounted set is empty, so precedence cannot apply at all.
         """
         import decimalai.openai_agents as oai

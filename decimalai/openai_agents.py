@@ -1404,11 +1404,14 @@ class _TraceAccumulator:
         # between offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
         # llm_call id -> the system prompt the SERVER echoed back for that
-        # call (`Response.instructions`). Held OFF `rendered_input` until
-        # after `_detect_skills` has run — the skills menu names every
-        # offered skill, and detection name-matches over system text, so
-        # splicing it in earlier would report every offered skill as
-        # ACTIVATED. Spliced in by `_attach_system_prompts`.
+        # call (`Response.instructions`). `ResponseSpanData` has no
+        # instructions slot, so this side table is where the system half of
+        # the prompt waits until `_attach_system_prompts` splices it onto
+        # `rendered_input` at trace-send — before the skill inference reads
+        # it, so a skill carried in the instructions is visible to it.
+        # (It was held until AFTER, back when the inference wrote ACTIVATION
+        # and the menu would have been promoted wholesale. The inference
+        # writes offered/delivered now; see the call site in `_send_trace`.)
         self.system_prompt_by_call: Dict[Any, str] = {}
 
     @property
@@ -2078,28 +2081,57 @@ class DecimalTracingProcessor:
             acc.skills_delivered.update(rail_loaded)
             acc.skills_offered_in_prompt.update(rail_loaded)
 
+        # Put the system half of the prompt back on `rendered_input`. STRICTLY
+        # BEFORE `_infer_skill_rungs` below, and that order is a REVERSAL —
+        # read this before moving it back.
+        #
+        # `ResponseSpanData.__slots__` is ("response", "input", "usage"), so on
+        # the Responses path (the SDK default) the span carries the input items
+        # ALONE and this splice is the ONLY way the instructions ever reach
+        # `rendered_input`. Splicing after the inference therefore made the
+        # instructions invisible to it, and putting a skill in the agent
+        # instructions is the ordinary way to use one on this SDK: a
+        # disk-discovered skill whose text lived there read as an EMPTY
+        # offered/delivered rung on every trace, while its body sat on the
+        # shipped record for anyone to see.
+        #
+        # The old order was NOT arbitrary. The inference used to write
+        # ACTIVATION, so splicing the skills menu — which names every OFFERED
+        # skill — in first would have reported the whole menu as activated.
+        # That is gone: `_infer_skill_rungs` writes `skills_offered_in_prompt`
+        # and `skills_delivered` only (see its body), nothing on this adapter
+        # writes `acc.active_skills` at all, and `acc.skills_loaded_by_agent`
+        # is written from the `loaded` rail alone — a body `_handle_load_skill`
+        # saw the router actually serve. No ordering can route prompt text to
+        # either.
+        #
+        # What still protects the DELIVERED rung is the precedence rule, not
+        # this ordering: the rail merges above run first, so `infer_prompt_rungs`
+        # subtracts every name the router already accounted for and cannot
+        # re-read the router's own menu as evidence. That is why the merges
+        # stay above and the inference stays below.
+        _attach_system_prompts(acc, run_rail.get("system_prompts"))
+
         # Infer offered/delivered for DISK skills the SDK did not inject.
         # STRICTLY AFTER the rail merges above: the precedence rule needs this
         # run's full router-accounted set, or a skill the router only put a
         # menu row for could be re-inferred here as delivered.
         self._infer_skill_rungs(acc)
 
-        # Build active_skills list. Nothing above writes it — an entry here is
-        # an explicit `log_skill_activation` or a `decimal.active_skills`
-        # declaration, never a prompt match.
+        # Build active_skills list. Nothing on this adapter writes
+        # `acc.active_skills` — no rail, no drain, and explicitly not the
+        # inference above. `log_skill_activation` fills the equivalent field on
+        # the GENERIC tracer, which is a different accumulator and never
+        # reaches this one, so on the Agents SDK the activation signal is
+        # `skills_loaded_by_agent`: a body the model asked for by calling
+        # load_skill. This list is built anyway so a future direct-selection
+        # source has somewhere to land, and so the field is never fabricated.
         active_skills_list: List[Dict[str, Any]] = []
         for name, h in acc.active_skills.items():
             entry: Dict[str, Any] = {"name": name}
             if h:
                 entry["hash"] = h
             active_skills_list.append(entry)
-
-        # Put the system half of the prompt back on `rendered_input`. STRICTLY
-        # AFTER `_infer_skill_rungs` above: the skills menu names every OFFERED
-        # skill, and the detector name-matches over system text, so splicing
-        # earlier would report the whole menu as DELIVERED — a smaller lie than
-        # the ACTIVATED it used to be, but the same kind.
-        _attach_system_prompts(acc, run_rail.get("system_prompts"))
 
         trace = RunTrace(
             id=uuid4(),
@@ -2151,6 +2183,10 @@ class DecimalTracingProcessor:
 
         Must run AFTER this run's rails are merged into ``acc``: the router's
         own names are excluded from the inference (see ``infer_prompt_rungs``).
+        Must also run after ``_attach_system_prompts``, which is what puts the
+        instructions on ``rendered_input`` — on the Responses path the span
+        carries the input items alone, so before that splice the haystack read
+        here is missing the half of the prompt a harness injects skills into.
         """
         if not self._skills_registry or not acc.llm_calls:
             return
@@ -2363,7 +2399,10 @@ def _attach_system_prompts(
     mapped onto calls without guessing, NOTHING is attached: an incomplete
     record beats an invented one.
 
-    MUST be called after ``_detect_skills`` — see the call site.
+    MUST be called after this run's rails are merged onto the accumulator and
+    BEFORE ``_infer_skill_rungs`` — see the call site for why that order is
+    what keeps a skill carried in the instructions visible to the inference
+    without letting the router's own menu be re-read as evidence.
     """
     calls = acc.llm_calls
     if not calls:

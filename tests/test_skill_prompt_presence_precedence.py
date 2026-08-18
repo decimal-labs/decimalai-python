@@ -336,9 +336,9 @@ class TestModelInitiatedShapesAreInvisibleHere:
 class TestOpenAIAgentsRail:
     """The oai processor must merge its run rail BEFORE inferring.
 
-    ``_infer_skill_rungs`` used to run first (as ``_detect_skills``), so the
-    router-accounted set was empty at inference time and precedence could not
-    apply even in principle.
+    The inference used to run FIRST, under an earlier name and writing the
+    activation rung, so the router-accounted set was empty when it read and
+    precedence could not apply even in principle.
     """
 
     def _acc_with_prompt(self, text):
@@ -386,14 +386,36 @@ class TestOpenAIAgentsRail:
         assert "tone-guide" in acc.skills_offered_in_prompt
         assert acc.skills_delivered == set()
 
-    def test_inference_runs_after_the_rail_merge_and_before_the_splice(self):
-        """Ordering pin for ``_send_trace``, which has to satisfy BOTH ends.
+    def test_inference_runs_after_both_the_rail_merge_and_the_splice(self):
+        """Ordering pin for ``_send_trace``. RETARGETED — the contract moved.
 
-        The inference must come after the rail merge (or the
-        router-accounted set is empty and precedence cannot apply) and before
-        ``_attach_system_prompts`` (or the spliced menu is inferred as a rung
-        the run never climbed). The behavioural half of this lives in
-        ``test_openai_agents_system_prompt.py``, which owns the span fixtures.
+        Was ``test_inference_runs_after_the_rail_merge_and_before_the_splice``,
+        asserting ``merge < infer < splice``. The splice/infer half has been
+        deliberately REVERSED; the assertion now reads ``merge < splice <
+        infer``.
+
+        Why the old order existed: the inference used to write ACTIVATION, so
+        splicing the skills menu in first would have reported every offered
+        skill as activated. Why it could go: the inference writes
+        offered/delivered only, and the precedence rule — which needs the rail
+        merge, hence the half of this assertion that did NOT move — already
+        subtracts the router's own names wherever in the prompt they sit.
+
+        Why it had to go: on the Responses path ``ResponseSpanData`` carries
+        the input items alone, so this splice is the only way the instructions
+        ever reach ``rendered_input``. Running it last made a disk skill
+        carried in the agent instructions invisible to the inference on the
+        SDK's default path — an empty rung where there was a real value.
+
+        Both halves still matter, for different reasons:
+          * ``merge < infer`` — precedence needs the router-accounted set, or
+            a skill the router only offered can be re-inferred as delivered.
+          * ``splice < infer`` — the inference needs the whole prompt, or the
+            instructions half is missing from the haystack.
+
+        The behavioural half lives in ``test_openai_agents_system_prompt.py``
+        and ``test_openai_agents_instructions_inference.py``, which own the
+        span fixtures.
         """
         import inspect
         from decimalai.openai_agents import DecimalTracingProcessor
@@ -402,9 +424,9 @@ class TestOpenAIAgentsRail:
         merge = src.index("acc.skills_offered_in_prompt.update(rail_offered)")
         infer = src.index("self._infer_skill_rungs(acc)")
         splice = src.index("_attach_system_prompts(acc,")
-        assert merge < infer < splice, (
-            "_send_trace order is rail-merge → infer → splice; got "
-            f"merge@{merge} infer@{infer} splice@{splice}"
+        assert merge < splice < infer, (
+            "_send_trace order is rail-merge → splice → infer; got "
+            f"merge@{merge} splice@{splice} infer@{infer}"
         )
 
 
