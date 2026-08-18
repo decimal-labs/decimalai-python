@@ -1,6 +1,6 @@
 """CrewAI driver — the two-halves OpenInference rail.
 
-Runs the snippet documented at ``decimalai-docs/sdk/python/frameworks/crewai.mdx``:
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/crewai``:
 DecimalAI's OTel exporter for the RECEIVING half, and the OpenInference CrewAI
 + LiteLLM instrumentors for the EMITTING half (CrewAI itself emits nothing to
 your tracer provider — its own telemetry runs on a private internal one). Then

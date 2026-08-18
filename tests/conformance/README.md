@@ -402,7 +402,7 @@ by editing one file:
 
 | Source | Where | Bites when the docs repo is absent? |
 |---|---|---|
-| the docs capability table | `decimalai-docs/sdk/python/frameworks.mdx`, vendored into `drivers.ADVERTISED_SNAPSHOT` | snapshot yes, re-derivation no |
+| the docs capability table | `https://docs.decimal.ai/sdk/python/frameworks`, vendored into `drivers.ADVERTISED_SNAPSHOT` | snapshot yes, re-derivation no |
 | `decimalai.init()`'s framework flags | this repo | **yes** |
 | the framework extras in `pyproject.toml` | this repo | **yes** |
 

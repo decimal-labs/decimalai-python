@@ -1,6 +1,6 @@
 """Google ADK driver.
 
-Runs the snippet documented at ``decimalai-docs/sdk/python/frameworks/adk.mdx``,
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/adk``,
 in its **explicit** form:
 
     runner = Runner(agent=..., app_name=..., session_service=...,

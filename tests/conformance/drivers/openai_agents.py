@@ -1,6 +1,6 @@
 """OpenAI Agents SDK driver.
 
-Runs the snippet documented at ``decimalai-docs/sdk/python/frameworks/openai-agents.mdx``
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/openai-agents``
 — build an ``agents.Agent``, hand it to ``instrument(agent=...)`` for full
 introspection, then ``Runner.run_sync`` — plus the module docstring's
 ``enable_skill_loader=True`` form for the skills rail, which is where semantic

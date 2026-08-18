@@ -316,7 +316,7 @@ DRIVER_MODULES: Tuple[str, ...] = (
 )
 
 #: The frameworks the product ADVERTISES, as slugs derived from the capability
-#: table in decimalai-docs/sdk/python/frameworks.mdx. Vendored here so the
+#: table in https://docs.decimal.ai/sdk/python/frameworks. Vendored here so the
 #: coverage guard still bites in a checkout that has only this repo;
 #: ``test_advertised_snapshot_matches_docs`` re-derives it whenever the docs repo
 #: IS on disk, so the snapshot cannot quietly go stale.

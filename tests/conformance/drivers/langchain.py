@@ -1,6 +1,6 @@
 """LangChain / LangGraph driver — the reference implementation.
 
-Runs the snippets documented at ``decimalai-docs/sdk/python/frameworks/langchain.mdx``:
+Runs the snippets documented at ``https://docs.decimal.ai/sdk/python/frameworks/langchain``:
 a compiled LangGraph invoked with ``config={"callbacks": [CallbackHandler(...)]}``
 for the traced phases, and the process-wide ``instrument(enable_skill_loader=True)``
 form for the skills rail (the only form the rail has).

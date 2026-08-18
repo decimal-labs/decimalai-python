@@ -14,7 +14,7 @@ and the gap is invisible precisely because nothing is red.
 
 Three independent sources, so the guard cannot be defeated by editing one file
 -------------------------------------------------------------------------------
-1. **The docs capability table** (``decimalai-docs/sdk/python/frameworks.mdx``)
+1. **The docs capability table** (``https://docs.decimal.ai/sdk/python/frameworks``)
    — what the product tells users it supports. Vendored into
    ``drivers.ADVERTISED_SNAPSHOT`` so the guard still bites in a checkout that
    has only this repo, and re-derived whenever the docs repo IS on disk, so the

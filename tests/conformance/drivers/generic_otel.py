@@ -1,6 +1,6 @@
 """Generic OpenTelemetry driver — the rail with no framework at all.
 
-The documented snippet at ``decimalai-docs/sdk/python/frameworks/otel.mdx`` is
+The documented snippet at ``https://docs.decimal.ai/sdk/python/frameworks/otel`` is
 ``decimalai.init(api_key=..., otel=True)`` plus the sentence "Any framework
 emitting OTEL spans will be captured", backed by a table of the ``gen_ai.*``
 attributes the exporter reads. So for THIS rail the snippet is the attributes

@@ -1,6 +1,6 @@
 """Pydantic AI driver.
 
-Runs the snippet documented at ``decimalai-docs/sdk/python/frameworks/pydantic-ai.mdx``.
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/pydantic-ai``.
 That page is explicit about the shape of this integration, and the shape decides
 what this driver has to do:
 

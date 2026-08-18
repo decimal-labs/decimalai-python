@@ -1,7 +1,7 @@
 """Claude Agent SDK / Claude Code driver.
 
 Runs the snippets documented at
-``decimalai-docs/sdk/python/frameworks/claude-agent-sdk.mdx``: a real
+``https://docs.decimal.ai/sdk/python/frameworks/claude-agent-sdk``: a real
 ``claude_agent_sdk.query(...)`` wrapped in ``trace_stream(...)`` — the
 "Explicit form — wrap a stream you already have" section, verbatim in shape.
 

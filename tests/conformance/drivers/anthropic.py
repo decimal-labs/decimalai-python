@@ -1,6 +1,6 @@
 """Raw Anthropic SDK driver — the no-framework rail.
 
-Runs the two snippets ``decimalai-docs/sdk/python/frameworks.mdx`` documents for
+Runs the two snippets ``https://docs.decimal.ai/sdk/python/frameworks`` documents for
 code that calls the provider SDK directly, with no agent framework in between:
 
 * tracing — ``init(anthropic=True)`` (here: its body,

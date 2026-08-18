@@ -1,6 +1,6 @@
 """LlamaIndex driver.
 
-Runs the snippet documented at ``decimalai-docs/sdk/python/frameworks/llamaindex.mdx``:
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/llamaindex``:
 ``decimalai.init(..., llamaindex=True)`` — i.e. ``decimalai.llamaindex.instrument()``
 — followed by a ``VectorStoreIndex`` query engine call. Embeddings are
 ``MockEmbedding`` and the LLM is a stub, so every phase runs with no key and no
@@ -18,7 +18,7 @@ second call ONE query engine call posts TWO traces, one under each agent name
 (measured, not assumed). The documented way to name a second agent is
 ``decimalai.providers.agent_run(...)`` — the same run scope the raw-provider and
 Pydantic AI rails use, documented for LlamaIndex at
-``decimalai-docs/sdk/python/frameworks/llamaindex.mdx`` under "Several agents in
+``https://docs.decimal.ai/sdk/python/frameworks/llamaindex`` under "Several agents in
 one process". Every phase wraps its run in that scope with its own ctx's agent
 name, which is exactly what a service handling two tenants' traffic would do,
 and it is what C6 (``second_agent``) and C9 (per-lane names) grade.

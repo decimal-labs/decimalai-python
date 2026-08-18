@@ -147,7 +147,7 @@ the GitHub Release and let `publish.yml` do the upload.
    exists without an entry for the version, but does not require one.
 4. **If you touched the README**: make every link an **absolute** `https://github.com/...` URL — relative
    `./` links render broken on PyPI.
-5. **Docs sync** (the `decimalai-docs` repo, ships with or right after the release):
+5. **Docs sync** (the docs site's source, ships with or right after the release):
    - add an `<Update>` entry to `changelog.mdx` — the page promises SDK release tracking;
    - if the release adds/changes CLI commands, update `sdk/cli.mdx`;
    - if `requires-python` changed, update the floor noted in `quickstart.mdx`, `faq.mdx`, and this
