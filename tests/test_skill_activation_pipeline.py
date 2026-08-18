@@ -53,11 +53,18 @@ SYSTEM_PROMPT_WITHOUT_SKILL = [
 ]
 
 
-# ── detect_skill_activations tests ───────────────────────
+# ── prompt-presence detection tests ──────────────────────
 
 
 class TestDetectSkillActivations:
-    """Tests for the detect_skill_activations function."""
+    """Tests for the ``detect_skill_activations`` compatibility alias.
+
+    The alias must keep returning the same NAMES in the same order as it
+    always has — that is the whole point of keeping it. The rung each name
+    lands on is now decided by ``infer_prompt_rungs`` and covered in
+    ``TestPromptRungInference``; nothing below claims these names were
+    activated.
+    """
 
     def test_name_pattern_match(self):
         """Skills referenced by name in system prompt are detected."""
@@ -185,8 +192,20 @@ class TestGenericTracerSkills:
         tg = next(s for s in trace.active_skills if s["name"] == "test-gen")
         assert "hash" not in tg
 
-    def test_auto_detect_from_prompt(self):
-        """Skills are auto-detected from LLM calls when skills_registry is set."""
+    def test_prompt_presence_lands_on_offered_not_activated(self):
+        """A skill NAME in the prompt is inferred as offered, never activated.
+
+        Retargeted from ``_active_skills``. Same input, same detection — only
+        the field changed. ``SYSTEM_PROMPT_WITH_SKILL`` puts ``## Skill:
+        code-review`` in a SYSTEM message, and a system message is the router
+        (or a harness) PUTTING the skill in front of the model. It is not the
+        model reaching for it, and recording it as activated is
+        indistinguishable downstream from a real activation.
+
+        Offered rather than delivered because the registry entry carries no
+        ``body``: only the name matched, so the strongest honest claim is that
+        the name was in the prompt. Nothing here can say a body arrived.
+        """
         from decimalai.generic import TraceContext
 
         ctx = TraceContext(agent_name="test-agent")
@@ -199,14 +218,23 @@ class TestGenericTracerSkills:
             output={"content": "LGTM"},
         )
 
-        # Run auto-detection
-        ctx._auto_detect_skills()
+        ctx._infer_skill_rungs_from_prompt()
 
-        assert "code-review" in ctx._active_skills
-        assert ctx._active_skills["code-review"] == "sha256:abc123"
+        assert "code-review" in ctx._skills_offered_in_prompt
+        assert "code-review" not in ctx._skills_delivered
+        assert ctx._active_skills == {}, (
+            "a skill named in a SYSTEM message was recorded as ACTIVATED"
+        )
 
-    def test_explicit_plus_auto_merge(self):
-        """Explicit skills are preserved; auto-detected skills are merged without overwriting."""
+    def test_explicit_activation_survives_prompt_inference(self):
+        """An explicit activation is untouched by the prompt inference.
+
+        Was ``test_explicit_plus_auto_merge``, which asserted that an explicit
+        hash beat the registry hash *inside* ``_active_skills``. The inference
+        no longer writes ``_active_skills`` at all, so that contest is gone —
+        this pins the stronger statement that replaced it: the two channels
+        write different rungs and neither disturbs the other.
+        """
         from decimalai.generic import TraceContext
 
         ctx = TraceContext(agent_name="test-agent")
@@ -221,10 +249,12 @@ class TestGenericTracerSkills:
             input=SYSTEM_PROMPT_WITH_SKILL,
             output={"content": "review"},
         )
-        ctx._auto_detect_skills()
+        ctx._infer_skill_rungs_from_prompt()
 
-        # Explicit hash should be preserved (not overwritten by registry hash)
-        assert ctx._active_skills["code-review"] == "sha256:custom"
+        # The explicit declaration is the only activation, with its own hash.
+        assert ctx._active_skills == {"code-review": "sha256:custom"}
+        # ...and the inference still records the rung it can honestly see.
+        assert "code-review" in ctx._skills_offered_in_prompt
 
     def test_no_skills_no_noise(self):
         """Without skills installed, active_skills is empty."""

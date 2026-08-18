@@ -841,6 +841,10 @@ class DecimalSpanExporter:
                     run_trace.skills_offered_in_prompt = sorted(offered)
                     run_trace.skills_delivered = sorted(delivered)
                     run_trace.skills_loaded_by_agent = sorted(loaded)
+                # Disk skills the SDK did not inject. After the rail merge, so
+                # the rail's own names are excluded rather than re-inferred,
+                # and so the assignments above cannot clobber the result.
+                self._infer_skill_rungs(run_trace)
                 self._send(run_trace)
         except Exception:
             logger.exception(
@@ -881,6 +885,53 @@ class DecimalSpanExporter:
         """Flush buffered traces out to the backend."""
         self._flush_pending()
         return True
+
+    def _infer_skill_rungs(self, run_trace: RunTrace) -> None:
+        """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
+
+        ``self._skills`` is disk-derived (``install(skills=...)`` else
+        ``discover_skills()``), so it describes skills a harness may have put
+        in the prompt itself. Prompt text establishes that the skill was put in
+        front of the model, never that the model reached for it — so
+        ``active_skills`` is untouched here. On this rail activation arrives
+        only through a ``decimal.active_skills`` span attribute (an explicit
+        declaration by the emitting framework) or a ``record_skill_rail``
+        ``loaded`` entry.
+
+        Called AFTER the rail merge in ``_finalize_trace``, for two reasons:
+        the precedence rule needs this run's router-accounted names, and the
+        merge assigns ``skills_delivered`` outright, so an earlier write would
+        be discarded.
+        """
+        if not self._skills or not run_trace.llm_calls:
+            return
+        try:
+            from .skills import infer_prompt_rungs
+
+            # Passed split for readability; infer_prompt_rungs pools them —
+            # see the trade-off note there on why suppression is blanket.
+            router_offered = set(run_trace.skills_offered_in_prompt)
+            router_delivered = set(run_trace.skills_delivered) | set(run_trace.skills_loaded_by_agent)
+            offered, delivered = infer_prompt_rungs(
+                (call.rendered_input for call in run_trace.llm_calls),
+                self._skills,
+                router_offered=router_offered,
+                router_delivered=router_delivered,
+            )
+            if not offered and not delivered:
+                return
+            # NO delivered->offered fold here: see the note on the same site
+            # in langchain.py. Tier-2 matches a BODY whose name may never
+            # appear in the prompt, so folding would assert a menu row that was
+            # never shown.
+            run_trace.skills_offered_in_prompt = sorted(
+                set(run_trace.skills_offered_in_prompt) | set(offered)
+            )
+            run_trace.skills_delivered = sorted(
+                set(run_trace.skills_delivered) | set(delivered)
+            )
+        except Exception:
+            logger.debug("Skill prompt-presence inference failed", exc_info=True)
 
     # ── Trace assembly ─────────────────────────────────────
 
@@ -1166,26 +1217,13 @@ class DecimalSpanExporter:
         if not trace_spans and not llm_calls:
             return None
 
-        # Auto-detect skills from SDK registry (if installed)
-        if self._skills and llm_calls:
-            try:
-                from .skills import detect_skill_activations
-                for call in llm_calls:
-                    if not call.rendered_input:
-                        continue
-                    detected = detect_skill_activations(
-                        call.rendered_input, self._skills
-                    )
-                    for skill_name in detected:
-                        if skill_name not in active_skills:
-                            registry_hash = next(
-                                (s.get("hash") for s in self._skills
-                                 if s.get("name") == skill_name),
-                                None,
-                            )
-                            active_skills[skill_name] = registry_hash
-            except Exception:
-                logger.debug("Skill auto-detection failed", exc_info=True)
+        # No prompt-matching here. Inferring the offered/delivered rungs is
+        # done by `_infer_skill_rungs` in the caller, STRICTLY AFTER the run's
+        # skill rail is merged — this method returns before the rail is popped,
+        # and the merge assigns `skills_delivered` outright, so anything
+        # written from in here would be silently discarded on every run that
+        # had a rail. `active_skills` below therefore holds only what a
+        # `decimal.active_skills` span attribute explicitly declared.
 
         # Build active_skills list
         active_skills_list: List[Dict[str, Any]] = []

@@ -371,24 +371,37 @@ class TestRailFallback:
 
 
 class TestMenuIsNotAnActivation:
-    """``detect_skill_activations`` name-matches over SYSTEM text.
+    """The prompt-presence detector name-matches over SYSTEM text.
 
-    So the splice must happen AFTER activation detection, or the menu — which
-    names every skill that was merely OFFERED — would mark them all ACTIVATED
-    and the offered→activated join would read 100% every time.
+    So the splice must happen AFTER the inference runs, or the menu — which
+    names every skill that was merely OFFERED — would have its whole contents
+    promoted a rung. Before the rewiring that rung was ACTIVATED and the
+    offered→activated join would have read 100% every time; now the inference
+    writes offered/delivered, so a mis-ordered splice would inflate DELIVERED
+    instead. A smaller lie, the same kind, and the ordering still costs
+    nothing.
 
     Measured caveat, so nobody over-claims what this guard buys: the router's
     CURRENT fragment format (``- name: description``) does not match the
     detector's Tier-1 patterns, so today the bug would not fire. The formats
     below (``[name]``, ``## name``) DO match, they are a server-side rendering
-    choice that can change without an SDK release, and the ordering costs
-    nothing. This test pins the ordering, not a live incident.
+    choice that can change without an SDK release. This test pins the
+    ordering, not a live incident.
     """
 
     REGISTRY = [
         {"name": "refund-policy", "description": "how refunds work", "body": "x"},
         {"name": "tone-guide", "description": "house style", "body": "y"},
     ]
+
+    #: A body long enough for Tier-2 fuzzy matching to actually see it. The
+    #: stub ``"x"`` above has no line over 10 chars, so no prompt can ever
+    #: demonstrate its delivery — which is the point of keeping both.
+    REAL_BODY = (
+        "Refund window is thirty calendar days from delivery.\n"
+        "Partial refunds require a supervisor approval code.\n"
+        "Always quote the original order identifier in the reply."
+    )
 
     def test_bracketed_menu_names_are_offered_not_activated(self):
         from decimalai.openai_agents import DecimalTracingProcessor
@@ -402,22 +415,43 @@ class TestMenuIsNotAnActivation:
 
         assert trace.active_skills == [], (
             "an offered-but-unused skill was recorded as ACTIVATED — the menu "
-            "was spliced into rendered_input before activation detection ran"
+            "was spliced into rendered_input before the inference ran"
+        )
+        assert trace.skills_delivered == [], (
+            "a menu row was recorded as DELIVERED — no body appears anywhere "
+            "in this prompt, so nothing observed one reaching the model"
+        )
+        assert trace.skills_offered_in_prompt == [], (
+            "the menu was re-read back off the record. `_attach_system_prompts` "
+            "RECONSTRUCTS the prompt from the rail, so inferring rungs from it "
+            "is the SDK reading its own bookkeeping and calling it evidence — "
+            "the router already reported offered directly through the rail"
         )
         # ...and the menu is still on the record, which is the other half.
         assert "refund-policy" in _system_text(trace)
 
-    def test_a_delivered_body_still_counts_as_activated(self):
-        """The guard must not silence a REAL activation.
+    def test_a_delivered_body_lands_on_delivered_not_activated(self):
+        """A body the router injected is DELIVERED. It is not an activation.
 
-        A body the router actually injected carries ``## Skill: <name>``, and
-        that genuinely reached the model — detection sees it because it comes
-        in on the span's own input, not through the splice.
+        Was ``test_a_delivered_body_still_counts_as_activated``. Its own
+        docstring convicted it: "that genuinely reached the model". Reaching
+        the model is the delivered rung. Recording it as activated is
+        indistinguishable downstream from the model actually asking for the
+        body, which is what C13 exists to forbid (contract.py:704-721).
+
+        The fixture body was lengthened from the ``"x"`` stub so Tier-2 can
+        genuinely match it — otherwise the case would prove nothing about
+        delivery, only about a name header.
         """
         from decimalai.openai_agents import DecimalTracingProcessor
 
         processor = DecimalTracingProcessor(
-            agent_name="a", skills_registry=self.REGISTRY
+            agent_name="a",
+            skills_registry=[
+                {"name": "refund-policy", "description": "how refunds work",
+                 "body": self.REAL_BODY},
+                {"name": "tone-guide", "description": "house style", "body": "y"},
+            ],
         )
         tid = f"trace_{uuid4().hex[:16]}"
         span = _MockSpan(
@@ -426,14 +460,79 @@ class TestMenuIsNotAnActivation:
                 "response",
                 response=_SyntheticResponse(instructions="Available skills:\n- x: y"),
                 input=[
-                    {"role": "system", "content": "## Skill: refund-policy\nrefund body"},
+                    {"role": "system",
+                     "content": f"## Skill: refund-policy\n{self.REAL_BODY}"},
                     {"role": "user", "content": "ping"},
                 ],
             ),
         )
         trace = _drive(processor, [span], tid)
 
-        assert [s["name"] for s in trace.active_skills] == ["refund-policy"]
+        assert trace.skills_delivered == ["refund-policy"]
+        # NOT implied. This fixture's body never repeats its own slug, so no
+        # menu row reached the model — and `skills_offered_in_prompt` means
+        # exactly "the menu row was in the prompt the model was shown". The
+        # blanket delivered->offered fold that used to make this pass asserted a
+        # menu row that was never there; it is gone.
+        assert "refund-policy" not in trace.skills_offered_in_prompt
+        assert trace.active_skills == [], (
+            "a body the router injected reached the model — that is DELIVERED. "
+            "Recording it as activated inflates router_activated_count and "
+            "promotes a pasted skill over one that was actually used."
+        )
+
+    def test_a_rail_offered_skill_is_not_promoted_by_disk_prompt_text(
+        self, monkeypatch
+    ):
+        """The run rail must be merged BEFORE the inference runs.
+
+        The rail records that the router only OFFERED ``refund-policy`` — it
+        served no body. A same-named skill also sits on disk, and its body is
+        in the prompt. Skill names are not unique across those two sources, so
+        without the precedence rule the disk file promotes the ROUTER's
+        offered-only skill to delivered — and this trace carries the router's
+        ``routing_id``, so that inflated delivery is joined straight onto the
+        routing decision's offered denominator.
+
+        Ordering matters as much as the rule: run the inference before the
+        rail merge (where ``_detect_skills`` used to sit) and the
+        router-accounted set is empty, so precedence cannot apply at all.
+        """
+        import decimalai.openai_agents as oai
+        from decimalai.openai_agents import DecimalTracingProcessor
+
+        processor = DecimalTracingProcessor(
+            agent_name="a",
+            skills_registry=[
+                {"name": "refund-policy", "description": "how refunds work",
+                 "body": self.REAL_BODY},
+            ],
+        )
+        tid = f"trace_{uuid4().hex[:16]}"
+        monkeypatch.setattr(oai, "_current_run_key", lambda: tid)
+        oai._record_run_rail(routing_id="rt_oai01", offered=["refund-policy"])
+
+        span = _MockSpan(
+            trace_id=tid,
+            span_data=_MockSpanData(
+                "response",
+                response=_SyntheticResponse(instructions=None),
+                input=[
+                    {"role": "system",
+                     "content": f"# Local project conventions\n{self.REAL_BODY}"},
+                    {"role": "user", "content": "ping"},
+                ],
+            ),
+        )
+        trace = _drive(processor, [span], tid)
+
+        assert trace.routing_id == "rt_oai01"
+        assert trace.skills_offered_in_prompt == ["refund-policy"]
+        assert trace.skills_delivered == [], (
+            "the router only OFFERED this skill; prompt text belonging to a "
+            "same-named DISK skill promoted it to delivered"
+        )
+        assert trace.active_skills == []
 
 
 # ── No double-rendering of a prompt already on the record ───

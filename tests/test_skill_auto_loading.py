@@ -177,7 +177,22 @@ class TestGenericAutoLoading:
                 assert ctx._skills_registry is None
 
     def test_auto_discovered_skills_used_for_detection(self, skill_dir):
-        """Skills from auto-discovery are used for detection during the trace."""
+        """Auto-discovered skills are matched against the prompt — as OFFERED.
+
+        Retargeted from ``_active_skills``: same fixture, same detection, the
+        rung corrected. The prompt names ``code-review`` in a SYSTEM message
+        and does not contain its body, so what the SDK observed is that the
+        name was put in front of the model. Nothing observed the model asking
+        for it.
+
+        The registry-hash assertions were dropped rather than moved.
+        ``skills_offered_in_prompt`` is a ``List[str]`` with no slot for a
+        hash, and the hash would be wrong to record anyway: it fingerprints
+        the version on DISK, while all that was seen in the prompt was a name.
+        Claiming a version for a body nobody saw is the same fabrication one
+        rung down. See the note in the report — the delivered rung has the
+        same gap.
+        """
         from decimalai.generic import start_trace
 
         with start_trace(
@@ -195,14 +210,58 @@ class TestGenericAutoLoading:
                 output={"content": "LGTM"},
             )
 
-            # Run auto-detection (normally called in _send)
-            ctx._auto_detect_skills()
+            # Run the inference (normally called in _send)
+            ctx._infer_skill_rungs_from_prompt()
 
-            # Should have detected the auto-discovered skill
-            assert "code-review" in ctx._active_skills
-            # Hash should come from the registry (SKILL.md content hash)
-            assert ctx._active_skills["code-review"] is not None
-            assert ctx._active_skills["code-review"].startswith("sha256:")
+            assert "code-review" in ctx._skills_offered_in_prompt
+            # The body never appeared, so the delivered rung stays empty...
+            assert "code-review" not in ctx._skills_delivered
+            # ...and so does activation.
+            assert ctx._active_skills == {}
+
+    def test_auto_discovered_body_in_prompt_is_delivered(self, skill_dir):
+        """The other half: when the BODY is in the prompt, that IS delivered.
+
+        New. The four retargeted tests above all inject a bare header, so
+        without this case nothing would pin the delivered rung on the
+        disk-discovery path — the exact rung this rewiring exists to feed, and
+        the one Claude Code and friends actually produce when they paste a
+        SKILL.md into the system prompt.
+        """
+        from decimalai.generic import start_trace
+        from decimalai.skills import discover_skills
+
+        body = next(
+            s["body"] for s in discover_skills([skill_dir], include_global=False)
+            if s["name"] == "code-review"
+        )
+
+        with start_trace(
+            agent_name="test-agent",
+            skill_dirs=[skill_dir],
+            auto_send=False,
+        ) as ctx:
+            ctx.log_llm_call(
+                model="gpt-4o",
+                input=[
+                    {"role": "system", "content": f"You are helpful.\n\n{body}"},
+                    {"role": "user", "content": "Check my PR."},
+                ],
+                output={"content": "LGTM"},
+            )
+            ctx._infer_skill_rungs_from_prompt()
+
+            assert "code-review" in ctx._skills_delivered
+            # NOT asserted: that the name also lands on `offered`. This body
+            # never repeats its own slug, so no menu row reached the model —
+            # `skills_offered_in_prompt` means "the menu row was in the prompt
+            # the model was shown", and claiming it here would assert something
+            # that did not happen. A SKILL.md whose heading DOES carry the slug
+            # lands on both rungs, which
+            # test_header_plus_body_reports_BOTH_facts covers.
+            assert "code-review" not in ctx._skills_offered_in_prompt
+            # But a body reaching the model is still not the model asking.
+            assert ctx._active_skills == {}
 
 
 # ── OpenAI Agents ─────────────────────────────────────────
@@ -450,7 +509,13 @@ class TestAutoLoadE2E:
     """Full pipeline: SKILL.md files → discover → detect → RunTrace.active_skills."""
 
     def test_generic_e2e_auto_load_to_trace(self, skill_dir):
-        """Auto-discovered skills are detected in LLM calls and appear on the trace."""
+        """Auto-discovered skills reach the trace — on the rung they earned.
+
+        Retargeted from ``active_skills``. The end-to-end claim this test
+        exists to make (SKILL.md on disk → discovered → matched → on the wire)
+        is intact; only the field it lands in changed, because a name in a
+        system prompt is an offer, not a use.
+        """
         from decimalai.generic import start_trace
 
         with start_trace(
@@ -468,8 +533,8 @@ class TestAutoLoadE2E:
                 output={"content": "Found 2 issues."},
             )
 
-            # Trigger auto-detection
-            ctx._auto_detect_skills()
+            # Trigger the prompt-presence inference
+            ctx._infer_skill_rungs_from_prompt()
 
         with patch("decimalai._config._get_config") as mock_get_config:
             mock_cfg = MagicMock()
@@ -478,17 +543,20 @@ class TestAutoLoadE2E:
 
             trace = ctx.build_trace()
 
-        assert len(trace.active_skills) >= 1
-        skill_names = {s["name"] for s in trace.active_skills}
-        assert "code-review" in skill_names
-
-        # Verify hash came from the SKILL.md file (not None)
-        cr_skill = next(s for s in trace.active_skills if s["name"] == "code-review")
-        assert "hash" in cr_skill
-        assert cr_skill["hash"].startswith("sha256:")
+        assert trace.skills_offered_in_prompt == ["code-review"]
+        assert trace.skills_delivered == []
+        assert trace.active_skills == [], (
+            "a disk-discovered skill merely NAMED in the system prompt was "
+            "recorded as activated — it becomes a TraceSkillActivation row "
+            "indistinguishable from a real one"
+        )
 
     def test_generic_e2e_serialization_preserves_auto_skills(self, skill_dir):
-        """Auto-discovered skills survive model_dump() → JSON serialization."""
+        """Auto-discovered skills survive model_dump() → JSON serialization.
+
+        Retargeted field-for-field: the roundtrip is the point, and it is now
+        asserted on ``skills_offered_in_prompt``, where the inference writes.
+        """
         from decimalai.generic import start_trace
         from decimalai.schema.trace import RunTrace
 
@@ -505,7 +573,7 @@ class TestAutoLoadE2E:
                 ],
                 output={"content": "Here are 5 tests."},
             )
-            ctx._auto_detect_skills()
+            ctx._infer_skill_rungs_from_prompt()
 
         with patch("decimalai._config._get_config") as mock_get_config:
             mock_cfg = MagicMock()
@@ -516,14 +584,22 @@ class TestAutoLoadE2E:
 
         # Serialize → deserialize roundtrip
         data = trace.model_dump(mode="json")
-        assert "active_skills" in data
-        assert any(s["name"] == "test-generator" for s in data["active_skills"])
+        assert data["skills_offered_in_prompt"] == ["test-generator"]
+        assert data["active_skills"] == []
 
         restored = RunTrace.model_validate(data)
-        assert any(s["name"] == "test-generator" for s in restored.active_skills)
+        assert restored.skills_offered_in_prompt == ["test-generator"]
+        assert restored.active_skills == []
 
     def test_oai_processor_uses_auto_discovered_skills_for_detection(self, skill_dir):
-        """DecimalTracingProcessor with auto-discovered skills detects them in LLM calls."""
+        """The oai processor matches auto-discovered skills — as OFFERED.
+
+        Retargeted from ``acc.active_skills``, and the registry-hash
+        assertions dropped for the reason given in
+        ``test_auto_discovered_skills_used_for_detection``: the offered rung
+        has no hash slot, and a disk hash would be a version claim about a
+        body that was never seen.
+        """
         from decimalai.skills import discover_skills
         from decimalai.openai_agents import DecimalTracingProcessor, _TraceAccumulator
         from decimalai.schema.trace import LlmCallRecord
@@ -548,12 +624,12 @@ class TestAutoLoadE2E:
             started_at=datetime.now(timezone.utc),
         ))
 
-        # Run detection
-        processor._detect_skills(acc)
+        # Run the inference
+        processor._infer_skill_rungs(acc)
 
-        assert "code-review" in acc.active_skills
-        assert acc.active_skills["code-review"] is not None
-        assert acc.active_skills["code-review"].startswith("sha256:")
+        assert "code-review" in acc.skills_offered_in_prompt
+        assert acc.skills_delivered == set()
+        assert acc.active_skills == {}
 
 
 class TestPullMissingTargetsDiskRuntimes:

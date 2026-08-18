@@ -1,10 +1,27 @@
-"""Skill discovery and activation detection for DecimalAI SDK.
+"""Skill discovery and prompt-presence detection for the DecimalAI SDK.
 
-Implements the three-tier skill tracking model:
+The usage ladder has three rungs: **offered** (the skill's name was in the
+prompt), **delivered** (its body reached the model) and **activated** (the
+model itself asked for it).
 
-1. **Auto-discovery** — Scans for SKILL.md files following the agentskills.io spec
-2. **Prompt-diff detection** — Matches rendered prompts against known skill content
-3. **Explicit declaration** — ``install(skills=[...])`` or ``log_skill_activation()``
+This module answers the first two, and only for skills the SDK did not inject
+itself — a harness like Claude Code or Cursor discovers SKILL.md from disk and
+injects it without telling us, so the rendered prompt is the only observable
+we have. What text in a prompt can establish is that the skill was PUT IN
+FRONT of the model. It cannot establish that the model reached for it.
+
+1. **Auto-discovery** — scans for SKILL.md files per the agentskills.io spec.
+2. **Prompt-presence detection** — matches rendered prompts against known
+   skill content and reports which rung the evidence supports: a name pattern
+   alone is *offered*, body-content overlap is *delivered*.
+3. **Explicit declaration** — ``install(skills=[...])`` or
+   ``log_skill_activation()``.
+
+ACTIVATION is deliberately not in that list. It comes only from a direct
+selection event — the model calling ``load_skill``, a tool-role message
+carrying the body — and on a rail that has no such event the activated rung is
+honestly EMPTY. A fabricated activation is indistinguishable downstream from a
+real one and biases every effectiveness ranking that reads it.
 
 See https://docs.decimal.ai/guides/skills for the full user-facing documentation.
 """
@@ -16,7 +33,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("decimalai.skills")
 
@@ -290,10 +307,11 @@ def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
         "invocation": str(invocation).strip().lower() if invocation else None,
         "source_path": str(Path(path).parent),
         # Retain the body so Tier-2 fuzzy body matching in
-        # detect_skill_activations can actually fire for auto-discovered
+        # detect_skills_present_in_prompt can actually fire for auto-discovered
         # skills. Without it the descriptor carried no body and Tier-2 was
-        # dead — only Tier-1 name matching ever ran. The body is already
-        # read above to compute the hash, so this is no extra I/O.
+        # dead — only Tier-1 name matching ever ran, which caps the whole
+        # registry at the OFFERED rung. The body is already read above to
+        # compute the hash, so this is no extra I/O.
         "body": body,
     }
 
@@ -340,34 +358,57 @@ class SkillRegistry:
         return bool(self._skills)
 
 
-def detect_skill_activations(
+#: Evidence label: ≥ ``fuzzy_threshold`` of the skill's body lines are in the
+#: prompt, so the BODY demonstrably reached the model. Supports *delivered*.
+EVIDENCE_BODY = "body"
+
+#: Evidence label: only the skill's NAME was found (``[name]``, ``## name``,
+#: ``## Skill: name``). A menu row has exactly this shape and carries no body,
+#: so the strongest honest claim is *offered*.
+EVIDENCE_NAME = "name"
+
+
+def detect_skills_present_in_prompt(
     rendered_input: Any,
     skill_registry: List[Dict[str, Any]],
     *,
     fuzzy_match: bool = True,
     fuzzy_threshold: float = 0.6,
-) -> List[str]:
-    """Detect which skills were activated by matching prompt content.
+) -> List[Tuple[str, str]]:
+    """Detect which skills are PRESENT in the prompt shown to the model.
 
-    Detection tiers (in order):
-    1. **Name-pattern matching** — looks for ``## Skill: code-review``,
-       ``[code-review]``, etc. in system/developer messages.
-    2. **Fuzzy body matching** (optional, default on) — checks whether
-       ≥ ``fuzzy_threshold`` of a skill's body lines appear in the prompt.
-       Catches cases where skill content is injected without a header.
+    Presence is not activation. This reads system/developer text only — by
+    construction it can never see an assistant message or a tool result, which
+    are the only places a model-initiated choice shows up. What it establishes
+    is that the text was put in front of the model, and the tier that matched
+    says which rung of the ladder that supports:
+
+    1. **Name-pattern matching** — ``## Skill: code-review``, ``[code-review]``,
+       ``# code-review``. A menu row matches this and carries no body, so on its
+       own it supports OFFERED and nothing more. Reported as
+       :data:`EVIDENCE_NAME`.
+    2. **Fuzzy body matching** (optional, default on) — ≥ ``fuzzy_threshold`` of
+       the skill's body lines appear in the prompt, so the body itself reached
+       the model. Supports DELIVERED. Reported as :data:`EVIDENCE_BODY`.
+
+    Both tiers are evaluated for every skill, and body evidence wins when both
+    match: a ``## Skill: x`` header followed by the real body is a delivery, and
+    short-circuiting on the header would have downgraded it to a bare name.
 
     Args:
         rendered_input: The rendered_input from an LlmCallRecord
             (list of message dicts or string).
         skill_registry: The skill registry list from SkillRegistry.skills.
-        fuzzy_match: Enable fuzzy body matching fallback. Default True.
-            Set to False to use name-pattern matching only.
+        fuzzy_match: Enable fuzzy body matching. Default True. Set to False for
+            name-pattern matching only — which caps every result at
+            :data:`EVIDENCE_NAME`, because nothing then inspects a body.
         fuzzy_threshold: Minimum line-overlap ratio (0.0–1.0) for fuzzy
             matching. Default 0.6 (60% of skill body lines must appear
             in the prompt). Set to 0.0 to effectively disable.
 
     Returns:
-        List of activated skill names.
+        ``[(skill_name, evidence)]`` in registry order, where evidence is
+        :data:`EVIDENCE_BODY` or :data:`EVIDENCE_NAME`.
     """
     if not skill_registry or not rendered_input:
         return []
@@ -376,24 +417,180 @@ def detect_skill_activations(
     if not system_text:
         return []
 
-    activated = []
+    present: List[Tuple[str, str]] = []
     for skill in skill_registry:
         name = skill.get("name", "")
         if not name:
             continue
 
-        # Tier 1: Name-pattern matching (fast, high precision)
-        if _skill_appears_in_text(name, system_text):
-            activated.append(name)
-            continue
+        name_hit = _skill_appears_in_text(name, system_text)
 
-        # Tier 2: Fuzzy body matching (fallback)
+        body_hit = False
         if fuzzy_match and fuzzy_threshold > 0.0:
             body = skill.get("body") or skill.get("body_markdown") or ""
-            if body and _fuzzy_body_match(body, system_text, fuzzy_threshold):
-                activated.append(name)
+            body_hit = bool(
+                body and _fuzzy_body_match(body, system_text, fuzzy_threshold)
+            )
 
-    return activated
+        # Both facts are reported when both are true, rather than picking a
+        # winner. They are INDEPENDENT observations: the name appearing in the
+        # prompt means the menu row was shown (offered), the body appearing
+        # means the body was shown (delivered), and a SKILL.md pasted whole
+        # satisfies both because its own heading carries the name.
+        #
+        # Collapsing them lost the offered fact whenever a body matched, and the
+        # caller then restored it with a blanket delivered->offered fold — which
+        # also fired when the name was NOT in the prompt, asserting a menu row
+        # that was never shown. Reporting both keeps the true half without
+        # inventing the false one.
+        if body_hit:
+            present.append((name, EVIDENCE_BODY))
+        if name_hit:
+            present.append((name, EVIDENCE_NAME))
+
+    return present
+
+
+def detect_skill_activations(
+    rendered_input: Any,
+    skill_registry: List[Dict[str, Any]],
+    *,
+    fuzzy_match: bool = True,
+    fuzzy_threshold: float = 0.6,
+) -> List[str]:
+    """Deprecated alias for :func:`detect_skills_present_in_prompt`.
+
+    The name is a misnomer kept for backward compatibility: matching prompt
+    text establishes PRESENCE (offered or delivered), never activation. It
+    returns the same skill names, in the same order, as it always has — only
+    the evidence tier is dropped. Prefer
+    :func:`detect_skills_present_in_prompt`, which reports the rung, or
+    :func:`infer_prompt_rungs`, which routes the rungs for you.
+
+    Returns:
+        List of skill names whose text is present in the prompt.
+    """
+    # Deduped: the underlying function reports name-evidence and
+    # body-evidence independently, so a SKILL.md pasted whole yields the same
+    # name twice. This alias has always returned each name once.
+    seen = set()
+    names = []
+    for name, _evidence in detect_skills_present_in_prompt(
+        rendered_input,
+        skill_registry,
+        fuzzy_match=fuzzy_match,
+        fuzzy_threshold=fuzzy_threshold,
+    ):
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+def infer_prompt_rungs(
+    rendered_inputs: Iterable[Any],
+    skill_registry: Optional[Sequence[Dict[str, Any]]],
+    *,
+    router_accounted: Optional[Iterable[str]] = None,
+    router_offered: Optional[Iterable[str]] = None,
+    router_delivered: Optional[Iterable[str]] = None,
+    fuzzy_match: bool = True,
+    fuzzy_threshold: float = 0.6,
+) -> Tuple[List[str], List[str]]:
+    """Infer the offered/delivered rungs from prompt text, for ONE run.
+
+    This is the single entry point every framework adapter uses, so the
+    precedence rule below is stated once instead of four times.
+
+    **Precedence.** ``skill_registry`` is fed from DISK, while the router rails
+    are fed by the router, and both can be live in one run — a user inside
+    Claude Code with disk skills who ALSO uses SkillRouter. When the router
+    injects a body for a skill that also exists on disk, this function would
+    otherwise match the router's own injection and re-report it. Worse, it
+    could re-report it at a DIFFERENT rung: the router knows it only put a menu
+    row in the prompt, and a Tier-1 name match on that same menu row would
+    promote it to delivered. So any name in ``router_accounted`` — the union of
+    this run's offered, delivered and loaded names — is dropped here outright.
+    The router observed what it did; a guess must never overwrite an
+    observation.
+
+    ``router_accounted`` must be THIS RUN's names. The SkillRouter singleton's
+    process-global rails hold a mix of every concurrent run, so subtracting
+    those would let one run's routing suppress another run's genuine disk
+    skills.
+
+    Args:
+        rendered_inputs: The ``rendered_input`` of each LLM call in the run.
+        skill_registry: Disk-discovered (or explicitly passed) skill
+            descriptors.
+        router_accounted: Names the router already recorded for this run.
+        fuzzy_match: Passed through to :func:`detect_skills_present_in_prompt`.
+        fuzzy_threshold: Passed through to
+            :func:`detect_skills_present_in_prompt`.
+
+    Returns:
+        ``(offered_names, delivered_names)`` — deduped, first-seen order.
+        Delivered does NOT imply offered here; callers apply that fold, since
+        each adapter already owns the ladder invariant for its own rails.
+        Neither list is ever an activation.
+    """
+    if not skill_registry:
+        return [], []
+
+    accounted = {
+        n.strip()
+        for n in (list(router_accounted or ()) + list(router_offered or ())
+                  + list(router_delivered or ()))
+        if isinstance(n, str) and n.strip()
+    }
+
+    registry = list(skill_registry)
+    offered: List[str] = []
+    delivered: List[str] = []
+    for rendered_input in rendered_inputs or ():
+        if not rendered_input:
+            continue
+        for name, evidence in detect_skills_present_in_prompt(
+            rendered_input,
+            registry,
+            fuzzy_match=fuzzy_match,
+            fuzzy_threshold=fuzzy_threshold,
+        ):
+            if name in accounted:
+                # The router already accounted for this skill on this run —
+                # observed, so never re-inferred.
+                #
+                # This is a BLANKET subtraction, and per-rung was tried and
+                # rejected. Per-rung reads more precise: let a router OFFER be
+                # overridden by an inferred DELIVERY, since a harness may have
+                # injected a body the router only offered a menu row for. But
+                # Tier-2 matches on line overlap, and a menu row whose
+                # description echoes a short body scores 100% — so per-rung lets
+                # the router's own menu row climb to "delivered", asserting a
+                # body reached the model when only the description did.
+                #
+                # The costs are not symmetric. Blanket LOSES a genuine harness
+                # delivery when the same name is on both sides — and names do
+                # overlap by construction, because `decimalai skills sync`
+                # uploads disk SKILL.md files by name, so this is the common
+                # case, not the edge. Per-rung FABRICATES a delivery. A missing
+                # rung is a gap; a fabricated one is indistinguishable from a
+                # real observation downstream and biases every effectiveness
+                # number computed from it. Take the gap.
+                #
+                # The real fix is upstream: make Tier-2 unable to match a menu
+                # row (require body-specific evidence, not line overlap). Until
+                # then, blanket.
+                continue
+            if evidence == EVIDENCE_BODY:
+                if name not in delivered:
+                    delivered.append(name)
+            elif name not in offered:
+                offered.append(name)
+
+    # A body seen on one call outranks a bare name seen on another.
+    delivered_set = set(delivered)
+    offered = [n for n in offered if n not in delivered_set]
+    return offered, delivered
 
 
 # ── Internal Helpers ────────────────────────────────────────
@@ -525,8 +722,13 @@ def _skill_appears_in_text(skill_name: str, text: str) -> bool:
 
     # Direct name reference (case-insensitive)
     patterns = [
-        rf"##?\s+(?:Active\s+)?Skill:\s*{re.escape(skill_name)}",
-        rf"##?\s+{re.escape(skill_name)}",
+        # The trailing (?![\w-]) is load-bearing. Without it a skill named
+        # "refund" matches the router's own injected block for a DIFFERENT
+        # skill, `## Skill: refund-policy` — so the precedence rule, which
+        # subtracts router-accounted names exactly, never removes it and the
+        # SDK infers a rung from its own injection under a neighbouring name.
+        rf"##?\s+(?:Active\s+)?Skill:\s*{re.escape(skill_name)}(?![\w-])",
+        rf"##?\s+{re.escape(skill_name)}(?![\w-])",
         rf"\[{re.escape(skill_name)}\]",
     ]
     for pattern in patterns:

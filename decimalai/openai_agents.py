@@ -2019,29 +2019,12 @@ class DecimalTracingProcessor:
         # Auto-register manifest from span data + the live Agent object
         manifest_id = self._maybe_register_manifest(acc, agent_name)
 
-        # Auto-detect skill activations from LLM calls
-        self._detect_skills(acc)
-
         config = _config._config
-
-        # Build active_skills list
-        active_skills_list: List[Dict[str, Any]] = []
-        for name, h in acc.active_skills.items():
-            entry: Dict[str, Any] = {"name": name}
-            if h:
-                entry["hash"] = h
-            active_skills_list.append(entry)
 
         # This run's own rail — routing decision, delivered bodies, loads —
         # keyed by the trace id both the instructions callable and this
         # method see. Popped, so it can't leak into a later trace.
         run_rail = _pop_run_rail(acc.trace_id) or {}
-
-        # Put the system half of the prompt back on `rendered_input`. STRICTLY
-        # AFTER `_detect_skills` above: the skills menu names every OFFERED
-        # skill, and `detect_skill_activations` name-matches over system text,
-        # so splicing earlier would report the whole menu as ACTIVATED.
-        _attach_system_prompts(acc, run_rail.get("system_prompts"))
 
         # Drain the Router's process-global rails unconditionally: an
         # undrained rail leaks into the NEXT trace. When this run recorded
@@ -2095,6 +2078,29 @@ class DecimalTracingProcessor:
             acc.skills_delivered.update(rail_loaded)
             acc.skills_offered_in_prompt.update(rail_loaded)
 
+        # Infer offered/delivered for DISK skills the SDK did not inject.
+        # STRICTLY AFTER the rail merges above: the precedence rule needs this
+        # run's full router-accounted set, or a skill the router only put a
+        # menu row for could be re-inferred here as delivered.
+        self._infer_skill_rungs(acc)
+
+        # Build active_skills list. Nothing above writes it — an entry here is
+        # an explicit `log_skill_activation` or a `decimal.active_skills`
+        # declaration, never a prompt match.
+        active_skills_list: List[Dict[str, Any]] = []
+        for name, h in acc.active_skills.items():
+            entry: Dict[str, Any] = {"name": name}
+            if h:
+                entry["hash"] = h
+            active_skills_list.append(entry)
+
+        # Put the system half of the prompt back on `rendered_input`. STRICTLY
+        # AFTER `_infer_skill_rungs` above: the skills menu names every OFFERED
+        # skill, and the detector name-matches over system text, so splicing
+        # earlier would report the whole menu as DELIVERED — a smaller lie than
+        # the ACTIVATED it used to be, but the same kind.
+        _attach_system_prompts(acc, run_rail.get("system_prompts"))
+
         trace = RunTrace(
             id=uuid4(),
             project=config.project if config else None,
@@ -2133,29 +2139,48 @@ class DecimalTracingProcessor:
         except Exception:
             logger.exception("Failed to queue trace %s", trace.id)
 
-    def _detect_skills(self, acc: _TraceAccumulator) -> None:
-        """Auto-detect skill activations from LLM call content."""
+    def _infer_skill_rungs(self, acc: _TraceAccumulator) -> None:
+        """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
+
+        ``_skills_registry`` is disk-derived, so it describes skills a harness
+        may have injected itself. Prompt text can show they were put in front
+        of the model; it can never show the model reaching for one, so nothing
+        here writes ``acc.active_skills``. On this rail the activation signal
+        is ``_handle_load_skill`` — which records a load only when the router
+        actually returned a body.
+
+        Must run AFTER this run's rails are merged into ``acc``: the router's
+        own names are excluded from the inference (see ``infer_prompt_rungs``).
+        """
         if not self._skills_registry or not acc.llm_calls:
             return
 
         try:
-            from .skills import detect_skill_activations
-            for call in acc.llm_calls:
-                if not call.rendered_input:
-                    continue
-                detected = detect_skill_activations(
-                    call.rendered_input, self._skills_registry
-                )
-                for skill_name in detected:
-                    if skill_name not in acc.active_skills:
-                        registry_hash = next(
-                            (s.get("hash") for s in self._skills_registry
-                             if s.get("name") == skill_name),
-                            None,
-                        )
-                        acc.active_skills[skill_name] = registry_hash
+            from .skills import infer_prompt_rungs
+
+            # Passed split for readability; infer_prompt_rungs pools them —
+            # see the trade-off note there on why suppression is blanket.
+            router_offered = set(acc.skills_offered_in_prompt)
+            router_delivered = set(acc.skills_delivered) | set(acc.skills_loaded_by_agent)
+            offered, delivered = infer_prompt_rungs(
+                (call.rendered_input for call in acc.llm_calls),
+                self._skills_registry,
+                router_offered=router_offered,
+                router_delivered=router_delivered,
+            )
+            # NO delivered->offered fold on the INFERRED path. That fold is
+            # sound for the router's own rails — it offered the menu row and
+            # then delivered the body, so it observed both — but here both
+            # rungs are guesses read off prompt text, and Tier-2 matches a
+            # BODY whose name may never appear in the prompt at all. Folding
+            # would then assert `skills_offered_in_prompt`, which means "the
+            # menu row was in the prompt the model was shown", for a name that
+            # was not. That is the same fabrication this rewiring exists to
+            # remove, moved one rung down.
+            acc.skills_offered_in_prompt.update(offered)
+            acc.skills_delivered.update(delivered)
         except Exception:
-            logger.debug("Skill auto-detection failed", exc_info=True)
+            logger.debug("Skill prompt-presence inference failed", exc_info=True)
 
     def _maybe_register_manifest(
         self, acc: _TraceAccumulator, agent_name: str

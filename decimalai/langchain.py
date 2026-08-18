@@ -1681,9 +1681,13 @@ class CallbackHandler(_CallbackBase):
                             role,
                         )
 
-        # Auto-detect skill activations from system prompts
-        if state.seen_prompts:
-            self._detect_skills_from_prompts(state)
+        # Skill rungs are NOT inferred here. This fires at
+        # on_chat_model_start, before `_capture_call_rails` and the trace-build
+        # rail merge have finished naming what the ROUTER accounted for on this
+        # run — and the precedence rule needs that set complete, or a skill the
+        # router only offered gets re-inferred from its own menu row. The
+        # inference runs once in `build_trace`, over `state.seen_prompts`,
+        # which is fully populated by then.
 
     def on_llm_end(
         self,
@@ -1972,6 +1976,11 @@ class CallbackHandler(_CallbackBase):
                     state.skills_offered_in_prompt.add(n.strip())
                     state.skills_delivered.add(n.strip())
 
+        # Infer offered/delivered for DISK skills the SDK did not inject.
+        # STRICTLY AFTER every rail merge above, so the precedence rule sees
+        # this run's complete router-accounted set.
+        self._infer_skill_rungs_from_prompts(state)
+
         routing_id = state.routing_id or ctx_routing_id or rail_routing_id
         agent_name = self._agent_name_or_default(state)
 
@@ -2161,40 +2170,57 @@ class CallbackHandler(_CallbackBase):
             logger.warning("Eval execution failed: %s", e)
             return []
 
-    def _detect_skills_from_prompts(self, state: Optional[_RunState] = None) -> None:
-        """Auto-detect skill activations from system/developer prompts.
+    def _infer_skill_rungs_from_prompts(self, state: Optional[_RunState] = None) -> None:
+        """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
 
-        Uses the global skills registry (from instrument()) to match
-        skill references in the rendered system prompt text.
+        The registry comes from ``instrument(skills=...)`` else
+        ``discover_skills()`` — disk either way — so it describes skills a
+        harness may have put in the prompt itself. Matching that prompt text
+        shows the skill was put in front of the model, never that the model
+        reached for it, so ``state.active_skills`` is untouched: on this rail
+        activation arrives only through an explicit ``log_skill_activation``
+        or a ``load_skill`` serve landing in ``skills_loaded_by_agent``.
+
+        Call from ``build_trace`` AFTER the rail merges — the precedence rule
+        needs this run's complete router-accounted set.
         """
         state = state or self._current
         skills_registry = (_explicit_manifest_config or {}).get("skills")
-        if not skills_registry:
+        if not skills_registry or state is None:
             return
 
         try:
-            from .skills import detect_skill_activations
+            from .skills import infer_prompt_rungs
             # Build system text from seen prompts
             system_text = "\n".join(state.seen_prompts.values())
             if not system_text:
                 return
 
-            detected = detect_skill_activations(
-                [{"role": "system", "content": system_text}],
+            # Passed split for readability; infer_prompt_rungs pools them —
+            # see the trade-off note there on why suppression is blanket.
+            router_offered = set(state.skills_offered_in_prompt)
+            router_delivered = set(state.skills_delivered) | set(state.skills_loaded_by_agent)
+            offered, delivered = infer_prompt_rungs(
+                [[{"role": "system", "content": system_text}]],
                 skills_registry,
+                router_offered=router_offered,
+                router_delivered=router_delivered,
             )
-            for skill_name in detected:
-                if skill_name not in state.active_skills:
-                    registry_hash = next(
-                        (s.get("hash") for s in skills_registry
-                         if s.get("name") == skill_name),
-                        None,
-                    )
-                    state.active_skills[skill_name] = registry_hash
+            # NO delivered->offered fold on the INFERRED path. That fold is
+            # sound for the router's own rails — it offered the menu row and
+            # then delivered the body, so it observed both — but here both
+            # rungs are guesses read off prompt text, and Tier-2 matches a
+            # BODY whose name may never appear in the prompt at all. Folding
+            # would then assert `skills_offered_in_prompt`, which means "the
+            # menu row was in the prompt the model was shown", for a name that
+            # was not. That is the same fabrication this rewiring exists to
+            # remove, moved one rung down.
+            state.skills_offered_in_prompt.update(offered)
+            state.skills_delivered.update(delivered)
         except Exception:
             _warn_once_then_debug(
-                "skill_activation_detection",
-                "Skill auto-detection from prompts failed",
+                "skill_prompt_presence_inference",
+                "Skill prompt-presence inference failed",
             )
 
     def _resolve_manifest_for_empty_run(self, agent_name: str) -> None:

@@ -360,8 +360,8 @@ class TraceContext:
         # Auto-register manifest before sending trace
         self._maybe_register_manifest()
 
-        # Auto-detect skills from LLM call content
-        self._auto_detect_skills()
+        # Infer the offered/delivered rungs for skills the SDK did NOT inject
+        self._infer_skill_rungs_from_prompt()
 
         try:
             client = _config._get_client()
@@ -390,34 +390,61 @@ class TraceContext:
             )
             logger.debug("Failed to queue trace %s", self._trace_id, exc_info=True)
 
-    def _auto_detect_skills(self) -> None:
-        """Auto-detect skills from LLM call content using the skills registry.
+    def _infer_skill_rungs_from_prompt(self) -> None:
+        """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
 
-        Runs detect_skill_activations() against each LLM call's rendered_input.
-        Merges with any explicitly logged skill activations (explicit wins).
+        ``_skills_registry`` comes from disk (explicit ``skills=`` else
+        ``discover_skills()``), so it describes skills a harness like Claude
+        Code may have injected itself, without ever telling the SDK. The
+        rendered prompt is then the only observable, and what it can establish
+        is that the skill was put in front of the model — the offered rung for
+        a bare name, the delivered rung for real body content.
+
+        It deliberately does NOT touch ``_active_skills``. Prompt text can
+        never show the model REACHING for a skill: ``_extract_system_text``
+        keeps system/developer messages only, so an assistant message or a
+        tool result — the only two shapes a model-initiated choice arrives in
+        — are discarded before any matching runs. Activation on this path
+        comes from ``log_skill_activation`` (a caller's declaration) or
+        ``log_skill_loaded`` (the model called ``load_skill``), and when
+        neither fired the activated rung stays honestly empty.
+
+        Skills the router already accounted for on THIS trace are excluded —
+        see ``infer_prompt_rungs``.
         """
         if not self._skills_registry or not self._llm_calls:
             return
 
         try:
-            from .skills import detect_skill_activations
-            for call in self._llm_calls:
-                if not call.rendered_input:
-                    continue
-                detected = detect_skill_activations(
-                    call.rendered_input, self._skills_registry
-                )
-                for skill_name in detected:
-                    if skill_name not in self._active_skills:
-                        # Use registry hash for version tracking
-                        registry_hash = next(
-                            (s.get("hash") for s in self._skills_registry
-                             if s.get("name") == skill_name),
-                            None,
-                        )
-                        self._active_skills[skill_name] = registry_hash
+            from .skills import infer_prompt_rungs
+
+            # Snapshot BEFORE writing: these are the names the router observed
+            # directly on this run, and an observation outranks an inference.
+            # Passed split for readability; infer_prompt_rungs pools them —
+            # see the trade-off note there on why suppression is blanket.
+            router_offered = set(self._skills_offered_in_prompt)
+            router_delivered = set(self._skills_delivered) | set(self._skills_loaded_by_agent)
+            offered, delivered = infer_prompt_rungs(
+                (call.rendered_input for call in self._llm_calls),
+                self._skills_registry,
+                router_offered=router_offered,
+                router_delivered=router_delivered,
+            )
+            if offered:
+                self.log_skill_offered(names=offered)
+            for name in delivered:
+                # Written directly rather than via log_skill_delivered, which
+                # folds delivered into offered. That fold is right for the
+                # ROUTER — it offered the menu row and then delivered the body,
+                # so it observed both — but both rungs here are guesses read off
+                # prompt text, and Tier-2 matches a BODY whose name may never
+                # appear in the prompt. Folding would assert
+                # `skills_offered_in_prompt` ("the menu row was in the prompt
+                # the model was shown") for a name that was not, which is the
+                # fabrication this rewiring exists to remove, one rung down.
+                self._skills_delivered.add(name)
         except Exception:
-            logger.debug("Skill auto-detection failed", exc_info=True)
+            logger.debug("Skill prompt-presence inference failed", exc_info=True)
 
     def _maybe_register_manifest(self) -> None:
         """Extract and register manifest from accumulated trace data.
