@@ -243,14 +243,27 @@ def _verify_backend_at_init(
     import urllib.request
 
     from . import _config as _cfg
-    from ._config import DecimalConfigError
+    from ._config import DecimalConfigError, sdk_user_agent
 
     url = f"{base_url.rstrip('/')}/api/v1/auth/verify"
+    # The version string is built in exactly ONE place (`_config.sdk_user_agent`)
+    # and `context="init-verify"` appends to the User-Agent's comment rather
+    # than restating the product token, so a startup probe stays
+    # distinguishable from steady-state ingest:
+    #     decimalai-sdk/<version> (python/<x.y.z>; <sys.platform>; init-verify)
+    # The `init-verify` substring survives from the previous format, so any
+    # log filter already written against it keeps matching.
+    #
+    # This calls sdk_user_agent() rather than the full sdk_headers() on
+    # purpose: sdk_headers() also sets Content-Type: application/json, which is
+    # meaningless on this bodyless GET, and this is the auth path — a
+    # regression here fails init() for every user. Changing exactly one header
+    # VALUE and adding nothing to the wire is the conservative trade.
     req = urllib.request.Request(
         url,
         headers={
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": f"decimalai-sdk/{__version__} (init-verify)",
+            "User-Agent": sdk_user_agent("init-verify"),
         },
     )
     try:

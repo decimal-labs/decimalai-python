@@ -10,6 +10,7 @@ from uuid import UUID
 
 import httpx
 
+from ._config import sdk_headers
 from ._responses import (
     AgentListResponse,
     IngestionResult,
@@ -256,10 +257,13 @@ class DecimalAIClient:
 
         # DEPRECATED (0.10.0): `project` no longer emits an `X-Decimal-Project`
         # header — the platform never read it. See DecimalConfig.api_headers.
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        #
+        # Built by the shared builder so trace ingest identifies the SDK. Before
+        # this change the dict set no User-Agent, so httpx supplied its own default
+        # and every ingested trace arrived stamped `python-httpx/<x.y.z>` — the
+        # transport's version, not the SDK's. That is why 285,660 production
+        # traces could not be attributed to an SDK version.
+        headers = sdk_headers(api_key)
 
         self._http = httpx.Client(
             base_url=self.base_url,

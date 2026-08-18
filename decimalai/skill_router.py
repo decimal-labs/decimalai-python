@@ -608,10 +608,12 @@ class SkillRouter:
         )
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        # Shared builder — see `_config.sdk_headers`. Routing requests carry the
+        # SDK version for the same reason ingest does: "which SDK version asked
+        # for this menu?" should be answerable from the request itself.
+        from ._config import sdk_headers
+
+        return sdk_headers(self.api_key)
 
     def _request(
         self,

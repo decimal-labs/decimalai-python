@@ -27,6 +27,101 @@ except ImportError:
     pass
 
 
+# ── SDK identity ───────────────────────────────────────────────
+#
+# Every request the SDK makes must say which SDK version made it.
+#
+# Why this exists: before this change the ONLY request that identified itself
+# was the one-off ``init()`` auth-verify probe. Trace ingest — the path that
+# matters — went out over an httpx.Client whose default User-Agent is
+# ``python-httpx/<x.y.z>``, so 285,660 production traces recorded the
+# TRANSPORT's version and nothing about the SDK. The consequence was
+# concrete: the synthetic-user fleet ran 0.8.0 against production for six
+# weeks while everyone believed it was current, and the only way to notice
+# was to grep Cloud Run logs for that single startup probe.
+#
+# Header choice — ``User-Agent``, and ONLY ``User-Agent``:
+#
+#   * Cloud Run already extracts it into the indexed ``httpRequest.userAgent``
+#     field. That is the exact field the 0.8.0 discovery was made in, so this
+#     change pays off with zero backend work:
+#         gcloud logging read '... httpRequest.userAgent:"decimalai-sdk"'
+#   * A custom ``X-Decimal-SDK-Version`` would parse more cleanly, but it is
+#     invisible to that field — Cloud Run does not log arbitrary request
+#     headers — so it would buy nothing until the backend is changed to read
+#     it. This module already carries the scar of shipping a header the
+#     platform silently ignored (``X-Decimal-Project``, see ``api_headers``);
+#     a second unread header repeats that mistake and creates the same false
+#     impression that something is being captured.
+#   * Sending BOTH was considered and rejected. The only argument for it is
+#     to avoid SDK adoption lag — but both headers would ship in the SAME
+#     release, so the population of clients sending one is identical to the
+#     population sending the other. The custom header's sole benefit over
+#     ``decimalai-sdk/(\S+)`` against the User-Agent is parse convenience,
+#     which does not justify a second wire format. When the backend actually
+#     persists this (see RELEASING/handoff notes), THAT is the moment to add
+#     a structured header, coupled to a reader.
+#
+# Privacy: the comment section carries the Python version and ``sys.platform``
+# ("linux" / "darwin" / "win32") and nothing else. Those two answer the
+# immediate follow-up question ("is this a container or someone's laptop, and
+# on which interpreter?") at zero cost. Deliberately absent: hostname,
+# username, filesystem paths, machine architecture, OS build — none of which
+# triage anything and all of which identify a user or a machine.
+
+# Static across the life of the process; computed once.
+_PY_VERSION = (
+    f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+)
+_PLATFORM = sys.platform
+
+
+def sdk_user_agent(context: Optional[str] = None) -> str:
+    """Build the SDK's ``User-Agent`` string.
+
+    Shape follows the conventional ``product/version (comment)`` form::
+
+        decimalai-sdk/<version> (python/<x.y.z>; <sys.platform>)
+        decimalai-sdk/<version> (python/<x.y.z>; <sys.platform>; init-verify)
+
+    ``context`` appends a label to the comment so a caller can distinguish
+    its traffic without restating the product token. ``init()``'s auth-verify
+    probe passes ``"init-verify"``, which preserves the previous ability to tell
+    a one-off startup probe apart from steady-state ingest — the substring
+    ``init-verify`` is still present, so log filters written against the old
+    ``decimalai-sdk/0.8.0 (init-verify)`` format keep matching.
+
+    The version is read from ``decimalai.__version__`` at call time rather
+    than copied into a constant here, so it can never drift from the package
+    (``TestVersion.test_version_matches_pyproject`` pins that to pyproject in
+    turn, making one source of truth for the whole chain).
+    """
+    # Lazy: this module is imported *by* ``decimalai/__init__.py``, so a
+    # module-level ``from . import __version__`` would be a circular import.
+    from . import __version__
+
+    comment = f"python/{_PY_VERSION}; {_PLATFORM}"
+    if context:
+        comment = f"{comment}; {context}"
+    return f"decimalai-sdk/{__version__} ({comment})"
+
+
+def sdk_headers(api_key: str, context: Optional[str] = None) -> dict[str, str]:
+    """The headers EVERY DecimalAI request sends.
+
+    This is the single shared builder. ``DecimalConfig.api_headers``,
+    ``DecimalAIClient``'s httpx client, ``SkillRouter._headers`` and the
+    ``init()`` verify probe all route through here so that adding a header
+    once adds it everywhere — the property that was missing when the version
+    lived only on the verify probe.
+    """
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": sdk_user_agent(context),
+    }
+
+
 @dataclass
 class DecimalConfig:
     """Configuration for the DecimalAI SDK."""
@@ -92,10 +187,7 @@ class DecimalConfig:
         # like it grouped traces when it did nothing at all.
         # Grouping that actually works: workspaces (resolved from the key, or
         # the X-Workspace-Id header the dashboard sends).
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        return sdk_headers(self.api_key)
 
     def resolve_disk_sync(self, loader_active: bool) -> bool:
         """Whether an adapter should mirror platform skills to disk (disk_sync).
