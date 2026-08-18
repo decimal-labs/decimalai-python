@@ -18,9 +18,14 @@ FRONT of the model. It cannot establish that the model reached for it.
    ``log_skill_activation()``.
 
 ACTIVATION is deliberately not in that list. It comes only from a direct
-selection event — the model calling ``load_skill``, a tool-role message
-carrying the body — and on a rail that has no such event the activated rung is
-honestly EMPTY. A fabricated activation is indistinguishable downstream from a
+selection event, which today means the model calling ``load_skill`` (recorded on
+``skills_loaded_by_agent``, which the backend merges into the activation set) or
+an explicit ``log_skill_activation()`` / ``decimal.active_skills`` declaration.
+On a rail with no such event the activated rung is honestly EMPTY.
+
+Reading a tool-role message as its own activation channel would be a reasonable
+addition — the body coming back IS the answer to a request the model made — but
+nothing here implements it today, so it is not claimed. A fabricated activation is indistinguishable downstream from a
 real one and biases every effectiveness ranking that reads it.
 
 See https://docs.decimal.ai/guides/skills for the full user-facing documentation.
