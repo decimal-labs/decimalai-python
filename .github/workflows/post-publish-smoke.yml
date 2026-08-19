@@ -1,12 +1,16 @@
 # Does the release a user can actually `pip install` still do what the docs say?
 #
-# ⚠ THIS CANNOT RUN YET. GitHub Actions is blocked for this org at the ACCOUNT
-#   level by billing — every run on every repo here dies in ~2s with steps=0, and
-#   the reason is visible only via `gh api /repos/{o}/{r}/check-runs/{id}/annotations`.
-#   The fix is a valid credit card on org billing, not a change to this file (a
-#   public-repo flip does NOT clear it — the same lock hits Free-plan public
-#   repos). Until that is resolved this workflow is written, validated and
-#   dormant: treat a missing run here as "no signal", never as "green".
+# This workflow runs. It did not while the repository was private: org billing
+# had lapsed, private repos consume billable Actions minutes, and every run died
+# in ~2s with steps=0 — with the reason visible only via
+# `gh api /repos/{o}/{r}/check-runs/{id}/annotations`, never in the job log.
+#
+# An earlier version of this comment asserted that a public-repo flip would NOT
+# clear it. That was wrong: public repositories get unbilled minutes, and the
+# flip turned CI green here with no billing change at all. Recorded because the
+# claim was argued from community threads rather than tested, and it cost time.
+#
+# Still true and worth keeping: a missing run is "no signal", never "green".
 #
 # ── why this exists ──────────────────────────────────────────────────────────
 # The release gate's clean-room step (scripts/release.sh) proves exactly two

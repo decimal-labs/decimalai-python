@@ -20,23 +20,22 @@ the tag *is* the trigger (so a shipped version can never be untagged), and prove
 **0.10.3 ships from `scripts/release.sh`.** Check which regime you are in before you cut anything
 (see below) — this section is a policy with a switch, not a standing preference.
 
-### The precondition, and why it is currently unmet
+### The precondition, and how it was met
 
-Actions jobs on `decimal-labs/decimalai-python` are **not started at all**: billing for this account
-has failed, and this is the last repo in the org that is still **private**. Private repos consume
-billable Actions minutes; public repos get them free. That single difference is why the OIDC path
-succeeded on `decimalai-mcp 0.1.3`, `agentversion 0.2.3`, and `skillevaluation 0.7.1` — all three of
-those repos are **public**. Those releases are real proof that the mechanism works; they are *not*
-evidence that it works here.
+This repository is **public**, and public repositories get Actions minutes that are not billed. That
+is what unblocked CI here: while this repo was private, every job died in about two seconds with
+`steps=0`, because org billing had lapsed and private repos consume billable minutes. The public
+flip cleared it without any billing change — the same reason the OIDC path already worked on
+`decimalai-mcp 0.1.3`, `agentversion 0.2.3`, and `skillevaluation 0.7.1`, all of which were public
+first.
 
-So the precondition is met when **either** of these becomes true:
+So the precondition is met, and the OIDC path is available. Note what that does *not* prove: no
+release has yet been cut through it from this repository, so the first one should be watched rather
+than assumed.
 
-- this repo is made **public** (free Actions minutes), or
-- **org billing is restored** (a valid payment method on the `decimal-labs` billing settings).
-
-Until then, cutting a GitHub Release for a new version does nothing useful: `publish.yml` fires, its
-`test` job never starts, `publish` (`needs: test`) is therefore skipped, and **nothing reaches PyPI**.
-You are left with a dangling tag and a Release for a version that does not exist.
+If Actions ever stops starting again — jobs failing in seconds with `steps=0` — check org billing
+before changing any workflow file. The give-away is that the reason appears only in the check-run
+annotation (`gh api /repos/{owner}/{repo}/check-runs/{id}/annotations`), not in the job log.
 
 ### Check which regime you are in — before cutting a release
 
