@@ -1,8 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Questions & discussion
-    url: https://github.com/orgs/decimal-labs/discussions
-    about: Ask questions and discuss usage with the community.
-  - name: Security issues (private)
-    url: https://github.com/decimal-labs/decimalai-python/security/policy
-    about: Report security vulnerabilities privately — please do not open a public issue.
