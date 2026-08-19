@@ -76,8 +76,23 @@ dependencies = [
 # releases. CVE-2026-40087 (Moderate) is fixed earlier, in 1.2.28 / 0.3.84.
 # 0.3.x is deliberately out of support even though it works: it cannot pair
 # with a current langgraph, which requires langchain-core>=1.4.7.
+#
+# The floor is HIGHER on Python 3.10, and the reason is per-run skill attribution,
+# not a CVE. langchain-core routes async runnable bodies through
+# runnables/utils.py::coro_with_context, which before 1.4.8 could only carry its
+# config ContextVar into a task via asyncio.create_task(..., context=) — an
+# argument that does not exist below Python 3.11. On 3.10 it therefore fell back
+# to a plain create_task and dropped the context, so _ambient_run_scope() (see
+# decimalai/langchain.py) reads no parent_run_id and the Router files every
+# load_skill() unscoped. Concurrent runs then cross-contaminate: measured on
+# 1.3.3/py3.10, one run's activation is lost and another reports one it never
+# made. 1.4.8 replaced that branch with context.run(asyncio.create_task, coro),
+# which works on every version. Bisected: 1.3.0–1.4.7 fail on py3.10, 1.4.8+
+# pass, and py3.11+ passes throughout. So >=1.3.3 is a true claim on 3.11+ and
+# was a false one on 3.10 — this marker states each where it holds.
 langchain = [
-    "langchain-core>=1.3.3,<2",  # Cap the major. Redundant while langgraph pins <2 itself, but bites for langchain-without-langgraph installs. Review the cap when 2.0 is announced — do not let it outlive its reason the way openai<3 did.
+    "langchain-core>=1.3.3,<2; python_version >= '3.11'",  # Cap the major. Redundant while langgraph pins <2 itself, but bites for langchain-without-langgraph installs. Review the cap when 2.0 is announced — do not let it outlive its reason the way openai<3 did.
+    "langchain-core>=1.4.8,<2; python_version < '3.11'",   # See above: per-run scope needs context.run(create_task) — 3.10 has no create_task(context=).
 ]
 # 2.26.0 is the effective floor (lowest that co-resolves with the modern
 # set). Resolve-verified; live-verify pending an OpenAI run (key quota-blocked).
@@ -135,8 +150,12 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-mock>=3.0",
     "responses>=0.23",
-    # See the [langchain] extra; floored at 1.3.0 (effective floor, CVE-clean).
-    "langchain-core>=1.3.0",
+    # Mirror the [langchain] extra exactly. This previously floored at 1.3.0 and
+    # called it "CVE-clean" — it was not: CVE-2026-44843 affects 1.0.0–1.3.2, so
+    # the floors job had been resolving a vulnerable langchain-core. pip-audit
+    # did not catch it because the audit job installs `.`, not `.[dev]`.
+    "langchain-core>=1.3.3; python_version >= '3.11'",
+    "langchain-core>=1.4.8; python_version < '3.11'",
     # openai-agents moved out of core deps into an extra; keep it in dev so the
     # default unit suite still exercises the openai_agents adapter.
     "openai-agents>=0.17.2",

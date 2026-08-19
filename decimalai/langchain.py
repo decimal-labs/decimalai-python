@@ -415,7 +415,9 @@ def _ambient_run_scope() -> Optional[str]:
 
 
 try:  # pragma: no cover - exercised by every scoped-rail test
-    from .skill_router import register_ambient_scope_resolver as _register_scope_resolver
+    from .skill_router import (
+        register_ambient_scope_resolver as _register_scope_resolver,
+    )
 
     _register_scope_resolver(_ambient_run_scope)
 except Exception:  # noqa: BLE001 - a Router-less install still traces fine

@@ -4,6 +4,34 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## Unreleased
+
+### Fixed
+
+- **Per-run skill attribution now has a floor that is true on Python 3.10.** The
+  `[langchain]` extra floored `langchain-core` at 1.3.3 for every interpreter,
+  but per-run attribution does not hold there on 3.10. `langchain-core` carries
+  its config `ContextVar` into an async runnable body through
+  `runnables/utils.py::coro_with_context`, which before 1.4.8 could only do so
+  via `asyncio.create_task(..., context=)` — an argument that does not exist
+  below Python 3.11. On 3.10 it fell back to a plain `create_task` and dropped
+  the context, so `decimalai.langchain._ambient_run_scope()` read no
+  `parent_run_id` and the Router filed every `load_skill()` unscoped. Two
+  concurrent runs then cross-contaminated: measured on 1.3.3 / 3.10, one run's
+  activation was lost and another reported one it never made. 1.4.8 replaced
+  that branch with `context.run(asyncio.create_task, coro)`, which works on
+  every interpreter. Bisected: 1.3.0–1.4.7 fail on 3.10, 1.4.8+ pass, 3.11+
+  passes throughout. The floor is now stated per interpreter — `>=1.3.3` on
+  3.11+, `>=1.4.8` on 3.10 — so the declared minimum is true wherever it is
+  declared. Nothing changes for 3.11+ installs.
+
+- **The `[dev]` extra no longer resolves a CVE-affected `langchain-core`.** It
+  floored at 1.3.0 and described that as "CVE-clean"; CVE-2026-44843 (High,
+  unsafe deserialization) affects 1.0.0–1.3.2 and is fixed in 1.3.3. The CI
+  floors job had therefore been installing a vulnerable version, and `pip-audit`
+  did not catch it because the audit job installs `.`, not `.[dev]`. The dev
+  extra now mirrors `[langchain]` exactly, marker included.
+
 ## 0.10.2 — 2026-08-15
 
 ### Fixed
