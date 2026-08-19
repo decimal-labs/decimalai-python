@@ -190,14 +190,26 @@ jobs:
     # suite against it. Added 2026-08-17 after `click>=8.0` turned out to be false —
     # a bare invocation exits 0 before click 8.2, so the start hint never fired.
     # Advisory until it has been green for a week, then promote to required.
-    name: Floors resolve and pass
+    #
+    # Matrixed over the supported interpreter ends (2026-08-18). A floor can be
+    # true on one Python and false on another: langchain-core>=1.3.3 held on 3.11+
+    # and did not on 3.10, because per-run scope propagation there needs
+    # asyncio.create_task(..., context=), which 3.10 does not have. The 3.10 leg
+    # caught that. The 3.13 leg is the mirror case — a floor that only breaks on a
+    # NEWER interpreter would otherwise ship unnoticed, since every other job runs
+    # latest deps rather than lowest.
+    name: Floors resolve and pass (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: "${{ matrix.python-version }}"
 
       - uses: astral-sh/setup-uv@v5
 

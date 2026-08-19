@@ -1,6 +1,7 @@
 """DecimalAI CLI — command-line interface."""
 
 import logging
+import urllib.parse
 
 import click
 
@@ -2299,7 +2300,10 @@ def compat_check(agent_name, fmt, recompute, api_key, base_url, project):
         if repair > 0:
             click.echo(f"  → {repair} trace(s) are mechanically repairable — preview with: decimalai repair preview --old-manifest-id <old> --new-manifest-id <new>")
         dashboard_url = _dashboard_url(base_url)
-        click.echo(f"  → View full report: {dashboard_url}/agents/{agent_name}?tab=manifests")
+        click.echo(
+            "  → View full report: "
+            f"{dashboard_url}/agents/{urllib.parse.quote(agent_name, safe='')}?tab=manifests"
+        )
     else:
         click.echo(f"  ✅ All {total} traces are compatible with {new_ver}")
 
@@ -2648,7 +2652,10 @@ def _render_regression_terminal(report: dict, agent_name: str, base_url: str) ->
     rc_id = report.get("id")
     if rc_id:
         dashboard = _dashboard_url(base_url)
-        click.echo(f"  → View full report: {dashboard}/agents/{agent_name}/regression/{rc_id}")
+        click.echo(
+            "  → View full report: "
+            f"{dashboard}/agents/{urllib.parse.quote(agent_name, safe='')}/regression/{rc_id}"
+        )
         click.echo("")
 
 
@@ -2734,7 +2741,6 @@ def demo_regression(reset, web, api_key, base_url, project):
     fan-out you get both in CI / pre-deploy and in the interactive
     repair→build→export flow.
     """
-    import urllib.parse
 
     client = _make_client(api_key, base_url, project)
     web_url = _demo_web_url(base_url, web)
