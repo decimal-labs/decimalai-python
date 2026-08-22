@@ -160,3 +160,174 @@ def test_openai_agents_still_passes_agent_name_at_call_time():
         "openai_agents stopped passing agent_name — the reference "
         "implementation for per-agent skill scoping"
     )
+
+
+# ── Streaming delivery ───────────────────────────────────────────────────────
+#
+# Skills were delivered on `invoke`/`ainvoke` only. A production chat agent
+# calls `.stream()`, which never touches either, so the most common shape of
+# agent in the wild received no skills at all — with no error to notice.
+#
+# The double-injection test is the other half and matters just as much:
+# `invoke` calls `generate` internally, and so does `stream` on a model with no
+# native `_stream`. Patching `generate` as well — the obvious way to "close the
+# gap" — would inject the menu twice on both paths.
+
+MENU = "## Recommended Skills\n| plant-care | waters things |"
+
+
+@pytest.fixture
+def loader_installed(monkeypatch):
+    """Install the REAL monkey-patch, then put BaseChatModel back."""
+    from langchain_core.language_models.chat_models import BaseChatModel
+
+    import decimalai.langchain as lc
+
+    patched = ("invoke", "ainvoke", "stream", "astream")
+    originals = {name: getattr(BaseChatModel, name) for name in patched}
+
+    monkeypatch.setattr(lc, "_skill_loader_installed", False)
+    monkeypatch.setattr(lc, "_install_agent_name", "refund-bot")
+    lc._install_skill_loader()
+    try:
+        yield
+    finally:
+        for name, fn in originals.items():
+            setattr(BaseChatModel, name, fn)
+        lc._skill_loader_installed = False
+
+
+@pytest.fixture
+def spy(monkeypatch):
+    import decimalai.langchain as lc
+
+    class _Router(_SpyRouter):
+        def build_prompt_fragment(self, query=None, **kwargs):
+            self.calls.append({"query": query, **kwargs})
+            return MENU, None
+
+    r = _Router()
+    monkeypatch.setattr(lc, "_get_skill_router", lambda: r)
+    return r
+
+
+def _fake_models():
+    from typing import Iterator
+
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+    seen: List[Any] = []
+
+    class NoNativeStream(BaseChatModel):
+        """No `_stream` — LangChain falls back through `generate`."""
+
+        def _generate(self, messages, stop=None, run_manager=None, **kw):
+            seen.append(list(messages))
+            return ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content="ok"))]
+            )
+
+        @property
+        def _llm_type(self) -> str:
+            return "fake"
+
+    class NativeStream(NoNativeStream):
+        """Has `_stream`, like every production provider — bypasses `generate`."""
+
+        def _stream(self, messages, stop=None, run_manager=None, **kw) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield ChatGenerationChunk(message=AIMessageChunk(content="ok"))
+
+        @property
+        def _llm_type(self) -> str:
+            return "native"
+
+    return NoNativeStream, NativeStream, seen
+
+
+def _menu_reached_model(seen: List[Any]) -> bool:
+    return any(
+        MENU in getattr(m, "content", "")
+        for msgs in seen
+        for m in msgs
+        if m.__class__.__name__ == "SystemMessage"
+    )
+
+
+class TestStreamingGetsSkills:
+    def test_sync_stream_delivers_skills(self, loader_installed, spy):
+        from langchain_core.messages import HumanMessage
+
+        _, Native, seen = _fake_models()
+        list(Native().stream([HumanMessage(content="water my fern?")]))
+
+        assert spy.calls, ".stream() never consulted the Router"
+        assert _menu_reached_model(seen), "the menu never reached the model on .stream()"
+
+    @pytest.mark.asyncio
+    async def test_async_stream_delivers_skills(self, loader_installed, spy):
+        from langchain_core.messages import HumanMessage
+
+        _, Native, seen = _fake_models()
+        async for _ in Native().astream([HumanMessage(content="water my fern?")]):
+            pass
+
+        assert spy.calls, ".astream() never consulted the Router"
+        assert _menu_reached_model(seen)
+
+    def test_invoke_injects_exactly_once(self, loader_installed, spy):
+        """`invoke` routes through `generate`; a `generate` patch would double it."""
+        from langchain_core.messages import HumanMessage
+
+        NoNative, _, seen = _fake_models()
+        NoNative().invoke([HumanMessage(content="water my fern?")])
+
+        assert len(spy.calls) == 1, f"expected 1 injection, got {len(spy.calls)}"
+        systems = [
+            m
+            for msgs in seen
+            for m in msgs
+            if m.__class__.__name__ == "SystemMessage"
+        ]
+        assert len(systems) == 1, f"menu injected {len(systems)}× into one call"
+
+    def test_stream_fallback_path_injects_exactly_once(self, loader_installed, spy):
+        """A model with no `_stream` reaches `generate` via `stream` — still once."""
+        from langchain_core.messages import HumanMessage
+
+        NoNative, _, seen = _fake_models()
+        list(NoNative().stream([HumanMessage(content="water my fern?")]))
+
+        assert len(spy.calls) == 1, f"expected 1 injection, got {len(spy.calls)}"
+
+    def test_generate_is_left_unpatched_on_purpose(self, loader_installed):
+        """Guards the comment: patching it would double-inject."""
+        from langchain_core.language_models.chat_models import BaseChatModel
+
+        assert BaseChatModel.generate.__name__ != "patched_generate"
+        assert BaseChatModel.agenerate.__name__ != "patched_agenerate"
+
+    def test_stream_stays_lazy(self, loader_installed, spy):
+        """Wrapping must not turn a lazy generator into eager work."""
+        from langchain_core.messages import HumanMessage
+
+        _, Native, seen = _fake_models()
+        gen = Native().stream([HumanMessage(content="hi")])
+        assert not spy.calls, "calling .stream() did work before iteration began"
+        list(gen)
+        assert spy.calls
+
+    @pytest.mark.asyncio
+    async def test_astream_fallback_path_injects_exactly_once(
+        self, loader_installed, spy
+    ):
+        """`astream` on a non-streaming model delegates to `ainvoke`."""
+        from langchain_core.messages import HumanMessage
+
+        NoNative, _, seen = _fake_models()
+        async for _ in NoNative().astream([HumanMessage(content="water my fern?")]):
+            pass
+
+        assert len(spy.calls) == 1, f"expected 1 injection, got {len(spy.calls)}"

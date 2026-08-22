@@ -785,8 +785,92 @@ def _install_skill_loader() -> None:
         finally:
             _close_call_rails(tokens)
 
+    # Streaming is a SEPARATE entry point, not a wrapper around invoke: a
+    # production chat agent calls `.stream()`, which never touches
+    # `invoke`/`ainvoke`, so patching those alone delivered skills to
+    # non-streaming callers only — silently, with no warning.
+    #
+    # These two are generator functions rather than plain functions that return
+    # the original generator, deliberately: the rails have to stay open for the
+    # whole consumption of the stream. A plain wrapper would close them the
+    # moment it handed the generator back, i.e. BEFORE the model call runs and
+    # before `on_chat_model_start` fires, filing the routing decision under no
+    # owner. `BaseChatModel.stream` is itself a generator function, so wrapping
+    # it in one preserves the caller's semantics exactly.
+    original_stream = BaseChatModel.stream
+    original_astream = BaseChatModel.astream
+
+    def _delegates_to_invoke(model, *, async_api: bool, kwargs: dict) -> bool:
+        """True when LangChain's own stream() will hand off to invoke/ainvoke.
+
+        `BaseChatModel.stream` opens with
+        `if not self._should_stream(...): yield self.invoke(...)` — so for a
+        model that cannot really stream, the stream path runs THROUGH the
+        invoke patch. Injecting in both puts the menu in the prompt twice.
+
+        Asking LangChain the same question it asks itself keeps this correct as
+        their rules evolve — `_should_stream` also accounts for
+        `disable_streaming` and callback state, which a structural
+        "does it override _stream" check would miss. If that private helper
+        ever moves, fall back to the structural check; and if even that fails,
+        assume native streaming and inject, because a duplicated menu is
+        visible and recoverable while silent non-delivery is the bug this
+        whole patch exists to fix.
+        """
+        try:
+            return not model._should_stream(async_api=async_api, **{**kwargs, "stream": True})
+        except Exception:
+            try:
+                return type(model)._stream is BaseChatModel._stream
+            except Exception:
+                return False
+
+    def patched_stream(self, input, config=None, *, stop=None, **kwargs):
+        if _delegates_to_invoke(self, async_api=False, kwargs=kwargs):
+            yield from original_stream(self, input, config=config, stop=stop, **kwargs)
+            return
+        tokens = _open_call_rails()
+        try:
+            try:
+                input = _inject_skills_into_input(input)
+            except Exception:
+                logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+            yield from original_stream(self, input, config=config, stop=stop, **kwargs)
+        finally:
+            _close_call_rails(tokens)
+
+    async def patched_astream(self, input, config=None, *, stop=None, **kwargs):
+        if _delegates_to_invoke(self, async_api=True, kwargs=kwargs):
+            async for chunk in original_astream(
+                self, input, config=config, stop=stop, **kwargs
+            ):
+                yield chunk
+            return
+        tokens = _open_call_rails()
+        try:
+            try:
+                input = _inject_skills_into_input(input)
+            except Exception:
+                logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+            async for chunk in original_astream(
+                self, input, config=config, stop=stop, **kwargs
+            ):
+                yield chunk
+        finally:
+            _close_call_rails(tokens)
+
     BaseChatModel.invoke = patched_invoke  # type: ignore[method-assign]
     BaseChatModel.ainvoke = patched_ainvoke  # type: ignore[method-assign]
+    BaseChatModel.stream = patched_stream  # type: ignore[method-assign]
+    BaseChatModel.astream = patched_astream  # type: ignore[method-assign]
+    # `generate`/`agenerate` are deliberately NOT patched, and this is load-bearing
+    # rather than an oversight — do not "close the gap" by adding them.
+    # `invoke` calls `generate` internally, and so does `stream` on a model with
+    # no native `_stream`; patching it too would inject the menu TWICE on both
+    # paths. It would not buy streaming coverage either, because a model that
+    # does implement `_stream` — i.e. every production provider — bypasses
+    # `generate` entirely. Both facts verified by running them, 2026-08-22.
+    # The four public entry points above are the correct seam.
     _skill_loader_installed = True
     logger.info("DecimalAI SkillRouter loader installed (LangChain)")
 

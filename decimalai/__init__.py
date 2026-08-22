@@ -331,6 +331,86 @@ def _verify_backend_at_init(
         )
 
 
+def _edit_distance_within(a: str, b: str, limit: int) -> bool:
+    """Bounded Levenshtein — is ``a`` within ``limit`` edits of ``b``?"""
+    if abs(len(a) - len(b)) > limit:
+        return False
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(
+                previous[j - 1] if ca == cb
+                else 1 + min(previous[j - 1], previous[j], current[j - 1])
+            )
+        if min(current) > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _warn_on_near_miss_agent_name(
+    *, base_url: str, api_key: str, agent_name: str, timeout: float,
+) -> None:
+    """Warn when ``agent_name`` looks like a typo of an agent that exists.
+
+    The failure this exists to catch is silent by construction: an agent is
+    identified by a bare string, so a user who creates ``refund-bot`` in the UI
+    and writes ``refund_bot`` in code gets a SECOND agent. Traces land, the
+    dashboard looks healthy, and the skills they attached are never offered —
+    with no error anywhere.
+
+    Deliberately near-miss only, not "this agent does not exist". A brand-new
+    name that matches nothing is the NORMAL first-run case — every user who
+    names an agent in code before it has traces is in it — so warning there
+    would be noise on every fresh install and would train people to ignore
+    the message. Firing only when a *similar* name already exists keeps the
+    signal rare and almost always actionable.
+
+    Best-effort throughout: any failure returns silently. This runs at import
+    time in someone's request path, so it must never raise and never block
+    for long.
+    """
+    import json as _json
+    import urllib.request
+
+    from ._config import sdk_user_agent
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url.rstrip('/')}/api/v1/agents?limit=1000",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": sdk_user_agent(context="init-agent-check"),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return
+            names = [
+                a.get("agent_name")
+                for a in _json.loads(resp.read().decode("utf-8")).get("agents", [])
+                if a.get("agent_name")
+            ]
+    except Exception:
+        return
+
+    if not names or agent_name in names:
+        return
+
+    near = [n for n in names if _edit_distance_within(agent_name.lower(), n.lower(), 2)]
+    if near:
+        logger.warning(
+            "decimalai.init: agent_name=%r does not exist in this workspace, but "
+            "%s does. If that is the agent you configured in the UI, traces and "
+            "skills will land under a DIFFERENT agent and nothing will error. "
+            "Fix the name, or ignore this if %r is genuinely new.",
+            agent_name,
+            " / ".join(repr(n) for n in near[:3]),
+            agent_name,
+        )
+
+
 def _activate_crewai_instrumentation(tracer_provider: Any) -> None:
     """Activate CrewAI span emission onto the DecimalAI OTEL exporter.
 
@@ -659,6 +739,15 @@ def init(
                 api_key=config.api_key,
                 timeout=verify_timeout,
             )
+            # Rides the same opt-out as the verify probe: anyone who turned
+            # verify off did so to avoid exactly this kind of startup round-trip.
+            if agent_name:
+                _warn_on_near_miss_agent_name(
+                    base_url=config.base_url,
+                    api_key=config.api_key,
+                    agent_name=agent_name,
+                    timeout=verify_timeout,
+                )
 
         if manifest_only:
             logger.info(
