@@ -75,6 +75,10 @@ def _scope() -> Optional[str]:
 
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
+# Set by `instrument(agent_name=...)`. Forwarded on every auto-injected
+# `messages.create()` so agent-scope skills resolve; None keeps the old
+# org-wide-only behaviour.
+_install_agent_name: Optional[str] = None
 _skill_router_singleton: Any = None
 
 
@@ -202,7 +206,13 @@ def _inject_skills_into_create_kwargs(kwargs: dict) -> None:
     base = kwargs.get("system")
     messages = kwargs.get("messages") or []
     query = _extract_query_from_anthropic_messages(messages)
-    kwargs["system"] = skill_system(base, query=query)
+    # Forward the installed agent name so agent-scope Use rows resolve — see the
+    # note in `decimalai.langchain._inject_skills_into_input`. `skill_system`
+    # has always accepted `agent_name`; the auto-patch path just never sent it,
+    # so registry skills pulled onto one agent were silently never offered.
+    kwargs["system"] = skill_system(
+        base, query=query, agent_name=_install_agent_name,
+    )
 
 
 def _install_skill_loader() -> None:
@@ -243,7 +253,10 @@ def _install_skill_loader() -> None:
 
 
 def instrument(
-    *, enable_skill_loader: bool = False, enable_load_skill_tool: bool = False,
+    *,
+    enable_skill_loader: bool = False,
+    enable_load_skill_tool: bool = False,
+    agent_name: Optional[str] = None,
 ) -> None:
     """Install DecimalAI integration for the Anthropic SDK.
 
@@ -262,6 +275,11 @@ def instrument(
         enable_skill_loader: When True, monkey-patch
             ``client.messages.create()`` so skills auto-inject into
             ``system`` before each request.
+        agent_name: Scopes the routed skill menu to this agent. Required for
+            agent-scope skills (a registry skill pulled onto one agent) to be
+            offered at all — without it the router only sees org-owned
+            workspace-scope skills. Callers who assemble ``system`` themselves
+            can keep passing it per-call to :func:`skill_system` instead.
         enable_load_skill_tool: Accepted but DORMANT on this adapter —
             the patch layer is a single
             ``messages.create()`` call, which cannot route a tool result
@@ -270,6 +288,9 @@ def instrument(
             trims + budgets bodies); the live load_skill tool ships on
             ``decimalai.openai_agents`` and ``decimalai.pydantic_ai``.
     """
+    global _install_agent_name
+    if agent_name is not None:
+        _install_agent_name = agent_name
     if enable_load_skill_tool:
         logger.warning(
             "enable_load_skill_tool is not supported on the anthropic adapter "

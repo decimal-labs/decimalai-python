@@ -708,8 +708,17 @@ def _inject_skills_into_input(input_value: Any) -> Any:
         return input_value
 
     query = _extract_query_from_messages(messages)
+    # `agent_name` is what scopes the routed menu to THIS agent. Without it the
+    # resolver only sees org-owned workspace-scope skills: an agent-scope Use —
+    # the row every registry skill pulled onto one agent lands in — matches on
+    # `SkillSubscription.agent_name`, so a router that doesn't send the name is
+    # offered NONE of them. Read at call time (not baked into the singleton in
+    # `_get_skill_router`) so a later `instrument(agent_name=...)` isn't ignored
+    # by a router built before it. `openai_agents`/`pydantic_ai` already pass it.
     try:
-        fragment, routing_id = router.build_prompt_fragment(query=query)
+        fragment, routing_id = router.build_prompt_fragment(
+            query=query, agent_name=_install_agent_name,
+        )
     except Exception:
         logger.debug("build_prompt_fragment failed (non-fatal)", exc_info=True)
         return input_value
