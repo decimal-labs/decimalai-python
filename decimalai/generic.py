@@ -125,6 +125,8 @@ class TraceContext:
         provider: Optional[str] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
         latency_ms: Optional[int] = None,
         temperature: Optional[float] = None,
         finish_reason: Optional[str] = None,
@@ -133,7 +135,28 @@ class TraceContext:
         response_format: Optional[Dict[str, Any]] = None,
         content_type: str = "text",
     ) -> None:
-        """Log an LLM call within this trace."""
+        """Log an LLM call within this trace.
+
+        ``cache_read_tokens`` / ``cache_creation_tokens`` carry the provider's
+        prompt-cache split. Pass them EXACTLY as the provider reported them and
+        do not fold them into ``input_tokens`` — whether a prompt prefix stayed
+        cacheable is the thing they exist to measure, and a summed number
+        cannot answer it.
+
+            Anthropic  ``usage.cache_read_input_tokens`` /
+                       ``usage.cache_creation_input_tokens``. These are
+                       ADDITIONAL to ``usage.input_tokens``, which is the
+                       uncached remainder.
+            OpenAI     ``usage.prompt_tokens_details.cached_tokens`` →
+                       ``cache_read_tokens``. This is a SUBSET of
+                       ``prompt_tokens``; leave ``cache_creation_tokens``
+                       unset (the auto-cache reports no creation step).
+
+        Leave a field UNSET when the provider did not report it. ``None`` and
+        ``0`` are stored as different facts all the way into the platform:
+        ``None`` means "never measured", ``0`` means "measured, and the cache
+        was cold". Defaulting an unknown to ``0`` manufactures a cache miss.
+        """
         now = datetime.now(timezone.utc)
         started = now
         if latency_ms:
@@ -160,6 +183,8 @@ class TraceContext:
             output=output,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             latency_ms=latency_ms,
             temperature=temperature,
             finish_reason=fr,

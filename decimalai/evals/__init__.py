@@ -107,6 +107,14 @@ class LlmCallView:
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # The provider's prompt-cache split, when it reported one. `None` means
+    # "not reported"; `0` means "reported, and the cache was cold". Deliberately
+    # NOT rolled into `prompt_tokens`/`total_tokens` — Anthropic's counts are
+    # ADDITIONAL to its prompt count while OpenAI's cached_tokens is already
+    # INSIDE it, so a provider-blind sum is wrong for one of them. An eval that
+    # wants effective context must branch on the model/provider itself.
+    cache_read_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     tool_calls: List[ToolCallView] = field(default_factory=list)
 
 
@@ -562,6 +570,11 @@ def trace_to_trace_data(trace: Any) -> TraceData:
                 prompt_tokens=input_tok,
                 completion_tokens=output_tok,
                 total_tokens=total_tok,
+                # `.get()` (not `or`) so a reported 0 is not silently rewritten
+                # to None — "cache was cold" and "we never measured" are the two
+                # answers these fields exist to keep apart.
+                cache_read_tokens=lc.get("cache_read_tokens"),
+                cache_creation_tokens=lc.get("cache_creation_tokens"),
                 tool_calls=[
                     ToolCallView(
                         name=(tc.get("function", {}).get("name") or tc.get("name", "")),

@@ -602,7 +602,14 @@ class TestRetrofitsAgentsBuiltBeforeInstrument:
         tools = asyncio.run(prebuilt.get_all_tools(types.SimpleNamespace()))
 
         assert "## Recommended Skills" in prompt
-        assert prompt.endswith("be terse")
+        # CONTRACT CHANGED (was `prompt.endswith("be terse")`): the retrofit
+        # used to put the routed fragment in FRONT of the agent's declared
+        # instructions. The fragment is rebuilt per query, so leading with it
+        # pushed the agent's stable instructions off the provider's cacheable
+        # prefix and cost a cache miss on every turn. The declared
+        # instructions now lead and the fragment trails.
+        assert prompt.startswith("be terse")
+        assert prompt.index("be terse") < prompt.index("## Recommended Skills")
         assert [t.name for t in tools] == ["load_skill"]
         # The retrofit must not mutate what the user declared.
         assert prebuilt.instructions == "be terse"

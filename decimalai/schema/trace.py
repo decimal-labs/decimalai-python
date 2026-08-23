@@ -51,6 +51,39 @@ class LlmCallRecord(BaseModel):
     finish_reason: Optional[FinishReason] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    # ── Prompt-cache split ────────────────────────────────────────────────
+    # Carried as the provider reported them, NEVER folded into
+    # ``input_tokens``. DecimalAI injects a per-query skill menu at the front
+    # of the system prompt, and varying bytes at position zero defeat every
+    # provider's prefix cache for everything behind them — so whether a
+    # prompt stayed cacheable is a number DecimalAI has to be able to show.
+    # A folded total cannot answer it (that fold is what the Claude adapter
+    # used to do, and it is why the signal did not exist).
+    #
+    # ``None`` and ``0`` are DIFFERENT FACTS and both round-trip to the
+    # platform intact:
+    #     None  the provider did not report it (no cache concept, older
+    #           adapter, usage block absent)
+    #     0     the provider reported it, and it was zero — a cache MISS
+    # Leave the field unset rather than defaulting it to 0; "we never
+    # measured" must not masquerade as "we measured a cold cache".
+    #
+    # The two providers relate these to ``input_tokens`` in OPPOSITE ways.
+    # Do not sum them without checking ``provider``:
+    #   Anthropic  ``input_tokens`` is the UNCACHED REMAINDER, so both fields
+    #              are ADDITIONAL to it.
+    #                cache_read_tokens     = usage.cache_read_input_tokens
+    #                cache_creation_tokens = usage.cache_creation_input_tokens
+    #                effective prompt = input + cache_read + cache_creation
+    #   OpenAI     ``prompt_tokens`` ALREADY INCLUDES the cached part, so
+    #              cache_read_tokens is a SUBSET of ``input_tokens`` and
+    #              cache_creation_tokens stays None (the auto-cache has no
+    #              separately-reported creation step).
+    #                cache_read_tokens = usage.prompt_tokens_details
+    #                                         .cached_tokens
+    #                effective prompt = input_tokens (already whole)
+    cache_read_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     latency_ms: Optional[int] = None
     cost_usd: Optional[float] = None
     # Streaming support

@@ -45,7 +45,7 @@ import logging
 import threading
 import warnings
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, NamedTuple, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .schema.common import CallRole, FinishReason, SpanType, Status
@@ -168,31 +168,82 @@ def _opt(options: Any, name: str) -> Any:
     return getattr(options, name, None)
 
 
-def _extract_usage(usage: Any) -> Tuple[Optional[int], Optional[int]]:
-    """Pull (input_tokens, output_tokens) from a ResultMessage usage payload.
+class _Usage(NamedTuple):
+    """One usage frame, kept SPLIT — see :func:`_extract_usage`."""
+
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    cache_read_tokens: Optional[int]
+    cache_creation_tokens: Optional[int]
+
+
+def _extract_usage(usage: Any) -> _Usage:
+    """Split a ResultMessage/AssistantMessage usage payload into four counts.
 
     Claude reports Anthropic-shaped token names (``input_tokens`` /
-    ``output_tokens``), as a dict from the CLI JSON or as an object.
+    ``output_tokens`` / ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``), as a dict from the CLI JSON or as an
+    object.
 
-    Anthropic's ``input_tokens`` is the UNCACHED remainder only — the
-    effective context adds ``cache_read_input_tokens`` and
-    ``cache_creation_input_tokens``. Sum them so traces report what the
-    model actually consumed (parity with the OpenAI handler, whose
-    ``prompt_tokens`` includes cached tokens); a Claude Code run with a
-    warm cache would otherwise read as a few-K-token call."""
+    BEHAVIOUR CHANGE (2026-08-22) — ``input_tokens`` MEANS SOMETHING NEW HERE.
+    ---------------------------------------------------------------------
+    This function used to return ONE input number:
+
+        inp += cache_read_input_tokens + cache_creation_input_tokens
+
+    i.e. the effective context size, chosen for parity with the OpenAI handler
+    (whose ``prompt_tokens`` already includes cached tokens). It now returns
+    ``input_tokens`` EXACTLY as Anthropic reported it — the UNCACHED REMAINDER —
+    and carries the two cache counts as their own fields.
+
+    Why the fold had to go: DecimalAI injects a query-routed skill menu at
+    position ZERO of the system prompt, and it is rebuilt per query. Varying
+    bytes at position zero defeat a provider's prefix cache for EVERYTHING
+    behind them, so a customer's otherwise-cacheable system prompt becomes a
+    full miss on every call. That is a cost regression DecimalAI causes, and
+    the folded number is precisely the number that cannot show it: a call that
+    went from 180k cached + 4k fresh to 184k fresh sums to 184k either way.
+    Summing three counts is not lossy-but-cheap, it is lossy in the one
+    dimension the product exists to measure.
+
+    What downstream changes, checked before landing:
+      * ``LlmCallRecord.input_tokens`` on the Claude path drops by the cached
+        amount — a warm Claude Code run now reads as a few-K-token call, which
+        is what the provider actually charged fresh input for.
+      * The platform's ``estimate_cost`` (input+output rates only, no cache
+        rate) therefore ESTIMATES LOWER on this path than it did. That is a
+        known, deliberate consequence: the old number over-billed cache reads
+        at ~10x their real rate, and there is no honest cache rate to apply
+        until ``MODEL_PRICING`` grows one. Cost is not silently patched here.
+      * ``_ingest_result``'s remainder allocation sums ``input_tokens`` across
+        turns; both sides of that comparison move together, so it is unaffected.
+      * The conformance driver (tests/conformance/drivers/claude_agent_sdk.py)
+        emits per-turn usage with no cache fields, so the contract's
+        "input_tokens is a positive int" row is unchanged.
+
+    Do NOT add these back together to get "total input". On Anthropic they are
+    additive to ``input_tokens``; on OpenAI ``cached_tokens`` is already inside
+    it. A provider-blind sum is wrong for one of them.
+    """
     if usage is None:
-        return None, None
+        return _Usage(None, None, None, None)
 
     def _field(name: str) -> Optional[int]:
         value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        # `bool` is a subclass of `int`; True must not become a token count of 1.
+        if isinstance(value, bool):
+            return None
         return value if isinstance(value, int) else None
 
-    inp = _field("input_tokens")
-    if inp is not None:
-        inp += (_field("cache_read_input_tokens") or 0) + (
-            _field("cache_creation_input_tokens") or 0
-        )
-    return inp, _field("output_tokens")
+    return _Usage(
+        input_tokens=_field("input_tokens"),
+        output_tokens=_field("output_tokens"),
+        # Reported 0 is KEPT as 0 (a measured cache miss), not normalised to
+        # None (never measured). The distinction survives all the way into the
+        # platform's `llm_call.cache_read_tokens` column.
+        cache_read_tokens=_field("cache_read_input_tokens"),
+        cache_creation_tokens=_field("cache_creation_input_tokens"),
+    )
 
 
 class _RunState:
@@ -322,8 +373,13 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
     # Per-turn usage. The CLI reports usage on every assistant frame, so each
     # model turn can carry its own token counts; ResultMessage.usage is the
     # run TOTAL and is only a fallback (see _ingest_result).
-    turn_in, turn_out = _extract_usage(getattr(message, "usage", None))
-    if turn_in is not None or turn_out is not None:
+    turn_usage = _extract_usage(getattr(message, "usage", None))
+    # Keyed on input/output only, exactly as before the cache split landed:
+    # `saw_turn_usage` gates the run-total REDISTRIBUTION below, and only
+    # input/output are ever redistributed. Widening it to "any of the four"
+    # would let a frame carrying cache counts but no input/output suppress the
+    # run-total fallback and leave the trace with no token counts at all.
+    if turn_usage.input_tokens is not None or turn_usage.output_tokens is not None:
         state.saw_turn_usage = True
 
     # One span per model turn, hung off the run root, sharing the LLM call's
@@ -347,8 +403,12 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
         rendered_input=rendered_input or None,
         output={"role": "assistant", "content": text_joined} if text_joined else None,
         finish_reason=FinishReason.TOOL_CALLS if tool_uses else FinishReason.STOP,
-        input_tokens=turn_in,
-        output_tokens=turn_out,
+        # Verbatim from the provider — `input_tokens` is Anthropic's UNCACHED
+        # remainder and the two cache counts sit alongside it, never folded in.
+        input_tokens=turn_usage.input_tokens,
+        output_tokens=turn_usage.output_tokens,
+        cache_read_tokens=turn_usage.cache_read_tokens,
+        cache_creation_tokens=turn_usage.cache_creation_tokens,
         started_at=started,
         ended_at=started,
     )
@@ -442,7 +502,8 @@ def _ingest_result(state: _RunState, message: Any) -> None:
     if not state.llm_calls:
         return
 
-    inp, out = _extract_usage(getattr(message, "usage", None))
+    run_usage = _extract_usage(getattr(message, "usage", None))
+    inp, out = run_usage.input_tokens, run_usage.output_tokens
     cost = getattr(message, "total_cost_usd", None)
 
     if not state.saw_turn_usage:
@@ -453,6 +514,23 @@ def _ingest_result(state: _RunState, message: Any) -> None:
             last.input_tokens = inp
         if out is not None:
             last.output_tokens = out
+        # The cache counts come along on the same frame and are RUN TOTALS.
+        # `saw_turn_usage` is keyed on input/output only, so this branch can be
+        # reached while per-turn frames DID report cache counts and those are
+        # already recorded on individual calls. Stamping the run total on the
+        # last call as well makes any sum across calls count the cache twice.
+        # So: only fall back to the totals when nothing recorded a cache count.
+        # A reported 0 is written as 0 (measured cache miss); an absent field
+        # leaves the record's None (never measured) alone.
+        already_have_cache = any(
+            c.cache_read_tokens is not None or c.cache_creation_tokens is not None
+            for c in state.llm_calls
+        )
+        if not already_have_cache:
+            if run_usage.cache_read_tokens is not None:
+                last.cache_read_tokens = run_usage.cache_read_tokens
+            if run_usage.cache_creation_tokens is not None:
+                last.cache_creation_tokens = run_usage.cache_creation_tokens
         if cost is not None:
             last.cost_usd = cost
         return
@@ -471,6 +549,14 @@ def _ingest_result(state: _RunState, message: Any) -> None:
         if call.output_tokens is None and out is not None and out > known_out:
             call.output_tokens = out - known_out
             known_out = out
+
+    # The cache counts are deliberately NOT redistributed the same way. They
+    # arrive on the SAME usage object as input_tokens on every assistant frame,
+    # so a turn that has input_tokens has its cache counts too; a turn that has
+    # neither is a turn the CLI reported nothing for, and inventing a cache
+    # split for it would be fabrication rather than inference. A per-turn
+    # None here means "this turn's cache behaviour is unknown", which is the
+    # honest answer and the one the platform's NULL column is built to hold.
 
     # ``total_cost_usd`` is also a run total. Splitting it across the turns by
     # their token share keeps per-call cost consistent with per-call tokens;

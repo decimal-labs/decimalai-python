@@ -270,5 +270,14 @@ class TestSkillLoaderOnlyReportsWhatItInjected:
         result = lc_mod._inject_skills_into_input(value)
 
         assert isinstance(result, list)
+        # Index 0 is still right HERE, and only here: none of these three
+        # shapes carries a caller system message, so there is no cacheable
+        # prefix in front for the menu to displace. The injector now inserts
+        # after the caller's leading system messages when there are any —
+        # that ordering contract lives in
+        # tests/test_prompt_cache_prefix_ordering.py, which states it in cache
+        # terms (bytes before the fragment are stable across queries) rather
+        # than index terms. This test is about DELIVERY: every supported input
+        # shape gets the menu at all.
         assert "SKILL MENU" in str(result[0].content)
         assert stub_router.calls == 1

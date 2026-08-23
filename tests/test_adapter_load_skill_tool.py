@@ -290,10 +290,18 @@ class TestOpenAIAgentsLoadSkillTool:
 
         out = agent.instructions(types.SimpleNamespace(), agent)
 
-        assert out.startswith("## Recommended Skills")
+        # CONTRACT CHANGED: this used to assert the fragment came FIRST and the
+        # agent's own instructions trailed it. That order was a prompt-cache
+        # bug, not a preference — the fragment is rebuilt from each turn's
+        # query, so ~115 varying tokens sat in front of the agent's stable
+        # instructions and knocked them off the provider's cacheable prefix,
+        # turning what should have been a hit into a full miss on every call.
+        # The agent's instructions now lead; the routed fragment trails them.
+        assert out.startswith("base")
         assert LOAD_SKILL_PROMPT_HINT in out
-        assert out.endswith("base")  # base instructions preserved after the fragment
-        # Hint sits between the fragment and the base prompt.
+        assert "## Recommended Skills" in out  # fragment still delivered
+        # Hint still sits with the fragment, after the base prompt.
+        assert out.index("base") < out.index("## Recommended Skills")
         assert out.index("## Recommended Skills") < out.index(LOAD_SKILL_PROMPT_HINT)
 
     def test_instructions_no_hint_when_tool_gated_off(self, fake_agents, monkeypatch):
@@ -317,7 +325,11 @@ class TestOpenAIAgentsLoadSkillTool:
         # ...so the fragment is delivered WITHOUT the load_skill hint.
         assert "## Recommended Skills" in out
         assert LOAD_SKILL_PROMPT_HINT not in out
-        assert out.endswith("base")
+        # CONTRACT CHANGED (was `out.endswith("base")`): the base instructions
+        # are the stable, cacheable half and now lead; the per-query fragment
+        # is the varying half and now trails. See the sibling test above.
+        assert out.startswith("base")
+        assert out.endswith("## Recommended Skills\n| a | b |")
 
 
 class TestOpenAIAgentsDeliveredRail:

@@ -420,161 +420,248 @@ class TestInstall:
 
 
 class TestUsageExtraction:
-    """_extract_usage — Anthropic's input_tokens is the uncached remainder;
-    effective input must add cache read/creation tokens (parity with the
-    OpenAI handler, whose prompt_tokens includes cached tokens)."""
+    """_extract_usage keeps the four Anthropic counts SPLIT.
 
-    def test_cache_tokens_added_to_input(self):
+    It used to return two numbers, with the cache counts summed into input:
+
+        inp += cache_read_input_tokens + cache_creation_input_tokens
+
+    That fold made the one thing DecimalAI most needs to see unobservable.
+    DecimalAI injects a query-routed skill menu at position ZERO of the system
+    prompt, rebuilt per query; varying bytes at position zero defeat the
+    provider's prefix cache for everything behind them. A call that goes from
+    "180k cached + 4k fresh" to "184k fresh" sums to 184k either way — the
+    regression is invisible in exactly the number that was being reported.
+
+    So `input_tokens` is now Anthropic's UNCACHED REMAINDER, verbatim, and the
+    cache counts ride as their own fields. This is a real behaviour change on
+    the Claude path (see the function's docstring for what moves downstream).
+    """
+
+    def test_cache_tokens_are_not_folded_into_input(self):
+        """The headline change: input stays 4,000, not 200,000."""
         from decimalai.claude_agent_sdk import _extract_usage
 
-        inp, out = _extract_usage({
+        usage = _extract_usage({
             "input_tokens": 4_000,
             "cache_read_input_tokens": 180_000,
             "cache_creation_input_tokens": 16_000,
             "output_tokens": 900,
         })
-        assert inp == 200_000
-        assert out == 900
+        assert usage.input_tokens == 4_000          # was 200_000 before
+        assert usage.output_tokens == 900
+        assert usage.cache_read_tokens == 180_000
+        assert usage.cache_creation_tokens == 16_000
 
-    def test_plain_usage_unchanged(self):
+    def test_absent_cache_fields_stay_none_not_zero(self):
+        """A provider that never reported cache tokens must not read as a MISS.
+
+        None ("never measured") and 0 ("measured, cache was cold") are
+        different facts, and the platform column that receives them is nullable
+        precisely so the difference survives. Defaulting absent → 0 would
+        manufacture a cache miss on every un-instrumented call.
+        """
         from decimalai.claude_agent_sdk import _extract_usage
 
-        assert _extract_usage({"input_tokens": 120, "output_tokens": 18}) == (120, 18)
-        assert _extract_usage(None) == (None, None)
+        usage = _extract_usage({"input_tokens": 120, "output_tokens": 18})
+        assert usage.input_tokens == 120
+        assert usage.output_tokens == 18
+        assert usage.cache_read_tokens is None
+        assert usage.cache_creation_tokens is None
 
-    def test_object_shaped_usage_with_cache(self):
-        from types import SimpleNamespace
-
+    def test_reported_zero_is_kept_as_zero(self):
+        """The other half of the same distinction: 0 is a measurement."""
         from decimalai.claude_agent_sdk import _extract_usage
 
-        usage = SimpleNamespace(
-            input_tokens=10, cache_read_input_tokens=90,
-            cache_creation_input_tokens=0, output_tokens=5,
-        )
-        assert _extract_usage(usage) == (100, 5)
-
-    def test_text_generation_without_cache(self):
-        """Pure text generation (no cache): uncached input + output unchanged."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 500,
-            "output_tokens": 250,
-        })
-        assert inp == 500  # no cache tokens to add
-        assert out == 250
-
-    def test_text_generation_with_only_cache_read(self):
-        """Cache read without creation: input = uncached + read only."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 100,
-            "cache_read_input_tokens": 900,  # warm cache hit
-            "output_tokens": 50,
-        })
-        assert inp == 1_000  # 100 + 900 + 0
-        assert out == 50
-
-    def test_text_generation_with_only_cache_creation(self):
-        """Cache creation without prior read: input = uncached + created."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 200,
-            "cache_creation_input_tokens": 1_800,  # cache fill
-            "output_tokens": 75,
-        })
-        assert inp == 2_000  # 200 + 0 + 1_800
-        assert out == 75
-
-    def test_text_generation_large_tokens(self):
-        """Large token counts (context-window scale) are summed correctly."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 50_000,
-            "cache_read_input_tokens": 900_000,
-            "cache_creation_input_tokens": 0,
-            "output_tokens": 2_000,
-        })
-        assert inp == 950_000
-        assert out == 2_000
-
-    def test_missing_cache_fields_treated_as_zero(self):
-        """Omitted cache fields default to 0 (not an error)."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 300,
-            # cache_read_input_tokens omitted
-            # cache_creation_input_tokens omitted
-            "output_tokens": 100,
-        })
-        assert inp == 300
-        assert out == 100
-
-    def test_zero_cache_fields_unchanged(self):
-        """Explicit zeros in cache fields are honored."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
+        usage = _extract_usage({
             "input_tokens": 400,
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
             "output_tokens": 150,
         })
-        assert inp == 400
-        assert out == 150
+        assert usage.cache_read_tokens == 0
+        assert usage.cache_creation_tokens == 0
+        assert usage.cache_read_tokens is not None
 
-    def test_object_shaped_usage_cache_read_only(self):
-        """SimpleNamespace with only cache_read (cache_creation omitted)."""
+    def test_no_usage_at_all(self):
+        from decimalai.claude_agent_sdk import _extract_usage
+
+        usage = _extract_usage(None)
+        assert usage == (None, None, None, None)
+
+    def test_object_shaped_usage(self):
+        """The CLI hands back objects as well as dicts."""
         from types import SimpleNamespace
 
         from decimalai.claude_agent_sdk import _extract_usage
 
-        usage = SimpleNamespace(
-            input_tokens=50,
-            cache_read_input_tokens=450,
-            output_tokens=30,
-        )
-        # cache_creation_input_tokens is not defined — defaults to None, treated as 0
-        assert _extract_usage(usage) == (500, 30)
+        usage = _extract_usage(SimpleNamespace(
+            input_tokens=10, cache_read_input_tokens=90,
+            cache_creation_input_tokens=0, output_tokens=5,
+        ))
+        assert usage == (10, 5, 90, 0)
 
-    def test_none_input_tokens_returns_none(self):
-        """If input_tokens itself is None, input stays None (no summing with cache)."""
+    def test_object_shaped_usage_with_field_missing(self):
+        """An attribute the object simply does not define reads as None."""
+        from types import SimpleNamespace
+
         from decimalai.claude_agent_sdk import _extract_usage
 
-        inp, out = _extract_usage({
+        usage = _extract_usage(SimpleNamespace(
+            input_tokens=50, cache_read_input_tokens=450, output_tokens=30,
+        ))
+        assert usage.cache_read_tokens == 450
+        assert usage.cache_creation_tokens is None   # not defined ≠ zero
+
+    def test_warm_cache_run_is_now_distinguishable_from_a_cold_one(self):
+        """Two runs the old fold reported IDENTICALLY.
+
+        Both charge the same effective context. Only the split says whether
+        the prefix was cacheable — which is the whole point of the change.
+        """
+        from decimalai.claude_agent_sdk import _extract_usage
+
+        warm = _extract_usage({
+            "input_tokens": 4_000,
+            "cache_read_input_tokens": 180_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 900,
+        })
+        cold = _extract_usage({
+            "input_tokens": 184_000,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 900,
+        })
+        # The old two-number contract collapsed these to the same pair.
+        assert (warm.input_tokens + (warm.cache_read_tokens or 0)) == (
+            cold.input_tokens + (cold.cache_read_tokens or 0)
+        )
+        # The new one does not.
+        assert warm != cold
+        assert warm.input_tokens != cold.input_tokens
+        assert warm.cache_read_tokens != cold.cache_read_tokens
+
+    def test_none_input_tokens_stays_none(self):
+        """A missing uncached remainder is not inferred from the cache counts."""
+        from decimalai.claude_agent_sdk import _extract_usage
+
+        usage = _extract_usage({
             "input_tokens": None,
             "cache_read_input_tokens": 100,
             "output_tokens": 50,
         })
-        assert inp is None  # uncached remainder is None → stop
-        assert out == 50
-
-    def test_dict_with_all_fields_present(self):
-        """Complete dict with all token fields (typical Anthropic response)."""
-        from decimalai.claude_agent_sdk import _extract_usage
-
-        inp, out = _extract_usage({
-            "input_tokens": 1_000,
-            "cache_read_input_tokens": 10_000,
-            "cache_creation_input_tokens": 2_000,
-            "output_tokens": 500,
-        })
-        assert inp == 13_000
-        assert out == 500
+        assert usage.input_tokens is None
+        assert usage.output_tokens == 50
+        assert usage.cache_read_tokens == 100     # still captured
 
     def test_non_integer_token_values_ignored(self):
-        """Non-integer token values (strings, floats) are skipped."""
+        """Strings/floats are not coerced — a wrong number beats no number never."""
         from decimalai.claude_agent_sdk import _extract_usage
 
-        inp, out = _extract_usage({
-            "input_tokens": "1000",  # string → ignored, becomes None
-            "cache_read_input_tokens": 100,
+        usage = _extract_usage({
+            "input_tokens": "1000",
+            "cache_read_input_tokens": 3.5,
             "output_tokens": 50,
         })
-        # input_tokens was None after type check, so input is None (no summing)
-        assert inp is None
-        assert out == 50
+        assert usage.input_tokens is None
+        assert usage.cache_read_tokens is None
+        assert usage.output_tokens == 50
+
+    def test_bool_is_not_a_token_count(self):
+        """`bool` subclasses `int`; True must not be stored as 1 token."""
+        from decimalai.claude_agent_sdk import _extract_usage
+
+        usage = _extract_usage({
+            "input_tokens": 100,
+            "cache_read_input_tokens": True,
+            "output_tokens": 50,
+        })
+        assert usage.cache_read_tokens is None
+
+
+class TestCacheTokensReachTheRecord:
+    """End-to-end within the adapter: split counts land on LlmCallRecord.
+
+    The extractor being right is necessary but not sufficient — the record is
+    what gets serialized onto the trace payload, so it is what the platform's
+    new `llm_call.cache_read_tokens` / `cache_creation_tokens` columns
+    actually receive.
+    """
+
+    def test_per_turn_usage_lands_on_the_call_record(self):
+        from types import SimpleNamespace
+
+        import decimalai.claude_agent_sdk as cas
+        from decimalai.schema.trace import LlmCallRecord
+
+        state = cas._RunState(
+            agent_name="cache-agent", project=None, parent_trace_id=None,
+            user_input="hi", options=None,
+        )
+        # Blocks are matched by class NAME, so reuse the module's fake TextBlock.
+        message = SimpleNamespace(
+            model="claude-sonnet-4-5",
+            content=[TextBlock("done")],
+            usage={
+                "input_tokens": 4_000,
+                "cache_read_input_tokens": 180_000,
+                "cache_creation_input_tokens": 16_000,
+                "output_tokens": 900,
+            },
+        )
+        cas._ingest_assistant(state, message)
+
+        assert len(state.llm_calls) == 1
+        call = state.llm_calls[0]
+        assert isinstance(call, LlmCallRecord)
+        assert call.input_tokens == 4_000
+        assert call.cache_read_tokens == 180_000
+        assert call.cache_creation_tokens == 16_000
+
+    def test_run_total_fallback_carries_the_split(self):
+        """When only ResultMessage reports usage, the cache totals ride along."""
+        from types import SimpleNamespace
+
+        import decimalai.claude_agent_sdk as cas
+        from decimalai.schema.trace import LlmCallRecord
+
+        state = cas._RunState(
+            agent_name="cache-agent", project=None, parent_trace_id=None,
+            user_input="hi", options=None,
+        )
+        state.llm_calls.append(LlmCallRecord(model_name="claude-sonnet-4-5"))
+        cas._ingest_result(state, SimpleNamespace(
+            session_id="s1", result="done", is_error=False, total_cost_usd=None,
+            usage={
+                "input_tokens": 4_000,
+                "cache_read_input_tokens": 180_000,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 900,
+            },
+        ))
+        call = state.llm_calls[-1]
+        assert call.input_tokens == 4_000
+        assert call.cache_read_tokens == 180_000
+        assert call.cache_creation_tokens == 0
+
+    def test_record_serializes_the_split_onto_the_payload(self):
+        """`_client` sends `model_dump(mode="json")` — the keys must be there."""
+        from decimalai.schema.trace import LlmCallRecord
+
+        payload = LlmCallRecord(
+            model_name="claude-sonnet-4-5",
+            input_tokens=4_000, output_tokens=900,
+            cache_read_tokens=180_000, cache_creation_tokens=0,
+        ).model_dump(mode="json")
+
+        assert payload["input_tokens"] == 4_000
+        assert payload["cache_read_tokens"] == 180_000
+        assert payload["cache_creation_tokens"] == 0
+
+    def test_unreported_split_serializes_as_null_not_zero(self):
+        from decimalai.schema.trace import LlmCallRecord
+
+        payload = LlmCallRecord(model_name="gpt-5.4-mini").model_dump(mode="json")
+        assert payload["cache_read_tokens"] is None
+        assert payload["cache_creation_tokens"] is None

@@ -178,6 +178,16 @@ def _system_text(trace) -> str:
     return "\n".join(out)
 
 
+# The WHOLE system prompt as the server saw it — the agent's own instructions
+# ("You are a fixture.") followed by the routed skill menu, which is the order
+# `_make_skill_aware_instructions` now emits (stable instructions lead so they
+# stay a cacheable prefix; the per-query fragment trails).
+#
+# The `rendered_input[0]` assertions below are NOT about that assembly order.
+# They are about the TRACE RECORD's message list: index 0 is the system message
+# and index 1 is the user turn. Those stayed put across the ordering fix, which
+# is why this file needed no contract change — the prompt-assembly contract is
+# pinned in tests/test_prompt_cache_prefix_ordering.py instead.
 MENU = (
     "You are a fixture.\n\n"
     "Available skills:\n"

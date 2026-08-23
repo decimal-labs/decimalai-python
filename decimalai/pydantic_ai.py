@@ -15,7 +15,15 @@ One-line install path::
 The install monkey-patches `pydantic_ai.Agent.__init__` so each newly
 constructed Agent gets an extra `@agent.system_prompt`-registered
 function that calls `SkillRouter.build_prompt_fragment()` per turn and
-prepends the result to the base system prompt.
+appends the result AFTER the base system prompt. (The docstring used to say
+"prepends", which was never what happened: Pydantic AI emits the constructor's
+`system_prompt=` strings first and only then runs the registered functions in
+registration order, so the routed fragment has always come last.) That order is
+the one to keep — the caller's `system_prompt` is the same bytes on every call
+and belongs in the cacheable prefix, while the routed fragment is rebuilt per
+turn. Anything the caller registers with their own `@agent.system_prompt`
+lands after ours, which is also correct: those runners are per-run/per-deps by
+construction, so they are the varying tail too.
 
 Tracing for Pydantic AI is observed via the underlying provider SDK
 (OpenAI/Anthropic) — install the matching tracing adapter alongside::
@@ -238,6 +246,15 @@ def _install_skill_loader() -> None:
         try:
             # Pydantic AI exposes the registration as a decorator AND
             # as a function call. We use the function-call form here.
+            #
+            # Registering (rather than editing the constructor's
+            # `system_prompt=`) is what puts the routed fragment in the right
+            # place for caching: Pydantic AI assembles the request as the
+            # constructor's static `system_prompt` strings first, then each
+            # registered function in registration order. So the caller's own
+            # instructions stay the byte-identical leading prefix a provider can
+            # cache, and our per-turn fragment is a separate part behind them.
+            # Do NOT move this into the constructor argument.
             register = getattr(self, "system_prompt", None)
             if callable(register):
                 register(_skills_system_prompt)

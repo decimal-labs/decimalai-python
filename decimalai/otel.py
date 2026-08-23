@@ -88,6 +88,32 @@ _ALT_OUTPUT_TOKEN_KEYS = (
     "llm.token_count.completion",
 )
 
+# ── Prompt-cache token attributes ────────────────────────────────────────
+# This exporter is the path RAW provider SDK calls take
+# (`decimalai.providers.instrument()` enables the OpenInference instrumentors
+# and routes their spans here), so it is where an un-adapted OpenAI or
+# Anthropic call's cache behaviour becomes visible — or silently does not.
+#
+# Two families of spelling, checked in that order:
+#   OpenInference (Arize) — what the provider instrumentors actually emit
+#     today; `cache_write` is Anthropic's cache CREATION, not a second read.
+#   GenAI semconv — what OTel-native instrumentations emit.
+#
+# Stored WITHOUT folding into input tokens, and the two providers disagree
+# about whether they are already inside the prompt count:
+#   Anthropic — additional to `input_tokens` (which is the uncached remainder)
+#   OpenAI    — `cached_tokens` is a SUBSET of `prompt_tokens`
+# so a provider-blind sum double-counts OpenAI. See LlmCallRecord's fields.
+_CACHE_READ_TOKEN_KEYS = (
+    "llm.token_count.prompt_details.cache_read",
+    "gen_ai.usage.cache_read_input_tokens",
+    "gen_ai.usage.cached_input_tokens",
+)
+_CACHE_CREATION_TOKEN_KEYS = (
+    "llm.token_count.prompt_details.cache_write",
+    "gen_ai.usage.cache_creation_input_tokens",
+)
+
 # gen_ai.operation.name values that are never themselves an LLM request.
 # Agent frameworks (AG2 among them) stamp gen_ai.request.model onto their
 # agent/conversation/tool spans as metadata; without this gate each such
@@ -1284,6 +1310,11 @@ class DecimalSpanExporter:
         output_tokens = _get_int(
             attrs, _GENAI_OUTPUT_TOKENS, *_ALT_OUTPUT_TOKEN_KEYS
         )
+        # Absent attribute → None ("the instrumentor never reported it"),
+        # a reported 0 → 0 ("reported, and the cache was cold"). `_get_int`
+        # keys off `is not None`, not truthiness, so the zero survives.
+        cache_read_tokens = _get_int(attrs, *_CACHE_READ_TOKEN_KEYS)
+        cache_creation_tokens = _get_int(attrs, *_CACHE_CREATION_TOKEN_KEYS)
 
         latency_ms = None
         if started_at and ended_at:
@@ -1331,6 +1362,8 @@ class DecimalSpanExporter:
             output=_output_message_from_attrs(attrs),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             latency_ms=latency_ms,
             finish_reason=finish_reason,
             status=status,

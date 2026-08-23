@@ -8,6 +8,37 @@ and patch releases are fixes.
 
 ### Fixed
 
+- **The routed skill menu no longer sits in front of your system prompt, so the
+  provider prompt cache survives.** The menu is built per query, so it differs
+  on every request. It was injected at position zero of the system block, which
+  meant a caller's own system prompt — stable, and the thing a provider would
+  otherwise cache — sat behind ~115 tokens of varying text and missed the cache
+  on every call. The cost was never the menu's own tokens; it was everything
+  behind it. The menu now lands after the caller's leading system instructions
+  on `langchain`, after the caller's `system` on `anthropic` (content blocks and
+  their `cache_control` hints are copied through untouched, so a positional
+  breakpoint still marks the same prefix), and after the agent's `instructions`
+  on `openai_agents`. `pydantic_ai` already behaved this way; only its docstring
+  claimed otherwise. **The model now reads your instructions before the skill
+  menu rather than after** — a visible change, and the one to notice if a prompt
+  depended on the old order. Contract pinned in cache terms rather than index
+  terms: given one caller prompt and two different queries, the bytes before the
+  menu must be byte-identical.
+
+- **`developer` counts as a system role.** OpenAI's current name for the system
+  role converts to a `SystemMessage`, but the reordering above matched only
+  `"system"` — so for anyone on the modern spelling the fix silently did nothing
+  and the varying menu went back to byte zero.
+
+- **Cache tokens are reported instead of being folded away.** The Claude Agent
+  SDK adapter added `cache_read_input_tokens` and `cache_creation_input_tokens`
+  into `input_tokens` and returned one number, so the split was destroyed at the
+  source and no consumer could see cache behaviour. They are now carried as
+  their own fields. `input_tokens` on that adapter is therefore SMALLER than
+  before for any cached run — it is now what the provider reported. Run totals
+  are no longer stamped onto the last call when per-turn frames already recorded
+  cache counts, which double-counted the cache in any sum across calls.
+
 - **Per-run skill attribution now has a floor that is true on Python 3.10.** The
   `[langchain]` extra floored `langchain-core` at 1.3.3 for every interpreter,
   but per-run attribution does not hold there on 3.10. `langchain-core` carries

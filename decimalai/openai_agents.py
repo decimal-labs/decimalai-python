@@ -338,9 +338,10 @@ def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str
 # ── SkillRouter dynamic loader ──────────────────────────────
 # When `install(enable_skill_loader=True)` runs, we monkey-patch
 # `agents.Agent.__init__` so every Agent created afterwards has its
-# string `instructions` wrapped into a callable that prepends skill
-# content fetched from the platform per-run. User-supplied callables
-# pass through untouched (their judgment wins).
+# string `instructions` wrapped into a callable that appends skill
+# content fetched from the platform per-run — after the agent's own
+# instructions, so those stay a stable cacheable prefix. User-supplied
+# callables pass through untouched (their judgment wins).
 
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
@@ -590,7 +591,15 @@ _BASE_INSTRUCTIONS_ATTR = "__decimalai_base_instructions__"
 
 
 def _make_skill_aware_instructions(base: str):
-    """Return a sync callable usable as `Agent.instructions`."""
+    """Return a sync callable usable as `Agent.instructions`.
+
+    The callable emits `base` FIRST and the routed skill fragment after it.
+    `base` is the agent's own instructions — identical bytes on every turn —
+    while the fragment is rebuilt from this turn's query and so differs turn to
+    turn. OpenAI auto-caches a request's stable leading prefix, so the varying
+    half has to be the tail: in front, it pushed the agent's whole (often much
+    larger) prompt off its cached prefix and made every call a full miss.
+    """
 
     def instructions_fn(ctx: Any, agent: Any) -> str:
         try:
@@ -645,7 +654,8 @@ def _make_skill_aware_instructions(base: str):
             if _load_skill_reachable(agent):
                 from .skill_router import LOAD_SKILL_PROMPT_HINT
                 fragment = f"{fragment}\n{LOAD_SKILL_PROMPT_HINT}"
-            return f"{fragment}\n\n{base}".strip() if base else fragment
+            # base first, fragment second — see the docstring above.
+            return f"{base}\n\n{fragment}".strip() if base else fragment
         except Exception:
             # Never break a run because of a Router hiccup.
             logger.debug("Skill loader callable failed (non-fatal)", exc_info=True)
@@ -1155,8 +1165,8 @@ def instrument(
 
     # SkillRouter dynamic loader — opt-in. When enabled, Agent.__init__
     # is monkey-patched so newly created Agents have their string
-    # `instructions` wrapped into a per-run callable that prepends
-    # skill content from the platform. See _install_skill_loader().
+    # `instructions` wrapped into a per-run callable that appends
+    # skill content from the platform after them. See _install_skill_loader().
     if enable_skill_loader:
         from .skill_router import _warn_if_disk_runtime_detected
         _warn_if_disk_runtime_detected("openai_agents")

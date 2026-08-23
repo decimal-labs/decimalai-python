@@ -680,14 +680,62 @@ def _as_message_list(input_value: Any) -> Optional[List[Any]]:
     return None
 
 
+def _is_system_message(msg: Any) -> bool:
+    """Whether one entry of a LangChain input list is a system message.
+
+    Covers every shape `BaseChatModel.invoke` accepts before LangChain's own
+    conversion runs: a `SystemMessage` (`.type == "system"`), a
+    `{"role": "system", ...}` dict, and the `("system", "...")` tuple form.
+    Anything unrecognized is treated as NOT a system message, which keeps the
+    fragment earlier rather than later — the conservative direction, since
+    landing in front of a non-system message is the pre-existing behaviour.
+    """
+    # "developer" is OpenAI's current name for the system role and LangChain
+    # converts it to a SystemMessage, so a caller using the modern spelling has
+    # a caller prefix exactly like anyone else. Matching only "system" made the
+    # whole reordering silently no-op for them — the varying fragment went back
+    # to byte 0, which is the bug this function exists to prevent.
+    _SYSTEM_ROLES = ("system", "developer")
+    role = getattr(msg, "type", None) or getattr(msg, "role", None)
+    if isinstance(role, str):
+        return role in _SYSTEM_ROLES
+    if isinstance(msg, dict):
+        role = msg.get("role") or msg.get("type")
+        return role in _SYSTEM_ROLES
+    if isinstance(msg, (tuple, list)) and len(msg) == 2:
+        return msg[0] in _SYSTEM_ROLES
+    return False
+
+
+def _system_prefix_len(messages: List[Any]) -> int:
+    """Count the leading system messages — i.e. the caller's own instructions.
+
+    That run of messages is the CACHEABLE PREFIX of the request: it is the same
+    bytes on every call, so a provider can match it (OpenAI auto-caches a stable
+    prefix above its token floor; Anthropic matches up to each `cache_control`
+    breakpoint). The skill fragment is rebuilt per query and therefore differs
+    call to call, so it has to land after this run, not in front of it.
+    """
+    count = 0
+    for msg in messages:
+        if not _is_system_message(msg):
+            break
+        count += 1
+    return count
+
+
 def _inject_skills_into_input(input_value: Any) -> Any:
-    """Prepend a SkillRouter-built system message to a chat model's input.
+    """Insert a SkillRouter-built system message into a chat model's input.
 
     Accepts the three input shapes LangChain's BaseChatModel.invoke sees: a
     string, a list of messages (BaseMessage / dict), and a PromptValue.
     Falls through unchanged — and without consulting the Router at all — on
     anything else, so the trace never claims a routing decision that did not
     reach the model.
+
+    Placement: immediately AFTER the caller's own leading system messages and
+    before the conversation. With no system message at all it still goes first,
+    which is what it always did.
     """
     # Shape dispatch FIRST. This used to run last, after the Router had
     # already been consulted and its routing_id + offered names stamped on
@@ -738,7 +786,14 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     if not fragment:
         return input_value
 
-    return [SystemMessage(content=fragment), *messages]
+    # STABLE content stays in the cacheable prefix; query-varying content goes
+    # after it. `fragment` is rebuilt from `query` on every call (~115 tokens
+    # that differ request to request), so at index 0 it invalidated the provider
+    # prompt cache for EVERYTHING behind it — a caller's 2,000-token system
+    # prompt that would otherwise have been a cache hit became a full miss on
+    # every request. The cost was never the 115 tokens; it was the 2,000.
+    cut = _system_prefix_len(messages)
+    return [*messages[:cut], SystemMessage(content=fragment), *messages[cut:]]
 
 
 def _install_skill_loader() -> None:
@@ -1203,7 +1258,8 @@ def instrument(
 
     # SkillRouter dynamic loader — opt-in. When enabled,
     # BaseChatModel.invoke/ainvoke get monkey-patched so a SystemMessage
-    # carrying the platform-routed skills is prepended on every call.
+    # carrying the platform-routed skills is inserted on every call — after
+    # the caller's own system messages, so their bytes stay cacheable.
     #
     # enable_load_skill_tool is accepted but DORMANT here:
     # this adapter patches chat-model invoke/ainvoke — a non-loop

@@ -15,7 +15,10 @@ One-line setup::
 `instrument()` monkey-patches `anthropic.resources.messages.Messages.create`
 (and the async counterpart) so the `system` argument is augmented with
 the platform-routed skill fragment before the request is sent. User
-``system`` content is preserved and placed AFTER the skill fragment.
+``system`` content is preserved and kept FIRST; the skill fragment is
+appended after it, so the caller's own instructions stay in the cacheable
+prefix (the fragment is rebuilt per query and so differs on every call —
+in front, it would break the prompt cache for everything behind it).
 
 Manual / explicit path::
 
@@ -133,15 +136,23 @@ def skill_system(
     query: Optional[str] = None,
     agent_name: Optional[str] = None,
 ) -> Union[str, List[Any]]:
-    """Build a ``system`` parameter for ``messages.create()`` with skills prepended.
+    """Build a ``system`` parameter for ``messages.create()`` with skills appended.
 
     The function returns whichever shape best matches the input:
 
     - If ``base`` is None or a string → returns a string with the skill
-      fragment prepended.
-    - If ``base`` is a list of content blocks → returns a new list with
-      a skill content block prepended (so user cache_control hints are
-      preserved on the trailing blocks).
+      fragment appended after it.
+    - If ``base`` is a list of content blocks → returns a new list that is
+      the caller's blocks unchanged, in their original order, with ONE skill
+      block added at the end.
+
+    Order matters for cost, not just for reading. The fragment is rebuilt from
+    ``query`` on every call, so it is different bytes each time; the caller's
+    ``base`` is the same bytes each time. Anthropic matches a cached prefix up
+    to each ``cache_control`` breakpoint, so a varying block in FRONT of the
+    caller's blocks moves every one of them off their cached offset and turns
+    a hit into a full miss. Appending leaves the caller's blocks — and any
+    ``cache_control`` hints they carry — byte-identical and in place.
 
     Args:
         base: The user's normal system prompt — string or content-block list.
@@ -194,10 +205,13 @@ def skill_system(
     except Exception:
         logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
 
+    # The caller's blocks are copied through untouched and in order — no
+    # rewriting, no re-tagging — so any `cache_control` breakpoint they carry
+    # still sits at the same offset in the request it did before we ran.
     if isinstance(base, list):
-        return [{"type": "text", "text": fragment}, *base]
+        return [*base, {"type": "text", "text": fragment}]
     if isinstance(base, str) and base:
-        return f"{fragment}\n\n{base}"
+        return f"{base}\n\n{fragment}"
     return fragment
 
 
