@@ -205,7 +205,7 @@ live-llm-tests = [
     # and langchain-anthropic 0.3.21 in turn requires anthropic>=0.69.0 — so the
     # old >=0.40.0 / >=0.3.0 pair was an unreachable fiction. Live-verify still
     # pending an ANTHROPIC_API_KEY run, but the install floors are now real.
-    "anthropic>=0.69.0",
+    "anthropic>=0.69.0,<1.0.0",
     "langchain-anthropic>=0.3.21",
 ]
 # Optional extras for the live CrewAI OTEL test (tests/integration/test_framework_live_crewai.py).
@@ -261,9 +261,34 @@ claude-agent-sdk-tests = [
 # block). anthropic stays at 0.40.0 here (not live-llm-tests' 0.69.0): this extra
 # has no langchain-anthropic to force it up, and the anthropic instrumentor imports
 # fine against SDK 0.40.0. Install with: pip install -e ".[providers-tests]"
+# ⚠ anthropic CAPPED at <1.0.0 in the TEST extras on 2026-08-23. anthropic 1.0.0
+# shipped 2026-08-20 and the OpenInference anthropic instrumentor stops capturing the
+# model turn against it: conformance goes from 14 pass to five FAILs (C3 llm_calls
+# empty, C4 rendered_input blank, C5 trace flat at one span, C8/C9 the skills rail
+# cannot prove what was in the prompt). Bisected on the DEPENDENCY, not the code —
+# 0.125.0 passes all 14, 1.0.0 fails five, with no source change between.
+# openinference-instrumentation-anthropic 1.1.2 (2026-08-07, predates the major)
+# declares `anthropic>=0.84.0` with no upper bound, so it admits 1.0.0 and the break
+# is upstream of us either way.
+#
+# On the [openai] extra's "NO major cap, deliberately" policy twelve lines up — this
+# does not contradict it, and the distinction is the point. That comment rejects a cap
+# that GUESSES at future breakage and says "if a future major does break us, the job
+# says so." The job said so. This cap is the response to a measured failure, not a
+# prediction of one, and it is scoped to the two test extras rather than anything a
+# user resolves.
+#
+# ⚠ WHAT THIS CAP DOES NOT DO: protect users. `anthropic` is in no runtime extra and
+# no core dep — a user brings their own, so nothing here constrains them. Someone on
+# anthropic 1.x today gets EMPTY llm_calls with no error, which is precisely the
+# silent no-op the C12 contract exists to forbid. The user-facing fix is a runtime
+# warning on the instrumentation path, not a version range; it is not in this change.
+#
+# Lift the cap when the instrumentor supports 1.x and conformance is green against it.
+# Do not lift it to make a build pass.
 providers-tests = [
     "openai>=2.26.0",
-    "anthropic>=0.40.0",
+    "anthropic>=0.40.0,<1.0.0",
     "google-genai>=1.65.0",
     "openinference-instrumentation-openai>=0.1.18",
     "openinference-instrumentation-anthropic>=0.1.14",
