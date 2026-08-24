@@ -1,6 +1,6 @@
 """Top-level test conftest for the DecimalAI Python SDK.
 
-Three cross-cutting concerns are handled here so individual test modules
+Four cross-cutting concerns are handled here so individual test modules
 don't have to:
 
 1. **Init-time verify probe is bypassed** via the ``DECIMALAI_SKIP_VERIFY``
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import os
 import sys
+import weakref
 
 import pytest
 
@@ -106,6 +107,93 @@ def _clear_langchain_global_handler():
         lc_mod = sys.modules.get("decimalai.langchain")
         if lc_mod is not None:
             lc_mod._decimal_callback_var.set(None)
+
+
+# ── 4. Span exports are drained between tests ──────────────────────────────────
+#
+# The SDK exports through a `BatchSpanProcessor`, whose whole job is to hand spans
+# to a worker thread and return. Nothing tied that worker to a test boundary, so a
+# span opened in one test could be exported while the NEXT test was running — and
+# land in that test's mock.
+#
+# That is not hypothetical. Three intermittent CI failures on 2026-08-22..23 had
+# this shape, each in a different file, each passing on rerun and unreproducible
+# locally:
+#
+#   test_skill_rail_per_run.py    TestAnthropicClaimsOnlyWhatItInjected
+#   test_pydantic_ai_run_scope.py TestRunScopeInstall
+#   test_manifest_only_mode.py    assert captured["agent_name"] == "support-agent"
+#                                 AssertionError: 'doomed' == 'support-agent'
+#
+# `doomed` is the agent name from test_llamaindex_run_identity.py:431 — a different
+# FILE. Demonstrated directly: three spans opened in one function were exported by
+# the batch worker while the next function was running, every time.
+#
+# Note what this is NOT. `_synchronous_sender` below already makes the *send*
+# inline, and `agent_run` already resets its ContextVar in a `finally` — both were
+# checked and both are correct. The gap is one layer up: the send is only reached
+# when the batch processor decides to export, and that decision was on its own
+# timer. Fixing the send half and leaving the export half async is why the flake
+# survived a fixture that looks like it should have caught it.
+#
+# Draining after every test closes it: a test's spans are exported before the next
+# one starts, so nothing can arrive late. `force_flush` is exactly this operation.
+# Providers built BY tests are covered too — six test files construct their own
+# `TracerProvider`, three of them the files that flaked — so `__init__` is wrapped
+# to record every instance weakly rather than relying on a hand-maintained list a
+# new test would silently fall out of.
+_LIVE_PROVIDERS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def pytest_sessionstart(session):
+    """Record every TracerProvider built during the session, weakly."""
+    try:
+        from opentelemetry.sdk.trace import TracerProvider
+    except ImportError:  # pragma: no cover - OTel is a core dep
+        return
+    if getattr(TracerProvider, "_decimalai_tracked", False):
+        return
+    original_init = TracerProvider.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        try:
+            _LIVE_PROVIDERS.add(self)
+        except TypeError:  # pragma: no cover - unhashable provider
+            pass
+
+    TracerProvider.__init__ = _tracking_init
+    TracerProvider._decimalai_tracked = True
+
+
+@pytest.fixture(autouse=True)
+def _drain_span_exports():
+    """Flush every live TracerProvider after each test, so no export lands late."""
+    yield
+    providers = list(_LIVE_PROVIDERS)
+    try:
+        from opentelemetry import trace as trace_api
+
+        providers.append(trace_api.get_tracer_provider())
+    except Exception:  # pragma: no cover - no OTel, nothing to drain
+        pass
+    try:
+        from decimalai import providers as _dp
+
+        if _dp._last_provider is not None:
+            providers.append(_dp._last_provider)
+    except Exception:  # pragma: no cover - SDK not importable here
+        pass
+    for provider in providers:
+        flush = getattr(provider, "force_flush", None)
+        if not callable(flush):
+            continue  # ProxyTracerProvider and friends have nothing to drain
+        try:
+            # Short on purpose: this runs after EVERY test, and a provider that
+            # cannot drain in a second is a finding, not something to wait out.
+            flush(timeout_millis=1000)
+        except Exception:  # noqa: BLE001 - a shut-down provider raises; not this
+            pass            # fixture's business, and never a reason to fail a test
 
 
 @pytest.fixture(autouse=True)
