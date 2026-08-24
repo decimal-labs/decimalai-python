@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decimalai"
-version = "0.10.3"
+version = "0.10.4"
 # Keep byte-identical with the GitHub repo description and the docs landing line.
 # It is the one sentence a stranger reads on PyPI, in GitHub search results and in
 # the org list, and it drifted: PyPI said "manifest-aware agent change management"

@@ -4,9 +4,58 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## Unreleased
+## 0.10.4 — 2026-08-24
 
 ### Fixed
+
+- **Registry skills attached to a single agent are now actually offered on
+  `langchain` and `anthropic`.** An agent's offered set is built from org-owned
+  skills scoped `workspace` plus `SkillSubscription` rows, and an agent-scope row
+  matches on `agent_name`. A skill pulled from the registry belongs to another
+  org, so it is never in the ambient set and reaches one agent only through that
+  agent-scope row — which the resolver can match only when the router is told
+  which agent it serves. Both auto-inject adapters injected without sending the
+  name, so **every registry skill attached to a single agent was silently never
+  offered**: no error, no empty-menu warning, just a prompt missing the skills
+  the user picked. `openai_agents` and `pydantic_ai` already sent it. LangChain
+  now reads the installed name at call time rather than baking it into the router
+  singleton, so a later `instrument(agent_name=...)` is not ignored by a router
+  built before it; the anthropic adapter's `instrument()` gains an optional
+  `agent_name` keyword, and a bare repeat call deliberately does not clear a name
+  already set.
+
+- **Skills are delivered on `.stream()` and `.astream()`.** Injection ran on
+  `invoke`/`ainvoke` only, so a production chat agent — which streams — received
+  no skills at all, and nothing said so. Both are now patched as generator
+  functions rather than plain wrappers, so the rails stay open for the whole
+  consumption of the stream; a plain wrapper closes them when it hands the
+  generator back, before the model call runs. `generate`/`agenerate` are
+  deliberately left alone: `invoke` calls `generate` internally, so patching it
+  would double-inject, and any model implementing `_stream` bypasses it anyway.
+  One further delegation is guarded — when a model cannot really stream,
+  LangChain's own `stream` yields `self.invoke(...)`, running the stream path
+  through the invoke patch.
+
+- **A near-miss agent name warns instead of failing silently.** A name that does
+  not match an installed agent previously produced an empty menu and no signal.
+
+- **LangChain files skill rails per run, so one run's `load_skill` is not
+  another's.** Two concurrent runs shared the router singleton: run A's tool call
+  loaded a skill, run B loaded nothing, B shipped first — and B reported an
+  activation it never made while A's real one was lost. Both halves fired at
+  once. The router now takes an ambient scope resolver: adapters register a
+  callable answering which run is executing, LangChain's reads its own runnable
+  config, and the reader accepts only run ids it already indexed as its own
+  callbacks'. The unscoped drain could not simply be deleted — LangChain
+  dispatches callbacks under `copy_context()`, so ContextVars written inside the
+  runnable are invisible at trace-send, and it registers no native `load_skill`
+  tool, so the call arrives from user code with no scope to pass.
+
+- **"View full report" links no longer break on an agent name containing spaces
+  or brackets.** Two sites interpolated the name raw, so the default demo agent —
+  literally named `[Demo] support-agent` — produced a URL nothing can follow. Two
+  other sites in the same file already quoted correctly; all four now share one
+  pattern.
 
 - **The routed skill menu no longer sits in front of your system prompt, so the
   provider prompt cache survives.** The menu is built per query, so it differs
@@ -62,6 +111,51 @@ and patch releases are fixes.
   floors job had therefore been installing a vulnerable version, and `pip-audit`
   did not catch it because the audit job installs `.`, not `.[dev]`. The dev
   extra now mirrors `[langchain]` exactly, marker included.
+
+### Changed
+
+- **The package summary now matches the repo description.** PyPI said
+  "manifest-aware agent change management" while GitHub said the lift sentence —
+  two different products to a skimming reader, on the two surfaces most likely to
+  be skimmed. Both now carry the lift sentence. This release is the first to
+  carry it to PyPI.
+
+- **The floors job runs on 3.10 and 3.13.** A floor can be true on one
+  interpreter and false on another, and only the 3.10 leg could see the
+  `langchain-core` case above. The 3.13 leg covers the mirror case: every other
+  job resolves latest dependencies rather than lowest, so a floor that breaks
+  only on a newer Python had nothing watching it.
+
+## 0.10.3 — 2026-08-17
+
+Published from CI through Trusted Publishing rather than a maintainer machine —
+the first release of this package to carry a PyPI attestation.
+
+### Added
+
+- **A framework conformance suite that asserts the wire.** Each driver runs in
+  its own process, with the real baseline recorded rather than assumed; 18 cells
+  closed across span parenting, agent identity and content. A separate floating
+  lane runs the same suite against latest framework releases on a schedule, so an
+  upstream break surfaces without gating the merge queue.
+- **A written support policy for framework versions**, and why each floor is
+  where it is.
+
+### Fixed
+
+- **A raw-provider run produces one trace instead of one trace per call**, with
+  the run boundary declared on the raw Anthropic rail.
+- **Instrumenting an agent no longer writes to the user's repo.**
+- **`llamaindex` no longer consumes the stream it is observing.**
+- **`otel` no longer drops traces that declare nothing**, and flushes at exit.
+- **`openai_agents` routes on the real query** and scopes routing per run.
+- **`langchain` keys trace state per run**, and traces worker threads.
+- Two floors that were fiction were corrected, and the `openai` major cap dropped.
+
+### Removed
+
+- **AutoGen/AG2 is no longer claimed.** The flag stays; the claim and the advice
+  that installed the wrong package are gone.
 
 ## 0.10.2 — 2026-08-15
 
