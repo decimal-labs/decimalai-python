@@ -2583,7 +2583,7 @@ def _render_regression_terminal(report: dict, agent_name: str, base_url: str) ->
     diff = (report.get("diff_summary") or {}).get("changes", []) or []
 
     click.echo("")
-    click.echo(f"  🔍 Decimal Manifest Impact — {agent_name}")
+    click.echo(f"  🔍 Agent Regression Check — {agent_name}")
     click.echo("")
 
     if verdict == "first_run":

@@ -45,7 +45,7 @@ decimalai demo regression             # → impact report: what your next change
 The impact report it produces looks like this — captured with the SDK's `decimalai regression-check` against the seeded reference agent, trimmed:
 
 ```text
-  🔍 Decimal Manifest Impact — [Demo] support-agent
+  🔍 Agent Regression Check — [Demo] support-agent
 
   Manifest changes:
     🟡 tool_renamed — lookup_price
