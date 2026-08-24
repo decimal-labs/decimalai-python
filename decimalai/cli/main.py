@@ -89,28 +89,319 @@ def common_options(func):
 
 # ── Init command ───────────────────────────────────────────
 
+_DEFAULT_BASE_URL = "https://api.decimal.ai"
+
+
+def _http_die(exc, base_url):
+    """Turn a failed platform call into the right one-line diagnosis.
+
+    Same triage `init` uses for /auth/verify, and for the same reason: when
+    the server ANSWERS, this is not a connection problem, and reporting a
+    rejected key as a network fault sends people off debugging DNS.
+    """
+    import httpx
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            click.echo("  ✗ Invalid API key — the server rejected it.", err=True)
+            click.echo(f"    Get a valid key at {_dashboard_url(base_url)}/settings")
+        else:
+            click.echo(f"  ✗ Server returned HTTP {status} from {base_url}.", err=True)
+            click.echo("    Check the base URL points at a DecimalAI backend, or try again.")
+    else:
+        click.echo(f"  ✗ Connection failed: {exc}", err=True)
+        click.echo(f"    Check your base URL ({base_url}) and network.")
+    raise SystemExit(1)
+
+
+def _scaffold_agent_file(
+    agent_name, api_key, base_url, framework, out_path, force, dry_run, model,
+):
+    """`decimalai init <agent-name>` — write a runnable file for a real agent.
+
+    The gap this closes: the dashboard stores a name, a description and a set
+    of skills, and the user still had to write the agent. Now the
+    configuration they already made becomes a file that runs. We generate;
+    they run — nothing executes on our side.
+
+    The agent is RESOLVED against the API rather than assumed. Inventing one
+    locally would produce a file that traces under a name the workspace does
+    not have: the dashboard page stays empty, the attached skills never
+    resolve, and nothing anywhere reports an error.
+    """
+    import os
+
+    from .scaffold import (
+        DEFAULT_OUTPUT,
+        ENV_VARS,
+        INSTALL,
+        UnknownFramework,
+        normalize_framework,
+        render_agent_file,
+    )
+
+    # Framework first: it needs no key and no network, so a typo fails in
+    # milliseconds instead of after two round trips.
+    try:
+        framework = normalize_framework(framework)
+    except UnknownFramework as e:
+        import textwrap
+        click.echo("")
+        first = True
+        # Wrapped per paragraph: the refusal explains WHY, which takes more
+        # than one line, and an unwrapped 200-character sentence is a wall
+        # nobody reads.
+        for para in str(e).splitlines():
+            for line in textwrap.wrap(para, width=74) or [""]:
+                click.echo(("  ✗ " if first else "    ") + line, err=True)
+                first = False
+        click.echo("")
+        raise SystemExit(1)
+
+    resolved_key = (
+        api_key
+        or os.environ.get("DECIMAL_API_KEY")
+        or os.environ.get("DECIMALAI_API_KEY")
+    )
+    if not resolved_key:
+        click.echo("")
+        click.echo("  ✗ No API key found.", err=True)
+        click.echo("")
+        click.echo("  Set your key:")
+        click.echo('    export DECIMAL_API_KEY="dai_sk_..."')
+        click.echo("")
+        click.echo(f"  Get one at {_dashboard_url(base_url)}/settings")
+        raise SystemExit(1)
+
+    out_path = out_path or DEFAULT_OUTPUT
+
+    from .._client import DecimalAIClient
+    client = DecimalAIClient(api_key=resolved_key, base_url=base_url)
+
+    # 1. Resolve the agent.
+    #
+    # This runs BEFORE the refuse-to-clobber check, and the order was chosen
+    # by running it the other way round: with the file check first, someone
+    # who typo'd the name in a directory that already had an agent.py was told
+    # "agent.py already exists" and offered `--force` — advice that, if
+    # followed, produces a completely different error. The name is the
+    # question they got wrong and cannot fix locally, so it is diagnosed
+    # first. The extra round trip costs ~0.1s.
+    try:
+        # No `limit`: the endpoint returns the full list when it is unset,
+        # and passing one activates a pagination path that truncates. The
+        # ordering puts manifest-only agents last, so a truncation would
+        # drop the never-traced UI-created agent this command exists to
+        # find, and report it as "no such agent".
+        resp = client._http.get("/api/v1/agents")
+        resp.raise_for_status()
+        agents = resp.json().get("agents") or []
+    except Exception as e:  # noqa: BLE001 — re-raised as a diagnosis
+        client.close()
+        _http_die(e, base_url)
+
+    names = [a.get("agent_name") for a in agents if a.get("agent_name")]
+    if agent_name not in names:
+        client.close()
+        click.echo("")
+        click.echo(f"  ✗ No agent named {agent_name!r} in this workspace.", err=True)
+        # A near miss is the common case (refund_bot vs refund-bot) and it is
+        # worth naming: the two look identical at a glance and produce a
+        # completely empty dashboard page.
+        try:
+            from .. import _edit_distance_within
+            close = [n for n in names if _edit_distance_within(agent_name, n, 2)]
+        except Exception:
+            close = []
+        click.echo("")
+        if close:
+            click.echo(f"  Did you mean: {', '.join(sorted(close)[:5])}")
+            click.echo("")
+        elif names:
+            click.echo(f"  Agents in this workspace: {', '.join(sorted(names)[:8])}")
+            click.echo("")
+        click.echo("  Create it first, then run this again:")
+        click.echo(f"    → {_dashboard_url(base_url)}/agents/new")
+        click.echo("")
+        raise SystemExit(1)
+
+    # 2. Refuse to clobber — after the name is known good, but still before
+    #    the second round trip and before anything is written.
+    #    The parent-directory check rides along here for the same reason the
+    #    name check moved ahead of the clobber check: a destination we cannot
+    #    write is knowable now, and diagnosing it after the second round trip
+    #    makes the user pay two requests for a stack trace.
+    parent = os.path.dirname(out_path) or "."
+    if not dry_run and not os.path.isdir(parent):
+        client.close()
+        click.echo("")
+        click.echo(f"  ✗ No such directory: {parent}", err=True)
+        click.echo("")
+        click.echo(f"  Create it:       mkdir -p {parent}")
+        click.echo("  Or write here:   decimalai init "
+                   f"{agent_name}")
+        click.echo("")
+        raise SystemExit(1)
+    if not dry_run and os.path.exists(out_path):
+        if not force:
+            client.close()
+            click.echo("")
+            click.echo(f"  ✗ {out_path} already exists.", err=True)
+            click.echo("")
+            click.echo("  Overwrite it:    decimalai init "
+                       f"{agent_name} --force")
+            click.echo("  Write elsewhere: decimalai init "
+                       f"{agent_name} --out my_agent.py")
+            click.echo("  See it first:    decimalai init "
+                       f"{agent_name} --dry-run")
+            click.echo("")
+            raise SystemExit(1)
+        if os.path.isdir(out_path):
+            # --force overwrites a file; it must never try to unlink a
+            # directory the user pointed at by accident.
+            client.close()
+            click.echo("")
+            click.echo(f"  ✗ {out_path} is a directory.", err=True)
+            click.echo("")
+            raise SystemExit(1)
+
+    # 3. Fetch its skills, so the file can name what it will use.
+    try:
+        quoted = urllib.parse.quote(agent_name, safe="")
+        resp = client._http.get(f"/api/v1/agents/{quoted}/skills")
+        resp.raise_for_status()
+        skills = resp.json().get("skills") or []
+    except Exception as e:  # noqa: BLE001
+        client.close()
+        _http_die(e, base_url)
+    client.close()
+
+    source = render_agent_file(
+        agent_name,
+        framework=framework,
+        skills=skills,
+        model=model,
+        # Only pinned when it is not the hosted default: it is not a secret,
+        # and a file scaffolded against a local backend that silently points
+        # at production is a worse default than a redundant line.
+        base_url=None if base_url == _DEFAULT_BASE_URL else base_url,
+    )
+
+    if dry_run:
+        click.echo(source, nl=False)
+        return
+
+    # The parent directory was checked above, but a race, a read-only mount,
+    # or a permission bit still surfaces here — and every other failure in
+    # this command is a one-line diagnosis, so this one is too.
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(source)
+    except OSError as e:
+        click.echo("")
+        click.echo(f"  ✗ Could not write {out_path}: {e}", err=True)
+        click.echo("")
+        click.echo("  Write elsewhere: decimalai init "
+                   f"{agent_name} --out ~/agent.py")
+        click.echo("  See it first:    decimalai init "
+                   f"{agent_name} --dry-run")
+        click.echo("")
+        raise SystemExit(1)
+
+    dashboard = _dashboard_url(base_url)
+    n = len(skills)
+    click.echo("")
+    click.echo(f"  ✓ Wrote {out_path} — {agent_name}, {framework}, "
+               f"{n} skill{'' if n == 1 else 's'}")
+    click.echo("")
+    click.echo("  Install:")
+    click.echo(f"    {INSTALL[framework]}")
+    click.echo("")
+    click.echo("  Set:")
+    for var in ENV_VARS[framework]:
+        already = " (already set)" if os.environ.get(var) else ""
+        click.echo(f'    export {var}="..."{already}')
+    click.echo("")
+    click.echo("  Run:")
+    click.echo(f"    python {out_path}")
+    click.echo("")
+    click.echo("  The trace appears at:")
+    click.echo(f"    → {dashboard}/agents/{urllib.parse.quote(agent_name, safe='')}")
+    click.echo("")
+
+
 @cli.command()
+@click.argument("agent_name", required=False)
 @click.option("--api-key", envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"], help="API key")
 @click.option(
     "--base-url",
     envvar=["DECIMAL_BASE_URL", "DECIMALAI_BASE_URL"],
-    default="https://api.decimal.ai",
+    default=_DEFAULT_BASE_URL,
     show_envvar=True,
     help="Platform URL",
 )
+@click.option(
+    # default=None, not "langchain": a flag that carries a default cannot be
+    # told apart from an unset one, which is how --framework came to be
+    # silently discarded on the no-agent-name path while its neighbours were
+    # loudly refused. The default is applied below instead.
+    "--framework",
+    default=None,
+    help="Framework to generate for: langchain (default) or openai-agents",
+)
+@click.option("--out", "out_path", default=None,
+              help="Where to write (default: ./agent.py)")
+@click.option("--model", default=None,
+              help="Model for the generated file's MODEL line")
+@click.option("--force", is_flag=True, help="Overwrite an existing file")
+@click.option("--dry-run", is_flag=True, help="Print the file instead of writing it")
 @click.option("--test-trace/--no-test-trace", default=True, help="Send a test trace to verify connectivity")
-def init(api_key, base_url, test_trace):
-    """Verify your setup and send a test trace.
+def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_run, test_trace):
+    """Verify your setup, or scaffold a runnable agent.
 
-    Checks API key validity, shows workspace info, and optionally
-    sends a test trace to confirm end-to-end connectivity.
+    With no argument: checks API key validity, shows workspace info, and
+    optionally sends a test trace to confirm end-to-end connectivity.
+
+    With an AGENT_NAME: writes an `agent.py` wired to that agent — its name
+    bound, its skills loaded, ready to run. The agent must already exist
+    (create one in the dashboard first). Nothing runs on DecimalAI's side;
+    the file is yours.
 
     \b
-    Example:
-        $ export DECIMAL_API_KEY="dai_sk_..."
-        $ decimalai init
+    Examples:
+        $ decimalai init                          # verify the setup
+        $ decimalai init refund-bot               # write ./agent.py
+        $ decimalai init refund-bot --dry-run     # print it instead
+        $ decimalai init refund-bot --framework openai-agents
     """
     import os
+
+    if agent_name:
+        return _scaffold_agent_file(
+            agent_name, api_key, base_url, framework or "langchain", out_path,
+            force, dry_run, model,
+        )
+
+    # Scaffold-only flags without a name would otherwise be silent no-ops,
+    # and the user would sit waiting for a file that was never going to be
+    # written.
+    scaffold_only = [
+        name for name, used in (
+            ("--framework", framework is not None),
+            ("--out", out_path is not None),
+            ("--model", model is not None),
+            ("--force", force),
+            ("--dry-run", dry_run),
+        ) if used
+    ]
+    if scaffold_only:
+        click.echo("")
+        click.echo(f"  ✗ {', '.join(scaffold_only)} needs an agent name.", err=True)
+        click.echo("")
+        click.echo("    decimalai init <agent-name>")
+        click.echo("")
+        raise SystemExit(1)
 
     # 1. Resolve API key
     resolved_key = api_key or os.environ.get("DECIMAL_API_KEY") or os.environ.get("DECIMALAI_API_KEY")
@@ -183,6 +474,9 @@ def init(api_key, base_url, test_trace):
 
     # 4. Show next steps
     dashboard_url = _dashboard_url(base_url)
+    click.echo("")
+    click.echo("  Already created an agent? Turn it into a runnable file:")
+    click.echo("    decimalai init <agent-name>   # writes ./agent.py, skills wired")
     click.echo("")
     click.echo("  See it work in 2 minutes — seeds a demo into your workspace:")
     click.echo("    decimalai demo regression   # what your next agent change would break")

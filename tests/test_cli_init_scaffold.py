@@ -1,0 +1,728 @@
+"""`decimalai init <agent-name>` — the scaffold that closes the gap between
+"created an agent in the dashboard" and "an agent is running".
+
+THE TEMPLATE IS CHECKED AS CODE, NOT AS A STRING. Every generated file in this
+module is `compile()`d, and the assertions about what it contains are made
+against its AST, not against substrings. A string test passes on a file with an
+unbalanced quote or an `enable_skill_loader` that landed inside a comment; both
+have to fail the build, because the product claim is that the file RUNS.
+
+The four things that must never regress:
+
+  1. `enable_skill_loader=True` is present, as a real keyword on the real
+     `instrument()` call. It defaults to False on both adapters, so a file
+     without it traces perfectly and delivers none of the agent's skills —
+     silently. That is the single most important line in the template.
+  2. The agent name is BOUND, and survives a name that needs escaping.
+     Unbound, the adapter auto-detects a name off the runnable and files
+     traces against a different agent than the one the user configured.
+  3. No API key literal is ever written. The file reads DECIMAL_API_KEY from
+     the environment, because people commit these.
+  4. Refusing to clobber. A scaffold that silently eats an existing agent.py
+     is worse than one that does not exist.
+
+No network: every HTTP call is mocked at `DecimalAIClient`.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+from click.testing import CliRunner
+
+from decimalai.cli.main import cli
+from decimalai.cli.scaffold import (
+    SUPPORTED_FRAMEWORKS,
+    UnknownFramework,
+    normalize_framework,
+    render_agent_file,
+)
+
+AGENT = "refund-bot"
+SKILLS = [
+    {"skill_name": "refund-policy", "description": "When a refund is allowed",
+     "scope": "agent"},
+    {"skill_name": "order-lookup", "description": "Find an order by email",
+     "scope": "agent"},
+    {"skill_name": "tone-check", "description": "House style", "scope": "workspace"},
+]
+
+
+# ── AST helpers: what the file MEANS, not what it says ───────────────
+
+
+def parse(source: str) -> ast.Module:
+    """Parse, which is also the syntax check. A broken template dies here."""
+    return ast.parse(source, filename="agent.py")
+
+
+def calls(tree: ast.Module, func_name: str) -> list:
+    """Every `ast.Call` whose callee ends in `func_name`.
+
+    Matches `instrument(...)` and `mod.instrument(...)` alike, so the test
+    does not care which import style the template chose.
+    """
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+        if name == func_name:
+            out.append(node)
+    return out
+
+
+def kwarg(call: ast.Call, name: str):
+    """The literal value of one keyword on a call, or `None` if absent."""
+    for kw in call.keywords:
+        if kw.arg == name:
+            return ast.literal_eval(kw.value)
+    return None
+
+
+def string_literals(tree: ast.Module) -> list:
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def imported_modules(tree: ast.Module) -> set:
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mods.add(node.module)
+    return mods
+
+
+# ── 1. every framework's template is valid, runnable Python ──────────
+
+
+class TestTemplateIsCode:
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_compiles(self, framework):
+        """compile(), not a substring match. A syntax error fails the suite."""
+        source = render_agent_file(AGENT, framework, SKILLS)
+        compile(source, "agent.py", "exec")
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_compiles_with_no_skills(self, framework):
+        compile(render_agent_file(AGENT, framework, []), "agent.py", "exec")
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_imports_resolve_to_the_adapter_that_has_the_seam(self, framework):
+        mods = imported_modules(parse(render_agent_file(AGENT, framework, SKILLS)))
+        assert "decimalai" in mods
+        expected = {
+            "langchain": "decimalai.langchain",
+            "openai-agents": "decimalai.openai_agents",
+        }[framework]
+        assert expected in mods, f"{framework} must import {expected}"
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_has_one_entry_point_and_one_example_call(self, framework):
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        funcs = [n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef)]
+        assert funcs == ["run"], f"expected exactly one entry point, got {funcs}"
+        assert len(calls(tree, "run")) == 1, "expected exactly one example call"
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_model_is_a_named_constant_the_user_can_change(self, framework):
+        """One assignment, one place to edit — not a literal buried in a call."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "MODEL"
+                           for t in n.targets)]
+        assert len(assigns) == 1
+        assert isinstance(ast.literal_eval(assigns[0].value), str)
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_model_override_reaches_the_file(self, framework):
+        source = render_agent_file(AGENT, framework, SKILLS, model="gpt-5-mini")
+        tree = parse(source)
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "MODEL"
+                           for t in n.targets)]
+        assert ast.literal_eval(assigns[0].value) == "gpt-5-mini"
+
+
+# ── 2. the flag that makes the whole thing worth shipping ────────────
+
+
+class TestSkillLoaderIsOn:
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_enable_skill_loader_is_true_on_instrument(self, framework):
+        """Both adapters default it to False. Without it the file traces and
+        delivers no skills, with no error anywhere — the exact silent failure
+        the scaffold exists to prevent."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        instruments = calls(tree, "instrument")
+        assert len(instruments) == 1, "expected exactly one instrument() call"
+        assert kwarg(instruments[0], "enable_skill_loader") is True
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_init_does_not_also_pass_a_framework_flag(self, framework):
+        """`init(langchain=True)` installs tracing with the loader OFF and the
+        later instrument() cannot undo the disk-mirror decision; on
+        openai-agents it registers a SECOND trace processor and double-sends
+        every trace. Either way the one-install shape is load-bearing."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        init_calls = calls(tree, "init")
+        assert len(init_calls) == 1
+        for flag in ("langchain", "openai_agents", "crewai", "otel", "adk"):
+            assert kwarg(init_calls[0], flag) is None, (
+                f"init() must not carry {flag}=True — see scaffold.py"
+            )
+
+    def test_openai_agents_instruments_before_constructing_the_agent(self):
+        """The loader wraps `Agent.__init__`, so an Agent built above the
+        instrument() call silently receives nothing on builds without the
+        run-time hooks."""
+        tree = parse(render_agent_file(AGENT, "openai-agents", SKILLS))
+        instrument_line = calls(tree, "instrument")[0].lineno
+        agent_line = calls(tree, "Agent")[0].lineno
+        assert instrument_line < agent_line
+
+
+# ── 3. the agent name is bound, and survives escaping ────────────────
+
+
+class TestAgentNameBinding:
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_name_is_interpolated_into_instrument(self, framework):
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        assert kwarg(calls(tree, "instrument")[0], "agent_name") == AGENT
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    @pytest.mark.parametrize("name", [
+        '[Demo] support-agent',      # the real default demo agent
+        'quote"bot',                 # naive f-string interpolation → SyntaxError
+        "apostrophe's-bot",
+        "back\\slash-bot",
+        "emoji-🤖-bot",
+        # Control characters. Trace ingest accepts these (validate_agent_name
+        # blocks only \x00), so an SDK-minted agent can carry one. The header
+        # comment was the one place the name skipped both _clean and repr, and
+        # a newline there ended the comment and turned the rest of the line
+        # into code — a file that does not parse, reported as "✓ Wrote".
+        "line\nbreak-bot",
+        "carriage\rreturn-bot",
+        "esc\x1bbot",
+        "tab\tbot",
+    ])
+    def test_hostile_names_still_parse_and_round_trip(self, framework, name):
+        """Escaped by Python's own `repr`, not by hand. A name that breaks the
+        file is a name that breaks the product for that user."""
+        tree = parse(render_agent_file(name, framework, SKILLS))
+        assert kwarg(calls(tree, "instrument")[0], "agent_name") == name
+
+    def test_empty_name_is_refused_rather_than_emitted(self):
+        with pytest.raises(ValueError):
+            render_agent_file("   ", "langchain", SKILLS)
+
+
+# ── 4. no secret is ever written to a file people commit ─────────────
+
+
+class TestNoKeyInFile:
+    # Key SHAPES, not the substring "sk-": the template legitimately contains
+    # the word "disk-mirror", and a test that cannot tell those apart teaches
+    # people to weaken it rather than to fix a real leak.
+    KEY_SHAPES = re.compile(r"dai_sk_[A-Za-z0-9_-]{4,}|\bsk-[A-Za-z0-9]{16,}")
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_no_api_key_literal_anywhere(self, framework):
+        source = render_agent_file(AGENT, framework, SKILLS)
+        assert not self.KEY_SHAPES.search(source)
+        assert "dai_sk_" not in source
+        tree = parse(source)
+        # init() takes no api_key at all — it reads the env itself, which is
+        # both fewer characters and impossible to leak.
+        assert kwarg(calls(tree, "init")[0], "api_key") is None
+        for literal in string_literals(tree):
+            assert "dai_sk_" not in literal
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_scaffold_run_with_a_key_in_env_does_not_bake_it_in(
+        self, framework, tmp_path, monkeypatch
+    ):
+        """End to end, not just the renderer: the CLI holds a real key in
+        memory while it writes the file."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--framework", framework,
+                           "--api-key", "dai_sk_supersecret_value"])
+        assert result.exit_code == 0, result.output
+        written = (tmp_path / "agent.py").read_text()
+        assert "dai_sk_supersecret_value" not in written
+        assert "supersecret" not in written
+
+    def test_a_default_base_url_is_not_baked_in(self):
+        """No inert line pinning the hosted default — but see below: a
+        non-default one IS pinned, deliberately."""
+        source = render_agent_file(AGENT, "langchain", SKILLS,
+                                   base_url=None)
+        assert kwarg(calls(parse(source), "init")[0], "base_url") is None
+
+    def test_a_local_base_url_is_baked_in(self):
+        """Otherwise a file scaffolded against a local backend silently points
+        at production — a URL is not a secret and the surprise costs more."""
+        source = render_agent_file(AGENT, "langchain", SKILLS,
+                                   base_url="http://localhost:8000")
+        assert kwarg(calls(parse(source), "init")[0],
+                     "base_url") == "http://localhost:8000"
+
+
+# ── 5. the skills are NAMED in the file ──────────────────────────────
+
+
+class TestSkillsAreNamed:
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_every_assigned_skill_appears_in_a_comment(self, framework):
+        source = render_agent_file(AGENT, framework, SKILLS)
+        for s in SKILLS:
+            assert s["skill_name"] in source
+
+    def test_workspace_scope_is_labelled_not_claimed_as_a_choice(self):
+        """A workspace-scoped subscription applies to EVERY agent in the org.
+        Listing it unlabelled would claim a deliberate pick that never
+        happened."""
+        source = render_agent_file(AGENT, "langchain", SKILLS)
+        line = [x for x in source.splitlines() if "tone-check" in x][0]
+        assert "workspace-wide" in line
+
+    def test_zero_skills_says_so_instead_of_printing_an_empty_list(self):
+        source = render_agent_file(AGENT, "langchain", [])
+        assert "No skills are attached" in source
+
+    def test_a_multiline_description_cannot_break_out_of_the_comment(self):
+        """The header is `#` comments, so a newline is the ONLY escape — which
+        is why every description is flattened before it goes in."""
+        evil = [{"skill_name": "x", "description": "line one\nMODEL = 'pwned'",
+                 "scope": "agent"}]
+        source = render_agent_file(AGENT, "langchain", evil)
+        tree = parse(source)
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "MODEL"
+                           for t in n.targets)]
+        assert len(assigns) == 1
+        assert ast.literal_eval(assigns[0].value) != "pwned"
+
+    def test_a_skill_name_containing_a_quote_does_not_break_the_file(self):
+        evil = [{"skill_name": 'weird"""name', "description": "x'''y",
+                 "scope": "agent"}]
+        compile(render_agent_file(AGENT, "langchain", evil), "agent.py", "exec")
+
+
+# ── 6. framework selection refuses unknowns, with the reason ─────────
+
+
+class TestFrameworkSelection:
+    def test_default_is_langchain(self):
+        assert SUPPORTED_FRAMEWORKS[0] == "langchain"
+
+    @pytest.mark.parametrize("spelling", [
+        "langchain", "LangChain", "openai-agents", "openai_agents", "OPENAI-AGENTS",
+    ])
+    def test_accepted_spellings(self, spelling):
+        assert normalize_framework(spelling) in SUPPORTED_FRAMEWORKS
+
+    def test_unknown_framework_lists_what_is_supported(self):
+        with pytest.raises(UnknownFramework) as e:
+            normalize_framework("langhcain")
+        for f in SUPPORTED_FRAMEWORKS:
+            assert f in str(e.value)
+
+    @pytest.mark.parametrize("framework", [
+        "llamaindex", "claude-agent-sdk", "crewai", "autogen", "otel", "adk",
+    ])
+    def test_seamless_frameworks_are_refused_with_the_reason(self, framework):
+        """These adapters trace but have no prompt seam. A scaffold that
+        silently delivers no skills is worse than no scaffold — so the refusal
+        has to say that, not just 'invalid choice'."""
+        with pytest.raises(UnknownFramework) as e:
+            normalize_framework(framework)
+        msg = str(e.value)
+        assert "no prompt seam" in msg
+        assert "langchain" in msg
+
+    @pytest.mark.parametrize("framework", ["anthropic", "pydantic-ai"])
+    def test_seamed_but_unscaffolded_frameworks_get_a_different_reason(
+        self, framework
+    ):
+        with pytest.raises(UnknownFramework) as e:
+            normalize_framework(framework)
+        assert "no scaffold for it yet" in str(e.value)
+
+    def test_cli_refuses_unknown_framework_before_touching_the_network(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        with patch("decimalai._client.DecimalAIClient") as client_cls:
+            result = CliRunner().invoke(cli, [
+                "init", AGENT, "--framework", "llamaindex",
+                "--api-key", "dai_sk_x",
+            ])
+        assert result.exit_code == 1
+        assert "no prompt seam" in result.output
+        client_cls.assert_not_called()
+        assert not (tmp_path / "agent.py").exists()
+
+
+# ── CLI: mocked HTTP, no network ─────────────────────────────────────
+
+
+def _client(agents=None, skills=None, agents_exc=None, skills_exc=None):
+    """A DecimalAIClient stub answering the two endpoints `init` calls."""
+    if agents is None:
+        agents = [{"agent_name": AGENT}, {"agent_name": "billing-agent"}]
+    if skills is None:
+        skills = SKILLS
+
+    def get(url, **kwargs):
+        resp = MagicMock()
+        if url.endswith("/api/v1/agents"):
+            if agents_exc:
+                raise agents_exc
+            resp.json.return_value = {"agents": agents}
+        elif "/skills" in url:
+            if skills_exc:
+                raise skills_exc
+            resp.json.return_value = {"agent_name": AGENT, "skills": skills}
+        else:
+            raise AssertionError(f"unexpected GET {url}")
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    c = MagicMock()
+    c._http.get.side_effect = get
+    return c
+
+
+def _run_cli(args, client=None):
+    with patch("decimalai._client.DecimalAIClient",
+               return_value=client or _client()):
+        return CliRunner().invoke(cli, ["init", *args])
+
+
+class TestCliWritesTheFile:
+    def test_writes_agent_py_that_compiles(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert result.exit_code == 0, result.output
+        source = (tmp_path / "agent.py").read_text()
+        compile(source, "agent.py", "exec")
+        tree = parse(source)
+        assert kwarg(calls(tree, "instrument")[0], "enable_skill_loader") is True
+        assert kwarg(calls(tree, "instrument")[0], "agent_name") == AGENT
+
+    def test_out_path_is_honored(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--out", "bot.py"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "bot.py").exists()
+        assert not (tmp_path / "agent.py").exists()
+
+    def test_next_steps_name_install_run_and_where_the_trace_lands(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert 'pip install "decimalai[langchain]"' in result.output
+        assert "python agent.py" in result.output
+        assert "DECIMAL_API_KEY" in result.output
+        assert f"https://app.decimal.ai/agents/{AGENT}" in result.output
+
+    def test_openai_agents_next_steps_name_the_right_extra(
+        self, tmp_path, monkeypatch
+    ):
+        """`decimalai[openai]` is the openai SDK, NOT the Agents SDK — copying
+        the wrong extra leaves the import failing on a machine that looks
+        correctly set up."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x",
+                           "--framework", "openai-agents"])
+        assert 'pip install "decimalai[openai-agents]"' in result.output
+
+    def test_skill_count_is_reported(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert "3 skills" in result.output
+
+    def test_agent_name_is_url_quoted_in_the_dashboard_link(
+        self, tmp_path, monkeypatch
+    ):
+        """`[Demo] support-agent` is a real default agent name; interpolated
+        raw it produces a URL nothing can follow."""
+        monkeypatch.chdir(tmp_path)
+        name = "[Demo] support-agent"
+        result = _run_cli([name, "--api-key", "dai_sk_x"],
+                          client=_client(agents=[{"agent_name": name}]))
+        assert result.exit_code == 0, result.output
+        assert "%5BDemo%5D%20support-agent" in result.output
+
+
+class TestRefusesToClobber:
+    def test_existing_file_is_not_overwritten(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        existing = tmp_path / "agent.py"
+        existing.write_text("# my real agent, do not eat\n")
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        assert existing.read_text() == "# my real agent, do not eat\n"
+
+    def test_the_refusal_names_all_three_ways_out(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("x = 1\n")
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert "--force" in result.output
+        assert "--out" in result.output
+        assert "--dry-run" in result.output
+
+    def test_force_overwrites(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("# old\n")
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--force"])
+        assert result.exit_code == 0, result.output
+        source = (tmp_path / "agent.py").read_text()
+        assert "# old" not in source
+        compile(source, "agent.py", "exec")
+
+    def test_out_path_is_also_protected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "bot.py").write_text("# mine\n")
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--out", "bot.py"])
+        assert result.exit_code == 1
+        assert (tmp_path / "bot.py").read_text() == "# mine\n"
+
+    def test_force_refuses_a_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").mkdir()
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--force"])
+        assert result.exit_code == 1
+        assert "is a directory" in result.output
+
+    def test_clobber_check_runs_before_the_skills_fetch(self, tmp_path, monkeypatch):
+        """Refuse after the name is confirmed, but before the second round
+        trip and before anything is written."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("x = 1\n")
+        client = _client()
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"], client=client)
+        assert result.exit_code == 1
+        urls = [c.args[0] for c in client._http.get.call_args_list]
+        assert urls == ["/api/v1/agents"], urls
+
+    def test_a_wrong_name_is_diagnosed_as_a_wrong_name_not_a_file_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        """Found by running it: with the file check first, a typo'd name in a
+        directory that already had an agent.py was reported as "agent.py
+        already exists" and offered `--force` — advice that, if followed,
+        produces a completely different error. The name is the thing they got
+        wrong and cannot fix locally, so it is diagnosed first."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("x = 1\n")
+        result = _run_cli(["refund_bot", "--api-key", "dai_sk_x"])
+        assert result.exit_code == 1
+        assert "Did you mean" in result.output
+        assert "already exists" not in result.output
+        assert "--force" not in result.output
+
+
+class TestDryRun:
+    def test_prints_the_file_and_writes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert not (tmp_path / "agent.py").exists()
+        compile(result.output, "agent.py", "exec")
+
+    def test_dry_run_output_is_exactly_the_file(self, tmp_path, monkeypatch):
+        """The reviewable path has to show what would land, byte for byte —
+        otherwise reviewing it proves nothing."""
+        monkeypatch.chdir(tmp_path)
+        printed = _run_cli([AGENT, "--api-key", "dai_sk_x", "--dry-run"]).output
+        _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert printed == (tmp_path / "agent.py").read_text()
+
+    def test_dry_run_does_not_clobber_and_does_not_refuse(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("# mine\n")
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "agent.py").read_text() == "# mine\n"
+
+
+class TestAgentResolution:
+    def test_unknown_agent_points_at_agents_new_and_writes_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """Inventing one locally would file traces under a name the workspace
+        does not have: empty page, unresolved skills, no error anywhere."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli(["ghost-bot", "--api-key", "dai_sk_x"])
+        assert result.exit_code == 1
+        assert "No agent named 'ghost-bot'" in result.output
+        assert "https://app.decimal.ai/agents/new" in result.output
+        assert not (tmp_path / "agent.py").exists()
+
+    def test_a_near_miss_is_named(self, tmp_path, monkeypatch):
+        """refund_bot vs refund-bot: identical at a glance, and the difference
+        is an agent page that stays empty forever."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli(["refund_bot", "--api-key", "dai_sk_x"])
+        assert result.exit_code == 1
+        assert "Did you mean" in result.output
+        assert AGENT in result.output
+
+    def test_an_unrelated_name_lists_the_workspace_instead_of_guessing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli(["totally-different", "--api-key", "dai_sk_x"])
+        assert "Did you mean" not in result.output
+        assert "billing-agent" in result.output
+
+    def test_empty_workspace_still_points_at_agents_new(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(agents=[]))
+        assert result.exit_code == 1
+        assert "/agents/new" in result.output
+
+    def test_an_agent_with_no_skills_still_scaffolds(self, tmp_path, monkeypatch):
+        """Zero skills is a legitimate state, not an error — the file says so."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(skills=[]))
+        assert result.exit_code == 0, result.output
+        source = (tmp_path / "agent.py").read_text()
+        compile(source, "agent.py", "exec")
+        assert "No skills are attached" in source
+        assert "0 skills" in result.output
+
+
+class TestErrorTriage:
+    """Same triage the keyless `init` uses: when the server ANSWERS, it is not
+    a connection problem, and saying so sends people off debugging DNS."""
+
+    def _exc(self, status):
+        return httpx.HTTPStatusError(
+            f"{status}", request=MagicMock(),
+            response=MagicMock(status_code=status),
+        )
+
+    def test_401_says_invalid_key(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_bad"],
+                          client=_client(agents_exc=self._exc(401)))
+        assert result.exit_code == 1
+        assert "Invalid API key" in result.output
+        assert "Connection failed" not in result.output
+
+    def test_500_names_the_status(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(agents_exc=self._exc(500)))
+        assert result.exit_code == 1
+        assert "HTTP 500" in result.output
+
+    def test_transport_error_says_connection_failed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(agents_exc=httpx.ConnectError("refused")))
+        assert result.exit_code == 1
+        assert "Connection failed" in result.output
+
+    def test_a_failing_skills_call_does_not_leave_a_half_written_file(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(skills_exc=self._exc(500)))
+        assert result.exit_code == 1
+        assert not (tmp_path / "agent.py").exists()
+
+    def test_no_key_points_at_settings(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        for k in ("DECIMAL_API_KEY", "DECIMALAI_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        result = CliRunner().invoke(cli, ["init", AGENT])
+        assert result.exit_code == 1
+        assert "No API key found" in result.output
+        assert "https://app.decimal.ai/settings" in result.output
+
+
+class TestBackwardCompatibility:
+    """`decimalai init` with no argument keeps doing what it always did —
+    the verify-and-test-trace flow every existing doc and script calls."""
+
+    def test_no_argument_still_verifies(self):
+        client = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = {"workspace_id": "ws_1", "scope": "workspace"}
+        resp.raise_for_status = MagicMock()
+        client._http.get.return_value = resp
+        with patch("decimalai._client.DecimalAIClient", return_value=client):
+            result = CliRunner().invoke(cli, [
+                "init", "--api-key", "dai_sk_x", "--no-test-trace",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Connected to workspace: ws_1" in result.output
+
+    def test_no_argument_advertises_the_scaffold(self):
+        client = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = {"workspace_id": "ws_1"}
+        resp.raise_for_status = MagicMock()
+        client._http.get.return_value = resp
+        with patch("decimalai._client.DecimalAIClient", return_value=client):
+            result = CliRunner().invoke(cli, [
+                "init", "--api-key", "dai_sk_x", "--no-test-trace",
+            ])
+        assert "decimalai init <agent-name>" in result.output
+
+    @pytest.mark.parametrize("flag", [
+        ["--force"], ["--dry-run"], ["--out", "x.py"], ["--model", "gpt-4o"],
+    ])
+    def test_scaffold_flags_without_a_name_fail_loudly(self, flag, monkeypatch):
+        """Otherwise they are silent no-ops and the user waits for a file that
+        was never going to be written."""
+        result = CliRunner().invoke(cli, ["init", "--api-key", "dai_sk_x", *flag])
+        assert result.exit_code == 1
+        assert "needs an agent name" in result.output
+
+    def test_help_documents_both_modes(self):
+        result = CliRunner().invoke(cli, ["init", "--help"])
+        assert result.exit_code == 0
+        assert "decimalai init refund-bot" in result.output
+        assert "--framework" in result.output
+
+
+class TestConsistencyWithFrontendSnippets:
+    """The dashboard's per-framework snippets and this template answer
+    different questions ("add it to your agent" vs "here IS an agent") but
+    must not contradict each other. Locked here because the two files live in
+    different repos and nothing else would notice them drifting."""
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_same_shape_as_the_snippet(self, framework):
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        # One bare init(), one instrument() carrying both the name and the
+        # loader — the shape the dashboard snippets settled on 2026-08-22.
+        assert len(calls(tree, "init")) == 1
+        inst = calls(tree, "instrument")
+        assert len(inst) == 1
+        assert kwarg(inst[0], "agent_name") == AGENT
+        assert kwarg(inst[0], "enable_skill_loader") is True

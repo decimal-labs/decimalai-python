@@ -4,6 +4,48 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## Unreleased
+
+### Added
+
+- **`decimalai init <agent-name>` writes a runnable `agent.py`.** Creating an
+  agent in the dashboard used to store a name, a description and a set of
+  skills, then hand back a snippet to paste into an agent you had to have
+  written already — so the product stored configuration and the user still
+  built the agent. `init` now turns that configuration into a file that runs:
+  the agent name bound, its assigned skills named in a comment, a model on one
+  editable line, and a single example call. We generate; they run — nothing
+  executes on DecimalAI's side, and the file is the user's from the moment it
+  lands.
+
+  - `--framework langchain` (default) and `--framework openai-agents`.
+    Frameworks whose adapter has no prompt seam — llamaindex,
+    claude_agent_sdk, crewai/autogen/otel, adk — are **refused, with the
+    reason**, rather than scaffolded: a generated file for those would trace
+    perfectly and deliver none of the agent's skills, silently, which is worse
+    than no scaffold at all.
+  - Every generated file passes `enable_skill_loader=True`. It defaults to
+    False on both adapters, so a scaffold that omitted it would hand the model
+    a list of skill titles it cannot read — the one thing this command has to
+    get right.
+  - The agent is **resolved against the API**, never invented. An unknown name
+    exits with the workspace's agents (or a "did you mean" on a near miss like
+    `refund_bot` vs `refund-bot`) and a link to `/agents/new`.
+  - `--dry-run` prints the file instead of writing it, byte for byte.
+    `--out` chooses the path; an existing file is never overwritten without
+    `--force`.
+  - No API key is ever written to the file: it reads `DECIMAL_API_KEY` from
+    the environment. A non-default `--base-url` **is** baked in, so a file
+    scaffolded against a local or self-hosted backend does not silently point
+    at production.
+  - `decimalai init` with no argument is unchanged — it still verifies the key
+    and sends a test trace.
+
+  The templates are checked as code, not as strings: the suite `compile()`s
+  every generated file and asserts against its AST, and a subprocess smoke test
+  actually runs them with only the LLM call stubbed, so a keyword the adapter
+  no longer accepts fails the build instead of the user's first run.
+
 ## 0.10.4 — 2026-08-24
 
 ### Fixed
