@@ -4,6 +4,42 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.11.1] — 2026-08-25
+
+### Added
+
+- **`decimalai.load_agent(name)` reads the system prompt you configured in the
+  dashboard**, so changing it there reaches production on your agent's next run
+  with no redeploy.
+
+  ```python
+  config = decimalai.load_agent("refund-bot")
+  agent  = Agent(name="refund-bot", instructions=config.system_prompt)
+  ```
+
+  It is **explicit** — the prompt is never injected for you. That asymmetry with
+  skills is deliberate: a skill menu is additive, so at worst it wastes a few
+  hundred tokens, while a system prompt is your agent's core instruction. If we
+  swapped it silently, your repo could say *"Never issue refunds over $500"*
+  while the model received *"You are a helpful assistant"*, and you would have no
+  way to see it.
+
+  `config.system_prompt` is `None` only when the agent genuinely has no prompt
+  set. Every failure — unknown agent, bad key, network error, timeout, an older
+  backend without the route, a pin that no longer resolves — **raises** instead.
+  A prompt that silently came back empty would leave your agent running with no
+  instructions at all, which is worse than failing at startup.
+
+- **`decimalai init <agent-name>` now wires the prompt into the file it writes.**
+  Previously the generated LangChain agent sent no system message at all and the
+  openai-agents one hardcoded *"You are &lt;name&gt;. Use the skills you are given."*,
+  quietly discarding what you had typed in the dashboard. Both now use your
+  actual prompt, and an agent with none still produces a file that runs.
+
+- **A one-time warning when the agent name you passed was renamed.** Its prompt
+  and skills follow the rename, but trace ingest does not — so traces keep
+  landing under the old name until you update `instrument(agent_name=...)`.
+
 ## [0.11.0] — 2026-08-24
 
 ### Added
