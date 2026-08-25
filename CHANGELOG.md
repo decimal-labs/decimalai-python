@@ -4,9 +4,32 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## Unreleased
+## [0.11.0] — 2026-08-24
 
 ### Added
+
+- **Skills now arrive as a cacheable prefix plus a one-line hint, instead of one
+  block that changed on every request.** The routed menu is the same information
+  it always was, but it is now split: a *prefix* listing every skill available to
+  the agent, byte-identical from turn to turn, and a *tail* naming the one or two
+  that look relevant to this particular request.
+
+  Why it matters: the old single block was rebuilt per query, so on providers
+  that merge system content it invalidated the prompt cache for everything behind
+  it. A caller's 2,000-token system prompt that should have been a cache hit
+  became a full miss on every request. The cost was never our own tokens — it was
+  theirs. The stable half can now sit inside the cached region.
+
+  This is automatic on LangChain; no code change. `SkillRouter.build_prompt_parts()`
+  exposes it directly for anyone assembling prompts by hand. Against an older
+  platform it degrades to exactly the previous behaviour.
+
+  One visible change on LangChain: skills are injected as **two** system messages
+  rather than one (stable first, hint second), both placed immediately after your
+  own system message. They are kept adjacent to your own deliberately —
+  `langchain_anthropic` raises `Received multiple non-consecutive system messages`
+  for a system message positioned after any human or AI turn, so the intuitive
+  "put the hint next to the question" placement breaks every ChatAnthropic caller.
 
 - **`decimalai init <agent-name>` writes a runnable `agent.py`.** Creating an
   agent in the dashboard used to store a name, a description and a set of
@@ -49,6 +72,13 @@ and patch releases are fixes.
 ## 0.10.4 — 2026-08-24
 
 ### Fixed
+
+- **`openinference-instrumentation-anthropic` is capped below 2.0.0.** Its 2.0
+  major requires `anthropic>=1.0.0` and, being uncapped, dragged `anthropic` past
+  the `<1.0.0` cap three lines above it — silently reinstating the failure that
+  cap exists to prevent, where the Anthropic instrumentor stops capturing the
+  model turn entirely. Affects the test extras only; `anthropic` is in no runtime
+  extra, so nothing a user resolves was constrained either way.
 
 - **Registry skills attached to a single agent are now actually offered on
   `langchain` and `anthropic`.** An agent's offered set is built from org-owned

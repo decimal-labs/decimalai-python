@@ -16,9 +16,11 @@ trigger, the workflow exchanges a short-lived OIDC identity against a publisher 
 automatically. That path is better than a laptop upload for two reasons that are not matters of taste:
 the tag *is* the trigger (so a shipped version can never be untagged), and provenance is free.
 
-**It has one precondition: GitHub Actions must actually run for this repo.** Today it does not, so
-**0.10.3 ships from `scripts/release.sh`.** Check which regime you are in before you cut anything
-(see below) — this section is a policy with a switch, not a standing preference.
+**It has one precondition: GitHub Actions must actually run for this repo.** As of 2026-08-24 it
+**does** — a full CI run on `5b01c13` executed all ten jobs with real steps — so the OIDC path is the
+one to use. Check which regime you are in before you cut anything (see below); this section is a
+policy with a switch, not a standing preference, and the switch has been thrown once already in each
+direction.
 
 ### The precondition, and how it was met
 
@@ -86,12 +88,12 @@ never make real model calls. Only the *upload* moves.
 | Gate | Where | Checks | Blocks the release? |
 |---|---|---|---|
 | **Live-LLM** | **Local — `scripts/release.sh`** | real model calls through a clean-room wheel | yes — always run before publishing, in either regime |
-| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | only when Actions runs. **Today it cannot start, so nothing gates the unit tests automatically.** |
+| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | yes — Actions runs again as of 2026-08-24, so this gate is live. ⚠ It runs a bare `pytest tests/`, and `addopts` deselects the conformance marker — so a RED conformance board does not block a publish. Check the board yourself. |
 
-> **While Actions is blocked, run the no-model suite yourself — `scripts/release.sh` does not.**
+> **Run the no-model suite yourself anyway — `scripts/release.sh` does not.**
 > The script's step 2 only builds the wheel and smoke-tests it (import, `__version__`, CLI); it never
-> invokes `pytest`. So the unit and contract tests are currently checked by *no one* unless you run
-> them. Do it before publishing:
+> invokes `pytest`. CI covers this now, but the release script alone does not, and CI's copy skips the
+> conformance marker. Do it before publishing:
 >
 > ```bash
 > pytest tests/ -q      # expect: NNNN passed, NN skipped
@@ -132,9 +134,9 @@ The package is pre-1.0 (`0.x`) while the API settles.
 
 ## Cutting a release
 
-Steps 1–6 are identical in both regimes. Only the last step differs: **today** (Actions blocked) run
-`scripts/release.sh` and then confirm the tag; **once the precondition is met**, run the gate, then cut
-the GitHub Release and let `publish.yml` do the upload.
+Steps 1–6 are identical in both regimes. Only the last step differs. **Today the precondition is
+met**, so: run the gate, then cut the GitHub Release and let `publish.yml` do the upload. The local
+`scripts/release.sh` upload path is the fallback for when Actions is down, not the default.
 
 1. **Pick the next version** (SemVer).
 2. **Bump it in both places**: `pyproject.toml` `version` and `decimalai/__init__.py` `__version__`.
@@ -154,12 +156,13 @@ the GitHub Release and let `publish.yml` do the upload.
 6. **Commit and push** the release commit. The script refuses to release a commit that is not on the
    remote (otherwise `gh` would tag the wrong revision).
 7. **Publish**, per the regime you confirmed above:
-   - **Actions blocked (today, and the path for 0.10.3)** — run the release script from the repo root,
-     then verify the tag landed:
+   - **Actions blocked (the fallback)** — run the release script from the repo root, then verify the
+     tag landed:
      ```bash
      ./scripts/release.sh
      ```
-   - **Actions healthy** — use the script for its gates only. It has no gate-only flag: run it, let
+   - **Actions healthy (today — use this one)** — use the script for its gates only. It has no
+     gate-only flag: run it, let
      the live-LLM gate go green, then answer anything other than `yes` at the
      `Type 'yes' to publish:` prompt, which aborts before the upload (`Aborted — nothing released.`).
      Then cut the Release, which is the trigger:
