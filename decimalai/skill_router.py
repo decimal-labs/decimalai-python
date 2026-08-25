@@ -43,6 +43,16 @@ _last_offered_names_ctx: ContextVar[Optional[List[str]]] = ContextVar(
     "decimalai_skill_router_last_offered_names", default=None,
 )
 
+# The prefix/tail split's two pre-rendered strings, handed from
+# `build_prompt_fragment` (which does the fetch and the caching) up to
+# `build_prompt_parts` (which is the public shape). A ContextVar rather than an
+# instance attribute for the same reason as the rails above: one Router
+# singleton serves concurrent runs, and an attribute would let one run read the
+# other's prefix.
+_last_split_parts_ctx: ContextVar[Optional[tuple]] = ContextVar(
+    "decimalai_skill_router_last_split_parts", default=None,
+)
+
 
 def consume_last_offered_names() -> List[str]:
     """Read + clear the names from the most recent `build_prompt_fragment`.
@@ -1366,6 +1376,7 @@ class SkillRouter:
         bypass_cache: bool = False,
         inject_body: Optional[bool] = None,
         scope: Optional[str] = None,
+        _want_parts: bool = False,
     ) -> tuple[str, Optional[str]]:
         """Return ``(prompt_fragment, routing_id)`` — the primitive every adapter calls.
 
@@ -1440,12 +1451,24 @@ class SkillRouter:
             # -> today's key, so their behaviour and routing-call volume are
             # unchanged.
             scope or "",
+            # The split path sets `skills_offered_in_prompt` to the whole menu
+            # (contract §2: what the model COULD see), while the fragment path
+            # sets it to the router's pick. Same query, different telemetry —
+            # so they cannot share a cache slot without one silently
+            # overwriting the other's rails.
+            bool(_want_parts),
         )
 
         if not bypass_cache:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
-                fragment, routing_id, offered_names, delivered_names = cached
+                fragment, routing_id, offered_names, delivered_names, split_parts = cached
+                # A cache hit must re-emit the split exactly as the miss did.
+                # Without this, the second LLM call of a turn loses the prefix
+                # and the adapter falls back to the fragment — the injected
+                # text would change mid-turn, which is the one thing a
+                # "byte-identical prefix" must never do.
+                _last_split_parts_ctx.set(split_parts)
                 # A cache hit must re-emit the telemetry the miss path set:
                 # a second turn inside the 30s window would otherwise lose
                 # offered/delivered names on every rail (the first turn's
@@ -1470,6 +1493,7 @@ class SkillRouter:
         # adapter and the generic quickstart never drain the rails).
         _last_offered_names_ctx.set(None)
         _last_delivered_names_ctx.set(None)
+        _last_split_parts_ctx.set(None)
 
         if query and self.strategy in ("auto", "semantic"):
             try:
@@ -1498,6 +1522,32 @@ class SkillRouter:
             name for s in (result.get("skills") or [])
             if isinstance(s, dict) and isinstance(name := s.get("name"), str) and name
         ]
+
+        # The router's own ranked pick, kept separate from `offered_names`
+        # because the split widens that to the whole menu. Bodies are chosen by
+        # RELEVANCE and must keep coming from the ranked list — iterating the
+        # menu instead would fetch bodies in menu order, i.e. arbitrarily.
+        routed_names = list(offered_names)
+
+        # The split's two pre-rendered strings. Computed before the body block
+        # because bodies ride the PREFIX (contract invariant 5).
+        split_prefix, split_tail = ("", "")
+        if _want_parts:
+            split_prefix, split_tail = self._split_parts(result)
+
+        # Contract §2: on the split path the model can reach for anything in
+        # the menu, so that is what gets reported as offered in the prompt.
+        # `routing_decision.offered_skill_names` on the SERVER is untouched and
+        # still records the router's own pick — `acceptance_rate` divides by
+        # that one, so widening here does not move it.
+        if _want_parts and split_prefix:
+            menu_names = [
+                n for n in (result.get("stable_menu_skills") or [])
+                if isinstance(n, str) and n
+            ]
+            if menu_names:
+                offered_names = menu_names
+
         if offered_names:
             _last_offered_names_ctx.set(offered_names)
 
@@ -1514,11 +1564,11 @@ class SkillRouter:
         # defense, count-capped, and the total respects body_token_budget.
         smart_routed = bool(query) and self.strategy in ("auto", "semantic")
         delivered_names: List[str] = []
-        if effective_inject and offered_names and smart_routed:
+        if effective_inject and routed_names and smart_routed:
             bodies = []
             body_tokens = 0
             count_cap = min(self.inject_body_top_k, self.max_loaded_bodies)
-            for name in offered_names[:count_cap]:
+            for name in routed_names[:count_cap]:
                 body = self.get_skill_body(name, max_chars=self.per_body_char_limit)
                 if not (body and body.strip()):
                     continue
@@ -1538,7 +1588,31 @@ class SkillRouter:
             if bodies:
                 body_block = "\n\n".join(bodies)
                 fragment = f"{fragment}\n\n{body_block}" if fragment else body_block
+                # Invariant 5: bodies ride the PREFIX. The tail does not exist
+                # on openai_agents / pydantic_ai, and a body placed there is
+                # dropped silently while still counted as delivered.
+                if split_prefix:
+                    split_prefix = f"{split_prefix}\n\n{body_block}"
                 _last_delivered_names_ctx.set(list(delivered_names))
+
+        # Invariant 6: delivered ⊆ offered ⊆ the injected text.
+        #
+        # A skill whose BODY was delivered can legitimately sit outside the
+        # menu: bodies come from the router's ranked pick, and the menu is
+        # capped and unions back only the HINTED names. Its `## Skill: <name>`
+        # header is in the prefix either way, so the name genuinely is in the
+        # injected text — it is `offered` that would be understating what the
+        # model can see. Widening the menu on the server instead would make the
+        # prefix depend on the routed set, which is the one thing it must not
+        # do (invariant 2).
+        if _want_parts and split_prefix and delivered_names:
+            for name in delivered_names:
+                if name not in offered_names:
+                    offered_names.append(name)
+            _last_offered_names_ctx.set(list(offered_names))
+            self._record_routing_rails(
+                routing_id, offered_names, delivered_names, scope=scope,
+            )
 
         # A fresh fragment marks a new turn: reset the on-demand body-load
         # budget so load_skill's caps apply per turn, not per process.
@@ -1566,11 +1640,86 @@ class SkillRouter:
         # retries on the assumption the failure was transient. The cached
         # value carries offered/delivered so cache hits can re-emit them;
         # the public return stays a 2-tuple.
+        split_parts = (split_prefix, split_tail) if split_prefix else None
+        _last_split_parts_ctx.set(split_parts)
+
         if fragment or routing_id:
             self._fragment_cache.set(
-                cache_key, (fragment, routing_id, offered_names, delivered_names),
+                cache_key,
+                (fragment, routing_id, offered_names, delivered_names, split_parts),
             )
         return fragment, routing_id
+
+    # ── The prefix/tail split ────────────────────────────────────────
+    #
+    # See `platform/docs/contracts/skill_route_split.md`. `stable_menu`,
+    # `menu_instruction` and `routing_hint` are PRE-RENDERED STRINGS. They are
+    # injected verbatim: this method never re-renders, re-sorts, or re-derives
+    # them, and in particular never re-writes the hint sentence — the server
+    # owns that wording, and two copies of it drift.
+
+    def _split_parts(self, result: Dict[str, Any]) -> tuple[str, str]:
+        """``(prefix, tail)`` from a routing result, or ``("", "")``.
+
+        A server that does not send `stable_menu` has not been upgraded. The
+        caller falls back to `prompt_fragment`, which is unchanged and still
+        correct — degrading to today's behaviour, never to an empty prompt.
+        That distinction is the whole lesson of the second attempt, where a
+        shape mismatch normalised to an empty list and no-oped in silence.
+        """
+        menu = result.get("stable_menu")
+        hint = result.get("routing_hint")
+        instruction = result.get("menu_instruction")
+        # Strings, or this server does not speak the split. A list here is an
+        # older/newer shape, NOT something to coerce.
+        if not isinstance(menu, str) or not menu.strip():
+            return "", ""
+        if not isinstance(hint, str):
+            hint = ""
+        if not isinstance(instruction, str):
+            instruction = ""
+        prefix = menu.rstrip("\n")
+        if instruction.strip():
+            prefix = f"{prefix}\n\n{instruction.strip()}"
+        return prefix, hint.strip()
+
+    def build_prompt_parts(
+        self,
+        query: Optional[str] = None,
+        *,
+        agent_name: Optional[str] = None,
+        category: Optional[str] = None,
+        top_k: int = 10,
+        bypass_cache: bool = False,
+        inject_body: Optional[bool] = None,
+        scope: Optional[str] = None,
+    ) -> tuple[str, str, Optional[str]]:
+        """Return ``(prefix, tail, routing_id)`` — the cacheable split.
+
+        `prefix` is byte-identical turn to turn for a given eligible set, so an
+        adapter can put it where the provider will cache it. `tail` is the one
+        sentence that depends on THIS query, and goes next to the query.
+
+        Skill BODIES ride the prefix, never the tail. Adapters differ in
+        whether they have a tail position at all (openai_agents and
+        pydantic_ai do not), and a body placed in a tail that does not exist is
+        dropped while still being counted as delivered — reported reach that
+        never happened.
+
+        Falls back to ``(fragment, "", routing_id)`` against a server that does
+        not send the split, so an older platform degrades to today's behaviour
+        rather than to an empty prompt.
+        """
+        fragment, routing_id = self.build_prompt_fragment(
+            query, agent_name=agent_name, category=category, top_k=top_k,
+            bypass_cache=bypass_cache, inject_body=inject_body, scope=scope,
+            _want_parts=True,
+        )
+        parts = _last_split_parts_ctx.get()
+        if parts is None:
+            return fragment, "", routing_id
+        prefix, tail = parts
+        return prefix, tail, routing_id
 
     def sync_skills(
         self,

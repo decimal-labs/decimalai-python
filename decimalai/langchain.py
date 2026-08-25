@@ -764,11 +764,28 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     # `_get_skill_router`) so a later `instrument(agent_name=...)` isn't ignored
     # by a router built before it. `openai_agents`/`pydantic_ai` already pass it.
     try:
-        fragment, routing_id = router.build_prompt_fragment(
-            query=query, agent_name=_install_agent_name,
-        )
+        # The prefix/tail split. `prefix` is byte-identical turn to turn, so it
+        # can sit inside the provider's cacheable region; `tail` is the one
+        # sentence that depends on this query. Against a platform that does not
+        # send the split this returns (fragment, "", routing_id) — today's
+        # behaviour exactly, never an empty prompt.
+        parts_fn = getattr(router, "build_prompt_parts", None)
+        if callable(parts_fn):
+            prefix, tail, routing_id = parts_fn(
+                query=query, agent_name=_install_agent_name,
+            )
+        else:
+            # A router object that predates the split still has to deliver
+            # skills. Without this branch the AttributeError is caught below
+            # and the adapter returns the input UNCHANGED — tracing perfectly
+            # while injecting nothing, which is the silent no-op this whole
+            # change exists to avoid. Degrade to the old primitive instead.
+            prefix, routing_id = router.build_prompt_fragment(
+                query=query, agent_name=_install_agent_name,
+            )
+            tail = ""
     except Exception:
-        logger.debug("build_prompt_fragment failed (non-fatal)", exc_info=True)
+        logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return input_value
 
     if routing_id:
@@ -783,17 +800,28 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     delivered = consume_last_delivered_names()
     if delivered:
         _add_skills_delivered(delivered)
-    if not fragment:
+    if not prefix:
         return input_value
 
-    # STABLE content stays in the cacheable prefix; query-varying content goes
-    # after it. `fragment` is rebuilt from `query` on every call (~115 tokens
-    # that differ request to request), so at index 0 it invalidated the provider
-    # prompt cache for EVERYTHING behind it — a caller's 2,000-token system
-    # prompt that would otherwise have been a cache hit became a full miss on
-    # every request. The cost was never the 115 tokens; it was the 2,000.
+    # STABLE content first, query-varying content after it. Injecting a
+    # per-query fragment at index 0 invalidated the provider prompt cache for
+    # EVERYTHING behind it — a caller's 2,000-token system prompt that would
+    # otherwise have been a cache hit became a full miss on every request. The
+    # cost was never the fragment's own tokens; it was the 2,000.
+    #
+    # Both parts go in as system messages CONSECUTIVE with the caller's own,
+    # and that is load-bearing rather than tidy: `langchain_anthropic` raises
+    # `ValueError: Received multiple non-consecutive system messages` for a
+    # system message placed after any human/AI turn. Putting the tail down
+    # beside the query — the obvious reading of "tail" — crashes every
+    # ChatAnthropic caller, single-turn and multi-turn alike. Verified against
+    # langchain_anthropic 1.6.1, and locked by
+    # `test_skill_route_split_langchain.py`.
     cut = _system_prefix_len(messages)
-    return [*messages[:cut], SystemMessage(content=fragment), *messages[cut:]]
+    injected = [SystemMessage(content=prefix)]
+    if tail:
+        injected.append(SystemMessage(content=tail))
+    return [*messages[:cut], *injected, *messages[cut:]]
 
 
 def _install_skill_loader() -> None:
