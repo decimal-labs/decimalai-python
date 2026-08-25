@@ -176,6 +176,7 @@ def _scaffold_agent_file(
 
     out_path = out_path or DEFAULT_OUTPUT
 
+    from .._agent import AgentConfig
     from .._client import DecimalAIClient
     client = DecimalAIClient(api_key=resolved_key, base_url=base_url)
 
@@ -275,6 +276,43 @@ def _scaffold_agent_file(
     except Exception as e:  # noqa: BLE001
         client.close()
         _http_die(e, base_url)
+
+    # 4. Read its prompt.
+    #
+    #    Two failures, two answers, and telling them apart is the whole point
+    #    of this block. The generated file calls `decimalai.load_agent()` at
+    #    module scope, so it needs the route to EXIST; but it reads the value
+    #    itself at run time, so it does not need this read to have SUCCEEDED.
+    from .._client import AgentNotFoundError
+    prompt = None
+    prompt_unreadable = False
+    try:
+        prompt = AgentConfig._from_payload(
+            client.get_agent_prompt(agent_name), requested_name=agent_name,
+        )
+    except AgentNotFoundError:
+        # Step 1 already proved this agent is in this workspace, so a 404
+        # HERE can only mean the route is missing. Writing the file anyway
+        # would hand someone a program whose first statement cannot succeed —
+        # a scaffold that dies on line one, every run, generated in silence.
+        # No string heuristic is needed: the existence check above is what
+        # makes this unambiguous.
+        client.close()
+        click.echo("")
+        click.echo("  ✗ This backend does not serve agent prompts yet.", err=True)
+        click.echo("")
+        click.echo("    It needs GET /api/v1/agents/{name}/prompt, which the")
+        click.echo("    generated file calls at startup. Update the backend, or")
+        click.echo(f"    point --base-url somewhere current ({base_url}).")
+        click.echo("")
+        raise SystemExit(1)
+    except Exception:  # noqa: BLE001 — cosmetic; the run-time read is the loud one
+        # A timeout or a 5xx does NOT prove the generated file cannot run: it
+        # reads the prompt itself at run time, and `load_agent()` raises there
+        # rather than returning an empty prompt. Cost a comment, not the
+        # scaffold. Nothing is written INTO the file from this read except a
+        # character count and a version number.
+        prompt_unreadable = True
     client.close()
 
     source = render_agent_file(
@@ -282,6 +320,7 @@ def _scaffold_agent_file(
         framework=framework,
         skills=skills,
         model=model,
+        prompt=prompt,
         # Only pinned when it is not the hosted default: it is not a secret,
         # and a file scaffolded against a local backend that silently points
         # at production is a worse default than a redundant line.
@@ -311,9 +350,23 @@ def _scaffold_agent_file(
 
     dashboard = _dashboard_url(base_url)
     n = len(skills)
+    # Says whether the prompt was picked up, at the moment someone would ask.
+    # Never "no system prompt" for a read that FAILED: that is a claim, it is
+    # the wrong one, and it sends someone to write a prompt they already wrote.
+    # An unreadable read gets its own line below instead.
+    prompt_note = ""
+    if prompt is not None:
+        prompt_note = (
+            ", system prompt" if prompt.system_prompt else ", no system prompt"
+        )
     click.echo("")
     click.echo(f"  ✓ Wrote {out_path} — {agent_name}, {framework}, "
-               f"{n} skill{'' if n == 1 else 's'}")
+               f"{n} skill{'' if n == 1 else 's'}{prompt_note}")
+    if prompt_unreadable:
+        click.echo("")
+        click.echo("  ! Could not read this agent's system prompt just now — the "
+                   "file reads it at")
+        click.echo("    run time, so this does not affect what it will send.")
     click.echo("")
     click.echo("  Install:")
     click.echo(f"    {INSTALL[framework]}")

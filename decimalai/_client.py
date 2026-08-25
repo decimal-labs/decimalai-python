@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, cast
 from uuid import UUID
 
@@ -223,6 +224,47 @@ class DecimalAPIError(httpx.HTTPStatusError):
             message += f" ({', '.join(suffix)})"
 
         super().__init__(message, request=response.request, response=response)
+
+
+class AgentNotFoundError(DecimalAPIError):
+    """A 404 from an agent-scoped route: this workspace has no such agent.
+
+    Its own class because it is the ONE failure of ``load_agent()`` the caller
+    can fix without leaving their editor — a typo, or a name that belongs to a
+    different workspace than the key. Everything else (network, key, 5xx) is
+    environmental, and a caller who wants to special-case the fixable one
+    should not have to string-match a message. Still a
+    :class:`DecimalAPIError`, so ``except httpx.HTTPStatusError`` keeps working.
+
+    NOT raised for "the agent exists but has no prompt". That is a real state
+    and comes back as ``system_prompt=None``; conflating the two is exactly the
+    confusion the null contract on the read route exists to prevent.
+    """
+
+    def __init__(self, response: "httpx.Response", *, agent_name: str = "") -> None:
+        super().__init__(response)
+        self.agent_name = agent_name
+
+        # An unmatched ROUTE and a missing AGENT are both 404, and they have
+        # opposite fixes. FastAPI's unmatched-route body is exactly
+        # `{"detail": "Not Found"}`, while every agent 404 on this router names
+        # the agent — so the two are distinguishable, and guessing wrong sends
+        # someone to rename an agent that was never the problem.
+        detail = (self.server_detail or "").strip()
+        if detail in ("", "Not Found"):
+            hint = (
+                "The server matched no route. This backend may predate agent "
+                "prompts (it needs GET /api/v1/agents/{name}/prompt) — check "
+                "the base URL, then the backend version. If both are current, "
+                f"check that {agent_name!r} is the name in the dashboard."
+            )
+        else:
+            hint = (
+                f"Check the spelling of {agent_name!r} in the dashboard, and "
+                "that your API key belongs to the same workspace. "
+                "`decimalai init <name>` lists this workspace's agents."
+            )
+        self.args = (f"{self.args[0]}\n{hint}",)
 
 
 def _raise_for_status(resp: "httpx.Response") -> None:
@@ -523,6 +565,57 @@ class DecimalAIClient:
         )
         _raise_for_status(resp)
         return cast(AgentListResponse, resp.json())
+
+    def get_agent_prompt(
+        self,
+        agent_name: str,
+        *,
+        version: Optional[int] = None,
+        if_none_match: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The agent's configured system prompt. Backs :func:`decimalai.load_agent`.
+
+        Deliberately its OWN endpoint rather than a scan of ``list_agents()``:
+        passing a ``limit`` there activates a truncating pagination path whose
+        ordering puts manifest-only agents LAST, so the never-traced,
+        UI-created agent this feature exists to serve is the first one dropped —
+        and reported as "no such agent".
+
+        Args:
+            agent_name: URL-quoted here, so a name needing escaping still
+                addresses the right agent instead of a mangled path.
+            version: Read one historical version instead of the effective one.
+            if_none_match: A previously seen ``content_hash``. The route
+                answers 304 when it still matches; this method then returns
+                ``None`` — "unchanged", distinct from a payload whose
+                ``system_prompt`` is ``None`` ("no prompt set"). Only useful to
+                a caller polling for edits; ``load_agent()`` never sends it,
+                because a cache is what would break the no-redeploy property it
+                is sold on.
+
+        Raises:
+            AgentNotFoundError: 404 — no such agent in this workspace (or a
+                backend with no prompt route at all; the message says which).
+            DecimalAPIError: any other 4xx/5xx, including the 409 an
+                unresolvable pin produces.
+        """
+        quoted = urllib.parse.quote(str(agent_name), safe="")
+        params: Dict[str, Any] = {}
+        if version is not None:
+            params["version"] = version
+        headers = {"If-None-Match": if_none_match} if if_none_match else None
+
+        resp = self._http.get(
+            f"/api/v1/agents/{quoted}/prompt", params=params, headers=headers,
+        )
+        # 304 is not `is_success`, so it has to be answered before
+        # `_raise_for_status` turns a correct conditional response into an error.
+        if resp.status_code == 304:
+            return None
+        if resp.status_code == 404:
+            raise AgentNotFoundError(resp, agent_name=str(agent_name))
+        _raise_for_status(resp)
+        return cast(Dict[str, Any], resp.json())
 
     # ── Manifest registration ─────────────────────────────────
 

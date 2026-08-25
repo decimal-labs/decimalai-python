@@ -34,6 +34,8 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from decimalai import AgentConfig
+from decimalai._client import AgentNotFoundError, DecimalAPIError
 from decimalai.cli.main import cli
 from decimalai.cli.scaffold import (
     SUPPORTED_FRAMEWORKS,
@@ -43,6 +45,10 @@ from decimalai.cli.scaffold import (
 )
 
 AGENT = "refund-bot"
+PROMPT = "Never issue a refund over $500."
+#: Distinguishes "this test did not say" from "this test said None", which are
+#: different states for a prompt: unreadable versus provably not set.
+_MISSING = object()
 SKILLS = [
     {"skill_name": "refund-policy", "description": "When a refund is allowed",
      "scope": "agent"},
@@ -188,6 +194,85 @@ class TestSkillLoaderIsOn:
         instrument_line = calls(tree, "instrument")[0].lineno
         agent_line = calls(tree, "Agent")[0].lineno
         assert instrument_line < agent_line
+
+
+# ── 2b. the agent's own system prompt is what it runs on ─────────────
+
+
+class TestPromptIsRead:
+    """Until 2026-08-25 the generated file ignored the prompt the user typed
+    at /agents/new: langchain sent no system message at all, and openai-agents
+    hardcoded "You are <name>. Use the skills you are given." — silently
+    overwriting it. `tests/test_cli_init_scaffold_runs.py` proves the value
+    reaches the model; these prove the CALL is right in the file itself."""
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_load_agent_is_called_once_with_the_bound_name(self, framework):
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        loads = calls(tree, "load_agent")
+        assert len(loads) == 1, "expected exactly one load_agent() call"
+        assert [ast.literal_eval(a) for a in loads[0].args] == [AGENT]
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_load_agent_runs_at_module_scope(self, framework):
+        """Not inside `run()`. The prompt is needed where the agent is built,
+        it is one request per process rather than one per turn, and a wrong
+        name should fail at startup instead of on a customer's first
+        question."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        in_a_function = {
+            id(c)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for c in calls(node, "load_agent")  # type: ignore[arg-type]
+        }
+        assert not in_a_function
+
+    def test_openai_agents_instructions_are_the_prompt_not_a_literal(self):
+        """The regression that shipped: a hardcoded `instructions=` string.
+        Asserted as "not a constant", so any future invented default fails
+        too — not just the one sentence that used to be there."""
+        tree = parse(render_agent_file(AGENT, "openai-agents", SKILLS))
+        instructions = [kw for kw in calls(tree, "Agent")[0].keywords
+                        if kw.arg == "instructions"]
+        assert len(instructions) == 1
+        value = instructions[0].value
+        assert not isinstance(value, ast.Constant), (
+            "instructions= must come from load_agent(), not a literal"
+        )
+        assert isinstance(value, ast.Attribute) and value.attr == "system_prompt"
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_the_prompt_body_is_never_baked_into_the_file(self, framework):
+        """A copy in the file is a second source of truth that goes stale on
+        the next dashboard edit — the whole point of reading it at run time."""
+        source = render_agent_file(
+            AGENT, framework, SKILLS,
+            prompt=AgentConfig(agent_name=AGENT, system_prompt=PROMPT,
+                               version_number=3),
+        )
+        assert PROMPT not in source
+        # …but the file does say that there IS one, and which version.
+        assert "System prompt: 31 characters, version 3" in source
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_an_agent_with_no_prompt_says_so_and_still_generates(self, framework):
+        source = render_agent_file(
+            AGENT, framework, SKILLS,
+            prompt=AgentConfig(agent_name=AGENT, system_prompt=None),
+        )
+        compile(source, "agent.py", "exec")
+        assert "no system prompt set" in source
+        assert len(calls(parse(source), "load_agent")) == 1
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_an_unreadable_prompt_says_nothing_rather_than_guessing(self, framework):
+        """`prompt=None` is "the scaffold could not read it" (older backend,
+        5xx). It must not render as "no prompt set" — that is a claim, and the
+        wrong one sends someone to write a prompt they already have."""
+        source = render_agent_file(AGENT, framework, SKILLS, prompt=None)
+        assert "system prompt" not in source.lower().split("import decimalai")[0]
+        assert len(calls(parse(source), "load_agent")) == 1
 
 
 # ── 3. the agent name is bound, and survives escaping ────────────────
@@ -377,12 +462,56 @@ class TestFrameworkSelection:
 # ── CLI: mocked HTTP, no network ─────────────────────────────────────
 
 
-def _client(agents=None, skills=None, agents_exc=None, skills_exc=None):
-    """A DecimalAIClient stub answering the two endpoints `init` calls."""
+def _prompt_payload(system_prompt=PROMPT, version_number=3):
+    """The shape `GET /api/v1/agents/{name}/prompt` returns."""
+    return {
+        "agent_name": AGENT,
+        "agent_id": "5f2c1a90-0f1e-4b6c-9a11-2b3c4d5e6f70",
+        "resolved_from": None,
+        "system_prompt": system_prompt,
+        "version_number": version_number if system_prompt is not None else None,
+        "content_hash": "b7f4c1" if system_prompt is not None else None,
+        "label": None,
+        "provenance": "ui",
+        "version_mode": "latest",
+        "pinned_version_number": None,
+    }
+
+
+def _response(status, detail):
+    """A real `httpx.Response` with its request attached.
+
+    Both error classes below are `httpx.HTTPStatusError` subclasses, so they
+    need a real response to construct — and a real one is what proves the CLI
+    branches on the exception TYPE the client raises rather than on a message
+    a test happened to write.
+    """
+    request = httpx.Request(
+        "GET", f"https://api.decimal.ai/api/v1/agents/{AGENT}/prompt",
+    )
+    return httpx.Response(status, json={"detail": detail}, request=request)
+
+
+def _agent_not_found(detail="Not Found"):
+    """What `get_agent_prompt` raises on a 404 — including from a backend
+    whose router has no prompt route at all, which is FastAPI's exact
+    unmatched-route body."""
+    return AgentNotFoundError(_response(404, detail), agent_name=AGENT)
+
+
+def _api_error(status, detail):
+    return DecimalAPIError(_response(status, detail))
+
+
+def _client(agents=None, skills=None, agents_exc=None, skills_exc=None,
+            prompt=_MISSING, prompt_exc=None):
+    """A DecimalAIClient stub answering the three endpoints `init` calls."""
     if agents is None:
         agents = [{"agent_name": AGENT}, {"agent_name": "billing-agent"}]
     if skills is None:
         skills = SKILLS
+    if prompt is _MISSING:
+        prompt = _prompt_payload()
 
     def get(url, **kwargs):
         resp = MagicMock()
@@ -399,8 +528,14 @@ def _client(agents=None, skills=None, agents_exc=None, skills_exc=None):
         resp.raise_for_status = MagicMock()
         return resp
 
+    def get_agent_prompt(name, **kwargs):
+        if prompt_exc:
+            raise prompt_exc
+        return prompt
+
     c = MagicMock()
     c._http.get.side_effect = get
+    c.get_agent_prompt.side_effect = get_agent_prompt
     return c
 
 
@@ -449,10 +584,93 @@ class TestCliWritesTheFile:
                            "--framework", "openai-agents"])
         assert 'pip install "decimalai[openai-agents]"' in result.output
 
+    def test_the_prompt_is_summarized_in_the_header(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
+        assert result.exit_code == 0, result.output
+        source = (tmp_path / "agent.py").read_text()
+        assert "System prompt: 31 characters, version 3" in source
+        assert PROMPT not in source          # a length, never a copy
+
+    def test_an_agent_with_no_prompt_is_told_it_has_none(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(prompt=_prompt_payload(None)))
+        assert result.exit_code == 0, result.output
+        assert "no system prompt set" in (tmp_path / "agent.py").read_text()
+
+    @pytest.mark.parametrize("exc", [
+        httpx.ConnectError("refused"),
+        _api_error(503, "upstream connect error"),
+    ])
+    def test_a_transient_prompt_failure_still_scaffolds(
+        self, exc, tmp_path, monkeypatch
+    ):
+        """A timeout or a 5xx does NOT prove the generated file cannot run —
+        it reads the prompt itself at run time, and `load_agent()` raises
+        there rather than returning an empty prompt. So this read feeds ONE
+        header comment, and losing it costs a comment, not the scaffold."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(prompt_exc=exc))
+        assert result.exit_code == 0, result.output
+        source = (tmp_path / "agent.py").read_text()
+        compile(source, "agent.py", "exec")
+        # Silent about a prompt it could not read — and still reads it at run time.
+        assert "System prompt:" not in source
+        assert "no system prompt set" not in source
+        assert 'decimalai.load_agent("refund-bot")' in source
+        # Said out loud, because a silently missing comment is indistinguishable
+        # from an agent that has no prompt.
+        assert "Could not read" in result.output
+
+    def test_a_backend_with_no_prompt_route_refuses_to_scaffold(
+        self, tmp_path, monkeypatch
+    ):
+        """The one prompt-read failure that IS fatal, and it is fatal for a
+        structural reason rather than a string heuristic: step 1 already
+        proved this agent is in this workspace, so a 404 on its prompt can
+        only mean the route is missing. The generated file calls
+        `load_agent()` at module scope, so writing it anyway would hand
+        someone a program that dies on line one, every run, in silence."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli(
+            [AGENT, "--api-key", "dai_sk_x"],
+            client=_client(prompt_exc=_agent_not_found()),
+        )
+        assert result.exit_code == 1, result.output
+        assert not (tmp_path / "agent.py").exists()
+        assert "does not serve agent prompts" in result.output
+
     def test_skill_count_is_reported(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         result = _run_cli([AGENT, "--api-key", "dai_sk_x"])
         assert "3 skills" in result.output
+
+    @pytest.mark.parametrize("prompt, expected", [
+        (_prompt_payload(), "3 skills, system prompt"),
+        (_prompt_payload(None), "3 skills, no system prompt"),
+    ])
+    def test_whether_the_prompt_was_picked_up_is_reported(
+        self, prompt, expected, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(prompt=prompt))
+        assert expected in result.output
+
+    def test_an_unreadable_prompt_is_not_reported_as_absent(
+        self, tmp_path, monkeypatch
+    ):
+        """"Could not read it" and "there isn't one" are different facts, and
+        only one of them sends someone to go write a prompt they already
+        wrote."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(prompt_exc=_api_error(500, "boom")))
+        assert result.exit_code == 0, result.output
+        assert "no system prompt" not in result.output
+        assert "Could not read this agent's system prompt" in result.output
 
     def test_agent_name_is_url_quoted_in_the_dashboard_link(
         self, tmp_path, monkeypatch

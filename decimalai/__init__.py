@@ -1771,6 +1771,12 @@ def push_langsmith_scores(
         from . import _config as _cfg
         client = _cfg._get_client()
     return _adapters.push_langsmith_scores(client, trace_id, run_scores)
+# Eager, unlike SkillRouter below: this module is a dataclass and one function
+# whose only import (`_config`) is deferred to call time, so it costs the
+# `import decimalai` path nothing. `AgentConfig` being a real symbol at import
+# is the point — it is what makes `config.system_prompt` fail at the attribute
+# on an older backend instead of KeyError-ing deep inside user code later.
+from ._agent import AgentConfig, load_agent  # noqa: E402, F401
 from .dataset import Dataset  # noqa: E402, F401
 from .generic import (  # noqa: E402, F401
     log_llm_call,
@@ -1805,13 +1811,23 @@ def __getattr__(name: str):
     if name == "SkillRouter":
         from .skill_router import SkillRouter
         return SkillRouter
+    if name == "AgentNotFoundError":
+        # Lazy for the same reason: it lives in `_client`, which imports httpx.
+        # Exported at all because it is the one `load_agent()` failure the
+        # caller can fix themselves, and catching it should not require
+        # string-matching a message or importing a private module.
+        from ._client import AgentNotFoundError
+        return AgentNotFoundError
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
+    "AgentConfig",
+    "AgentNotFoundError",
     "SkillRouter",
     "__version__",
     "init",
+    "load_agent",
     "flush",
     "last_send_error",
     "export_status",

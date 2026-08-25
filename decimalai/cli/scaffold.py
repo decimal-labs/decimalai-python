@@ -10,8 +10,26 @@ We generate; they run. Nothing here executes the agent, ships a runtime, or
 phones home at run time beyond the SDK the file imports — the model is
 `create-next-app`, not hosting.
 
-TWO THINGS THIS TEMPLATE EXISTS TO GET RIGHT
---------------------------------------------
+THREE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
+----------------------------------------------
+
+0. The agent's own SYSTEM PROMPT is what it runs on. Until 2026-08-25 the
+   langchain template sent no system message at all and the openai-agents one
+   hardcoded "You are <name>. Use the skills you are given." — so whatever the
+   user typed at /agents/new was silently discarded by the file we generated
+   for them. Both now read it with `decimalai.load_agent(...)`.
+
+   EXPLICITLY, and that is the design, not an implementation detail: the
+   prompt lands in a variable in THEIR file and is passed to the model by a
+   line they can see. Skills go the other way (instrument() injects them),
+   because a skill menu is additive and a system prompt is not — silently
+   replacing one means their repo says "Never issue refunds over $500" while
+   the model receives something else, which is unfixable from their side.
+
+   `load_agent()` runs at process start, so the no-redeploy property survives:
+   edit the prompt in the dashboard, restart, done. And when an agent has NO
+   prompt set (a real state — it is optional at creation) the file still runs
+   and sends nothing rather than inventing one.
 
 1. `enable_skill_loader=True`. Both skill-capable adapters default it to
    False (decimalai/langchain.py, decimalai/openai_agents.py), so a file that
@@ -66,7 +84,10 @@ reason rather than printing a bare "invalid choice".
 from __future__ import annotations
 
 import shlex
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
+
+if TYPE_CHECKING:  # keeps this module pure — it imports nothing at run time
+    from .._agent import AgentConfig
 
 # Changing this is a one-line edit in the generated file; it lives here so the
 # CLI's --model default and the template cannot drift apart.
@@ -202,10 +223,42 @@ def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
     return lines
 
 
+def _prompt_comment_lines(prompt: Optional["AgentConfig"]) -> List[str]:
+    """The `# System prompt …` line: whether this agent has one, not what it says.
+
+    Never the prompt TEXT. A copy pasted into the file is a second source of
+    truth that goes stale the moment someone edits it in the dashboard — the
+    exact problem `load_agent()` exists to remove — and a prompt can carry
+    material nobody meant to commit.
+
+    `None` means the scaffold could not read it (an older backend, a 5xx), and
+    then this says nothing at all rather than guessing. The generated file
+    fetches it at run time either way.
+    """
+    if prompt is None:
+        return []
+    if prompt.system_prompt is None:
+        return [
+            "#",
+            "# This agent has no system prompt set. The file below runs anyway and",
+            "# sends none — it will not invent one. Write one in the dashboard and it",
+            "# takes effect on the next run; no need to regenerate this file.",
+        ]
+    version = (f", version {prompt.version_number}"
+               if prompt.version_number is not None else "")
+    return [
+        "#",
+        f"# System prompt: {len(prompt.system_prompt):,} characters{version}. Read at run",
+        "# time by the load_agent() call below, so editing it in the dashboard changes",
+        "# the next run — this file does not change and does not carry a copy.",
+    ]
+
+
 def _header_lines(
     agent_name: str,
     framework: str,
     skills: Sequence[Mapping[str, Any]],
+    prompt: Optional["AgentConfig"] = None,
 ) -> List[str]:
     # _clean() before quoting, not after: this string lands inside a `#`
     # comment, so a name carrying a newline would end the comment and take
@@ -227,6 +280,7 @@ def _header_lines(
             "# from DecimalAI at run time, so changing what is attached in the dashboard",
             "# changes what this file does — you do not have to regenerate it.",
         ]
+    lines += _prompt_comment_lines(prompt)
     lines += [
         "#",
         "# This file is yours now: edit it, commit it, rename it. Nothing runs on",
@@ -258,6 +312,7 @@ def _render_langchain(
         "import decimalai",
         "from decimalai.langchain import instrument",
         "from langchain.chat_models import init_chat_model",
+        "from langchain_core.messages import HumanMessage, SystemMessage",
         "",
         "# Change this to any chat model you have a key for, e.g.",
         '#   "gpt-4o-mini" · "anthropic:claude-sonnet-4-5" · "google_genai:gemini-2.5-flash"',
@@ -277,6 +332,24 @@ def _render_langchain(
         "# disk-mirror decision it already made.",
         f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
         "",
+        "# Your agent's system prompt, as it stands in the dashboard right now.",
+        "# It is handed to you as data and sent by the line YOU can see below —",
+        "# nothing injects it behind your back, so what this file sends is what",
+        "# this file says. (Skills are the other way round: instrument() delivers",
+        "# those for you, because a menu is additive and a system prompt is not.)",
+        "#",
+        "# Read at run time, so editing the prompt in the dashboard changes the",
+        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
+        f"config = decimalai.load_agent({_py(agent_name)})",
+        "",
+        "# None means this agent has no prompt set — a real state, not a failure",
+        "# (a failed read raises instead). Then we send no system message at all,",
+        "# rather than invent one and put words in the agent's mouth.",
+        "PREAMBLE = (",
+        "    [SystemMessage(content=config.system_prompt)] if config.system_prompt",
+        "    else []",
+        ")",
+        "",
         "agent = init_chat_model(MODEL)",
         "",
         "",
@@ -286,7 +359,10 @@ def _render_langchain(
         "    Add tools, memory or a graph here — the skills rail is already wired",
         "    and stays wired, because it is installed on the chat model itself.",
         '    """',
-        "    return agent.invoke(question).content",
+        "    # Message objects, not (\"system\", \"...\") tuples: the skills rail reads",
+        "    # the human turn off this list to route, and a tuple carries no role",
+        "    # it can read — with tuples every call falls back to the full menu.",
+        "    return agent.invoke([*PREAMBLE, HumanMessage(content=question)]).content",
         "",
         "",
         'if __name__ == "__main__":',
@@ -323,10 +399,23 @@ def _render_openai_agents(
         "# second trace processor and every trace is sent twice.",
         f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
         "",
+        "# Your agent's system prompt, as it stands in the dashboard right now.",
+        "# It is handed to you as data and passed to the Agent by the line YOU can",
+        "# see below — nothing injects it behind your back, so what this file sends",
+        "# is what this file says. (Skills are the other way round: instrument()",
+        "# delivers those for you, because a menu is additive and a prompt is not.)",
+        "#",
+        "# Read at run time, so editing the prompt in the dashboard changes the",
+        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
+        f"config = decimalai.load_agent({_py(agent_name)})",
+        "",
         "agent = Agent(",
         f"    name={_py(agent_name)},",
         "    model=MODEL,",
-        f"    instructions={_py('You are ' + str(agent_name) + '. Use the skills you are given.')},",
+        "    # None when this agent has no prompt set — a real state, not a failure",
+        "    # (a failed read raises instead). The Agent then runs with no",
+        "    # instructions rather than a default this file made up.",
+        "    instructions=config.system_prompt,",
         ")",
         "",
         "",
@@ -374,6 +463,7 @@ def render_agent_file(
     *,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    prompt: Optional["AgentConfig"] = None,
 ) -> str:
     """Return the complete source of a runnable agent file.
 
@@ -389,11 +479,18 @@ def render_agent_file(
             comment so the file shows what it will use.
         model: Overrides `DEFAULT_MODEL` on the generated MODEL line.
         base_url: Baked in only when it is not the hosted default.
+        prompt: The agent's prompt config, from `client.get_agent_prompt`.
+            COMMENT ONLY — it decides one header line about whether a prompt
+            exists, never what the file sends. The generated file always reads
+            the prompt itself at run time, so passing None (the scaffold could
+            not read it) costs a comment and changes no behaviour.
     """
     framework = normalize_framework(framework)
     if not str(agent_name).strip():
         raise ValueError("agent_name is required")
 
     body = _RENDERERS[framework](agent_name, model or DEFAULT_MODEL, base_url)
-    lines = _header_lines(agent_name, framework, skills or []) + [""] + body
+    lines = (
+        _header_lines(agent_name, framework, skills or [], prompt) + [""] + body
+    )
     return "\n".join(lines) + "\n"
