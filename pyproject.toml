@@ -284,14 +284,27 @@ claude-agent-sdk-tests = [
 # silent no-op the C12 contract exists to forbid. The user-facing fix is a runtime
 # warning on the instrumentation path, not a version range; it is not in this change.
 #
-# Lift the cap when the instrumentor supports 1.x and conformance is green against it.
-# Do not lift it to make a build pass.
+# ⚠ THE INSTRUMENTOR IS NOW CAPPED TOO, 2026-08-24, and this is the mechanism the
+# paragraph above predicted ("the break is upstream of us either way").
+# openinference-instrumentation-anthropic 2.0.0 declares `anthropic>=1.0.0`, so an
+# UNCAPPED instrumentor drags anthropic straight past the `<1.0.0` cap three lines
+# down and reinstates the exact failure that cap exists to prevent — the same five
+# conformance FAILs, led by "C3 llm_calls: no trace carried any llm_calls — the model
+# turn never reached the wire". A version range on one half of a pair whose other half
+# can force it is not a cap; it is a suggestion.
+# Bisected on the DEPENDENCY, not the code, the same way: re-running the last GREEN
+# commit (f603432, green 19:22, run 32767802803) with no source change went red on the
+# identical job. Same bytes, different resolution, different result.
+# 1.1.2 is the last 1.x and declares `anthropic>=0.84.0`, which the cap below admits.
+#
+# Lift BOTH caps together, when the instrumentor supports 1.x and conformance is green
+# against it. Do not lift either to make a build pass.
 providers-tests = [
     "openai>=2.26.0",
     "anthropic>=0.40.0,<1.0.0",
     "google-genai>=1.65.0",
     "openinference-instrumentation-openai>=0.1.18",
-    "openinference-instrumentation-anthropic>=0.1.14",
+    "openinference-instrumentation-anthropic>=0.1.14,<2.0.0",
     "openinference-instrumentation-google-genai>=1.0.2",
 ]
 # Every framework the HERMETIC conformance tier drives (tests/conformance, Tier A —
