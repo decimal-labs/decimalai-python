@@ -73,6 +73,28 @@ and patch releases are fixes.
 
 ### Fixed
 
+- **Skill messages the SDK injects are no longer mistaken for your system
+  prompt.** Auto-detection keeps the first system message it sees and warns when
+  a later one differs, on the theory that a prompt changing mid-trace is a
+  dynamic template you should pin. That is right for your prompts and wrong for
+  ours: the skill menu and the routing hint are two system messages by design,
+  so every call emitted *"Auto-detected system prompt changed within trace"* and
+  advised `install(prompts=...)` — a fix that cannot work, because the message
+  that "changed" was one we added. A bare `invoke` went from 0 warnings to 1 and
+  a three-turn conversation from 3 to 6.
+
+  The same change fixes something older and worse: an agent whose code passes no
+  system message of its own had the routed skill menu recorded **as** its system
+  prompt — a prompt the user never wrote. Now nothing is recorded, which is the
+  truth. Injected messages carry a marker in `additional_kwargs`; it reaches no
+  model and costs you nothing.
+
+- **`pydantic>=2.3`, corrected from `>=2.0`.** Before 2.3 two of our model
+  fields raise `NameError` at class-definition time rather than warning, so the
+  old floor admitted four releases (2.0, 2.0.3, 2.1, 2.2) on which
+  `import decimalai` could not succeed at all — pip resolved happily and the
+  first import died. Bisected; 2.3 is the true floor.
+
 - **`openinference-instrumentation-anthropic` is capped below 2.0.0.** Its 2.0
   major requires `anthropic>=1.0.0` and, being uncapped, dragged `anthropic` past
   the `<1.0.0` cap three lines above it — silently reinstating the failure that

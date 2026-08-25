@@ -45,7 +45,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic>=2.0",
+    # >=2.3, not >=2.0: `Field name "schema_json" shadows an attribute in
+    # parent "BaseModel"` and `Field "model_name" has conflict with protected
+    # namespace "model_"` are hard NameErrors at class-definition time before
+    # 2.3, and only became warnings in 2.3. So the old floor admitted four
+    # releases (2.0, 2.0.3, 2.1, 2.2) on which `import decimalai` cannot
+    # succeed at all — pip resolved happily and the first import died.
+    # Bisected: 2.0 FAIL, 2.0.3 FAIL, 2.1 FAIL, 2.2 FAIL, 2.3 OK, 2.4 OK.
+    "pydantic>=2.3",
     "httpx>=0.28.1",
     # 8.2 is the floor a bare `decimalai` invocation actually needs: before it,
     # a no-args group exits 0 instead of 2, so the start hint never fires.

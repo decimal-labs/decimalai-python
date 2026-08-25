@@ -195,3 +195,72 @@ class TestAgainstRealChatAnthropic:
             # stable content strictly before varying content
             assert (next(i for i, b in enumerate(blocks) if PREFIX_MARKER in b)
                     < next(i for i, b in enumerate(blocks) if TAIL_MARKER in b))
+
+
+class TestInjectedMessagesAreNotMistakenForTheCallersPrompt:
+    """The manifest's auto-detection keeps the first system message it sees and
+    warns when a later one differs — sound for the caller's own prompts, wrong
+    for ours. The split injects two system messages BY DESIGN, so every call
+    tripped the check and advised a fix (`install(prompts=...)`) that cannot
+    work, because the message that "changed" is one the SDK added.
+
+    Measured before the mark: a bare invoke went 0 -> 1 warnings and a 3-turn
+    conversation 3 -> 6.
+    """
+
+    def _capture(self, adapter, msgs):
+        import uuid
+        import decimalai.langchain as lc
+
+        lc_mod = adapter(_SplitRouter())
+        h = lc_mod.CallbackHandler()
+        rid = uuid.uuid4()
+        h.on_chat_model_start(
+            {"name": "x"}, [lc_mod._inject_skills_into_input(msgs)], run_id=rid
+        )
+        return (h._state_for(rid, None).seen_prompts or {}).get("system", "")
+
+    def test_the_callers_own_prompt_is_still_captured(self, adapter):
+        got = self._capture(
+            adapter, [SystemMessage(content=CALLER), HumanMessage(content="q")]
+        )
+        assert got.strip() == CALLER
+        assert PREFIX_MARKER not in got
+
+    def test_with_no_caller_prompt_nothing_is_captured(self, adapter):
+        """Not the skill menu. Before the mark, an agent whose code passes no
+        system message had its manifest record the routed menu AS its system
+        prompt — a prompt the user never wrote."""
+        got = self._capture(adapter, [HumanMessage(content="q")])
+        assert got == "", got
+
+    def test_no_drift_warning_is_emitted(self, adapter, caplog):
+        import logging
+        import uuid
+        import decimalai.langchain as lc_mod
+
+        lc = adapter(_SplitRouter())
+        convo = [SystemMessage(content=CALLER)]
+        with caplog.at_level(logging.WARNING, logger="decimalai.langchain"):
+            h = lc.CallbackHandler()
+            rid = uuid.uuid4()
+            for i in range(3):
+                convo = convo + [HumanMessage(content=f"q{i}")]
+                h.on_chat_model_start(
+                    {"name": "x"},
+                    [lc._inject_skills_into_input(list(convo))],
+                    run_id=rid,
+                )
+                convo = convo + [AIMessage(content=f"a{i}")]
+        drift = [r for r in caplog.records if "changed within trace" in r.getMessage()]
+        assert not drift, [r.getMessage() for r in drift]
+
+    def test_the_mark_never_reaches_the_model(self, adapter):
+        """It rides in additional_kwargs, which providers ignore — the content
+        the model sees must be exactly the prefix and the tail."""
+        lc = adapter(_SplitRouter())
+        out = lc._inject_skills_into_input(
+            [SystemMessage(content=CALLER), HumanMessage(content="q")]
+        )
+        for m in out:
+            assert "decimalai_injected" not in _text(m)

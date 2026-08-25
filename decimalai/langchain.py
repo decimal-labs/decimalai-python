@@ -724,6 +724,36 @@ def _system_prefix_len(messages: List[Any]) -> int:
     return count
 
 
+# Marks a system message this SDK created, so our own tracing can tell it apart
+# from the caller's prompt. Rides in `additional_kwargs`, which LangChain carries
+# through unchanged and providers ignore, so it costs the caller nothing and
+# reaches no model.
+#
+# Why it is needed: the manifest's auto-detection keeps the FIRST system message
+# it sees and warns when a later one differs, on the theory that a prompt which
+# changes mid-trace is a dynamic template the user should pin. That is sound for
+# the caller's own prompts and wrong for ours — the skill prefix and the routing
+# hint are two system messages BY DESIGN, so every call tripped the check and
+# emitted "Auto-detected system prompt changed within trace", advising a fix
+# (`install(prompts=...)`) that cannot possibly help, because the message that
+# "changed" is one the SDK injected. Measured before this: a bare invoke went
+# from 0 warnings to 1, and a three-turn conversation from 3 to 6.
+_INJECTED_MARK = {"decimalai_injected": True}
+
+
+def _is_sdk_injected(msg: Any) -> bool:
+    """True for a message this SDK added to the caller's list."""
+    kwargs = getattr(msg, "additional_kwargs", None)
+    if isinstance(kwargs, dict) and kwargs.get("decimalai_injected"):
+        return True
+    # Dict-shaped messages (the unconverted forms LangChain also accepts).
+    if isinstance(msg, dict):
+        extra = msg.get("additional_kwargs")
+        if isinstance(extra, dict) and extra.get("decimalai_injected"):
+            return True
+    return False
+
+
 def _inject_skills_into_input(input_value: Any) -> Any:
     """Insert a SkillRouter-built system message into a chat model's input.
 
@@ -818,9 +848,11 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     # langchain_anthropic 1.6.1, and locked by
     # `test_skill_route_split_langchain.py`.
     cut = _system_prefix_len(messages)
-    injected = [SystemMessage(content=prefix)]
+    injected = [SystemMessage(content=prefix, additional_kwargs=dict(_INJECTED_MARK))]
     if tail:
-        injected.append(SystemMessage(content=tail))
+        injected.append(
+            SystemMessage(content=tail, additional_kwargs=dict(_INJECTED_MARK))
+        )
     return [*messages[:cut], *injected, *messages[cut:]]
 
 
@@ -2115,6 +2147,15 @@ class CallbackHandler(_CallbackBase):
         #   install(prompts={"system": "Your static template text..."})
         for msg_list in messages:
             for msg in msg_list:
+                # Skip what WE put there. The skill prefix and the routing hint
+                # are two system messages by design, so without this every call
+                # tripped the drift warning below and told the user to pin a
+                # template — advice that cannot work, because the message that
+                # "changed" is the SDK's own. It would also let the skill menu
+                # be recorded AS the agent's system prompt whenever the caller
+                # passes none of their own.
+                if _is_sdk_injected(msg):
+                    continue
                 role = normalize_role(msg)
                 content = extract_message_content(msg)
                 if role in ("system", "developer") and content and role not in state.seen_prompts:
