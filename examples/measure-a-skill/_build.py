@@ -146,9 +146,9 @@ cells = [
         # turns the evidence gate off for all of them and leaves the cell printing
         # only the arithmetic it was written to stop being sufficient.
         "              \"require_all_prompts_served\": True},\n"
-        "    \"registry_disclosure\": {\"measured_public_skills\": 29825, \"graded_cases\": 666467,\n"
+        "    \"registry_disclosure\": {\"measured_public_skills\": 43819, \"graded_cases\": 980708,\n"
         "                            \"cases_withheld_pct\": 12.6, \"platform_cases_withheld_pct\": 56.6,\n"
-        "                            \"github_import_cases_withheld_pct\": 0.7, \"as_of\": \"2026-08-17\"},\n"
+        "                            \"github_import_cases_withheld_pct\": 0.7, \"as_of\": \"2026-08-28\"},\n"
         "}\n"
         "\n"
         "try:\n"
