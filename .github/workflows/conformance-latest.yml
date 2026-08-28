@@ -111,3 +111,58 @@ jobs:
                 issue_number: existing.data[0].number, body,
               });
             }
+
+      - name: Close the advisory when the lane recovers
+        # The counterpart to the step above, and it was missing. Without it this
+        # lane can only ever ADD red to the issue tab: #11 was filed 2026-08-21,
+        # the lane went green on 08-24, and on 08-28 the issue was still open,
+        # still the top thing a visitor sees, describing a break that upstream
+        # and a version cap had already resolved. An advisory nobody retracts
+        # stops being an advisory and becomes background noise — the exact
+        # outcome the "one open issue at a time" rule above was protecting.
+        #
+        # Deliberately closes rather than just commenting: `if: success()` means
+        # the whole matrix passed on newest, which is the same evidence that
+        # would have kept the issue from being filed at all.
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: ["conformance-latest"],
+            });
+            if (open.data.length === 0) return;
+
+            let resolved = "";
+            try {
+              const fs = require("fs");
+              resolved = "\n\nResolved on this run:\n\n```\n"
+                + fs.readFileSync("resolved-versions.txt", "utf8").trim()
+                + "\n```";
+            } catch { /* the artifact step is best-effort; the close is not */ }
+
+            const body = [
+              "The floating conformance lane is green again — the full matrix passed against newest.",
+              "",
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Closing automatically. If the row broke again the nightly would have filed a new issue",
+              "rather than leaving this one open, so an open issue here always means *currently* red.",
+              "",
+              "Worth checking before you treat this as fully resolved: a lane can go green because the",
+              "adapter was fixed, or because a version cap stopped it floating to the release that broke",
+              "it. Those are different outcomes, and only the first one is a fix. The resolved versions",
+              "below say which happened.",
+            ].join("\n") + resolved;
+
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, state: "closed", state_reason: "completed",
+              });
+            }
