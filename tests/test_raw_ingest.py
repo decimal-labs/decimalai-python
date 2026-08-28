@@ -124,8 +124,12 @@ class TestClientRawMethods:
         with patch.object(client, "_request_with_retry", return_value=mock_response) as mock_req:
             result = client.ingest_raw_trace({"agent_name": "raw-agent"})
 
+            # idempotent=True: a raw trace carries a client-generated id, so a
+            # retry after a 5xx cannot double-write — that is what buys it the
+            # 500 retry the other POST routes deliberately do not get.
             mock_req.assert_called_once_with(
-                "POST", "/api/v1/traces", json={"agent_name": "raw-agent"}
+                "POST", "/api/v1/traces", json={"agent_name": "raw-agent"},
+                idempotent=True,
             )
             assert result == {"id": "trace-789"}
 
@@ -148,7 +152,7 @@ class TestClientRawMethods:
             result = client.ingest_raw_traces_batch(payloads)
 
             mock_req.assert_called_once_with(
-                "POST", "/api/v1/traces/batch", json=payloads
+                "POST", "/api/v1/traces/batch", json=payloads, idempotent=True
             )
             assert result == {"ingested": 2}
 

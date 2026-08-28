@@ -51,12 +51,19 @@ def _atexit_flush() -> None:
 
     Must never raise: atexit handlers run during shutdown when the
     interpreter may already be in a degraded state.
+
+    ``flush()`` keeps the buffer when the failure was transient (a 503, a
+    connection blip) so a later flush can still deliver it — but this IS the
+    last flush. ``discard_undelivered`` turns that "kept for next time" into an
+    explicit "these N traces were lost", which is the only honest thing to say
+    on the way out.
     """
     try:
         from . import _config as _cfg
         client = getattr(_cfg, "_client", None)
         if client is not None:
             client.flush()
+            client.discard_undelivered("Exiting")
     except Exception:
         # Swallow — atexit shouldn't crash a process that's already exiting.
         pass

@@ -32,9 +32,36 @@ logger = logging.getLogger("decimalai")
 _MAX_RETRIES = 3
 _DEFAULT_RETRY_DELAY = 1.0  # seconds
 
+# How many traces `buffer_trace` accumulates before auto-flushing — and, because
+# `flush()` now hangs on to a batch the backend was merely too sick to accept,
+# the ceiling on how many traces may be carried across failed flushes. One
+# number on purpose: the buffer's steady state is a single batch, so "keep one
+# batch" is the whole retention policy and there is nothing to tune.
+_AUTO_FLUSH_THRESHOLD = 50
+
+# Statuses that say "the request never reached the application, or the
+# application is transiently unhealthy" — the payload is not implicated, so the
+# same bytes can succeed a second later. These are what a Google Frontend / load
+# balancer returns while a Cloud Run revision is restarting or has no healthy
+# instance.
+#
+# 500 is deliberately NOT in this set. It means the application DID run and blew
+# up part-way, so replaying a non-idempotent POST can double-write. Call sites
+# that are safe to replay opt in with `idempotent=True`.
+_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+
+# How long `buffer_trace` stops triggering an AUTOMATIC flush after one failed
+# retryably. Without it, a preserved buffer sits exactly AT
+# `_AUTO_FLUSH_THRESHOLD`, so every single trace the caller records afterwards
+# kicks off another full retry ladder (up to 1+2+4s of sleeping) on the caller's
+# own thread — a backend outage would stall the user's agent instead of just
+# delaying its traces. This is not a new backoff scheme: it is one more step of
+# the existing one, i.e. the wait the next attempt would have started from.
+_FLUSH_RETRY_COOLDOWN = _DEFAULT_RETRY_DELAY * (2 ** _MAX_RETRIES)  # 8.0s
+
 
 def _parse_retry_after(value: Optional[str]) -> float:
-    """Parse a 429 ``Retry-After`` header into delta-seconds.
+    """Parse a ``Retry-After`` header into delta-seconds.
 
     Per RFC 7231 the value may be delta-seconds ("5")
     OR an HTTP-date ("Wed, 21 Oct 2025 07:28:00 GMT") — many proxies/CDNs/LBs
@@ -313,6 +340,14 @@ class DecimalAIClient:
             timeout=timeout,
         )
         self._trace_buffer: List[RunTrace] = []
+        # Monotonic deadline before which `buffer_trace` will not auto-flush.
+        # Set only when a flush fails in a way a later flush could still fix;
+        # an explicit flush()/close()/atexit ignores it. See
+        # `_preserve_buffer_after_failed_flush`.
+        self._flush_cooldown_until: float = 0.0
+        # Traces destroyed by the buffer cap since the last successful flush.
+        # Counted rather than logged per trace, and reported once per flush.
+        self._dropped_while_buffer_full: int = 0
 
     # ── Auth ────────────────────────────────────────────────────
 
@@ -325,59 +360,73 @@ class DecimalAIClient:
     # ── Retry logic ────────────────────────────────────────────
 
     def _request_with_retry(
-        self, method: str, url: str, **kwargs: Any
+        self, method: str, url: str, *, idempotent: bool = False, **kwargs: Any
     ) -> httpx.Response:
-        """Make an HTTP request with retry-on-429.
+        """Make an HTTP request, retrying the failures a retry can actually fix.
 
-        Retries up to ``_MAX_RETRIES`` times when the server responds with
-        HTTP 429. Uses the ``Retry-After`` header if present, otherwise
-        falls back to exponential backoff (1s, 2s, 4s).
+        Retries up to ``_MAX_RETRIES`` times on HTTP 429 and on the transient
+        server-side statuses in ``_RETRYABLE_STATUSES`` (502/504 from a proxy,
+        503 from a load balancer with no healthy instance). Uses the
+        ``Retry-After`` header if present, otherwise exponential backoff
+        (1s, 2s, 4s) — one ladder, shared by both.
+
+        ``idempotent=True`` adds 500 to that set. It is opt-in per call site
+        because a 500 means the application ran and failed part-way, so blindly
+        replaying a POST that writes can double-write. Trace ingest opts in:
+        every trace carries a client-generated ``id``, so a replay either stores
+        a trace that was never stored or is rejected as a duplicate (409
+        ``trace_id_conflict`` on ``POST /traces``, a per-trace ``errors`` entry
+        on ``POST /traces/batch``) — never a second copy.
+
+        Until this change the loop returned or raised on EVERY non-429 status,
+        so a 503 got zero retries and ``flush()`` then cleared the buffer: a
+        single blip destroyed up to a full batch of traces. The DecimalAI
+        fleet's own HTTP client had been retrying 5xx for months, which is why
+        the internal numbers never showed the loss the SDK was taking.
         """
         last_exc: Optional[httpx.HTTPStatusError] = None
 
         for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2, 3
             resp = self._http.request(method, url, **kwargs)
 
-            if resp.status_code != 429:
-                _raise_for_status(resp)
-                return resp
-
-            # A plan quota is TERMINAL — it does not clear until the billing period rolls
-            # over, so the retry loop below can only burn wall-clock: each 429 costs 3
-            # attempts before the payload is dropped. Fail fast with an error that names
-            # the exhausted dimension.
-            quota_dimension = resp.headers.get("X-Quota-Exceeded")
-            if quota_dimension:
-                body = {}
-                try:
-                    parsed = resp.json()
-                    detail = parsed.get("detail") if isinstance(parsed, dict) else None
-                    body = detail if isinstance(detail, dict) else {}
-                except Exception:  # noqa: BLE001 — a malformed body must not mask the quota
+            if resp.status_code == 429:
+                # A plan quota is TERMINAL — it does not clear until the billing period rolls
+                # over, so the retry loop below can only burn wall-clock: each 429 costs 3
+                # attempts before the payload is dropped. Fail fast with an error that names
+                # the exhausted dimension.
+                quota_dimension = resp.headers.get("X-Quota-Exceeded")
+                if quota_dimension:
                     body = {}
-                raise DecimalQuotaExceededError(
-                    dimension=quota_dimension,
-                    resets_in_seconds=int(body.get("resets_in_seconds") or 0),
-                    plan=str(body.get("plan") or resp.headers.get("X-RateLimit-Plan") or ""),
+                    try:
+                        parsed = resp.json()
+                        detail = parsed.get("detail") if isinstance(parsed, dict) else None
+                        body = detail if isinstance(detail, dict) else {}
+                    except Exception:  # noqa: BLE001 — a malformed body must not mask the quota
+                        body = {}
+                    raise DecimalQuotaExceededError(
+                        dimension=quota_dimension,
+                        resets_in_seconds=int(body.get("resets_in_seconds") or 0),
+                        plan=str(body.get("plan") or resp.headers.get("X-RateLimit-Plan") or ""),
+                    )
+
+                # 429 — parse Retry-After (delta-seconds OR HTTP-date) and maybe retry
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+
+                last_exc = httpx.HTTPStatusError(
+                    "429 Too Many Requests",
+                    request=resp.request,
+                    response=resp,
                 )
 
-            # 429 — parse Retry-After (delta-seconds OR HTTP-date) and maybe retry
-            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-            delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+                if attempt < _MAX_RETRIES:
+                    logger.warning(
+                        "Rate limited (429). Retrying in %.1fs (attempt %d/%d)",
+                        delay, attempt + 1, _MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
 
-            last_exc = httpx.HTTPStatusError(
-                "429 Too Many Requests",
-                request=resp.request,
-                response=resp,
-            )
-
-            if attempt < _MAX_RETRIES:
-                logger.warning(
-                    "Rate limited (429). Retrying in %.1fs (attempt %d/%d)",
-                    delay, attempt + 1, _MAX_RETRIES,
-                )
-                time.sleep(delay)
-            else:
                 raise DecimalRateLimitError(
                     retry_after=retry_after,
                     message=(
@@ -385,6 +434,29 @@ class DecimalAIClient:
                         f"Server says retry after {retry_after}s."
                     ),
                 )
+
+            retryable = resp.status_code in _RETRYABLE_STATUSES or (
+                idempotent and resp.status_code == 500
+            )
+            if retryable and attempt < _MAX_RETRIES:
+                # A load-balancer 503 rarely carries Retry-After, but honour it
+                # when it does — same precedence and same ladder as the 429 path
+                # above, so there is only ever one backoff scheme to reason about.
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+                logger.warning(
+                    "Server error (HTTP %d) on %s %s. Retrying in %.1fs (attempt %d/%d)",
+                    resp.status_code, method, url, delay, attempt + 1, _MAX_RETRIES,
+                )
+                time.sleep(delay)
+                continue
+
+            # Success, a 4xx, or a retryable 5xx whose attempts are spent. In the
+            # failure cases _raise_for_status raises a DecimalAPIError carrying
+            # the real status code — which is what lets flush() below tell a
+            # transient 5xx apart from a payload the server will never accept.
+            _raise_for_status(resp)
+            return resp
 
         # Should never reach here, but satisfy type checker
         raise last_exc  # type: ignore[misc]
@@ -424,7 +496,9 @@ class DecimalAIClient:
             return skipped
         payload = _scrub_surrogates(trace.model_dump(mode="json"))
         _warn_if_strict_manifest_missing(bool(payload.get("manifest_id")))
-        resp = self._request_with_retry("POST", "/api/v1/traces", json=payload)
+        resp = self._request_with_retry(
+            "POST", "/api/v1/traces", json=payload, idempotent=True
+        )
         logger.debug("Ingested trace %s", trace.id)
         return cast(IngestionResult, resp.json())
 
@@ -444,7 +518,9 @@ class DecimalAIClient:
         _warn_if_strict_manifest_missing(
             all(p.get("manifest_id") for p in payload) if payload else True
         )
-        resp = self._request_with_retry("POST", "/api/v1/traces/batch", json=payload)
+        resp = self._request_with_retry(
+            "POST", "/api/v1/traces/batch", json=payload, idempotent=True
+        )
         logger.debug("Ingested %d traces", len(traces))
         return cast(IngestionResult, resp.json())
 
@@ -464,7 +540,9 @@ class DecimalAIClient:
         # JSON encoder raises UnicodeEncodeError before the request is built.
         payload = _scrub_surrogates(payload)
         _warn_if_strict_manifest_missing(bool(payload.get("manifest_id")))
-        resp = self._request_with_retry("POST", "/api/v1/traces", json=payload)
+        resp = self._request_with_retry(
+            "POST", "/api/v1/traces", json=payload, idempotent=True
+        )
         logger.debug("Ingested raw trace")
         return cast(IngestionResult, resp.json())
 
@@ -487,7 +565,7 @@ class DecimalAIClient:
             all(p.get("manifest_id") for p in payloads) if payloads else True
         )
         resp = self._request_with_retry(
-            "POST", "/api/v1/traces/batch", json=payloads
+            "POST", "/api/v1/traces/batch", json=payloads, idempotent=True
         )
         logger.debug("Ingested %d raw traces", len(payloads))
         return cast(IngestionResult, resp.json())
@@ -499,33 +577,152 @@ class DecimalAIClient:
         eventually be flushed, but in manifest_only mode we never want to
         send — short-circuiting here also avoids unbounded buffer growth
         from framework integrations that fire repeatedly during CI runs.
+
+        The auto-flush is also suppressed for ``_FLUSH_RETRY_COOLDOWN`` after a
+        flush failed retryably: a preserved buffer sits AT the threshold, so
+        without the cooldown every subsequent trace would drag the caller's
+        thread through another full retry ladder. An explicit ``flush()`` (or
+        ``close()``, or the atexit hook) still tries immediately.
+
+        That cooldown is the ONLY window in which the buffer can exceed
+        ``_AUTO_FLUSH_THRESHOLD``, so the cap is enforced here too — a busy agent
+        would otherwise grow it without limit for the length of an outage, and
+        an unbounded buffer is its own bug.
         """
         if not self._should_send_traces("buffer_trace"):
             return
         self._trace_buffer.append(trace)
-        if len(self._trace_buffer) >= 50:
+        if len(self._trace_buffer) < _AUTO_FLUSH_THRESHOLD:
+            return
+        if time.monotonic() >= self._flush_cooldown_until:
             self.flush()
+        if len(self._trace_buffer) > _AUTO_FLUSH_THRESHOLD:
+            # Only reachable when the cooldown above suppressed the flush — a
+            # flush that ran and preserved has already trimmed to the cap. The
+            # buffer is a full batch the backend just refused, so drop the
+            # OLDEST to hold the bound and COUNT it rather than logging once per
+            # trace: a per-trace warning through an outage is its own kind of
+            # damage. The running total is reported on the next flush, whichever
+            # way that one goes.
+            del self._trace_buffer[0]
+            self._dropped_while_buffer_full += 1
+
+    def _preserve_buffer_after_failed_flush(self, reason: str) -> None:
+        """Keep the buffered traces for a later flush — bounded, and logged.
+
+        For the failures a later flush could still fix. The bound is the other
+        half of that promise: ``buffer_trace`` auto-flushes at
+        ``_AUTO_FLUSH_THRESHOLD``, so a preserved buffer would otherwise grow
+        without limit while a backend stayed down. Keep the
+        ``_AUTO_FLUSH_THRESHOLD`` most RECENT traces — during an outage the ones
+        someone is about to go looking for sit next to the symptom, not at the
+        start of the incident — and say plainly how many were lost, because a
+        dropped trace never comes back.
+        """
+        overflow = max(0, len(self._trace_buffer) - _AUTO_FLUSH_THRESHOLD)
+        if overflow:
+            del self._trace_buffer[:overflow]
+            self._dropped_while_buffer_full += overflow
+        self._flush_cooldown_until = time.monotonic() + _FLUSH_RETRY_COOLDOWN
+        if self._dropped_while_buffer_full:
+            logger.warning(
+                "%s — preserving the %d most recent trace(s) for the next flush. "
+                "The buffer is at its %d-trace cap, so %d trace(s) have been "
+                "DROPPED since the last successful flush. They are gone.",
+                reason, len(self._trace_buffer), _AUTO_FLUSH_THRESHOLD,
+                self._dropped_while_buffer_full,
+            )
+        else:
+            logger.warning(
+                "%s — preserving %d buffered trace(s) for the next flush",
+                reason, len(self._trace_buffer),
+            )
+
+    def _drop_buffer_after_failed_flush(self, exc: BaseException) -> None:
+        """Clear the buffer for a failure no retry can fix — and make it visible.
+
+        This is a permanent trace loss, so it is also recorded on the background
+        sender: ``export_status().last_error`` / ``last_send_error()`` is where a
+        production health check looks, and the batch path used to drop traces
+        without ever touching either — the same silence that made the original
+        bug take weeks to notice. Mirrors ``otel._submit_or_send_inline``, which
+        already records failures from a foreground send.
+        """
+        self._trace_buffer.clear()
+        self._flush_cooldown_until = 0.0
+        self._dropped_while_buffer_full = 0
+        try:
+            from . import _config
+
+            _config._sender._record_failure(exc)
+        except Exception:  # noqa: BLE001 — observability must never break flush
+            logger.debug("Could not record the flush failure on the sender", exc_info=True)
 
     def flush(self) -> None:
         """Flush all buffered traces to the platform.
 
-        On rate limit errors (429), the buffer is **preserved** so that
-        traces are not lost — the next call to ``flush()`` will retry.
-        For all other errors the buffer is cleared.
+        The buffer is **preserved** for every failure a later flush could still
+        fix: a rate limit (429, once ``_request_with_retry`` has exhausted its
+        backoff), a server-side 5xx, and a transport error (DNS, connect, read
+        timeout). None of those are a verdict on the payload. Clearing on them
+        is what made a single 503 destroy traces permanently — and because
+        ``buffer_trace`` auto-flushes at ``_AUTO_FLUSH_THRESHOLD``, the batch in
+        hand when a blip arrived was usually a full one.
+
+        The buffer is cleared when the failure is terminal: a 4xx (the server
+        has judged these bytes and will judge them the same way forever), a plan
+        quota (it does not clear until the billing period rolls over), and a
+        local serialization failure. Holding a permanently-rejected batch would
+        wedge every later trace behind it — an unbounded buffer is its own bug.
+
+        Never raises: a failed flush must not take down the caller's agent.
         """
         if not self._trace_buffer:
             return
         try:
             self.ingest_traces_batch(self._trace_buffer)
             self._trace_buffer.clear()
+            self._flush_cooldown_until = 0.0
+            if self._dropped_while_buffer_full:
+                # Close the loop on the outage: the recovery log is the last
+                # chance to say how much never made it, and it is the line
+                # someone reads when the trace count looks short.
+                logger.warning(
+                    "Flush recovered, but %d trace(s) were dropped while the "
+                    "buffer sat at its %d-trace cap during the failure.",
+                    self._dropped_while_buffer_full, _AUTO_FLUSH_THRESHOLD,
+                )
+                self._dropped_while_buffer_full = 0
         except DecimalRateLimitError:
-            logger.warning(
-                "Rate limited — preserving %d buffered traces for later flush",
-                len(self._trace_buffer),
+            self._preserve_buffer_after_failed_flush("Rate limited")
+        except DecimalAPIError as exc:
+            # The one branch this whole change exists for. `status_code` is the
+            # server's, not a guess: 5xx means "try again", 4xx means "these
+            # bytes are the problem".
+            if exc.status_code >= 500:
+                self._preserve_buffer_after_failed_flush(
+                    f"Server error (HTTP {exc.status_code}) after "
+                    f"{_MAX_RETRIES} retries — {exc}"
+                )
+            else:
+                logger.exception(
+                    "Failed to flush %d traces — the server rejected them with "
+                    "HTTP %d, which a retry cannot fix. Dropping the batch.",
+                    len(self._trace_buffer), exc.status_code,
+                )
+                self._drop_buffer_after_failed_flush(exc)
+        except httpx.RequestError as exc:
+            # Never reached the server at all (DNS, refused connection, read
+            # timeout). Same reasoning as a 5xx: the payload is not implicated.
+            self._preserve_buffer_after_failed_flush(
+                f"Transport error ({type(exc).__name__}: {exc})"
             )
-        except Exception:
+        except Exception as exc:
+            # Everything else — a quota (terminal until the billing period rolls
+            # over), a serialization failure, a bug. Dropping is the honest
+            # outcome; the log and export_status() carry the cause.
             logger.exception("Failed to flush %d traces", len(self._trace_buffer))
-            self._trace_buffer.clear()
+            self._drop_buffer_after_failed_flush(exc)
 
     # ── Trace queries ──────────────────────────────────────────
 
@@ -1699,9 +1896,37 @@ class DecimalAIClient:
 
     # ── Lifecycle ──────────────────────────────────────────────
 
+    def discard_undelivered(self, when: str = "Closing") -> None:
+        """Report and drop traces that ``flush()`` kept when nothing will retry.
+
+        ``flush()`` deliberately hangs on to a batch a *later* flush could still
+        deliver. ``close()`` and interpreter shutdown ARE the last attempt, so
+        leaving the caller with "preserving N trace(s) for the next flush" would
+        be a promise nobody is left to keep. Say the traces were lost, plainly,
+        at the one moment it becomes true.
+        """
+        if not self._trace_buffer:
+            return
+        logger.warning(
+            "%s with %d buffered trace(s) that never reached the platform — "
+            "the last flush failed and there is no later attempt.%s Call "
+            "decimalai.export_status() for the cause.",
+            when,
+            len(self._trace_buffer),
+            (
+                f" A further {self._dropped_while_buffer_full} trace(s) were "
+                "dropped earlier at the buffer cap."
+                if self._dropped_while_buffer_full
+                else ""
+            ),
+        )
+        self._trace_buffer.clear()
+        self._dropped_while_buffer_full = 0
+
     def close(self) -> None:
         """Flush remaining traces and close the HTTP client."""
         self.flush()
+        self.discard_undelivered("Closing the client")
         self._http.close()
 
     def __enter__(self) -> "DecimalAIClient":
