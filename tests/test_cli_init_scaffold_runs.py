@@ -92,12 +92,30 @@ print("BOUND:", _ours[0].default_agent_name if _ours else "<no processor>")
     "langchain": {
         "requires": "langchain",
         "stub": """
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 _sent = []
-class _Fake:
-    def invoke(self, x, *a, **k):
-        _sent.append(x)          # exactly what the template handed the model
-        return AIMessage(content="stubbed answer")
+
+# A REAL BaseChatModel subclass, not a duck-typed object.
+#
+# The skill rail works by monkey-patching BaseChatModel.invoke. A plain class
+# that merely defines its own `invoke` never inherits that patch, so the
+# injection code never runs and `_sent` captures the template's messages
+# BEFORE any skill routing. That is exactly what this file used to do, and it
+# is why a rail that delivered nothing at all kept the whole suite green.
+# Overriding `_generate` (the abstract leaf) instead leaves `invoke` — and
+# therefore the patch — on the call path.
+class _Fake(BaseChatModel):
+    @property
+    def _llm_type(self):
+        return "fake"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        _sent.append(messages)   # what the model was ACTUALLY handed, post-injection
+        return ChatResult(generations=[
+            ChatGeneration(message=AIMessage(content="stubbed answer"))
+        ])
 _stack.enter_context(patch("langchain.chat_models.init_chat_model", return_value=_Fake()))
 """,
         "probe": """
@@ -109,12 +127,55 @@ print("BOUND:", adapter._install_agent_name)
 # message and the question has to stay last: the skills rail reads the trailing
 # human turn to route, and providers reject a system message after one.
 _msgs = _sent[-1]
-_system = [m for m in _msgs if getattr(m, "type", None) == "system"]
+# The rail injects its own system messages after the caller's leading system
+# run, so "the first system message" is no longer the same thing as "the
+# agent's prompt". Filter the rail's out by their headings — otherwise a
+# no-prompt agent looks like it has one, and the assertion that a no-prompt
+# agent sends NO invented instructions silently stops testing anything.
+_system = [
+    m for m in _msgs
+    if getattr(m, "type", None) == "system"
+    and not str(getattr(m, "content", "")).lstrip().startswith(
+        ("## Available Skills", "## Skill:")
+    )
+]
 print("PROMPT_SEEN:", _system[0].content if _system else "<none>")
 print("LAST_TURN:", getattr(_msgs[-1], "type", None))
+
+# THE CANARY. Every message the model was handed, concatenated. The skill's
+# body is only in here if the rail DELIVERED it — a menu row carries the
+# skill's name and description and never its body.
+_all = "\\n".join(str(getattr(m, "content", "")) for m in _msgs)
+print("SKILL_OFFERED:", "restocking-policy" in _all)
+print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
 """,
     },
 }
+
+#: A fact no model has priors for. If it reaches the model, it reached it as a
+#: SKILL BODY and by no other route — which is the only way to assert delivery
+#: rather than mere offering.
+CANARY = "Opened boxes carry a 23.5% restocking fee."
+CANARY_SKILL = "restocking-policy"
+
+#: The shape `SkillRouter._request` sees from the real backend, reduced to the
+#: keys the client actually reads. Patched in rather than reached over HTTP so
+#: this test needs no network and no live model.
+ROUTER_FIXTURE = """
+def _fake_router_request(self, method, path, **kw):
+    if path.endswith("/body"):
+        return {{"body": {canary!r}, "content_hash": "sha256:canary", "version": 1}}
+    return {{
+        "skills": [{{"name": {skill!r}, "description": "When a refund is allowed."}}],
+        "prompt_fragment": "## Available Skills\\n\\n| Skill | Description |\\n"
+                           "| --- | --- |\\n| {skill} | When a refund is allowed. |",
+        "strategy": "semantic",
+        "routing_id": "rt_" + "0" * 24,
+    }}
+_stack.enter_context(patch(
+    "decimalai.skill_router.SkillRouter._request", _fake_router_request,
+))
+""".format(canary=CANARY, skill=CANARY_SKILL)
 
 DRIVER = """\
 import contextlib, runpy
@@ -123,10 +184,21 @@ from unittest.mock import patch
 from decimalai import AgentConfig
 
 _stack = contextlib.ExitStack()
+{router}
 {stub}
-# init() is stubbed only because it would make a real network call to verify a
-# fake key. The adapter seam below it is NOT stubbed — that is the point.
-_init = _stack.enter_context(patch("decimalai.init"))
+# init() runs FOR REAL, with only its network probe turned off.
+#
+# It used to be replaced wholesale, which meant no DecimalConfig was ever built,
+# so the skill router singleton could not be constructed and the skills rail was
+# inert for the entire test — the rail was asserted to be INSTALLED while having
+# nothing to route with. Wrapping instead of replacing keeps `_init.called` true
+# and makes the rail actually run.
+import decimalai as _decimalai
+_real_init = _decimalai.init
+_init = _stack.enter_context(patch(
+    "decimalai.init",
+    side_effect=lambda *a, **k: _real_init(*a, **{{**k, "verify": False}}),
+))
 _flush = _stack.enter_context(patch("decimalai.flush"))
 
 # load_agent() is the third network call the generated file makes, and it runs
@@ -167,7 +239,7 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER.format(
         stub=spec["stub"], probe=spec["probe"], path=str(agent_py),
-        agent=AGENT, prompt=prompt,
+        agent=AGENT, prompt=prompt, router=ROUTER_FIXTURE,
     ))
 
     proc = subprocess.run(
@@ -227,8 +299,247 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     if framework == "langchain":
         assert "LAST_TURN: human" in out, out
 
+        # THE CANARY — the assertion this whole file existed without.
+        #
+        # Every other check here proves a rail was INSTALLED or a name was
+        # BOUND. None of them proved the thing the product promises: that a
+        # skill's knowledge reaches the model. On 2026-08-28 a real agent built
+        # by `decimalai init` answered a customer with one sentence about its
+        # own tooling, because LangChain owns no tool loop and body injection
+        # defaulted off — so the model got a menu of titles it could not read.
+        # The suite was green throughout.
+        #
+        # Offered-but-not-delivered is the exact failure state, so assert both
+        # rungs separately: a test that only checked "the skill was mentioned"
+        # would have passed against the bug.
+        assert "SKILL_OFFERED: True" in out, out
+        assert "SKILL_BODY_DELIVERED: True" in out, (
+            "The skill's BODY never reached the model — it was offered as a menu "
+            "row the model has no way to read. On an adapter with no tool loop, "
+            "prompt injection is the only body channel.\n" + out
+        )
+
     # Exactly one DecimalAI processor. Two would mean every span is sent
     # twice — the failure `init(openai_agents=True)` plus `instrument()`
     # produces, and the reason the template passes a bare `init()`.
     if framework == "openai-agents":
         assert "PROCESSORS: 1" in out, out
+
+
+# ── the langchain template must be an AGENT, not a chat completion ───
+#
+# The test above runs the template AS GENERATED, with no tools. That is the
+# happy path and it stayed green through the entire defect: until 2026-08-29
+# the template emitted `agent = init_chat_model(MODEL)` — a chat completion in
+# a variable named `agent` — and answering one question with no tools works
+# fine on a bare chat model.
+#
+# What did not work was the very next thing the template's own docstring told
+# the user to do: "Add tools, memory or a graph here". Binding a tool to a bare
+# chat model makes the model reply with `tool_calls` and an EMPTY `.content`.
+# Nothing runs the tool, nothing feeds a result back, and `run()` returns "".
+# So the file shipped by the DEFAULT framework of a product whose whole
+# vocabulary is "agent" stopped being an agent the moment it was used as one.
+#
+# This test does what that user would do — it adds a tool at the seam the
+# template advertises — and asserts the loop actually closes.
+
+#: The seam. Asserted to exist before the substitution, so removing `TOOLS`
+#: from the template fails here loudly instead of turning the replace below
+#: into a silent no-op that leaves the test passing against nothing.
+#: Subprocess budget for the two tests below.
+#:
+#: 300, not the 120 the parametrized test above uses, and measured rather than
+#: guessed: each of these spends ~60s importing langchain + langgraph and
+#: building a real agent graph in a cold interpreter, which fits inside 120
+#: alone and does NOT fit when the rest of the suite is competing for the
+#: machine. It failed exactly that way once. A generous ceiling on a subprocess
+#: that normally finishes in a minute costs nothing when it passes; a tight one
+#: makes the whole suite flaky under load, which is worse than slow.
+SLOW_TIMEOUT = 300
+
+TOOL_SEAM = "TOOLS: list = []"
+
+#: A fact only the TOOL can supply — not in the prompt, not in the skill body,
+#: not in the model stub's own vocabulary. It reaches the transcript only if
+#: the tool was really called and its result was really fed back to the model.
+TOOL_FACT = "ORDER-7 shipped on Tuesday"
+
+TOOL_DEFINITION = f'''from langchain_core.tools import tool
+
+
+@tool
+def order_status(order_id: str) -> str:
+    """Look up an order's status."""
+    return {TOOL_FACT!r}
+
+
+TOOLS: list = [order_status]'''
+
+#: A model that behaves like gpt-4o-mini does with a tool bound: one turn of
+#: `tool_calls` with EMPTY content, then an answer that quotes what came back.
+TOOL_LOOP_STUB = '''
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+_sent = []
+
+
+class _Fake(BaseChatModel):
+    """A real BaseChatModel subclass, so the skills rail's `invoke` patch is
+    still on the call path (see the sibling stub for why that matters)."""
+
+    @property
+    def _llm_type(self):
+        return "fake"
+
+    def bind_tools(self, tools, **kwargs):
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        return self.bind(
+            tools=[convert_to_openai_tool(t) for t in tools], **kwargs
+        )
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        _sent.append(messages)
+        bound = kwargs.get("tools") or []
+        results = [m for m in messages if getattr(m, "type", None) == "tool"]
+        if bound and not results:
+            # EXACTLY the shape that broke the old template: tool_calls, and
+            # content is the empty string.
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(
+                content="",
+                tool_calls=[{"name": "order_status",
+                             "args": {"order_id": "7"}, "id": "call_1"}],
+            ))])
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(
+            content="Status: " + (str(results[-1].content) if results
+                                  else "<the tool never ran>"),
+        ))])
+
+
+_stack.enter_context(
+    patch("langchain.chat_models.init_chat_model", return_value=_Fake())
+)
+'''
+
+TOOL_LOOP_PROBE = '''
+# What run() actually returned. The old template returned "" here.
+_answer = _mod["run"]("Where is order 7?")
+print("ANSWER:", repr(_answer))
+print("ANSWER_EMPTY:", not str(_answer).strip())
+
+# The tool was bound to the model at all — the old template never passed
+# TOOLS anywhere, so nothing was ever bound.
+print("TOOLS_BOUND:", any(
+    getattr(m, "tool_calls", None) for msgs in _sent for m in msgs
+) or len(_sent) > 1)
+
+# And the skill body still arrives with a tool in play: adding a tool must not
+# cost the user their skills.
+_all = "\\n".join(
+    str(getattr(m, "content", "")) for msgs in _sent for m in msgs
+)
+print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
+'''
+
+
+def test_langchain_template_survives_a_bound_tool(tmp_path):
+    """Add a tool where the template says to, and the agent still answers.
+
+    RED against the pre-2026-08-29 template, which built a bare chat model:
+    `run()` returned "" and the tool's result never reached the model.
+    """
+    if not _have("langchain"):
+        pytest.skip("langchain not installed")
+
+    source = render_agent_file(AGENT, "langchain", SKILLS)
+    assert TOOL_SEAM in source, (
+        "the langchain template no longer exposes a TOOLS seam — either it "
+        "regressed to a bare chat model, or the seam was renamed and this "
+        "test must be renamed with it.\n" + source
+    )
+    agent_py = tmp_path / "agent.py"
+    agent_py.write_text(source.replace(TOOL_SEAM, TOOL_DEFINITION))
+
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER.format(
+        stub=TOOL_LOOP_STUB, probe=TOOL_LOOP_PROBE, path=str(agent_py),
+        agent=AGENT, prompt=PROMPT, router=ROUTER_FIXTURE,
+    ))
+
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        capture_output=True, text=True, cwd=tmp_path, timeout=SLOW_TIMEOUT,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(REPO_ROOT),
+            "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
+            "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
+            "DECIMAL_AUTOINIT": "false",
+        },
+    )
+    assert proc.returncode == 0, (
+        f"the generated langchain file died once a tool was added:\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )
+    out = proc.stdout
+
+    # THE RATCHET. A bare chat model answers a tool call with empty content,
+    # so this is the assertion the old template failed.
+    assert "ANSWER_EMPTY: False" in out, (
+        "run() returned an empty string once a tool was bound — the template "
+        "is a chat completion, not an agent. A bare chat model replies with "
+        "tool_calls and no content, and nothing runs the loop.\n" + out
+    )
+    # And the loop CLOSED: the tool ran and its result went back to the model.
+    # Without this, a template that merely returned some non-empty string
+    # (an error message, say) would pass the check above.
+    assert f"Status: {TOOL_FACT}" in out, (
+        "the tool's result never reached the model — the loop did not close.\n"
+        + out
+    )
+    # Adding a tool must not cost the user their skills.
+    assert "SKILL_BODY_DELIVERED: True" in out, out
+
+
+def test_langchain_template_emits_no_deprecation_warnings(tmp_path):
+    """The generated file must not warn on every run.
+
+    `langgraph.prebuilt.create_react_agent` — the obvious way to add a loop —
+    raises `LangGraphDeprecatedSinceV10` on import-and-call and is removed in
+    langgraph 2.0. A scaffold whose first run prints a deprecation notice
+    teaches the user their setup is wrong when it is not, so the template uses
+    `langchain.agents.create_agent` instead. This is what keeps it there.
+    """
+    if not _have("langchain"):
+        pytest.skip("langchain not installed")
+
+    agent_py = tmp_path / "agent.py"
+    agent_py.write_text(render_agent_file(AGENT, "langchain", SKILLS))
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER.format(
+        stub=RUNTIMES["langchain"]["stub"], probe="", path=str(agent_py),
+        agent=AGENT, prompt=PROMPT, router=ROUTER_FIXTURE,
+    ))
+
+    proc = subprocess.run(
+        [sys.executable, "-W", "error::DeprecationWarning", str(driver)],
+        capture_output=True, text=True, cwd=tmp_path, timeout=SLOW_TIMEOUT,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(REPO_ROOT),
+            "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
+            "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
+            "DECIMAL_AUTOINIT": "false",
+        },
+    )
+    # Match on the class name rather than the module: langchain and langgraph
+    # each subclass DeprecationWarning under their own name, and -W error
+    # surfaces whichever fires.
+    assert "Deprecat" not in proc.stderr, (
+        "the generated file emits a deprecation warning on a plain run:\n"
+        + proc.stderr
+    )
+    assert proc.returncode == 0, (
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )

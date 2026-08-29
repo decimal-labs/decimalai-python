@@ -134,9 +134,9 @@ def _scaffold_agent_file(
 
     from .scaffold import (
         DEFAULT_OUTPUT,
-        ENV_VARS,
-        INSTALL,
         UnknownFramework,
+        env_vars,
+        install_command,
         normalize_framework,
         render_agent_file,
     )
@@ -369,10 +369,10 @@ def _scaffold_agent_file(
         click.echo("    run time, so this does not affect what it will send.")
     click.echo("")
     click.echo("  Install:")
-    click.echo(f"    {INSTALL[framework]}")
+    click.echo(f"    {install_command(framework, model)}")
     click.echo("")
     click.echo("  Set:")
-    for var in ENV_VARS[framework]:
+    for var in env_vars(framework, model):
         already = " (already set)" if os.environ.get(var) else ""
         click.echo(f'    export {var}="..."{already}')
     click.echo("")

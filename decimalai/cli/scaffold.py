@@ -10,8 +10,8 @@ We generate; they run. Nothing here executes the agent, ships a runtime, or
 phones home at run time beyond the SDK the file imports — the model is
 `create-next-app`, not hosting.
 
-THREE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
-----------------------------------------------
+FOUR THINGS THIS TEMPLATE EXISTS TO GET RIGHT
+---------------------------------------------
 
 0. The agent's own SYSTEM PROMPT is what it runs on. Until 2026-08-25 the
    langchain template sent no system message at all and the openai-agents one
@@ -44,6 +44,27 @@ THREE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    filed under a different agent than the one the user configured — their page
    stays empty forever while traces pile up somewhere else. Same bug the
    dashboard snippets were fixed for on 2026-08-22.
+
+3. What comes out is an AGENT. Until 2026-08-29 the langchain template emitted
+   `agent = init_chat_model(MODEL)` — a chat completion with a variable named
+   `agent` and no tool loop anywhere — while its own docstring said "Add tools,
+   memory or a graph here". Following that advice breaks the file: binding a
+   tool to a bare chat model makes the model reply with `tool_calls` and an
+   EMPTY `.content`, so `run()` returns `""` and nothing ever runs the tool.
+   Measured against gpt-4o-mini and reproduced in
+   `tests/test_cli_init_scaffold_runs.py::test_langchain_template_survives_a_bound_tool`.
+   It now emits `create_agent(model, tools=TOOLS, system_prompt=...)` with
+   `TOOLS = []` — a real loop that happens to have no tools yet, so the seam
+   the docstring points at is one the file actually has.
+
+   `langchain.agents.create_agent`, NOT `langgraph.prebuilt.create_react_agent`.
+   Two reasons, both checked by running it: the langgraph symbol raises
+   `LangGraphDeprecatedSinceV10` on every single run (it moved, and goes away in
+   langgraph 2.0), and it lives in a package the template does not otherwise
+   import. `langchain.agents` is the same distribution `init_chat_model` already
+   comes from, so the install line does not grow. `langchain` 0.3.x has no
+   `create_agent`, and cannot be what resolves here: `decimalai[langchain]`
+   floors `langchain-core>=1.3.3`, which 0.3.x caps below 1.0.
 
 RELATIONSHIP TO THE DASHBOARD'S COPY-PASTE SNIPPETS
 ---------------------------------------------------
@@ -311,21 +332,29 @@ def _render_langchain(
     return [
         "import decimalai",
         "from decimalai.langchain import instrument",
+        "from langchain.agents import create_agent",
         "from langchain.chat_models import init_chat_model",
-        "from langchain_core.messages import HumanMessage, SystemMessage",
+        "from langchain_core.messages import HumanMessage",
         "",
         "# Change this to any chat model you have a key for, e.g.",
-        '#   "gpt-4o-mini" · "anthropic:claude-sonnet-4-5" · "google_genai:gemini-2.5-flash"',
-        "# (install that provider's package too: pip install langchain-anthropic)",
+        '#   "gpt-4o-mini" · "anthropic:claude-sonnet-4-6" · "google_genai:gemini-3.5-flash"',
+        "# (install that provider\'s package too: langchain-anthropic /",
+        "#  langchain-google-genai)",
         f"MODEL = {_py(model)}",
         "",
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         _init_call(base_url),
         "",
-        "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# It defaults to False, and tracing alone does not deliver them: without",
-        "# this flag the model is handed a list of skill titles it cannot read.",
+        "# Two things have to be true for a skill to reach the model on LangChain.",
+        "# enable_skill_loader=True puts the skill MENU in the prompt. Delivering the",
+        "# skill's BODY is separate: the DecimalAI LangChain adapter registers no",
+        "# load_skill tool — it installs on the chat model, below any loop — so",
+        "# prompt injection is the only body channel it has. That stays true no",
+        "# matter how many tools you add to TOOLS below; the agent loop is yours,",
+        "# not a channel the adapter can hand a skill body back through.",
+        "# The SDK turns injection on by default for adapters with no load_skill",
+        "# tool — pass init(inject_skill_body=False) if you want menu-only.",
         "#",
         "# Do not also pass langchain=True to init() above. That installs tracing a",
         "# first time with the loader off, and the repeat call cannot undo the",
@@ -342,27 +371,43 @@ def _render_langchain(
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
         f"config = decimalai.load_agent({_py(agent_name)})",
         "",
-        "# None means this agent has no prompt set — a real state, not a failure",
-        "# (a failed read raises instead). Then we send no system message at all,",
-        "# rather than invent one and put words in the agent's mouth.",
-        "PREAMBLE = (",
-        "    [SystemMessage(content=config.system_prompt)] if config.system_prompt",
-        "    else []",
-        ")",
+        "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
+        "# loop runs, the skills rail delivers, and adding a tool later needs no",
+        "# other change to this file.",
+        "#",
+        "# This has to be an agent loop and not a bare chat model, which is what",
+        "# this template used to emit. `init_chat_model(MODEL)` on its own has no",
+        "# loop, so the moment you bind a tool to it the model replies with",
+        "# tool_calls and an EMPTY .content — nothing runs the tool, nothing feeds",
+        "# the result back, and run() returns \"\". Measured on gpt-4o-mini,",
+        "# 2026-08-28; the old template's own docstring invited exactly that.",
+        "TOOLS: list = []",
         "",
-        "agent = init_chat_model(MODEL)",
+        "# create_agent runs the tool loop and returns the final state. The system",
+        "# prompt is handed to it BY THIS LINE, from the config read above — and",
+        "# None (this agent has no prompt set, a real state; a failed read raises",
+        "# instead) means it sends no system message at all, rather than one this",
+        "# file invented.",
+        "agent = create_agent(",
+        "    init_chat_model(MODEL),",
+        "    tools=TOOLS,",
+        "    system_prompt=config.system_prompt,",
+        ")",
         "",
         "",
         "def run(question: str) -> str:",
-        '    """One turn.',
+        '    """One turn: the loop runs until the model answers.',
         "",
-        "    Add tools, memory or a graph here — the skills rail is already wired",
-        "    and stays wired, because it is installed on the chat model itself.",
+        "    Add tools to TOOLS above — the skills rail is installed on the chat",
+        "    model itself, so it stays wired through every turn of the loop.",
         '    """',
-        "    # Message objects, not (\"system\", \"...\") tuples: the skills rail reads",
-        "    # the human turn off this list to route, and a tuple carries no role",
+        "    # A HumanMessage object, not a (\"human\", \"...\") tuple: the skills rail",
+        "    # reads the trailing human turn to route, and a tuple carries no role",
         "    # it can read — with tuples every call falls back to the full menu.",
-        "    return agent.invoke([*PREAMBLE, HumanMessage(content=question)]).content",
+        "    state = agent.invoke({\"messages\": [HumanMessage(content=question)]})",
+        "    # The LAST message, which after the loop is the model's answer. An",
+        "    # intermediate tool-call turn has empty content; this one does not.",
+        "    return state[\"messages\"][-1].content",
         "",
         "",
         'if __name__ == "__main__":',
@@ -379,17 +424,24 @@ def _render_openai_agents(
     return [
         "import decimalai",
         "from agents import Agent, Runner",
+        "from agents.exceptions import MaxTurnsExceeded",
         "from decimalai.openai_agents import instrument",
         "",
         "# Change this to any model your OpenAI key can reach.",
         f"MODEL = {_py(model)}",
+        f"AGENT_NAME = {_py(agent_name)}",
+        "# The SDK default is 10, which a skill-loading turn can legitimately",
+        "# exceed. Raise it if your agent has many tools; lower it to fail faster.",
+        "MAX_TURNS = 20",
         "",
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         _init_call(base_url),
         "",
         "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# It defaults to False, and tracing alone does not deliver them.",
+        "# It defaults to False, and tracing alone does not deliver them. This",
+        "# adapter owns a tool loop, so the model fetches each skill's body on",
+        "# demand via the load_skill tool rather than having it injected.",
         "#",
         "# This call must stay ABOVE the Agent(...) below: the loader works by",
         "# wrapping Agent.__init__, and on builds without the run-time hooks an",
@@ -425,7 +477,17 @@ def _render_openai_agents(
         "    Add tools or handoffs to the Agent above — the skills rail rides on",
         "    the agent's instructions, so it survives both.",
         '    """',
-        "    return Runner.run_sync(agent, question).final_output",
+        "    try:",
+        "        return Runner.run_sync(agent, question, max_turns=MAX_TURNS).final_output",
+        "    except MaxTurnsExceeded:",
+        "        # The model kept calling tools without answering. Usually it is",
+        "        # chasing a tool the prompt names but this file does not define —",
+        "        # check the Tools line in your system prompt against the tools",
+        "        # actually attached to the Agent above.",
+        "        return (",
+        "            f\"[{AGENT_NAME}] stopped after {MAX_TURNS} turns without an answer. \"",
+        "            \"See the comment in run().\"",
+        "        )",
         "",
         "",
         'if __name__ == "__main__":',
@@ -454,6 +516,60 @@ ENV_VARS: Dict[str, tuple] = {
     "langchain": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
     "openai-agents": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
 }
+
+#: LangChain's `init_chat_model` takes a `provider:model` string. The provider
+#: half decides which package to install and which key to export — so the
+#: framework alone does not determine either.
+_PROVIDER_REQUIREMENTS: Dict[str, tuple] = {
+    # provider prefix -> (extra pip packages, model-provider env var)
+    "openai": ("langchain-openai", "OPENAI_API_KEY"),
+    "anthropic": ("langchain-anthropic", "ANTHROPIC_API_KEY"),
+    "google_genai": ("langchain-google-genai", "GOOGLE_API_KEY"),
+    "google_vertexai": ("langchain-google-vertexai", "GOOGLE_API_KEY"),
+    "groq": ("langchain-groq", "GROQ_API_KEY"),
+    "mistralai": ("langchain-mistralai", "MISTRAL_API_KEY"),
+    "cohere": ("langchain-cohere", "COHERE_API_KEY"),
+    "fireworks": ("langchain-fireworks", "FIREWORKS_API_KEY"),
+    "together": ("langchain-together", "TOGETHER_API_KEY"),
+    "ollama": ("langchain-ollama", ""),  # local, no key
+}
+
+
+def model_provider(model: str) -> str:
+    """The provider half of a `provider:model` string; "openai" when bare.
+
+    `init_chat_model("gpt-4o-mini")` infers OpenAI from the model name, so a
+    bare string means OpenAI in practice.
+    """
+    raw = str(model or "")
+    return raw.split(":", 1)[0].strip().lower() if ":" in raw else "openai"
+
+
+def install_command(framework: str, model: str = DEFAULT_MODEL) -> str:
+    """The pip line for this (framework, model) pair.
+
+    Keyed on the pair, not on the framework: until 2026-08-28 this was a dict
+    on framework alone, so `--model anthropic:...` printed
+    `pip install langchain-openai` and `export OPENAI_API_KEY` — the wrong
+    package and the wrong key, while the key the user actually needed went
+    unmentioned.
+    """
+    if framework != "langchain":
+        return INSTALL[framework]
+    package, _ = _PROVIDER_REQUIREMENTS.get(
+        model_provider(model), _PROVIDER_REQUIREMENTS["openai"]
+    )
+    return f'pip install "decimalai[langchain]" langchain {package}'
+
+
+def env_vars(framework: str, model: str = DEFAULT_MODEL) -> tuple:
+    """The env vars this (framework, model) pair needs, DECIMAL_API_KEY first."""
+    if framework != "langchain":
+        return ENV_VARS[framework]
+    _, key = _PROVIDER_REQUIREMENTS.get(
+        model_provider(model), _PROVIDER_REQUIREMENTS["openai"]
+    )
+    return ("DECIMAL_API_KEY", key) if key else ("DECIMAL_API_KEY",)
 
 
 def render_agent_file(

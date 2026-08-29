@@ -54,6 +54,12 @@ dependencies = [
     # Bisected: 2.0 FAIL, 2.0.3 FAIL, 2.1 FAIL, 2.2 FAIL, 2.3 OK, 2.4 OK.
     "pydantic>=2.3",
     "httpx>=0.28.1",
+    # `_config.py` reads a project's .env at import so DECIMAL_API_KEY can live
+    # in a file rather than a shell. That was written as a best-effort optional
+    # import, which meant whether the feature existed at all depended on what
+    # some OTHER package happened to drag in — present on a laptop with a fat
+    # venv, absent in a slim container, with no signal either way. Declare it.
+    "python-dotenv>=1.0",
     # 8.2 is the floor a bare `decimalai` invocation actually needs: before it,
     # a no-args group exits 0 instead of 2, so the start hint never fires.
     # Bisected 2026-08-17 — 8.0/8.1 fail, 8.2/8.3 pass.
@@ -169,6 +175,16 @@ dev = [
     # did not catch it because the audit job installs `.`, not `.[dev]`.
     "langchain-core>=1.3.3; python_version >= '3.11'",
     "langchain-core>=1.4.8; python_version < '3.11'",
+    # The `langchain` package itself, and langchain-openai — NOT redundant with
+    # langchain-core above. The scaffold's generated file imports
+    # `from langchain.chat_models import init_chat_model`, which lives in
+    # `langchain`, not `langchain-core`. Without these two, both langchain cases
+    # of tests/test_cli_init_scaffold_runs.py SKIPPED on every CI run — a
+    # permanent skip that read as a pass — so the framework 100% of `decimalai
+    # init` users get by default was the one whose execution test never ran.
+    # That is how the 2026-08-28 skill-delivery defect reached users green.
+    "langchain",
+    "langchain-openai",
     # openai-agents moved out of core deps into an extra; keep it in dev so the
     # default unit suite still exercises the openai_agents adapter.
     "openai-agents>=0.17.2",
