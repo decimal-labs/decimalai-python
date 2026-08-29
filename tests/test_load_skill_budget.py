@@ -92,8 +92,13 @@ class TestLoadSkill:
         # Server-side trim requested: max_chars carried as a query param.
         params = req.call_args[1]["params"]
         assert params["max_chars"] == router.per_body_char_limit
-        # Best-effort activation telemetry.
-        logged.assert_called_once_with(name="code-review")
+        # Best-effort activation telemetry. Asserted on the NAME rather than on
+        # the whole call: `log_skill_loaded` also takes an optional `hash=` (the
+        # body's content_hash, so the activation resolves to a skill VERSION),
+        # and pinning the exact signature here made adding it look like a
+        # behaviour change when the reported load is identical.
+        logged.assert_called_once()
+        assert logged.call_args.kwargs["name"] == "code-review"
 
     def test_agent_name_kwarg_forwarded_as_param(self):
         router = _router()
@@ -124,9 +129,18 @@ class TestLoadSkill:
             # The refusal tells the model what IS loaded so it can proceed.
             assert "a" in refusal and "b" in refusal
 
-            # Dedup: an ALREADY loaded name is free and returns the body again.
+            # Dedup: an ALREADY loaded name still costs no budget, but it does
+            # NOT get the body back a second time. Returning it again is what let
+            # the openai-agents scaffold loop turns 3..10 on one skill and die
+            # with MaxTurnsExceeded without ever answering — the refusal path
+            # above only fires on DISTINCT names, so it never saw the repeat.
             again = router.load_skill("a")
-            assert again == "## Skill: a\n\nBODY of a"
+            assert "already loaded" in again
+            assert "BODY of a" not in again
+            assert "answer the user" in again.lower()
+            # Still free: the repeat is not reported as budget exhaustion, so it
+            # did not consume one of the two body slots a second time.
+            assert "budget exhausted" not in again
 
     def test_token_budget_refuses_second_large_body(self):
         router = _router(body_token_budget=50)
@@ -225,8 +239,13 @@ class TestBodyLoadBudgetDeadline:
         assert "deadline" in refusal
         assert "budget exhausted" in refusal
 
-        # Dedup stays free even past the deadline.
-        assert budget.check("first") is None
+        # A repeat is still free of BUDGET — it is not the deadline refusal —
+        # but it now returns the "already loaded, answer now" message rather
+        # than None, so the caller hands that to the model instead of the body.
+        repeat = budget.check("first")
+        assert repeat is not None
+        assert "already loaded" in repeat
+        assert "budget exhausted" not in repeat
 
 
 # ── inject path guardrail ────────────────────────────────────────

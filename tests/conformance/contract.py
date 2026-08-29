@@ -30,7 +30,16 @@ C11         a run writes nothing into the working directory
 C12         when the adapter cannot do what was asked, it says so
 C13         nothing is recorded as activated that the model did not ask for
 C13b        a body the model DID pull is not silently dropped
+C14         a skill's BODY reached the model, by any channel
+D1          …and each channel delivers ON ITS OWN (see the delivery axis below)
 ==========  ==========================================================
+
+C1–C14 are the per-driver matrix: one capture per driver, in the adapter's own
+resolved configuration. D1 is a second axis over the SAME contract style — one
+capture per (driver, body channel), with the other channel switched off — and is
+graded by :func:`grade_delivery` rather than by an entry in ``ITEMS``, because
+adding it to ``ITEMS`` would grade the adapter's default channel twice and vary
+nothing. See ``delivery.py`` for why the axis exists.
 
 C7b is the second clause of C7 ("a degenerate run does not fabricate a breaking
 change") split into its own function so a framework that has no degenerate form
@@ -49,7 +58,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .delivery import (
+    DEFAULT as DELIVERY_DEFAULT,
+)
+from .delivery import (
+    MODE_CHANNELS,
+    MODE_ENV,
+    PROMPT_CHANNEL,
+    TOOL_CHANNEL,
+)
 from .harness import Observation, Phase
+from .isolation import body_sentinel
 
 PASS = "pass"
 FAIL = "fail"
@@ -931,10 +950,17 @@ def c13_skills_activation(obs: Observation) -> Result:
     if problems:
         return _fail(item, title, _summarize(problems))
     if not activated_total:
+        # Say only what this item graded. The message used to assert
+        # "the strongest observable rung is delivered" unconditionally, without
+        # consulting `served`, the rendered text, or anything else — so on a rail
+        # that delivered NOTHING, the one line a human reads in the matrix told
+        # them delivery had happened. C14 now owns the delivery verdict; C13
+        # reports the absence of activation and nothing more.
         return _pass(
             item, title,
-            f"{len(traces)} rail run(s) recorded NO activation; correct for a "
-            f"prompt-injection rail, where the strongest observable rung is delivered",
+            f"{len(traces)} rail run(s) recorded no activation — expected on a "
+            f"prompt-injection rail, where the model never asks for a skill by "
+            f"name. Whether a body actually reached it is C14's verdict, not this one",
         )
     counts = set(per_trace)
     shape = (
@@ -1002,6 +1028,454 @@ def c13b_skills_activation_recorded(obs: Observation) -> Result:
     )
 
 
+def c14_skills_body_delivered(obs: Observation) -> Result:
+    """A skill's BODY reached the model — by any channel.
+
+    THE ITEM THIS SUITE DID NOT HAVE, and the reason a shipped agent could
+    answer a customer with one sentence about its own tooling while this matrix
+    printed 14 pass / 0 FAIL.
+
+    The skills ladder has three rungs — OFFERED (a menu row naming the skill),
+    DELIVERED (its bytes in front of the model), ACTIVATED (the model asked for
+    it). C8 grades OFFERED. C13/C13b grade ACTIVATED. DELIVERED was graded only
+    as a converse: C8's clause sits behind ``if served:``, so a rail that fetches
+    ZERO bodies satisfies it vacuously — the guard fires only when delivery has
+    already happened. Verified: the suite is byte-identically green with the body
+    channel working and with it dead.
+
+    This item grades the OUTCOME, so no adapter can decline it on capability
+    grounds. "This adapter has no way to deliver a body" is not an exemption,
+    it is the finding: an adapter with no tool loop is exactly the one for which
+    prompt injection is the ONLY channel, so it is where a False default is
+    fatal rather than merely suboptimal.
+
+    Gated on ``has_skills_rail`` alone — a framework that was never offered a
+    skill genuinely cannot deliver one. It is deliberately NOT gated on
+    ``model_can_load_skill_bodies``: that flag says which CHANNEL is available,
+    and this item does not care which channel carried the bytes.
+    """
+    item, title = "C14", "skills_body_delivered"
+    phase = obs.phase("skills")
+    traces = phase.attempted
+    if not traces:
+        return _fail(
+            item, title,
+            "the skills-rail run produced no trace at all — delivery cannot be "
+            "graded because nothing reached the wire",
+        )
+
+    bodies = {s["name"]: s.get("body", "") for s in obs.probe.skills}
+    # Prefer the fixture's explicit sentinel over the longest-line heuristic:
+    # a menu row can never contain it, whatever the skill's prose looks like.
+    sentinels = {n: (body_sentinel(b) or _body_signature(b)) for n, b in bodies.items()}
+
+    delivered_by_trace: List[str] = []
+    for t in traces:
+        rendered = _rendered_text(t)
+        hit = ""
+        for name, sig in sentinels.items():
+            if not sig:
+                continue
+            if sig in rendered:
+                hit = f"{name} (in the prompt the model was shown)"
+                break
+            if any(
+                role in _TOOL_RESULT_ROLES and sig in text
+                for role, text in _role_messages(t)
+            ):
+                hit = f"{name} (returned by a tool call)"
+                break
+        delivered_by_trace.append(hit)
+
+    delivered = [h for h in delivered_by_trace if h]
+    if not delivered:
+        offered = sorted(bodies)
+        return _fail(
+            item, title,
+            f"the rail offered {offered} across {len(traces)} run(s) and delivered "
+            "ZERO bodies by any channel: no body text in what the model was shown, "
+            "and no tool-role message carrying one. The model was handed a MENU it "
+            "has no mechanism to read, so a skill cannot influence its answer and "
+            "activation is structurally impossible. Check that this adapter has at "
+            "least one body channel: a registered load_skill tool, or "
+            "inject_skill_body resolving True (see DecimalConfig.resolve_inject_body).",
+        )
+
+    return _pass(
+        item, title,
+        f"{len(delivered)}/{len(traces)} rail run(s) put a skill body in front of "
+        f"the model — {delivered[0]}",
+    )
+
+
+# ── the delivery axis (D1) ───────────────────────────────────────────────────
+#
+# C14 asks "did a body reach the model AT ALL?". This asks the next question:
+# "does THIS channel carry it, ON ITS OWN?" — because the defect that started all
+# of this was channel arithmetic, not a single broken channel. langchain had
+# `inject_skill_body` False AND no `load_skill` tool: each half was defensible on
+# its own and the sum was zero. C14 catches the sum being zero. D1 catches one
+# half being zero, which is where the sum goes wrong next.
+#
+# It is graded on a SEPARATE observation per (driver, mode), captured in a child
+# process whose environment switched the other channel OFF — so every cell is
+# also a kill-switch test: the OFF channel must really be off. See delivery.py.
+#
+# Deliberately NOT in ITEMS. The per-driver matrix grades each adapter in its own
+# resolved default mode; adding a 17th column there would grade the same default
+# twice and vary nothing.
+
+DELIVERY_ITEM = "D1"
+
+
+def _delivery_channels(trace: Dict[str, Any], sentinel: str) -> set:
+    """Which channel(s) put ``sentinel`` in front of the model in this trace.
+
+    Two channels, told apart by WHO spoke — the same distinction C13 rests on:
+
+    * ``prompt`` — the body is in a system/developer message, or in a
+      ``rendered_input`` that carried no role at all. That is the router pasting
+      it in.
+    * ``tool``   — the body comes back under a tool/function role, or as the
+      output of a tool span. That is the model having asked.
+
+    A user or assistant message carrying the body is NEITHER: it is the user
+    pasting it or the model quoting it back, and counting it would let a cell
+    pass on a channel nobody switched on. Verified against real captures of all
+    four rail adapters — every delivery lands as ``system`` or as ``tool``.
+    """
+    found: set = set()
+    if not sentinel:
+        return found
+    for role, text in _role_messages(trace):
+        if sentinel not in text:
+            continue
+        if role in _TOOL_RESULT_ROLES:
+            found.add(TOOL_CHANNEL)
+        elif role in ("system", "developer", UNSTRUCTURED_ROLE):
+            found.add(PROMPT_CHANNEL)
+    for span in _tool_spans(trace):
+        if sentinel in _flat(span.get("output_preview")):
+            found.add(TOOL_CHANNEL)
+    return found
+
+
+def _mode_env_text(mode: str) -> str:
+    env = MODE_ENV.get(mode, {})
+    return " ".join(f"{k}={v}" for k, v in sorted(env.items()))
+
+
+def _grade_framework_limit(obs: Observation, mode: str, limit: Any) -> Result:
+    """A declared framework limit must PROVE itself on this run.
+
+    ``Capabilities.__post_init__`` enforces that a reason exists, never that it
+    is true — which is how C13b came to be N/A on langchain by a reason that was
+    the defect, stated correctly. So an N/A here is not granted for being
+    declared: the driver ASKS the adapter for the mode, and the adapter has to
+    refuse out loud, in this process, on this run. If the adapter ever grows the
+    capability the refusal stops being emitted and the excuse stops being
+    accepted — the N/A goes red rather than outliving the limit.
+    """
+    item, title = f"{DELIVERY_ITEM}[{mode}]", "delivery_channel"
+    phase = obs.phase("skills")
+    said = [line for line in phase.logs if limit.refusal_marker in line]
+    if not said:
+        return _fail(
+            item, title,
+            f"{obs.driver.name} declares the {mode} channel a FRAMEWORK limit, but "
+            f"the adapter never said so on this run: nothing in the captured "
+            f"warnings contains {limit.refusal_marker!r}. Either the adapter grew "
+            f"the capability (delete the delivery_limits entry and let the cell be "
+            f"graded), or it stopped warning and now fails silently — which is the "
+            f"defect, not the exemption. Captured warnings: "
+            f"{_summarize(phase.logs) or 'none'}",
+        )
+    # The limit claims the channel does not exist. Prove it did not quietly work.
+    bodies = {s["name"]: s.get("body", "") for s in obs.probe.skills}
+    sentinels = {n: (body_sentinel(b) or _body_signature(b)) for n, b in bodies.items()}
+    forbidden = MODE_CHANNELS[mode][0]
+    leaked = sorted(
+        name
+        for t in phase.attempted
+        for name, sig in sentinels.items()
+        if forbidden in _delivery_channels(t, sig)
+    )
+    if leaked:
+        return _fail(
+            item, title,
+            f"{obs.driver.name} declares the {mode} channel impossible and the "
+            f"adapter printed its refusal — but the body of {leaked} reached the "
+            f"model by that very channel anyway. One of the two is lying, and a "
+            f"limit that is not true is worse than no limit: it is a permanent "
+            f"exemption for a rung the adapter can actually climb.",
+        )
+    return Result(
+        item, title, NA,
+        f"{limit.reason} PROVEN ON THIS RUN: the adapter emitted "
+        f"{limit.refusal_marker!r} when asked, and delivered zero bodies by the "
+        f"{forbidden} channel.",
+    )
+
+
+def grade_delivery(obs: Observation) -> Result:
+    """One body channel, on its own: does it deliver, and is the other one OFF?
+
+    Reads ``obs.ctx.delivery_mode`` — stamped by the child that ran with the
+    matching environment — so this function cannot be pointed at a capture taken
+    under some other mode and asked to grade this one.
+    """
+    mode = obs.ctx.delivery_mode
+    if mode == DELIVERY_DEFAULT:
+        return _fail(
+            DELIVERY_ITEM, "delivery_channel",
+            "grade_delivery was handed a capture taken in the adapter's DEFAULT "
+            "mode — that grades whichever channel the adapter felt like, which is "
+            "the thing this axis exists to replace",
+        )
+    limit = obs.driver.capabilities.delivery_limit(mode)
+    if limit is not None:
+        return _grade_framework_limit(obs, mode, limit)
+
+    item, title = f"{DELIVERY_ITEM}[{mode}]", "delivery_channel"
+    required, forbidden = MODE_CHANNELS[mode]
+    phase = obs.phase("skills")
+    traces = phase.attempted
+    if not traces:
+        return _fail(
+            item, title,
+            f"the {mode} rail run produced no trace at all — the channel cannot be "
+            f"graded because nothing reached the wire",
+        )
+
+    bodies = {s["name"]: s.get("body", "") for s in obs.probe.skills}
+    sentinels = {n: (body_sentinel(b) or _body_signature(b)) for n, b in bodies.items()}
+
+    delivered: List[str] = []
+    leaked: List[str] = []
+    for t in traces:
+        for name, sig in sentinels.items():
+            channels = _delivery_channels(t, sig)
+            if required in channels:
+                delivered.append(name)
+            if forbidden in channels:
+                leaked.append(name)
+
+    # Both clauses are reported, not just the first. "the channel under test is
+    # dead" and "the channel you switched off delivered anyway" are different
+    # defects that can hold at once, and the second is what explains why the
+    # adapter still looked healthy in its default mode.
+    problems: List[str] = []
+    if not delivered:
+        problems.append(
+            f"the {mode} channel delivered NOTHING across {len(traces)} rail run(s). "
+            f"This process ran with {_mode_env_text(mode)}, so the {forbidden} "
+            f"channel is switched off and {required} is the only one left — a menu "
+            f"of skill titles the model has no mechanism to read, which is not a "
+            f"degraded rail but a rail that cannot work. Both settings are public "
+            f"SDK surface (init(inject_skill_body=...) / init(load_skill_tool=False)), "
+            f"so this is a configuration a user can be in. Offered: {sorted(bodies)}; "
+            f"skills_delivered on the wire: "
+            f"{sorted({n for t in traces for n in (t.get('skills_delivered') or [])})}"
+        )
+    if leaked:
+        problems.append(
+            f"the {forbidden} channel is switched OFF for this run "
+            f"({_mode_env_text(mode)}) and yet the body of {sorted(set(leaked))} "
+            f"reached the model through it. A kill switch the SDK ignores is worse "
+            f"than one it does not have: the caller believes they cut the token "
+            f"cost / the tool surface, and they did not"
+        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"{len(delivered)} delivery/deliveries across {len(traces)} rail run(s) by "
+        f"the {required} channel alone ({_mode_env_text(mode)}), and none by "
+        f"{forbidden}",
+    )
+
+
+# ── J1: the journey ──────────────────────────────────────────────────────────
+#
+# Everything above grades ONE ADAPTER, handed a Ctx by a driver that already
+# knows the agent, already holds the skills, and never runs the product's own
+# entry point. This grades the path a user actually walks: an agent exists on the
+# platform with a prompt and skills → `decimalai init` writes a file for it →
+# that file runs → the skill's knowledge is in front of the model.
+#
+# Deliberately NOT in ITEMS. It is not per-adapter: it is per SCAFFOLDABLE
+# FRAMEWORK, it takes a different capture (see journey.py), and keeping it its
+# own item is the whole point — a journey break and an adapter break must not be
+# reported as the same failure. On 2026-08-28 every adapter item was green while
+# this path was broken end to end.
+
+JOURNEY_ITEM = "J1"
+
+#: The three calls `decimalai init <name>` makes, as (method, path suffix).
+#: Read off `decimalai/cli/main.py::_scaffold_agent_file` — resolve the name
+#: against the full list, fetch the skills, read the prompt.
+_JOURNEY_INIT_CALLS: Tuple[Tuple[str, str], ...] = (
+    ("GET", "/api/v1/agents"),
+    ("GET", "/skills"),
+    ("GET", "/prompt"),
+)
+
+
+def _journey_init_problems(capture: Any) -> List[str]:
+    """What went wrong in the `decimalai init` half, if anything."""
+    problems: List[str] = []
+    if capture.init_returncode != 0:
+        problems.append(
+            f"`decimalai init {capture.agent_name} --framework {capture.framework}` "
+            f"exited {capture.init_returncode}. stdout: {capture.init_stdout or 'none'} "
+            f"stderr: {capture.init_stderr or 'none'}"
+        )
+    paths = [(r.method, r.path) for r in capture.init_phase.requests]
+    for method, suffix in _JOURNEY_INIT_CALLS:
+        if not any(m == method and p.endswith(suffix) for m, p in paths):
+            problems.append(
+                f"init never made its {method} …{suffix} call — the probe recorded "
+                f"{paths or 'no requests at all'}. The command resolves the agent "
+                f"against the full agent list, reads its skills and reads its "
+                f"prompt; a journey that skipped one of those scaffolded against "
+                f"something it did not look up"
+            )
+    refused = [
+        f"{r.method} {r.path} -> {r.status}"
+        for r in capture.init_phase.requests
+        if not r.accepted
+    ]
+    if refused:
+        problems.append(
+            f"the probe refused an init request: {_summarize(refused)}. The probe "
+            f"serves the shapes the backend serves, so a 4xx here is the SDK asking "
+            f"for something production does not offer"
+        )
+    if not capture.file_written:
+        problems.append(
+            f"no file at {capture.out_path}. `decimalai init` is the step that turns "
+            f"a dashboard agent into something runnable; if it wrote nothing there "
+            f"is no journey"
+        )
+    elif not capture.file_source.strip():
+        problems.append(f"{capture.out_path} was written but is empty")
+    return problems
+
+
+def grade_journey(capture: Any) -> Result:
+    """Did the whole journey work — CLI to file to run to knowledge-in-context?
+
+    Five clauses, in the order a user meets them. The last two are the ones no
+    adapter item can stand in for:
+
+    * the agent's stored PROMPT reached the model. The scaffold deliberately
+      never writes the prompt text into the file, so this sentence can only be
+      there because the generated file READ it at run time. A file that dropped
+      its ``load_agent()`` call still runs, still traces and still delivers
+      skills — and fails only here.
+    * the skill's BODY sentinel reached the model. A menu row cannot contain it
+      (menu rows are name + description), which is what tells "the skill was
+      offered" apart from "the skill was readable" — the 2026-08-28 defect.
+
+    Not asserted, and worth saying rather than implying: what the model DID with
+    any of it. The model is a stub. That question needs a real one and belongs to
+    the live end-to-end tier.
+    """
+    item, title = JOURNEY_ITEM, "journey"
+
+    problems = _journey_init_problems(capture)
+    if problems:
+        return _fail(item, title, _summarize(problems))
+
+    # ── the file ran at all ──────────────────────────────────
+    if capture.run_returncode != 0:
+        return _fail(
+            item, title,
+            f"the generated file exited {capture.run_returncode} — "
+            f"`{' '.join(capture.run_command)}`. `decimalai init` reported success, "
+            f"so this is a file the product wrote and the product cannot run. "
+            f"stderr: {capture.run_stderr or 'none'} stdout: "
+            f"{capture.run_stdout or 'none'}",
+        )
+    if capture.model_requests == 0:
+        return _fail(
+            item, title,
+            "the generated file ran and exited 0 but never reached the model — the "
+            "stub model server was handed zero requests. An agent file that makes "
+            "no model call is the shape of the langchain template that emitted a "
+            "bare chat model with no loop: it imports, it exits 0, and it answers "
+            f"nothing. stdout: {capture.run_stdout or 'none'}",
+        )
+    if capture.answer_sentinel not in capture.run_stdout:
+        return _fail(
+            item, title,
+            f"the generated file ran and called the model "
+            f"{capture.model_requests} time(s), but its own output does not carry "
+            f"the model's answer ({capture.answer_sentinel!r}). The file ends in "
+            f"`print(run(...))`, so the answer not being on stdout means run() "
+            f"returned something else — an empty string is what a tool-call turn "
+            f"returns when nothing runs the loop. stdout: "
+            f"{capture.run_stdout or 'none'}",
+        )
+
+    # ── what was actually in front of the model ──────────────
+    shown = capture.model_context
+    problems = []
+    if capture.prompt_sentinel not in shown:
+        problems.append(
+            f"the agent's stored system prompt never reached the model: the "
+            f"platform holds a prompt containing {capture.prompt_sentinel!r} for "
+            f"{capture.agent_name!r}, and none of the {capture.model_requests} "
+            f"model request(s) carried it. The scaffold never copies the prompt "
+            f"INTO the file (by design — a copy goes stale the moment somebody "
+            f"edits it in the dashboard), so the only way it can arrive is the "
+            f"generated file reading it at run time. This is the clause that "
+            f"catches a file which runs perfectly and sends the agent no "
+            f"instructions at all"
+        )
+    delivered = sorted(
+        name for name, sentinel in capture.skill_sentinels.items()
+        if sentinel and sentinel in shown
+    )
+    if not delivered:
+        problems.append(
+            f"no skill BODY reached the model. The agent holds "
+            f"{sorted(capture.skill_sentinels)} on the platform and the file ran "
+            f"and answered, but not one body sentinel is in the "
+            f"{capture.model_requests} request(s) the model was handed — so the "
+            f"model was shown a menu of titles it had no mechanism to read. That "
+            f"is the 2026-08-28 defect exactly: `inject_skill_body` resolving "
+            f"False on an adapter that registers no load_skill tool sums to zero "
+            f"body channels, and every adapter contract item stays green"
+        )
+    # The last thing `decimalai init` prints is "The trace appears at → …". That
+    # is a promise the command makes about the file it just wrote, so the journey
+    # is where it is owed. Kept last and deliberately weak — "a trace naming this
+    # agent left the file and the probe took it" — because C1/C2 own trace
+    # correctness per adapter and this cell must not fail for their reasons.
+    traced = [
+        t for t in capture.run_phase.traces
+        if t.get("agent_name") == capture.agent_name
+    ]
+    if not traced:
+        problems.append(
+            f"the run produced no accepted trace naming {capture.agent_name!r}. "
+            f"`decimalai init` ends by printing 'The trace appears at → "
+            f"/agents/{capture.agent_name}', so a file that runs and traces "
+            f"nothing leaves the user staring at an empty page having done "
+            f"everything right. Probe saw: "
+            f"{[(r.method, r.path, r.status) for r in capture.run_phase.requests]}"
+        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"`decimalai init` → {capture.out_path} → ran → {capture.model_requests} "
+        f"model call(s) carrying the agent's stored prompt and the body of "
+        f"{delivered} → {len(traced)} trace(s) for {capture.agent_name}",
+    )
+
+
 # ── registry ─────────────────────────────────────────────────────────────────
 
 ITEMS: Dict[str, Callable[[Observation], Result]] = {
@@ -1020,6 +1494,7 @@ ITEMS: Dict[str, Callable[[Observation], Result]] = {
     "C12": c12_loud_failure,
     "C13": c13_skills_activation,
     "C13b": c13b_skills_activation_recorded,
+    "C14": c14_skills_body_delivered,
 }
 
 #: Display order — dict order is insertion order, but be explicit.

@@ -241,3 +241,15 @@ def _synchronous_sender(request, monkeypatch):
     monkeypatch.setattr(sender, "submit", _sync_submit)
     yield
 
+
+
+@pytest.fixture(autouse=True)
+def _clear_prompt_cache():
+    """`load_agent()` keeps the last good config per process so it can serve it
+    during a platform outage. That is process-local state, so it has to be reset
+    between tests or one case's fetch answers the next case's assertion."""
+    from decimalai._agent import _reset_prompt_cache
+
+    _reset_prompt_cache()
+    yield
+    _reset_prompt_cache()

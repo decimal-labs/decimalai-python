@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
+from .delivery import DEFAULT as DELIVERY_DEFAULT
 from .drivers import Ctx, Driver
 from .probe import Probe, Recorded
 
@@ -214,8 +215,28 @@ def _run_phase(
     )
 
 
-def observe(driver: Driver, probe: Probe, *, skills: Sequence[Dict[str, Any]] = ()) -> Observation:
-    """Run every phase of ``driver`` against ``probe`` and return the capture."""
+def observe(
+    driver: Driver,
+    probe: Probe,
+    *,
+    skills: Sequence[Dict[str, Any]] = (),
+    delivery_mode: str = DELIVERY_DEFAULT,
+    only: Optional[Sequence[str]] = None,
+) -> Observation:
+    """Run every phase of ``driver`` against ``probe`` and return the capture.
+
+    ``delivery_mode`` is recorded on the ``Ctx`` and read by the contract; the
+    environment that PRODUCES the mode is set by whoever spawned this process
+    (``isolation._child_env``), because ``DecimalConfig`` reads it once, at
+    construction, and every adapter caches its ``SkillRouter`` for the life of
+    the process.
+
+    ``only`` restricts which phases run — used by the delivery matrix, which
+    grades the skills phase and would otherwise pay for six phases it never
+    reads. A phase that did not run is recorded ``ran=False`` with a reason,
+    exactly like a driver hook that is absent, so nothing can mistake it for a
+    phase that ran and produced nothing.
+    """
     import decimalai
 
     caps = driver.capabilities
@@ -231,7 +252,18 @@ def observe(driver: Driver, probe: Probe, *, skills: Sequence[Dict[str, Any]] = 
         tool_sentinel=f"SENTINEL-TOOL-{token}",
         workdir=workdir,
         skills=tuple(skills),
+        delivery_mode=delivery_mode,
     )
+
+    wanted = None if only is None else set(only)
+
+    def _skipped(name: str) -> Optional[str]:
+        if wanted is None or name in wanted:
+            return None
+        return (
+            f"the {name} phase was not selected for this run "
+            f"(delivery_mode={delivery_mode})"
+        )
 
     probe.skills = [dict(s) for s in skills] if caps.has_skills_rail else []
 
@@ -242,22 +274,29 @@ def observe(driver: Driver, probe: Probe, *, skills: Sequence[Dict[str, Any]] = 
         decimalai.init(api_key=probe.api_key, base_url=probe.base_url, verify=False)
 
         phases: Dict[str, Phase] = {}
-        phases["main"] = _run_phase("main", driver.run, [ctx], probe, fanout=False)
-        phases["repeat"] = _run_phase("repeat", driver.run, [ctx], probe, fanout=False)
+        phases["main"] = _run_phase(
+            "main", driver.run, [ctx], probe, fanout=False,
+            na_reason=_skipped("main"),
+        )
+        phases["repeat"] = _run_phase(
+            "repeat", driver.run, [ctx], probe, fanout=False,
+            na_reason=_skipped("repeat"),
+        )
         # A SECOND, differently-named agent in the same process. Costs a driver
         # nothing (it is `run` again with a derived ctx) and is the only way to
         # see process-global agent identity — the "every trace after the first
         # keeps shipping the first agent's name" defect.
         phases["second_agent"] = _run_phase(
             "second_agent", driver.run, [ctx.derive(99)], probe, fanout=False,
+            na_reason=_skipped("second_agent"),
         )
         phases["degenerate"] = _run_phase(
             "degenerate", driver.run_degenerate, [ctx], probe, fanout=False,
-            na_reason=caps.na_reason("C7b"),
+            na_reason=_skipped("degenerate") or caps.na_reason("C7b"),
         )
         phases["error"] = _run_phase(
             "error", driver.run_error, [ctx], probe, fanout=False,
-            na_reason=caps.na_reason("C10"),
+            na_reason=_skipped("error") or caps.na_reason("C10"),
         )
         phases["concurrent"] = _run_phase(
             "concurrent",
@@ -265,7 +304,7 @@ def observe(driver: Driver, probe: Probe, *, skills: Sequence[Dict[str, Any]] = 
             [ctx.derive(i) for i in range(CONCURRENCY)],
             probe,
             fanout=True,
-            na_reason=caps.na_reason("C9"),
+            na_reason=_skipped("concurrent") or caps.na_reason("C9"),
         )
         # LAST on purpose: on several adapters turning the rail on is an
         # irreversible process-wide monkey-patch, so it must not colour the
@@ -280,7 +319,7 @@ def observe(driver: Driver, probe: Probe, *, skills: Sequence[Dict[str, Any]] = 
             [ctx.derive(i, rename=False) for i in range(CONCURRENCY)],
             probe,
             fanout=True,
-            na_reason=caps.na_reason("C8"),
+            na_reason=_skipped("skills") or caps.na_reason("C8"),
         )
     finally:
         for k, v in prev_env.items():

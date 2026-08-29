@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence
 
+from ..delivery import TOOL_LOADED
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
@@ -24,6 +25,7 @@ from . import (
     Ctx,
     Driver,
     DriverError,
+    FrameworkLimit,
     fanout_threads,
     stub_script,
     tool_result,
@@ -161,10 +163,21 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     be undone, and a global handler would double-trace every other phase. The
     lanes then run through that one global handler, which is what a real
     multi-request process does.
+
+    In the ``tool_loaded`` delivery cell the driver ASKS for the tool loop
+    (``enable_load_skill_tool=True``) instead of quietly not asking. That is what
+    turns this framework's N/A from a sentence into an observation: the adapter
+    has to refuse, out loud, on this run, or the cell fails instead of being
+    excused. Asking is not an assertion — the grading of what comes back lives
+    in ``contract.grade_delivery``.
     """
     from decimalai.langchain import instrument
 
-    instrument(agent_name=ctxs[0].agent_name, enable_skill_loader=True)
+    instrument(
+        agent_name=ctxs[0].agent_name,
+        enable_skill_loader=True,
+        enable_load_skill_tool=ctxs[0].delivery_mode == TOOL_LOADED,
+    )
 
     def _one(ctx: Ctx) -> Any:
         return _graph(ctx, _stub_model(ctx)).invoke({"messages": _messages(ctx)})
@@ -203,6 +216,24 @@ DRIVER = Driver(
                 "for bare prompt-injection usage.' C13 still applies and is graded: with "
                 "no loader, a delivered body is exactly what is most likely to be "
                 "promoted to a fabricated activation."
+            ),
+        },
+        delivery_limits={
+            TOOL_LOADED: FrameworkLimit(
+                reason=(
+                    "LangChain's callback/invoke layer is an OBSERVER of a turn, not "
+                    "the owner of a tool loop: this adapter patches "
+                    "BaseChatModel.invoke/ainvoke, which sees one model call and "
+                    "cannot route a tool RESULT back into the same turn. There is "
+                    "nowhere for a load_skill result to go, so the tool-loaded "
+                    "channel does not exist here at any setting of any flag. "
+                    "Prompt injection is the whole rail — which is why the injected "
+                    "cell is graded strictly and is not allowed to be N/A."
+                ),
+                adapter_module="decimalai/langchain.py",
+                refusal_marker=(
+                    "enable_load_skill_tool is not supported on the langchain adapter"
+                ),
             ),
         },
     ),

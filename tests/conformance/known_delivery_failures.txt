@@ -1,0 +1,11 @@
+# Delivery-channel cells that are known-red today, as `driver:mode`.
+#
+# Same contract as known_failures.txt, and the same self-cleaning property: a
+# NEW red cell fails the build, and an entry here that starts PASSING also fails
+# the build — so this file shrinks instead of outliving the defect. Shrink it;
+# never add to it to make a build go green.
+#
+# Everything below was recorded ON THE DAY the delivery axis went live
+# (2026-08-29), against an adapter that already had the defect. That is the only
+# thing this file is for. A cell that goes red because of a change under test is
+# a finding about that change, not a line for this file.

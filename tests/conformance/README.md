@@ -220,7 +220,18 @@ actually calls — discovered by reading `decimalai/_client.py` and
 `GET /auth/verify` · `POST /traces` · `POST /traces/batch` ·
 `POST|GET /manifests` · `GET /manifests/{id}` · `POST /skills/route` ·
 `GET /skills/menu` · `GET /skills/{name}/body` · `GET /skills/hashes` ·
-`GET /skills` · `GET /skills/{name}` · `POST /skills/sync`
+`GET /skills` · `GET /skills/{name}` · `POST /skills/sync` ·
+`GET /agents` · `GET /agents/{name}/skills` · `GET /agents/{name}/prompt`
+
+The last three are the journey's (J1): the three calls `decimalai init <name>`
+makes, ported from the platform's own agent handlers rather than invented.
+The list one is deliberately **unpaginated**, because `init` never sends a
+`limit` on purpose — one activates a truncating path whose ordering drops the
+never-traced UI-created agent the command exists to find. And
+`/agents/{name}/skills` deliberately returns subscriptions **without bodies**,
+exactly as the backend does, which is what makes J1's body-sentinel clause
+falsifiable: the scaffold cannot learn a skill body from that route, so a body
+in front of the model got there through the rail.
 
 Anything else 404s and lands in the request log, so a driver that depends on an
 unmodelled endpoint shows up as a 404 rather than a mystery.
@@ -266,6 +277,9 @@ run*.
 | C12 `loud_failure` | a phase that emits nothing, or a trace the backend refuses, is never silent |
 | C13 `skills_activation` | nothing is recorded as activated that the model did not itself ask for |
 | C13b `skills_activation_recorded` | a body the model *did* pull is not silently dropped |
+| C14 `skills_body_delivered` | a skill's **body** reached the model, by any channel |
+| D1 `delivery_channel` | …and each channel delivers **on its own**, with the other switched off |
+| J1 `journey` | the whole path: an agent on the platform → `decimalai init` → a file that runs → its prompt and a skill body in front of the model |
 
 C7b is the second clause of C7, split out so a framework with no degenerate form
 can declare that one clause N/A without silencing the first.
@@ -283,6 +297,133 @@ changed the output.
 
 Exact token counts are **not** asserted here — a stub model's numbers are
 arbitrary. Presence and plausibility are Tier A's job; exact counts are Tier B's.
+
+### The delivery axis (D1)
+
+C1–C14 grade one capture per driver, in whatever configuration that adapter
+resolves to on its own. D1 is a **second axis over the same capture style**: one
+child process per *(driver, body channel)*, with the **other channel switched
+off** in that process's environment.
+
+| | `injected` | `tool_loaded` |
+|---|---|---|
+| what carries the body | the router pastes it into the prompt | the model pulls it with `load_skill` |
+| what is switched off | `DECIMALAI_LOAD_SKILL_TOOL=0` | `DECIMALAI_INJECT_SKILL_BODY=0` |
+| langchain / anthropic | graded | N/A — framework limit, re-proven every run |
+| openai-agents / pydantic-ai | graded | graded |
+
+Why it exists: C14 asks whether a body reached the model **at all**, which closes
+"zero channels". The defect that produced C14 was *arithmetic* — langchain had
+`inject_skill_body` defaulting False **and** no `load_skill` tool, and each half
+was defensible alone. D1 closes the next shape of the same hole: one channel
+contributing nothing while the other covers for it. Until this axis existed,
+`inject_skill_body` appeared **zero times** in the whole suite — the body channel
+had never been varied, so there was no cell for it to be wrong in.
+
+Both settings are public SDK surface (`init(inject_skill_body=…)`,
+`init(load_skill_tool=False)` / the two env vars), so every cell is a
+configuration a user can actually be in — and every cell is also a **kill-switch
+test**: the off channel must really be off, or the caller cut a token cost they
+did not cut.
+
+A separate process per mode is not tidiness. `DecimalConfig` reads the
+environment once, at construction, and each adapter freezes the answer into a
+module-level `SkillRouter` singleton, so a second mode in the same process would
+be graded against the first mode's router.
+
+**An N/A here has to prove itself on the run.** `Capabilities.__post_init__`
+enforces that a reason *exists*, never that it is *true* — which is how C13b came
+to be N/A on langchain by a sentence that was accurate and *was the defect*. So a
+`FrameworkLimit` carries a file and a marker instead of prose, the driver ASKS
+the adapter for the channel, and `contract._grade_framework_limit` refuses the
+N/A unless the adapter emits its documented refusal **and** delivers nothing by
+that channel. An adapter that grows the capability stops being excused.
+
+### The journey axis (J1)
+
+C1–C14 and D1 all grade **one adapter**, handed a `Ctx` by a driver that already
+knows the agent's name, already holds the skills, and never once runs the
+product's own entry point. J1 grades what a user actually does:
+
+```
+an agent exists on the platform, with a prompt somebody typed and skills somebody attached
+   → decimalai init <name>            the REAL console entry point, as a subprocess
+   → python agent.py                  the REAL generated source, under runpy, as __main__
+   → the skill's knowledge is in the context the model is handed
+```
+
+It is hermetic for the same reason the rest of the tier is: the probe already
+stands in for `api.decimal.ai`, so it was taught the three routes `decimalai
+init` calls — `GET /api/v1/agents` (the unpaginated list it resolves the name
+against), `…/{name}/skills` and `…/{name}/prompt` — and `journey.JourneyModel`
+stands in for the provider the same way `drivers/_openai_wire.py` does. No
+backend, no key, no network, no cost. Verified: with every non-loopback route
+pointed at a dead proxy, both cells still pass in the same time.
+
+Five clauses, in the order a user meets them:
+
+1. `decimalai init` exits 0 and makes all three platform calls, all accepted.
+2. It wrote a non-empty file.
+3. That file runs, reaches the model, and its own stdout carries the answer —
+   which is what catches the template that emitted a bare chat model with no
+   loop, where `run()` returned `""` on every call with no error anywhere.
+4. **The agent's stored prompt reached the model.** The scaffold deliberately
+   never copies the prompt text into the file, so the sentinel can only be there
+   because the generated file read it at run time. A file that drops its
+   `load_agent()` call still runs, still traces and still delivers skills — and
+   fails only here.
+5. **The skill's body sentinel reached the model.** A menu row cannot contain it,
+   which is what tells "the skill was offered" from "the skill was readable".
+   Plus one weak trailer: the run produced an accepted trace naming the agent,
+   because "The trace appears at → …" is the last thing `decimalai init` prints.
+
+The stub model's script is derived from the **request**, never from the
+framework: if the request offers a `load_skill` tool and no body has come back
+yet, it asks for one, otherwise it answers. langchain's adapter registers no such
+tool and must deliver by injection; openai-agents' does and delivers through the
+loop; neither is scripted for by name. A per-framework script would be a driver
+artifact in the one cell that exists to be channel-agnostic.
+
+**Which frameworks get a cell** is read off `decimalai/cli/scaffold.py`
+directly — `SUPPORTED_FRAMEWORKS` today is langchain and openai-agents. The other
+seven drivers are a declared N/A whose reason is the SDK's own
+`UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM` classification, recomputed and
+compared by `test_coverage.test_every_journey_na_is_declared_and_counted`. Write
+a template and the exemption fails until the ledger line is deleted; the cell
+starts being graded on the same commit.
+
+**What it does not cover:** the model's *answer*. The model is a stub, so this
+tier can prove the skill's body was in the context and can prove nothing about
+whether a real model then used it. That needs a real model and belongs to
+the live end-to-end tier that runs against a real backend and a real model.
+
+### Nothing is skipped, and the holes are counted
+
+Two ledgers, both in `na_ledger.py`, both compared to the computed set in both
+directions by `test_coverage.py`:
+
+* `DECLARED_NA` — every `driver:item` the drivers would grade N/A, with the flag
+  granting it, plus `NA_BUDGET` as a number a reviewer sees move in a diff.
+* `DECLARED_DELIVERY_NA` — the same for delivery channels.
+* `DECLARED_JOURNEY_NA` — the same for frameworks `decimalai init` writes no file
+  for. Unlike the other two, no line in it is this suite's judgement: the set is
+  recomputed from the shipped scaffold ledger.
+
+And every skip in the package goes through `na_ledger.skip_declared`, which
+**fails** rather than skips when the key is not declared; the only exceptions are
+the three `ENVIRONMENT_SKIPS` (the docs repo, the platform repo, an opt-in env
+var), and `test_no_undeclared_skip_call_sites` fails on any new `pytest.skip`
+that is neither. `pytest -q` printing `102 skipped` next to a green bar is read
+by nobody, so a skip has to be one somebody declared.
+
+`has_skills_rail` is additionally cross-checked against the SDK's *own* ledger of
+seam-carrying frameworks — `decimalai/cli/scaffold.py`'s `SUPPORTED_FRAMEWORKS` /
+`UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM`. Two independent sources for the same
+claim, one of them the code users actually run.
+
+`known_delivery_failures.txt` is the delivery axis's debt ledger, with the same
+contract as `known_failures.txt`: recorded once, self-cleaning (a listed cell
+that starts passing fails the build), and never a pressure valve for a new red.
 
 ## Tiers
 
@@ -448,6 +589,23 @@ Stated so nobody mistakes a green cell for a guarantee.
   LangChain it is currently `{"input": "{'query': '…'}"}` — the dict
   stringified under an invented key. Worth a C14; deliberately out of v1 scope.
   (Renumbered from "C13", which now names the activation item above.)
+- **What the model DOES with a delivered skill.** C14, D1 and J1 all stop at the
+  same line: the body was in the context the model was handed. The model here is
+  a stub, so nothing in Tier A says a real one read it, followed it, or answered
+  differently for having it. That question needs a real model and belongs to
+  the live end-to-end tier that runs against a real backend and a real model.
+- **The journey on a framework with no scaffold.** J1 only exists where
+  `decimalai init` writes a file — two frameworks today. The other seven are a
+  declared N/A, and the exemption is only as good as the day somebody writes
+  their template.
+- **The journey's own install set.** J1's langchain cell needs `langchain` and
+  `langchain-openai` — the umbrella package and the provider binding, neither of
+  which `decimalai[langchain]` pulls (that extra is `langchain-core` only). They
+  come from `[dev]`, and both Tier A jobs install `[dev]` alongside
+  `[conformance-tests]`, so the cell does run in CI. A job that installed
+  `[conformance-tests]` *alone* would skip it — loudly under
+  `DECIMAL_CONFORMANCE_REQUIRE_ALL=1`, silently without. If the extras are ever
+  reorganised, `journey_requirements()` names exactly what is missing.
 - **Exact token counts, cost, latency.** Tier B's job.
 - **Cross-driver isolation.** Fixed: each driver's phases now run in their own
   process (see [One driver, one process](#one-driver-one-process)), so a late

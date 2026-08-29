@@ -59,29 +59,71 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .delivery import DEFAULT as DELIVERY_DEFAULT
+from .delivery import MODE_ENV, mode_env
 from .drivers import Ctx, Driver
 from .harness import Observation, Phase
 from .probe import Probe, Recorded
 
+#: Every environment variable any delivery mode sets — stripped from a child's
+#: environment before the mode is applied, so an inherited value cannot decide
+#: what a cell means.
+_DELIVERY_ENV_KEYS = frozenset(k for env in MODE_ENV.values() for k in env)
+
 #: Bumped when the payload shape changes. A child from a stale checkout then
 #: fails loudly instead of being graded on fields the parent misreads.
-WIRE_VERSION = 1
+#: 2 — ``Ctx`` gained ``delivery_mode`` (the body-channel axis).
+WIRE_VERSION = 2
 
 #: Skills the probe's router offers when a driver declares a skills rail.
 #: Lives here rather than in ``conftest.py`` because the CHILD needs it and a
 #: child should not have to import a pytest plugin module to run a driver.
+#:
+#: Each body carries a SENTINEL line: a fact that appears nowhere else, that a
+#: menu row cannot contain (menu rows are name + description), and that no model
+#: has priors for. C14 asserts the sentinel reached the model, which is the only
+#: way to tell "the skill was offered" from "the skill was readable".
+#:
+#: Deliberately shaped as a checkable fact rather than a random token so ONE
+#: fixture can serve both tiers: the hermetic tier asserts the sentence is in the
+#: prompt, and a live tier asserts the number is in the model's answer. Two
+#: fixtures would drift.
 CONFORMANCE_SKILLS: Tuple[Dict[str, str], ...] = (
     {
         "name": "conformance-skill-alpha",
         "description": "Alpha skill offered by the conformance probe.",
-        "body": "# Alpha\n\nAlpha guidance for the conformance run.",
+        "body": (
+            "# Alpha\n\n"
+            "SENTINEL-SKILLBODY-ALPHA: opened boxes carry a 23.5% restocking fee.\n"
+            "Only a delivered body carries this line."
+        ),
     },
     {
         "name": "conformance-skill-beta",
         "description": "Beta skill offered by the conformance probe.",
-        "body": "# Beta\n\nBeta guidance for the conformance run.",
+        "body": (
+            "# Beta\n\n"
+            "SENTINEL-SKILLBODY-BETA: expedited returns close within 4.75 business days.\n"
+            "Only a delivered body carries this line."
+        ),
     },
 )
+
+#: The per-skill sentinel, derived from the body so the two cannot drift.
+#: `_body_signature`'s longest-line heuristic is fine for today's fixture but is
+#: not safe in general — a real skill whose longest body line restates its
+#: description would let a MENU ROW satisfy the very clause that exists to catch
+#: an undelivered body.
+SENTINEL_PREFIX = "SENTINEL-SKILLBODY-"
+
+
+def body_sentinel(body: str) -> str:
+    """The sentinel line of a conformance skill body, or "" if it has none."""
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(SENTINEL_PREFIX):
+            return stripped
+    return ""
 
 #: How long one driver's seven phases may take before the child is killed.
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -254,17 +296,31 @@ _REPO_ROOT = _TESTS_DIR.parent
 _CHILD = _HERE / "_child.py"
 
 
-def _child_env() -> Dict[str, str]:
+def _child_env(delivery_mode: str = DELIVERY_DEFAULT) -> Dict[str, str]:
     """Inherit the caller's environment, plus the paths the child imports from.
 
     ``sys.executable`` + an inherited ``PYTHONPATH`` is what makes this work
     from a scratch venv (repo not installed, PYTHONPATH points at the checkout)
     and in CI (repo installed) without either knowing about the other.
+
+    The delivery mode is applied HERE rather than inside the child, so the
+    variables are in place before the interpreter starts. ``DecimalConfig`` reads
+    them in ``default_factory``, i.e. once, at construction — and each adapter
+    then freezes the answer into a module-level ``SkillRouter`` singleton. Set
+    them any later and the child would be graded on the mode it did not run.
     """
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     parts = [str(_REPO_ROOT)] + ([existing] if existing else [])
     env["PYTHONPATH"] = os.pathsep.join(parts)
+    # Strip first, then apply. `default` must mean "whatever the ADAPTER resolves
+    # to", and an inherited DECIMALAI_INJECT_SKILL_BODY in the developer's shell
+    # would silently redefine the whole per-driver matrix — the same class of
+    # "it passes if you run it this way" the registry-order comment in
+    # conftest.py refuses.
+    for key in _DELIVERY_ENV_KEYS:
+        env.pop(key, None)
+    env.update(mode_env(delivery_mode))
     return env
 
 
@@ -284,23 +340,35 @@ def _tail(text: Any, limit: int = 2000) -> str:
     return text if len(text) <= limit else "...\n" + text[-limit:]
 
 
-def run_driver_in_child(driver: Driver) -> Observation:
-    """Run every phase of ``driver`` in a fresh process and return the capture."""
+def run_driver_in_child(
+    driver: Driver, delivery_mode: str = DELIVERY_DEFAULT
+) -> Observation:
+    """Run ``driver`` in a fresh process and return the capture.
+
+    ``delivery_mode`` picks which body channel the run is held to. Anything but
+    ``default`` runs the SKILLS PHASE ONLY: the other six phases do not touch the
+    rail, so paying for them per mode would triple the suite's runtime to grade
+    nothing new. The unrun phases come back ``ran=False`` with a reason, never as
+    empty phases that ran.
+    """
+    label = driver.name if delivery_mode == DELIVERY_DEFAULT else (
+        f"{driver.name}[{delivery_mode}]"
+    )
     workdir = tempfile.mkdtemp(prefix=f"conformance-child-{driver.name}-")
     out_path = Path(workdir) / "observation.json"
-    cmd = [sys.executable, str(_CHILD), driver.name, str(out_path)]
+    cmd = [sys.executable, str(_CHILD), driver.name, str(out_path), delivery_mode]
     try:
         proc = subprocess.run(
             cmd,
             cwd=str(_REPO_ROOT),
-            env=_child_env(),
+            env=_child_env(delivery_mode),
             capture_output=True,
             text=True,
             timeout=_timeout_seconds(),
         )
     except subprocess.TimeoutExpired as exc:
         raise DriverProcessError(
-            f"{driver.name}: the driver process did not finish within "
+            f"{label}: the driver process did not finish within "
             f"{_timeout_seconds():.0f}s and was killed — nothing was graded for this "
             f"framework.\n"
             f"stdout: {_tail(exc.stdout)}\n"
@@ -309,7 +377,7 @@ def run_driver_in_child(driver: Driver) -> Observation:
 
     if proc.returncode != 0 or not out_path.exists():
         raise DriverProcessError(
-            f"{driver.name}: the driver process exited {proc.returncode} "
+            f"{label}: the driver process exited {proc.returncode} "
             f"{'without writing a capture' if not out_path.exists() else ''} — "
             f"nothing was graded for this framework.\n"
             f"command: {' '.join(cmd)}\n"
@@ -320,11 +388,20 @@ def run_driver_in_child(driver: Driver) -> Observation:
         payload = json.loads(out_path.read_text())
     except (OSError, ValueError) as exc:
         raise DriverProcessError(
-            f"{driver.name}: the driver process wrote a capture this parent cannot "
+            f"{label}: the driver process wrote a capture this parent cannot "
             f"read ({exc}) — nothing was graded for this framework.\n"
             f"stderr: {_tail(proc.stderr)}"
         ) from exc
     observation = decode_observation(payload, driver)
+    got = observation.ctx.delivery_mode
+    if got != delivery_mode:
+        # The one failure the capture itself can hide: a child that ran the
+        # adapter's default and came back looking like a mode. Grading that
+        # would report a channel nobody switched on.
+        raise DriverProcessError(
+            f"{label}: the child returned a capture stamped delivery_mode={got!r} "
+            f"but was asked for {delivery_mode!r} — nothing was graded for this cell."
+        )
     # Only once it is safely in memory. A capture that could NOT be read stays on
     # disk, because that is the one time somebody needs to look at it.
     shutil.rmtree(workdir, ignore_errors=True)
@@ -343,27 +420,45 @@ def jobs(count: int) -> int:
     return max(1, min(DEFAULT_JOBS, max(1, cpus // 2), max(1, count)))
 
 
+def run_jobs(
+    jobs_: Sequence[Tuple[Driver, str]],
+) -> Tuple[Dict[Tuple[str, str], Observation], Dict[Tuple[str, str], str]]:
+    """Run each ``(driver, delivery_mode)`` in its own process.
+
+    Returns ``(observations, failures)``, both keyed by ``(driver name, mode)``.
+    A crashed child lands in ``failures``; the caller turns that into a hard
+    error at lookup time. It is never silently dropped.
+    """
+    observed: Dict[Tuple[str, str], Observation] = {}
+    failures: Dict[Tuple[str, str], str] = {}
+    if not jobs_:
+        return observed, failures
+
+    order: List[Tuple[str, str]] = [(d.name, m) for d, m in jobs_]
+    with ThreadPoolExecutor(max_workers=jobs(len(jobs_))) as pool:
+        futures = {
+            (d.name, m): pool.submit(run_driver_in_child, d, m) for d, m in jobs_
+        }
+    for key in order:
+        try:
+            observed[key] = futures[key].result()
+        except DriverProcessError as exc:
+            failures[key] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - a harness bug is still that driver's error
+            failures[key] = (
+                f"{key[0]}[{key[1]}]: harness could not run the driver process: {exc!r}"
+            )
+    return observed, failures
+
+
 def run_drivers(
     drivers: Sequence[Driver],
 ) -> Tuple[Dict[str, Observation], Dict[str, str]]:
-    """Run each driver in its own process. Returns ``(observations, failures)``.
-
-    A crashed child lands in ``failures`` keyed by driver name; the caller turns
-    that into a hard error at lookup time. It is never silently dropped.
+    """The per-driver matrix's jobs: every driver, in its adapter's own default
+    delivery mode. Keyed by driver name, as the contract matrix has always been.
     """
-    observed: Dict[str, Observation] = {}
-    failures: Dict[str, str] = {}
-    if not drivers:
-        return observed, failures
-
-    order: List[str] = [d.name for d in drivers]
-    with ThreadPoolExecutor(max_workers=jobs(len(drivers))) as pool:
-        futures = {d.name: pool.submit(run_driver_in_child, d) for d in drivers}
-    for name in order:
-        try:
-            observed[name] = futures[name].result()
-        except DriverProcessError as exc:
-            failures[name] = str(exc)
-        except Exception as exc:  # noqa: BLE001 - a harness bug is still that driver's error
-            failures[name] = f"{name}: harness could not run the driver process: {exc!r}"
-    return observed, failures
+    observed, failures = run_jobs([(d, DELIVERY_DEFAULT) for d in drivers])
+    return (
+        {name: obs for (name, _), obs in observed.items()},
+        {name: why for (name, _), why in failures.items()},
+    )

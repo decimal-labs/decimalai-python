@@ -15,14 +15,21 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
 from .contract import FAIL, NA, PASS, Result
+from .delivery import DELIVERY_MODES
 from .drivers import Driver, all_drivers
 from .harness import Observation
-from .isolation import CONFORMANCE_SKILLS, DriverProcessError, run_drivers
+from .isolation import (
+    CONFORMANCE_SKILLS,
+    DriverProcessError,
+    run_drivers,
+    run_jobs,
+)
+from .journey import JourneyCapture, journey_framework, run_journeys
 
 #: Set this to a path and the matrix is also written there as JSON, for a caller
 #: that needs the result structurally rather than as terminal text. The release
@@ -35,7 +42,13 @@ REPORT_JSON_ENV = "DECIMAL_CONFORMANCE_REPORT_JSON"
 #: Skills the probe's router offers when a driver declares a skills rail. Defined
 #: in ``isolation`` (the child needs it too) and re-exported here, where it has
 #: always lived.
-__all__ = ["CONFORMANCE_SKILLS", "observations", "record"]
+__all__ = [
+    "CONFORMANCE_SKILLS",
+    "delivery_observations",
+    "journey_captures",
+    "observations",
+    "record",
+]
 
 #: (driver, item, Result) as graded, for the terminal matrix.
 _REPORT: List[Tuple[str, Result]] = []
@@ -50,8 +63,12 @@ def record(driver_name: str, result: Result) -> None:
     _REPORT.append((driver_name, result))
 
 
-class _Observations(Dict[str, Optional[Observation]]):
+class _Observations(Dict[str, Any]):
     """The captures, with a crashed driver kept LOUD.
+
+    Holds ``Observation``s for the driver and delivery matrices and
+    ``JourneyCapture``s for the journey one — the raising-lookup behaviour below
+    is the whole content of the class and is identical for all three.
 
     A driver whose process died has no capture. Returning ``None`` for it would
     make every one of its items skip — fifteen quiet skips reading as "not
@@ -61,13 +78,13 @@ class _Observations(Dict[str, Optional[Observation]]):
 
     def __init__(
         self,
-        data: Dict[str, Optional[Observation]],
+        data: Dict[str, Any],
         failures: Dict[str, str],
     ) -> None:
         super().__init__(data)
         self.failures = failures
 
-    def __getitem__(self, key: str) -> Optional[Observation]:
+    def __getitem__(self, key: str) -> Any:
         if key in self.failures:
             raise DriverProcessError(self.failures[key])
         return super().__getitem__(key)
@@ -117,6 +134,110 @@ def observations(request: pytest.FixtureRequest) -> Dict[str, Optional[Observati
     out.update(observed)
     for name, why in failures.items():
         _CRASHED[name] = why
+    return _Observations(out, failures)
+
+
+def _selected_delivery_jobs(session: pytest.Session) -> set:
+    """Which ``(driver, delivery mode)`` cells this session collected.
+
+    Same reasoning as ``_selected_driver_names``: under ``-k injected`` there is
+    no reason to spawn the children for the other mode. Order is not taken from
+    here — the fixture walks the registry, as the per-driver matrix does.
+    """
+    jobs = set()
+    for item in session.items:
+        params = getattr(getattr(item, "callspec", None), "params", {})
+        name, mode = params.get("driver_name"), params.get("delivery_mode")
+        if isinstance(name, str) and isinstance(mode, str):
+            jobs.add((name, mode))
+    return jobs
+
+
+@pytest.fixture(scope="session")
+def delivery_observations(
+    request: pytest.FixtureRequest,
+) -> Dict[Tuple[str, str], Optional[Observation]]:
+    """One capture per ``(driver, delivery mode)`` — each in its OWN process.
+
+    A separate process per mode is not tidiness. ``DecimalConfig`` reads the
+    delivery environment once, at construction, and every adapter then freezes
+    the answer into a module-level ``SkillRouter`` singleton
+    (``decimalai/pydantic_ai.py::_get_skill_router`` and its three siblings), so
+    a second mode in the same process would be graded against the first mode's
+    router — a false result in whichever direction the first mode happened to
+    resolve.
+
+    Only the skills phase runs in these children; the other six do not touch the
+    rail. ``None`` == driver unavailable; a crashed child raises at lookup.
+    """
+    wanted = _selected_delivery_jobs(request.session)
+    out: Dict[Tuple[str, str], Optional[Observation]] = {}
+    runnable: List[Tuple[Driver, str]] = []
+    for driver in all_drivers():
+        for mode in DELIVERY_MODES:
+            if (driver.name, mode) not in wanted:
+                continue
+            if not driver.available:
+                _UNAVAILABLE[driver.name] = (
+                    f"missing import(s): {', '.join(driver.missing_requirements)}"
+                )
+                out[(driver.name, mode)] = None
+                continue
+            runnable.append((driver, mode))
+
+    observed, failures = run_jobs(runnable)
+    out.update(observed)
+    for (name, mode), why in failures.items():
+        _CRASHED[f"{name}[{mode}]"] = why
+    return _Observations(out, failures)
+
+
+def _selected_journey_drivers(session: pytest.Session) -> set:
+    """Which drivers this session collected a journey cell for."""
+    names = set()
+    for item in session.items:
+        if getattr(item, "originalname", None) != "test_journey":
+            continue
+        params = getattr(getattr(item, "callspec", None), "params", {})
+        name = params.get("driver_name")
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
+@pytest.fixture(scope="session")
+def journey_captures(
+    request: pytest.FixtureRequest,
+) -> Dict[str, Optional[JourneyCapture]]:
+    """One full `decimalai init` → run → context walk per scaffoldable framework.
+
+    ``None`` == this driver has no scaffold template, so there is no journey to
+    walk; the test turns that into a DECLARED N/A cross-checked against the SDK's
+    own ledger, never a bare skip. A journey that blew up raises at lookup, for
+    the same reason a dead driver child does: an ungraded cell must not reach the
+    exit code as a success.
+
+    No child process of our own, unlike ``observations``. Nothing in this fixture
+    imports a framework — the CLI and the generated file are each their own
+    subprocess — so there is no adapter global here to contaminate.
+    """
+    wanted = _selected_journey_drivers(request.session)
+    out: Dict[str, Optional[JourneyCapture]] = {}
+    pairs: List[Tuple[str, str]] = []
+    # Registry order, always. Same rule as `observations`.
+    for driver in all_drivers():
+        if driver.name not in wanted:
+            continue
+        framework = journey_framework(driver.name)
+        if framework is None:
+            out[driver.name] = None
+            continue
+        pairs.append((driver.name, framework))
+
+    captured, failures = run_journeys(pairs)
+    out.update(captured)
+    for name, why in failures.items():
+        _CRASHED[f"{name}[journey]"] = why
     return _Observations(out, failures)
 
 

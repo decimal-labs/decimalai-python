@@ -1,6 +1,6 @@
 """The child process: run ONE driver's phases, write the capture, exit.
 
-    python tests/conformance/_child.py <driver-name> <out.json>
+    python tests/conformance/_child.py <driver-name> <out.json> [<delivery-mode>]
 
 Invoked by ``isolation.run_driver_in_child``; not a test module (pytest collects
 ``test_*.py`` only) and not meant to be run by hand, though it is perfectly
@@ -30,6 +30,8 @@ for _path in (str(_REPO_ROOT), str(_TESTS_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+from conformance.delivery import DEFAULT as DELIVERY_DEFAULT  # noqa: E402
+from conformance.delivery import DELIVERY_MODES  # noqa: E402
 from conformance.drivers import all_drivers  # noqa: E402
 from conformance.harness import observe  # noqa: E402
 from conformance.isolation import (  # noqa: E402
@@ -41,10 +43,21 @@ from conformance.probe import Probe  # noqa: E402
 
 
 def main(argv: list) -> int:
-    if len(argv) != 3:
-        print(f"usage: {argv[0]} <driver-name> <out.json>", file=sys.stderr)
+    if len(argv) not in (3, 4):
+        print(
+            f"usage: {argv[0]} <driver-name> <out.json> [<delivery-mode>]",
+            file=sys.stderr,
+        )
         return 2
     name, out_path = argv[1], argv[2]
+    mode = argv[3] if len(argv) == 4 else DELIVERY_DEFAULT
+    if mode != DELIVERY_DEFAULT and mode not in DELIVERY_MODES:
+        print(
+            f"unknown delivery mode {mode!r}; known: {DELIVERY_DEFAULT}, "
+            f"{', '.join(DELIVERY_MODES)}",
+            file=sys.stderr,
+        )
+        return 2
 
     drivers = {d.name: d for d in all_drivers()}
     driver = drivers.get(name)
@@ -62,7 +75,16 @@ def main(argv: list) -> int:
 
     probe = Probe().start()
     try:
-        obs = observe(driver, probe, skills=CONFORMANCE_SKILLS)
+        # A forced delivery mode grades the skills phase and nothing else —
+        # the other six do not touch the rail. `only` records them as not-run
+        # rather than running them and reporting empty.
+        obs = observe(
+            driver,
+            probe,
+            skills=CONFORMANCE_SKILLS,
+            delivery_mode=mode,
+            only=None if mode == DELIVERY_DEFAULT else ("skills",),
+        )
         text = dump_payload(encode_observation(obs))
     finally:
         probe.stop()

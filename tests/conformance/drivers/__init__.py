@@ -26,7 +26,11 @@ import importlib
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from ..delivery import DEFAULT as DELIVERY_DEFAULT
+from ..delivery import DELIVERY_MODES
 
 # ── What a driver is handed ──────────────────────────────────────────────────
 
@@ -53,6 +57,14 @@ class Ctx:
     workdir: str
     skills: Tuple[Mapping[str, Any], ...] = ()
     lane: int = 0
+    #: Which body channel this run is being held to — see ``delivery.py``.
+    #: ``default`` (the per-driver matrix) means "whatever the adapter resolves
+    #: to"; ``injected`` / ``tool_loaded`` mean the OTHER channel is switched off
+    #: in this process's environment. A driver reads it for one reason only: to
+    #: script its stub model against the tools that actually exist in this mode
+    #: (asking for a ``load_skill`` tool the mode switched off would be a driver
+    #: artifact dressed up as an adapter defect). It is never an assertion.
+    delivery_mode: str = DELIVERY_DEFAULT
 
     def derive(self, lane: int, *, rename: bool = True) -> "Ctx":
         """A per-lane variant — distinct sentinels, and by default a distinct agent.
@@ -77,6 +89,7 @@ class Ctx:
             workdir=self.workdir,
             skills=self.skills,
             lane=lane,
+            delivery_mode=self.delivery_mode,
         )
 
 
@@ -142,7 +155,12 @@ STUB_MODEL_NAME = "conformance-stub-1"
 #: driver author sees the cost of turning a flag off: the items it silences.
 CAPABILITY_ITEMS: Mapping[str, Tuple[str, ...]] = {
     "has_tools": ("C5",),
-    "has_skills_rail": ("C8", "C13", "C13b"),
+    # C14 is gated by has_skills_rail and by rail_can_deliver_bodies, and by
+    # nothing else. It must NOT appear under model_can_load_skill_bodies: an
+    # adapter with no tool loop is exactly the one for which prompt injection is
+    # the only body channel, so exempting it would exempt the case the item
+    # exists to catch.
+    "has_skills_rail": ("C8", "C13", "C13b", "C14"),
     "supports_concurrency": ("C9",),
     "supports_error_path": ("C10",),
     "supports_degenerate": ("C7b",),
@@ -150,7 +168,59 @@ CAPABILITY_ITEMS: Mapping[str, Tuple[str, ...]] = {
     # False flag that gates the item, so a framework with no rail at all keeps
     # printing its rail reason for C13b instead of needing a second one.
     "model_can_load_skill_bodies": ("C13b",),
+    # Split out of model_can_load_skill_bodies (2026-08-29). That one flag was
+    # answering two different questions — "can the MODEL pull a body?" (a true
+    # statement about a tool loop, which C13b needs) and "can this rail get a
+    # body in front of the model AT ALL?" — and the second answer is not a
+    # capability, it is a defect. Same ordering rule: after has_skills_rail.
+    # A driver may not actually set this False; see
+    # test_coverage.test_no_rail_may_declare_it_cannot_deliver.
+    "rail_can_deliver_bodies": ("C14",),
 }
+
+
+#: Where the SDK's adapters live, for a ``FrameworkLimit``'s static proof.
+_SDK_ROOT = Path(__file__).resolve().parents[3]
+
+
+@dataclass(frozen=True)
+class FrameworkLimit:
+    """A delivery mode a FRAMEWORK cannot do — declared with a CHECKED proof.
+
+    ``Capabilities.__post_init__`` enforces only that a REASON EXISTS, never
+    that it is true, and that gap is not theoretical: langchain's C13b N/A was
+    argued in prose that was accurate, well written, and *was the defect* — "the
+    model has no way to ASK for a body, so the strongest rung observable here is
+    DELIVERED" describes a rail that then delivered nothing. Prose cannot tell a
+    framework's limit from an adapter's choice, because both read identically.
+
+    So a limit carries two things a reader cannot fake:
+
+    * ``adapter_module`` + ``refusal_marker`` — the adapter must still SAY it, in
+      source. Checked statically by
+      ``test_coverage.test_every_framework_limit_is_still_in_the_adapter``.
+    * the same marker must be EMITTED at runtime when the driver asks for the
+      mode. ``contract.grade_delivery`` refuses the N/A without it, so a limit
+      whose adapter quietly grew the capability stops being accepted rather than
+      sitting in the matrix as a permanent excuse.
+
+    ``adapter_module`` is relative to the repo root, e.g. ``decimalai/langchain.py``.
+    """
+
+    reason: str
+    adapter_module: str
+    refusal_marker: str
+
+    @property
+    def adapter_path(self) -> Path:
+        return _SDK_ROOT / self.adapter_module
+
+    def marker_in_source(self) -> bool:
+        """Whether the adapter still contains the refusal this limit cites."""
+        try:
+            return self.refusal_marker in self.adapter_path.read_text()
+        except OSError:
+            return False
 
 
 @dataclass(frozen=True)
@@ -175,10 +245,22 @@ class Capabilities:
     #: activation applies to every rail, and a rail with no loader is exactly
     #: where a delivered body is most likely to be promoted to an activation.
     model_can_load_skill_bodies: bool = True
+    #: Whether this rail can get a body in front of the model by ANY channel.
+    #: There is no legitimate False here while ``has_skills_rail`` is True — a
+    #: rail that cannot deliver is not a rail, it is the defect C14 exists to
+    #: catch — and ``test_coverage.test_no_rail_may_declare_it_cannot_deliver``
+    #: refuses that combination. It is a named flag rather than nothing at all
+    #: so that "declare C14 N/A" is a move somebody has to make explicitly, in a
+    #: place a guard is watching, instead of by widening
+    #: ``model_can_load_skill_bodies`` until it covers C14 too.
+    rail_can_deliver_bodies: bool = True
     supports_concurrency: bool = True
     supports_error_path: bool = True
     supports_degenerate: bool = True
     reasons: Mapping[str, str] = field(default_factory=dict)
+    #: delivery mode -> the FrameworkLimit that makes it structurally
+    #: impossible here. Empty for a framework that can do both channels.
+    delivery_limits: Mapping[str, FrameworkLimit] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for flag in CAPABILITY_ITEMS:
@@ -189,6 +271,20 @@ class Capabilities:
                     f"gets printed. Silent skips are the failure mode this suite exists "
                     f"to remove."
                 )
+        for mode, limit in self.delivery_limits.items():
+            if mode not in DELIVERY_MODES:
+                raise ValueError(
+                    f"delivery_limits names {mode!r}, which is not a delivery mode "
+                    f"({', '.join(DELIVERY_MODES)}) — a limit on a mode that does not "
+                    f"exist silences nothing and reads like coverage."
+                )
+            if not isinstance(limit, FrameworkLimit):
+                raise ValueError(
+                    f"delivery_limits[{mode!r}] must be a FrameworkLimit carrying a "
+                    f"checkable proof, not {type(limit).__name__}. A reason in prose "
+                    f"is how C13b was N/A'd on langchain by a sentence that WAS the "
+                    f"defect."
+                )
 
     def na_reason(self, item: str) -> Optional[str]:
         """Why ``item`` does not apply here, or None if it does apply."""
@@ -196,6 +292,16 @@ class Capabilities:
             if item in items and not getattr(self, flag):
                 return self.reasons[flag]
         return None
+
+    def delivery_limit(self, mode: str) -> Optional[FrameworkLimit]:
+        """The framework limit making ``mode`` impossible here, or None.
+
+        A framework with no rail at all has no delivery cell to grade, and says
+        so through ``has_skills_rail`` — not through a limit per mode.
+        """
+        if not self.has_skills_rail:
+            return None
+        return self.delivery_limits.get(mode)
 
 
 @dataclass(frozen=True)

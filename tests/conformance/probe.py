@@ -35,8 +35,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 # ── Ported constants (backend trust-boundary allowlists) ──────────────────────
 
@@ -288,6 +288,12 @@ class Probe:
         # deterministically detectable: if run A's trace carries a routing_id
         # the probe minted for run B's query, the rail crossed runs.
         self.routing_queries: Dict[str, Optional[str]] = {}
+        # Agents this workspace holds — the platform state `decimalai init`
+        # resolves a name against, reads a prompt from and lists skills for.
+        # Populated by the JOURNEY tier (`journey.py`) via `register_agent`;
+        # empty for every driver run, which is why the adapter matrix sees no
+        # change. agent_name -> the row below.
+        self.agents: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -425,6 +431,41 @@ class Probe:
                 "require_manifest_on_ingest": self.require_manifest,
                 "message": "conformance probe",
             }, []
+
+        # ── agents (the surface `decimalai init` resolves against) ──
+        #
+        # Three routes, because `decimalai init <name>` makes exactly three
+        # calls and the generated file makes a fourth. Modelled from the
+        # backend's own handlers rather than invented — see
+        # the platform's agent handlers: `list_agents`,
+        # `list_agent_skills` (:2563) and `get_agent_prompt` (:3399, whose
+        # response shape is `_GET_PROMPT_EXAMPLE` at :3382).
+        #
+        # Deliberately NO pagination on the list. The route returns the full
+        # set when `limit` is unset, and `init` never sends one on purpose —
+        # its comment says a `limit` "activates a pagination path that
+        # truncates", whose ordering drops the never-traced UI-created agent
+        # the command exists to find. A probe that paginated anyway would make
+        # this tier greener than production.
+        if method == "GET" and path == "/api/v1/agents":
+            with self._lock:
+                rows = [self._agent_row(a) for a in self.agents.values()]
+            return 200, {"agents": rows, "total": len(rows)}, []
+
+        m = re.fullmatch(r"/api/v1/agents/([^/]+)/skills", path)
+        if method == "GET" and m:
+            return self._agent_skills(unquote(m.group(1)))
+
+        m = re.fullmatch(r"/api/v1/agents/([^/]+)/prompt", path)
+        if method == "GET" and m:
+            # No `If-None-Match` / 304 arm, and the omission is deliberate
+            # rather than a shortcut: the handler does not receive headers, and
+            # neither caller in this journey sends one — `load_agent()` never
+            # does (a cache is what would break the no-redeploy property it is
+            # sold on) and `init` does not either. Modelling a conditional
+            # nobody sends would be untested probe code standing between the
+            # SDK and its answer.
+            return self._agent_prompt(unquote(m.group(1)), query)
 
         if method == "POST" and path == "/api/v1/traces":
             return self._ingest_one(body)
@@ -594,6 +635,145 @@ class Probe:
             "version_label": version,
             "is_new": True,
             "components": len(body.get("components") or []),
+        }, []
+
+    # ── agents ───────────────────────────────────────────────
+
+    def register_agent(
+        self,
+        agent_name: str,
+        *,
+        system_prompt: Optional[str] = None,
+        skills: Sequence[Dict[str, Any]] = (),
+    ) -> Dict[str, Any]:
+        """Put an agent in this workspace, as the dashboard would.
+
+        The journey this backs is the one a user walks: an agent already EXISTS
+        on the platform, with a prompt somebody typed and skills somebody
+        attached, and `decimalai init` turns that into a file. So the fixture
+        has to be platform state, not a constructor argument the CLI is handed
+        — the whole point of the tier is that the prompt and the skill bodies
+        travel over the wire.
+
+        The skills are also added to the ROUTER's offer set (`self.skills`), so
+        the rail at run time offers exactly what this agent holds. One agent per
+        journey run makes that exact; the router is not agent-scoped here for
+        the same reason it is not in the driver tier — it is a fixture, and a
+        per-agent index would be probe machinery nothing grades.
+        """
+        prompt = system_prompt
+        with self._lock:
+            row = {
+                "agent_name": agent_name,
+                "agent_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "agent:" + agent_name)),
+                "system_prompt": prompt,
+                "version_number": 1 if prompt is not None else None,
+                "version_id": (
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, "prompt:" + agent_name))
+                    if prompt is not None else None
+                ),
+                "content_hash": _short_hash(prompt) if prompt is not None else None,
+                "label": "created with the agent" if prompt is not None else None,
+                "skills": [dict(s) for s in skills],
+            }
+            self.agents[agent_name] = row
+            offered = {s.get("name") for s in self.skills}
+            for skill in skills:
+                if skill.get("name") not in offered:
+                    self.skills.append(dict(skill))
+        return row
+
+    @staticmethod
+    def _agent_row(agent: Dict[str, Any]) -> Dict[str, Any]:
+        """One row of `GET /api/v1/agents` — the backend's `list_agents` shape.
+
+        `trace_count: 0` is the honest value AND the interesting one: a
+        UI-created agent that has never been traced is exactly the agent
+        `decimalai init` exists to serve, and the one a truncating pagination
+        path would drop.
+        """
+        return {
+            "agent_name": agent["agent_name"],
+            "trace_count": 0,
+            "last_trace_at": None,
+            "unevaluated_count": 0,
+            "is_subagent": False,
+            "is_demo": False,
+            "latest_manifest": None,
+            "compat_counts": None,
+            "compat_scope": None,
+        }
+
+    def _agent_skills(self, agent_name: str) -> Tuple[int, Any, List[str]]:
+        """`GET /api/v1/agents/{name}/skills` — subscriptions, never bodies.
+
+        The backend says so in as many words ("The skill's full metadata
+        (description, body, etc.) is not returned here"), and that is the
+        load-bearing property for this tier: the scaffold CANNOT learn a skill
+        body from this route, so a body that reaches the model at run time got
+        there through the rail. A probe that helpfully included bodies would
+        make the journey's sentinel clause unfalsifiable.
+        """
+        with self._lock:
+            agent = self.agents.get(agent_name)
+        if agent is None:
+            return 404, {"detail": f"Agent '{agent_name}' not found"}, []
+        rows = [
+            {
+                "subscription_id": str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"sub:{agent_name}:{s['name']}")
+                ),
+                "skill_id": str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, "skill:" + s["name"])
+                ),
+                "skill_name": s["name"],
+                "description": s.get("description", ""),
+                "category": None,
+                "pinned_version_id": None,
+                "pinned_version_number": None,
+                "scope": "agent",
+                "created_at": None,
+            }
+            for s in agent["skills"]
+        ]
+        return 200, {"agent_name": agent_name, "skills": rows, "total": len(rows)}, []
+
+    def _agent_prompt(
+        self, agent_name: str, query: Dict[str, List[str]]
+    ) -> Tuple[int, Any, List[str]]:
+        """`GET /api/v1/agents/{name}/prompt` — the route `load_agent()` reads.
+
+        Shape copied from the backend's `_GET_PROMPT_EXAMPLE`. The one field
+        that must be present even when there is no prompt is `system_prompt`
+        itself: `AgentConfig._from_payload` checks for the KEY and refuses a
+        payload without it rather than reading `.get()` and calling a
+        wrong-shaped 200 "no prompt set".
+        """
+        with self._lock:
+            agent = self.agents.get(agent_name)
+        if agent is None:
+            return 404, {
+                "detail": f"No agent named '{agent_name}' in this workspace."
+            }, []
+        requested = (query.get("version") or [None])[0]
+        if requested is not None and str(requested) != str(agent["version_number"]):
+            return 404, {
+                "detail": f"No version {requested} of '{agent_name}'s system prompt."
+            }, []
+        return 200, {
+            "agent_name": agent["agent_name"],
+            "agent_id": agent["agent_id"],
+            "resolved_from": None,
+            "system_prompt": agent["system_prompt"],
+            "version_id": agent["version_id"],
+            "version_number": agent["version_number"],
+            "content_hash": agent["content_hash"],
+            "label": agent["label"],
+            "provenance": "ui",
+            "created_at": None,
+            "updated_at": None,
+            "version_mode": "latest",
+            "pinned_version_number": None,
         }, []
 
     def _skill(self, name: str) -> Optional[Dict[str, Any]]:

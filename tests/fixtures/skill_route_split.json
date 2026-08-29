@@ -1,15 +1,15 @@
 {
-  "_contract": "docs/contracts/skill_route_split.md — stable_menu and routing_hint are PRE-RENDERED STRINGS, never lists or objects.",
+  "_contract": "docs/contracts/skill_route_split.md \u2014 stable_menu and routing_hint are PRE-RENDERED STRINGS, never lists or objects.",
   "routing_id": "rd_01J8XKQ2M4N7P9R3T5V6W8Y0AB",
   "strategy": "smart_routing",
-  "prompt_fragment": "## Recommended Skills\n\n| Skill | Description | Relevance |\n|-------|-------------|-----------|\n| laptop-refund-policy | Acme's refund and return policy for laptops. | 91% |\n| zz-refund-policy-check | Check refund eligibility before issuing a refund. | 84% |\n\nTo use a skill, state: \"I'll use the [skill-name] skill for this task.\"\n",
+  "prompt_fragment": "## Recommended Skills\n\n| Skill | Description | Relevance |\n|-------|-------------|-----------|\n| laptop-refund-policy | Acme's refund and return policy for laptops. | 91% |\n| zz-refund-policy-check | Check refund eligibility before issuing a refund. | 84% |\n\nWhen a skill above applies, follow its instructions and then answer the user directly. Do not reply with only a statement about which skill you are using.\n",
   "stable_menu": "## Available Skills\n\n| Skill | Description |\n|-------|-------------|\n| aaa-flight-search | Search available airline flights by origin and destination. |\n| laptop-refund-policy | Acme's refund and return policy for laptops. |\n| zz-refund-policy-check | Check refund eligibility before issuing a refund. |\n",
   "stable_menu_skills": [
     "aaa-flight-search",
     "laptop-refund-policy",
     "zz-refund-policy-check"
   ],
-  "menu_instruction": "To use a skill, state: \"I'll use the [skill-name] skill for this task.\"",
+  "menu_instruction": "When a skill above applies, follow its instructions and then answer the user directly. Do not reply with only a statement about which skill you are using.",
   "routing_hint": "Most relevant for this request: laptop-refund-policy, zz-refund-policy-check.",
   "skills": [
     {

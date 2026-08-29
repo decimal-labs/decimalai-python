@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence
 
+from ..delivery import INJECTED
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
@@ -102,9 +103,15 @@ def _skill_script(ctx: Ctx) -> List[StubTurn]:
     in a real tool loop here — the body comes back mid-run. Same shape and same
     reply text as the shared script; only the tool called differs, because the
     tool IS the mechanism under test.
+
+    In the ``injected`` delivery cell the ``load_skill`` tool is switched OFF in
+    this process's environment (``DECIMALAI_LOAD_SKILL_TOOL=0``), so the model is
+    scripted onto the ordinary conformance tool instead: asking for a tool that
+    does not exist would be a driver artifact dressed up as an adapter defect.
+    The body has to arrive by injection in that cell, which is the point of it.
     """
     turns = stub_script(ctx)
-    if not ctx.skills:
+    if not ctx.skills or ctx.delivery_mode == INJECTED:
         return turns
     ask, answer = turns[0], turns[-1]
     return [

@@ -179,13 +179,24 @@ def test_a_tool_call_argument_alone_is_enough() -> None:
     assert _c13([t]).status == contract.PASS
 
 
-def test_an_empty_activation_set_passes_and_says_it_recorded_nothing() -> None:
-    """The prompt-injection rails. A vacuous green must announce itself."""
+def test_an_empty_activation_set_passes_and_says_only_what_it_graded() -> None:
+    """The prompt-injection rails. A vacuous green must announce itself — and
+    must not announce something it never looked at.
+
+    This test used to assert the message contained the word "delivered". The
+    branch it grades never consults `served`, the rendered text, or anything
+    else, so on a rail that delivered NOTHING the matrix still printed "the
+    strongest observable rung is delivered". The fixture here passes the body in
+    the system prompt, which made the claim true for this case and false for the
+    integration path that reuses the same branch. Delivery is now C14's verdict.
+    """
     r = _c13([_trace(messages=[_system(ALPHA_BODY)])], served=[])
     assert r.status == contract.PASS
-    assert "recorded NO activation" in r.message
-    assert "delivered" in r.message
+    assert "recorded no activation" in r.message
+    assert "C14" in r.message, "it must point at the item that DOES grade delivery"
     assert "verified" not in r.message
+    # The load-bearing half: this branch must not claim a delivery it never checked.
+    assert "rung is delivered" not in r.message
 
 
 # ── the fabrication shapes: C13 must go red ──────────────────────────────────
@@ -438,7 +449,8 @@ def test_c13b_fails_with_no_trace() -> None:
 def test_the_items_are_registered_and_ordered_last() -> None:
     assert contract.ITEMS["C13"] is contract.c13_skills_activation
     assert contract.ITEMS["C13b"] is contract.c13b_skills_activation_recorded
-    assert contract.ITEM_ORDER[-2:] == ["C13", "C13b"]
+    assert contract.ITEMS["C14"] is contract.c14_skills_body_delivered
+    assert contract.ITEM_ORDER[-3:] == ["C13", "C13b", "C14"]
 
 
 def test_the_rail_flag_gates_both_items_and_the_loader_flag_gates_only_c13b() -> None:
@@ -513,3 +525,284 @@ def test_trace_to_trace_data_active_skills_is_empty_when_the_payload_is() -> Non
     from decimalai.evals import trace_to_trace_data
 
     assert trace_to_trace_data({"id": "x", "agent_name": "a"}).active_skills == []
+
+
+# ── D1: the delivery axis ────────────────────────────────────────────────────
+#
+# Same reason the C13 tests above exist, one axis over. Only two of the four rail
+# drivers are installable in a bare checkout, so four of the eight delivery cells
+# SKIP there — and a grading function whose only exercise is a cell that skips is
+# a grading function nobody has run. These feed `grade_delivery` the shapes
+# directly: the body on the right channel, on the wrong one, on neither, and a
+# framework limit with and without its proof.
+
+SENTINEL = "SENTINEL-SKILLBODY-ALPHA: opened boxes carry a 23.5% restocking fee."
+SENTINEL_BODY = f"# Alpha\n\n{SENTINEL}\nOnly a delivered body carries this line."
+
+
+def _delivery_driver(**limits: Any) -> Any:
+    """A minimal real Driver — the contract reads its name and capabilities."""
+    from tests.conformance.drivers import Capabilities, Driver
+
+    noop = lambda *a, **k: None  # noqa: E731 - a hook that is never called
+    return Driver(
+        name="fake-rail",
+        covers=frozenset(),
+        requires=(),
+        entrypoint="test",
+        run=noop,
+        run_concurrent=noop,
+        run_error=noop,
+        run_degenerate=noop,
+        run_skills=noop,
+        capabilities=Capabilities(delivery_limits=dict(limits)),
+    )
+
+
+def _delivery_obs(
+    messages: List[Any],
+    mode: str,
+    *,
+    logs: Optional[List[str]] = None,
+    spans: Optional[List[Dict[str, Any]]] = None,
+    driver: Any = None,
+    lanes: int = 2,
+) -> Observation:
+    from tests.conformance.drivers import Ctx
+
+    trace = {
+        "routing_id": "rt_" + "0" * 24,
+        "skills_offered_in_prompt": [ALPHA],
+        "active_skills": [],
+        "skills_loaded_by_agent": [],
+        "skills_delivered": [],
+        "llm_calls": [{"rendered_input": messages, "tool_calls": [], "output": "done"}],
+        "spans": spans or [],
+    }
+    reqs = [
+        Recorded(seq=i, method="POST", path="/api/v1/traces", query={}, body=trace,
+                 status=200)
+        for i in range(lanes)
+    ]
+    probe = Probe()
+    probe.skills = [{"name": ALPHA, "description": "Alpha skill.", "body": SENTINEL_BODY}]
+    phase = Phase(name="skills", ctxs=[], requests=reqs, logs=logs or [])
+    ctx = Ctx(
+        base_url="", api_key="", agent_name="a", prompt_sentinel="p",
+        reply_sentinel="r", tool_name="t", tool_sentinel="ts", workdir="",
+        delivery_mode=mode,
+    )
+    return Observation(
+        driver=driver or _delivery_driver(), probe=probe, ctx=ctx,
+        phases={"skills": phase},
+    )
+
+
+def _sys(text: str) -> Dict[str, Any]:
+    return {"role": "system", "content": text}
+
+
+def _tool(text: str) -> Dict[str, Any]:
+    return {"role": "tool", "name": "load_skill", "content": text}
+
+
+def test_injected_passes_when_the_body_is_in_the_system_prompt() -> None:
+    from tests.conformance.delivery import INJECTED
+
+    r = contract.grade_delivery(_delivery_obs([_sys(MENU + SENTINEL_BODY)], INJECTED))
+    assert r.status == contract.PASS, r.message
+    assert "prompt channel alone" in r.message
+    assert "DECIMALAI_LOAD_SKILL_TOOL=0" in r.message
+
+
+def test_injected_fails_when_only_the_MENU_reached_the_model() -> None:
+    """The defect, in its purest form: titles, no body, no way to read one."""
+    from tests.conformance.delivery import INJECTED
+
+    r = contract.grade_delivery(_delivery_obs([_sys(MENU)], INJECTED))
+    assert r.status == contract.FAIL
+    assert "delivered NOTHING" in r.message
+    # The message must name the configuration, because that is what a reader
+    # needs to reproduce it.
+    assert "DECIMALAI_INJECT_SKILL_BODY=1" in r.message
+
+
+def test_injected_fails_when_the_body_arrives_by_the_switched_off_tool() -> None:
+    """A kill switch the SDK ignores is worse than one it does not have."""
+    from tests.conformance.delivery import INJECTED
+
+    r = contract.grade_delivery(
+        _delivery_obs([_sys(MENU), _tool(SENTINEL_BODY)], INJECTED)
+    )
+    assert r.status == contract.FAIL
+    assert "switched OFF" in r.message
+
+
+def test_tool_loaded_passes_on_a_tool_role_body() -> None:
+    from tests.conformance.delivery import TOOL_LOADED
+
+    r = contract.grade_delivery(
+        _delivery_obs([_sys(MENU), _tool(SENTINEL_BODY)], TOOL_LOADED)
+    )
+    assert r.status == contract.PASS, r.message
+    assert "tool channel alone" in r.message
+
+
+def test_tool_loaded_passes_on_a_load_skill_span_alone() -> None:
+    """openai-agents carries the body on a span as well as a message; either is
+    the tool channel, and an item that hardcodes one breaks when an adapter
+    legitimately changes it."""
+    from tests.conformance.delivery import TOOL_LOADED
+
+    span = {
+        "id": "sp1", "span_type": "tool", "name": "load_skill",
+        "input_preview": {"name": ALPHA},
+        "output_preview": f"## Skill: {ALPHA}\n\n{SENTINEL_BODY}",
+    }
+    r = contract.grade_delivery(
+        _delivery_obs([_sys(MENU)], TOOL_LOADED, spans=[span])
+    )
+    assert r.status == contract.PASS, r.message
+
+
+def test_tool_loaded_fails_when_injection_leaked_through_anyway() -> None:
+    from tests.conformance.delivery import TOOL_LOADED
+
+    r = contract.grade_delivery(
+        _delivery_obs([_sys(MENU + SENTINEL_BODY), _tool(SENTINEL_BODY)], TOOL_LOADED)
+    )
+    assert r.status == contract.FAIL
+    assert "switched OFF" in r.message
+
+
+def test_a_user_pasting_the_body_is_not_a_delivery_on_either_channel() -> None:
+    """Neither channel, so it neither satisfies a cell nor trips the leak clause
+    — the same rule C13 applies to activation evidence."""
+    from tests.conformance.delivery import INJECTED, TOOL_LOADED
+
+    msgs = [_sys(MENU), {"role": "user", "content": SENTINEL_BODY}]
+    assert contract.grade_delivery(_delivery_obs(msgs, INJECTED)).status == contract.FAIL
+    r = contract.grade_delivery(_delivery_obs(msgs, TOOL_LOADED))
+    assert r.status == contract.FAIL
+    assert "delivered NOTHING" in r.message
+
+
+def test_grading_refuses_a_capture_taken_in_the_adapters_default_mode() -> None:
+    """The cell means "this channel, alone". A default-mode capture cannot say
+    that, so grading it would report a channel nobody switched on."""
+    from tests.conformance.delivery import DEFAULT
+
+    r = contract.grade_delivery(_delivery_obs([_sys(MENU + SENTINEL_BODY)], DEFAULT))
+    assert r.status == contract.FAIL
+    assert "DEFAULT mode" in r.message
+
+
+def test_no_trace_at_all_fails_rather_than_passing_vacuously_on_delivery() -> None:
+    from tests.conformance.delivery import INJECTED
+
+    r = contract.grade_delivery(_delivery_obs([_sys(MENU)], INJECTED, lanes=0))
+    assert r.status == contract.FAIL
+    assert "no trace at all" in r.message
+
+
+# ── D1: a framework limit must prove itself, on this run ─────────────────────
+
+REFUSAL = "enable_load_skill_tool is not supported on the langchain adapter"
+
+
+def _limited_driver() -> Any:
+    from tests.conformance.delivery import TOOL_LOADED
+    from tests.conformance.drivers import FrameworkLimit
+
+    return _delivery_driver(**{
+        TOOL_LOADED: FrameworkLimit(
+            reason="an invoke-layer patch owns no tool loop.",
+            adapter_module="decimalai/langchain.py",
+            refusal_marker=REFUSAL,
+        )
+    })
+
+
+def test_a_framework_limit_is_granted_only_with_the_adapters_own_refusal() -> None:
+    from tests.conformance.delivery import TOOL_LOADED
+
+    r = contract.grade_delivery(_delivery_obs(
+        [_sys(MENU)], TOOL_LOADED,
+        logs=[f"decimalai.langchain: {REFUSAL} (invoke-layer patch)"],
+        driver=_limited_driver(),
+    ))
+    assert r.status == contract.NA
+    assert "PROVEN ON THIS RUN" in r.message
+
+
+def test_a_framework_limit_with_no_refusal_on_the_run_FAILS_rather_than_skips() -> None:
+    """The whole point. `Capabilities.__post_init__` checks a reason EXISTS,
+    never that it is TRUE — which is how C13b was N/A'd on langchain by a
+    sentence that was the defect. A limit that stops being emitted stops being
+    accepted."""
+    from tests.conformance.delivery import TOOL_LOADED
+
+    r = contract.grade_delivery(_delivery_obs(
+        [_sys(MENU)], TOOL_LOADED, logs=["something else entirely"],
+        driver=_limited_driver(),
+    ))
+    assert r.status == contract.FAIL
+    assert "never said so on this run" in r.message
+
+
+def test_a_framework_limit_fails_when_the_channel_quietly_worked_anyway() -> None:
+    """Declared impossible, printed its refusal — and delivered by that channel.
+    One of the two is lying, and a false limit is a permanent exemption."""
+    from tests.conformance.delivery import TOOL_LOADED
+
+    r = contract.grade_delivery(_delivery_obs(
+        [_sys(MENU), _tool(SENTINEL_BODY)], TOOL_LOADED,
+        logs=[f"decimalai.langchain: {REFUSAL}"],
+        driver=_limited_driver(),
+    ))
+    assert r.status == contract.FAIL
+    assert "reached the model by that very channel" in r.message
+
+
+def test_a_limit_on_a_mode_that_does_not_exist_is_refused_at_construction() -> None:
+    from tests.conformance.drivers import Capabilities, FrameworkLimit
+
+    with pytest.raises(ValueError, match="not a delivery mode"):
+        Capabilities(delivery_limits={
+            "carrier-pigeon": FrameworkLimit(reason="r", adapter_module="m", refusal_marker="x"),
+        })
+
+
+def test_a_limit_declared_as_bare_PROSE_is_refused_at_construction() -> None:
+    """Prose is what failed. A limit carries a file and a marker or it is not
+    a limit."""
+    from tests.conformance.delivery import TOOL_LOADED
+    from tests.conformance.drivers import Capabilities
+
+    with pytest.raises(ValueError, match="checkable proof"):
+        Capabilities(delivery_limits={TOOL_LOADED: "no tool loop on this adapter"})
+
+
+def test_a_framework_with_no_rail_declares_no_delivery_limits() -> None:
+    """`has_skills_rail=False` already silences the whole rail; a per-mode limit
+    on top would be a second exemption for the same hole, and two exemptions for
+    one hole is how a ledger stops meaning anything."""
+    from tests.conformance.delivery import DELIVERY_MODES
+    from tests.conformance.drivers import Capabilities
+
+    no_rail = Capabilities(has_skills_rail=False, reasons={"has_skills_rail": "none"})
+    assert all(no_rail.delivery_limit(m) is None for m in DELIVERY_MODES)
+
+
+def test_the_delivery_flag_gates_c14_and_the_loader_flag_still_only_gates_c13b() -> None:
+    """The split. `model_can_load_skill_bodies` keeps its true, narrow meaning;
+    C14 moves onto its own flag, which a guard then forbids turning off."""
+    from tests.conformance.drivers import CAPABILITY_ITEMS
+
+    assert CAPABILITY_ITEMS["model_can_load_skill_bodies"] == ("C13b",)
+    assert CAPABILITY_ITEMS["rail_can_deliver_bodies"] == ("C14",)
+    assert "C14" in CAPABILITY_ITEMS["has_skills_rail"]
+    # Ordering is load-bearing: na_reason returns the FIRST False flag, so a
+    # framework with no rail keeps printing its rail reason for C14.
+    flags = list(CAPABILITY_ITEMS)
+    assert flags.index("has_skills_rail") < flags.index("rail_can_deliver_bodies")

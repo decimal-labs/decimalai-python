@@ -50,11 +50,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..delivery import TOOL_LOADED
 from . import (
     SYSTEM_PROMPT,
     Capabilities,
     Ctx,
     Driver,
+    FrameworkLimit,
     fanout_threads,
     stub_script,
     tool_result,
@@ -280,10 +282,18 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     Runs last, like every process-wide monkeypatch in this suite — the patch has
     no uninstall, so a rail-enabled ``create()`` would otherwise colour the
     phases above.
+
+    In the ``tool_loaded`` delivery cell the driver ASKS for the tool loop
+    instead of quietly not asking, so the adapter has to refuse out loud on this
+    run — see ``contract.grade_delivery``, which will not accept the N/A without
+    that refusal. Asking is not an assertion.
     """
     from decimalai.anthropic import instrument
 
-    instrument(enable_skill_loader=True)
+    instrument(
+        enable_skill_loader=True,
+        enable_load_skill_tool=ctxs[0].delivery_mode == TOOL_LOADED,
+    )
     return fanout_threads(run)(ctxs)
 
 
@@ -321,6 +331,23 @@ DRIVER = Driver(
                 "measurable for bare prompt-injection usage.' C13 still applies and is "
                 "graded: with no loader, a delivered body is exactly what is most likely "
                 "to be promoted to a fabricated activation."
+            ),
+        },
+        delivery_limits={
+            TOOL_LOADED: FrameworkLimit(
+                reason=(
+                    "This rail is a patched `client.messages.create()` — ONE provider "
+                    "request. The tool loop belongs to the caller's own while-loop, "
+                    "which the SDK never sees, so there is no turn for a load_skill "
+                    "result to be routed back into. The tool-loaded channel does not "
+                    "exist here at any setting of any flag; prompt injection is the "
+                    "whole rail, which is why the injected cell is graded strictly "
+                    "and is not allowed to be N/A."
+                ),
+                adapter_module="decimalai/anthropic.py",
+                refusal_marker=(
+                    "enable_load_skill_tool is not supported on the anthropic adapter"
+                ),
             ),
         },
     ),
