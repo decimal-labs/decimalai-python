@@ -33,7 +33,7 @@ import threading
 import warnings
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from .schema.common import FinishReason, SpanType, Status
@@ -201,6 +201,7 @@ def record_skill_rail(
     offered: Optional[Sequence[str]] = None,
     delivered: Optional[Sequence[str]] = None,
     loaded: Optional[Sequence[str]] = None,
+    loaded_hashes: Optional[Mapping[str, Optional[str]]] = None,
     prompt_text: Optional[str] = None,
 ) -> bool:
     """Attribute one routing/loading fact to the run whose trace is live NOW.
@@ -212,6 +213,15 @@ def record_skill_rail(
         offered: names whose menu row was put in the prompt.
         delivered: names whose BODY was put in the prompt.
         loaded: names whose body reached the model as a tool result.
+        loaded_hashes: ``name -> content_hash`` for those bodies, so the
+            activation resolves to the skill VERSION the model actually read
+            instead of reporting ``skill_hash: null``. Advisory and optional —
+            a caller that passes nothing gets exactly the previous behaviour.
+            Names outside ``loaded`` are ignored, and a name recorded twice with
+            two different digests degrades to ``None``: one rail can name only
+            one version, and a gap is cheaper than a wrong version (NULL already
+            means "no known hash" everywhere downstream, while a wrong hash
+            resolves to a real, wrong row).
         prompt_text: the text that was actually injected. When given, ``offered``
             and ``delivered`` are filtered down to names that genuinely appear
             in it — the router derives its offered list and its prompt fragment
@@ -257,6 +267,7 @@ def record_skill_rail(
                 "offered": [],
                 "delivered": [],
                 "loaded": [],
+                "loaded_hashes": {},
             }
             _skill_rails[key] = rail
         if routing_id and not rail["routing_id"]:
@@ -270,6 +281,15 @@ def record_skill_rail(
             for name in incoming:
                 if name not in bucket:
                     bucket.append(name)
+        # `setdefault`, because a rail created before this key existed is
+        # still live in a long-running process mid-upgrade.
+        digests = rail.setdefault("loaded_hashes", {})
+        for name in kept_loaded:
+            incoming_hash = (loaded_hashes or {}).get(name)
+            if name in digests and digests[name] != incoming_hash:
+                digests[name] = None      # two versions, one rail: claim neither
+            else:
+                digests[name] = incoming_hash
         # A run whose root span never reaches the exporter would sit here
         # forever. Same discipline as the pending-span buffer: bounded, oldest
         # evicted first.
@@ -867,6 +887,30 @@ class DecimalSpanExporter:
                     run_trace.skills_offered_in_prompt = sorted(offered)
                     run_trace.skills_delivered = sorted(delivered)
                     run_trace.skills_loaded_by_agent = sorted(loaded)
+                    # The VERSION of each loaded body, where the rail carries
+                    # one. This cannot change which skills the trace reports as
+                    # activated: every name added here is already in
+                    # `skills_loaded_by_agent`, which the backend unions into
+                    # the activation set and dedupes by name with the
+                    # `active_skills` entry winning
+                    # (trace_service._record_skill_activations). The single
+                    # observable difference is `TraceSkillActivation.skill_hash`,
+                    # null until now — which is what broke the join from a
+                    # measured lift back to the version that produced it.
+                    # A name with no hash is not added: it would carry nothing
+                    # the plain string in `skills_loaded_by_agent` does not.
+                    digests = rail.get("loaded_hashes") or {}
+                    if digests:
+                        already = {
+                            e.get("name") for e in (run_trace.active_skills or [])
+                            if isinstance(e, dict)
+                        }
+                        for sname in sorted(loaded):
+                            shash = digests.get(sname)
+                            if shash and sname not in already:
+                                run_trace.active_skills.append(
+                                    {"name": sname, "hash": shash}
+                                )
                 # Disk skills the SDK did not inject. After the rail merge, so
                 # the rail's own names are excluded rather than re-inferred,
                 # and so the assignments above cannot clobber the result.

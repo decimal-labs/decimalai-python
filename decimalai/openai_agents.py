@@ -335,6 +335,44 @@ def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str
     )
 
 
+def _drain_router_loaded_hashes(
+    scope: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """``name -> content_hash`` for the bodies load_skill served.
+
+    A SEPARATE drain from `_drain_router_rails` rather than a fifth element on
+    its tuple: that tuple is unpacked in this module and mirrored in
+    `langchain.py`, and widening it to carry advisory metadata would touch
+    every one of those sites for no gain. A router that has never heard of this
+    method (an older SDK, or a caller's stand-in) answers `{}` and the adapter
+    reports what it always did — the name, with a null hash.
+
+    Both rails are drained: the scoped one because it is this run's own, the
+    unscoped one because leaving it would leak into the NEXT trace, exactly as
+    `_drain_router_rails` explains for the names. The scoped values win on a
+    key collision.
+
+    Safe to read across runs even so, and that is a property of the map rather
+    than of the caller: it is keyed by skill NAME, the caller only ever looks up
+    names its own rail already claims, and the Router degrades a name loaded at
+    two different versions to `None` instead of guessing between them.
+    """
+    router = _skill_router_singleton
+    if router is None:
+        return {}
+    merged: Dict[str, Optional[str]] = {}
+    try:
+        merged.update(router.consume_loaded_hashes() or {})
+        if scope:
+            merged.update(router.consume_loaded_hashes(scope=scope) or {})
+    except (AttributeError, TypeError):
+        return {}       # a router predating the hash rail, or one taking no scope
+    except Exception:
+        logger.debug("router hash-rail drain failed (non-fatal)", exc_info=True)
+        return {}
+    return merged
+
+
 # ── SkillRouter dynamic loader ──────────────────────────────
 # When `install(enable_skill_loader=True)` runs, we monkey-patch
 # `agents.Agent.__init__` so every Agent created afterwards has its
@@ -359,7 +397,7 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
-            inject_body=getattr(config, "inject_skill_body", False),
+            inject_body=config.resolve_inject_body(has_tool_loop=_has_tool_loop()),
         )
         return _skill_router_singleton
     except Exception:
@@ -502,6 +540,23 @@ def _note_user_input(acc: Any, raw: Any) -> None:
         acc.user_input_preview = _preview(text)
 
 
+#: Set True when `_make_load_skill_tool()` could not produce a tool. Read by
+#: `_has_tool_loop()` so a failed registration falls back to prompt injection
+#: rather than leaving the model with a menu it cannot read.
+_load_skill_tool_registration_failed = False
+
+
+def _has_tool_loop() -> bool:
+    """Whether this adapter will really deliver bodies via a load_skill tool.
+
+    NOT the same question as `_load_skill_tool_enabled()`, which reads a config
+    flag. A flag saying "register the tool" plus a registration that failed adds
+    up to zero body channels — the same conjunction that made langchain ship
+    broken. Answer with the outcome where one is known.
+    """
+    return _load_skill_tool_enabled() and not _load_skill_tool_registration_failed
+
+
 def _load_skill_tool_enabled() -> bool:
     """Config gate for the load_skill tool (kill switch:
     DECIMALAI_LOAD_SKILL_TOOL=0 / init(load_skill_tool=False))."""
@@ -545,9 +600,19 @@ def _make_load_skill_tool() -> Any:
     routed back to the model mid-turn. This adapter therefore registers
     load_skill as a real tool; the langchain / anthropic adapters wrap a layer
     with no tool loop, so they surface skills in the prompt instead."""
+    global _load_skill_tool_registration_failed
     try:
         from agents import function_tool
     except Exception:
+        # Loud, not DEBUG: if this returns None the model gets no load_skill tool,
+        # and `resolve_inject_body(has_tool_loop=...)` would still be told this
+        # adapter HAS a tool loop — leaving zero body channels, silently. Exactly
+        # the conjunction that shipped broken on langchain.
+        _load_skill_tool_registration_failed = True
+        logger.warning(
+            "load_skill tool unavailable: could not import `function_tool` from "
+            "`agents`. Skill bodies will be prompt-injected instead."
+        )
         return None
     from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
 
@@ -556,10 +621,18 @@ def _make_load_skill_tool() -> Any:
 
     load_skill.__doc__ = LOAD_SKILL_TOOL_DESCRIPTION
     try:
-        return function_tool(load_skill)
+        tool = function_tool(load_skill)
     except Exception:
-        logger.debug("function_tool(load_skill) failed (non-fatal)", exc_info=True)
+        _load_skill_tool_registration_failed = True
+        logger.warning(
+            "load_skill tool could not be built (function_tool raised) — skill "
+            "bodies will be prompt-injected instead. Set logging to DEBUG for the "
+            "traceback.",
+        )
+        logger.debug("function_tool(load_skill) failed", exc_info=True)
         return None
+    _load_skill_tool_registration_failed = False
+    return tool
 
 
 def _agent_has_load_skill_tool(agent: Any) -> bool:
@@ -2091,6 +2164,28 @@ class DecimalTracingProcessor:
             acc.skills_delivered.update(rail_loaded)
             acc.skills_offered_in_prompt.update(rail_loaded)
 
+        # The VERSION of each body the model read. Drained unconditionally, for
+        # the same leak reason the names are, and stamped only onto names this
+        # run already claims as loaded.
+        #
+        # This CANNOT change which skills the trace reports as activated, and
+        # that is the point: every name written here is already in
+        # `skills_loaded_by_agent`, which the backend unions into the activation
+        # set and dedupes by name with the `active_skills` entry winning
+        # (trace_service._record_skill_activations). So the entry replaces a
+        # string with a dict of the same name, and the only observable
+        # difference is `TraceSkillActivation.skill_hash` — null before this,
+        # which is what broke the join from a measured lift to the skill VERSION
+        # that produced it.
+        #
+        # A name with NO hash is deliberately not written: it would be an entry
+        # carrying nothing the plain string does not already carry.
+        _loaded_hashes = _drain_router_loaded_hashes(acc.trace_id)
+        for _name in acc.skills_loaded_by_agent:
+            _digest = _loaded_hashes.get(_name)
+            if _digest and _name not in acc.active_skills:
+                acc.active_skills[_name] = _digest
+
         # Put the system half of the prompt back on `rendered_input`. STRICTLY
         # BEFORE `_infer_skill_rungs` below, and that order is a REVERSAL —
         # read this before moving it back.
@@ -2128,14 +2223,16 @@ class DecimalTracingProcessor:
         # menu row for could be re-inferred here as delivered.
         self._infer_skill_rungs(acc)
 
-        # Build active_skills list. Nothing on this adapter writes
-        # `acc.active_skills` — no rail, no drain, and explicitly not the
-        # inference above. `log_skill_activation` fills the equivalent field on
-        # the GENERIC tracer, which is a different accumulator and never
-        # reaches this one, so on the Agents SDK the activation signal is
+        # Build active_skills list. The ONE writer of `acc.active_skills` on
+        # this adapter is the hash stamp above, and it only ever re-states a
+        # name `skills_loaded_by_agent` already carries — so this list still
+        # names no skill the model did not demonstrably read. Nothing else
+        # writes it: not a rail, and explicitly not the inference above.
+        # `log_skill_activation` fills the equivalent field on the GENERIC
+        # tracer, which is a different accumulator and never reaches this one,
+        # so on the Agents SDK the activation SIGNAL remains
         # `skills_loaded_by_agent`: a body the model asked for by calling
-        # load_skill. This list is built anyway so a future direct-selection
-        # source has somewhere to land, and so the field is never fabricated.
+        # load_skill. What this list adds is the VERSION of that body.
         active_skills_list: List[Dict[str, Any]] = []
         for name, h in acc.active_skills.items():
             entry: Dict[str, Any] = {"name": name}

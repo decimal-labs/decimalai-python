@@ -18,13 +18,43 @@ from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger("decimalai")
 
-# Try to load .env if python-dotenv is available
+# Try to load .env if python-dotenv is available.
+#
+# `find_dotenv(usecwd=True)` is load-bearing. Bare `load_dotenv()` resolves from the CALLING
+# FRAME's file — this module, inside site-packages — and walks UP from there. With a project-local
+# venv (`myapp/.venv/`) that walk escapes site-packages and happens to land on `myapp/.env`, so it
+# works on a laptop. With the interpreter anywhere else — a container's
+# /usr/local/lib/python3.x/site-packages with the app at /app, a Lambda layer, a shared venv — the
+# walk never reaches the project and returns '', so the .env is silently ignored and init() dies
+# with "No API key provided". Same code, same .env, opposite outcome, decided by venv placement.
+# `usecwd=True` walks up from the working directory instead, i.e. from next to the user's agent.py.
 try:
-    from dotenv import load_dotenv
+    from dotenv import find_dotenv, load_dotenv
 
-    load_dotenv(override=False)
-except ImportError:
+    _dotenv_path = find_dotenv(usecwd=True)
+    if _dotenv_path:
+        load_dotenv(_dotenv_path, override=False)
+    else:
+        load_dotenv(override=False)
+except Exception:
+    # ImportError when python-dotenv is absent; anything else means a malformed .env,
+    # which must not stop the SDK from importing.
     pass
+
+
+def _tristate_env(name: str) -> Optional[bool]:
+    """Read a boolean env var that distinguishes "unset" from "explicitly false".
+
+    Returns None when the variable is absent or empty, so a caller can tell
+    "the user did not say" from "the user said no".
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip().lower()
+    if not raw:
+        return None
+    return raw in ("1", "true", "yes", "on")
 
 
 # ── SDK identity ───────────────────────────────────────────────
@@ -144,11 +174,20 @@ class DecimalConfig:
     backend_require_manifest_on_ingest: Optional[bool] = None
     # When True, framework adapters inject the routed skill's BODY (the knowledge K) into the
     # prompt at runtime — not just a menu row — so a benchmarked skill's value actually reaches the
-    # agent. Off by default (menu-only, unchanged). Enable via init(inject_skill_body=True) or
-    # DECIMALAI_INJECT_SKILL_BODY=1.
-    inject_skill_body: bool = field(
-        default_factory=lambda: os.environ.get("DECIMALAI_INJECT_SKILL_BODY", "").strip().lower()
-        in ("1", "true", "yes", "on")
+    # agent.
+    #
+    # TRI-STATE, and the None is load-bearing. Unset (None) means "let the adapter decide", which
+    # `resolve_inject_body()` below answers from whether that adapter owns a tool loop. An explicit
+    # True/False — from init(inject_skill_body=...) or DECIMALAI_INJECT_SKILL_BODY=0/1 — always wins.
+    #
+    # This was a plain `bool` defaulting False until 2026-08-28, and that default silently broke the
+    # whole point of the skill rail on every adapter with no tool loop: langchain and anthropic
+    # register no `load_skill` tool, so prompt injection is their ONLY body channel, and False meant
+    # the model got a menu of titles it could never read. Verified end to end — a skill body saying
+    # "opened boxes carry a 23.5% restocking fee" against a real model produced 15% (confabulated)
+    # with the old default and 23.5% with injection on. Do not flatten this back to a bool.
+    inject_skill_body: Optional[bool] = field(
+        default_factory=lambda: _tristate_env("DECIMALAI_INJECT_SKILL_BODY")
     )
     # Progressive disclosure: register the native load_skill tool on
     # adapters that own their tool loop (openai_agents, pydantic_ai) whenever
@@ -173,9 +212,26 @@ class DecimalConfig:
             os.environ.get("DECIMALAI_SKILL_AUTHORITY", "").strip().lower() or "auto"
         )
     )
-    # Internal
-    _max_batch_size: int = field(default=50, repr=False)
-    _flush_interval_seconds: float = field(default=5.0, repr=False)
+    # `_max_batch_size = 50` and `_flush_interval_seconds = 5.0` used to sit
+    # here. Both were DELETED on 2026-08-29 rather than wired up, because
+    # neither described anything this SDK does, and a config field that reads
+    # like a knob but turns nothing is worse than no field: someone reasoning
+    # about trace latency would have concluded there was a 5-second periodic
+    # flush, and there never was one.
+    #
+    # There is no periodic flush because there is nothing for it to drain.
+    # `BackgroundSender.submit` hands each trace straight to a
+    # ThreadPoolExecutor, which starts the send immediately — the send path
+    # holds no queue that time could bound. The ONE buffer in the SDK is
+    # `DecimalAIClient._trace_buffer`, and it is bounded by COUNT
+    # (`_AUTO_FLUSH_THRESHOLD` in _client.py) plus the explicit
+    # `flush()`/`close()`/atexit drains, not by a clock. A daemon timer would
+    # be a thread guarding a queue that does not exist.
+    #
+    # `_max_batch_size` was dead the same way: the real batch size is
+    # `_AUTO_FLUSH_THRESHOLD`, which this value never fed and never agreed with.
+    # If a time-based flush is ever wanted, it belongs on that buffer in
+    # _client.py, next to the threshold it would sit beside.
 
     @property
     def api_headers(self) -> dict[str, str]:
@@ -203,6 +259,28 @@ class DecimalConfig:
         if authority == "harness":
             return True
         return not loader_active  # auto
+
+    def resolve_inject_body(self, *, has_tool_loop: bool) -> bool:
+        """Whether this adapter should inject the routed skill's BODY into the prompt.
+
+        An explicit setting always wins — init(inject_skill_body=...) or
+        DECIMALAI_INJECT_SKILL_BODY=0/1. Unset, the answer comes from the adapter:
+
+          no tool loop  (langchain, anthropic)      => True
+              Prompt injection is the ONLY body channel these have. Without it the model
+              is handed a menu of skill titles it has no mechanism to read, which is not a
+              degraded rail — it is a rail that cannot work.
+
+          has tool loop (openai_agents, pydantic_ai) => False
+              These register a real `load_skill` tool, so the model fetches on demand.
+              Injecting as well would double-deliver and double the token cost.
+
+        Only reached once an adapter's skill loader is enabled (`enable_skill_loader=True`),
+        which is opt-in and off by default — so nobody who never asked for skills is affected.
+        """
+        if self.inject_skill_body is not None:
+            return bool(self.inject_skill_body)
+        return not has_tool_loop
 
 
 class DecimalConfigError(Exception):

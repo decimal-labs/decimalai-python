@@ -97,7 +97,7 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
-            inject_body=getattr(config, "inject_skill_body", False),
+            inject_body=config.resolve_inject_body(has_tool_loop=False),
         )
         return _skill_router_singleton
     except Exception:

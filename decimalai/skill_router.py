@@ -25,7 +25,7 @@ import warnings
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -173,8 +173,74 @@ def load_skill_tool_spec() -> Dict[str, Any]:
 # instruction unchanged so evaluation stays on-distribution with production.
 LOAD_SKILL_PROMPT_HINT = (
     "If a skill applies, call the load_skill tool with its exact name to read "
-    "its full instructions before using it."
+    "its full instructions before using it. Load each skill at most once, then "
+    "answer the user directly using what you loaded."
 )
+
+
+# ── hot-path availability ───────────────────────────────────
+#
+# "Hot path" = a call that happens INSIDE a user's turn, so its latency is the
+# customer's latency. Everything else (CLI, publish, scans) can afford to wait.
+_HOT_PATHS = ("/api/v1/skills/route", "/api/v1/skills/menu")
+# connect/read/write/pool. Read is the one that matters: a hung backend must not
+# hold a turn open. The caller degrades to an empty menu, which is correct —
+# the agent answers without skills rather than not answering at all.
+_HOT_PATH_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=2.0, pool=1.0)
+_COLD_PATH_TIMEOUT = 30.0
+
+
+def _is_hot_path(path: str) -> bool:
+    return any(path.startswith(p) for p in _HOT_PATHS)
+
+
+class _CircuitBreaker:
+    """Stop paying the timeout once the platform is clearly unreachable.
+
+    Failing open is the right call for skill routing, but before this the SDK
+    failed open only AFTER the full timeout, and re-attempted the same dead
+    endpoint on the next turn, and the one after that. With a short timeout the
+    per-turn cost is small; with a breaker it goes to zero for a cooldown window
+    and the agent stops making a doomed call on every request it serves.
+    """
+
+    def __init__(self, threshold: int = 3, cooldown_s: float = 30.0):
+        self.threshold = threshold
+        self.cooldown_s = cooldown_s
+        self._consecutive_failures = 0
+        self._opened_at: Optional[float] = None
+        self._lock = Lock()
+
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._opened_at is None:
+                return False
+            if time.monotonic() - self._opened_at >= self.cooldown_s:
+                # Half-open: let one call through to test the water.
+                self._opened_at = None
+                self._consecutive_failures = 0
+                return False
+            return True
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.threshold and self._opened_at is None:
+                self._opened_at = time.monotonic()
+                logger.warning(
+                    "SkillRouter: %d consecutive transport failures — pausing "
+                    "skill routing for %.0fs. Agents will run without skills "
+                    "until the platform is reachable.",
+                    self._consecutive_failures, self.cooldown_s,
+                )
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._opened_at = None
+
+
+_hot_path_breaker = _CircuitBreaker()
 
 
 class _BodyLoadBudget:
@@ -199,9 +265,23 @@ class _BodyLoadBudget:
         self._first_load_at: Optional[float] = None
 
     def check(self, name: str) -> Optional[str]:
-        """None if the load may proceed, else a refusal message for the model."""
+        """None if the load may proceed, else a message to return to the model instead.
+
+        A repeat load still costs no budget, but it no longer returns the body a
+        second time. Handing back the identical text with no signal invited an
+        unbounded loop: observed 4/4 runs of the shipped openai-agents scaffold
+        re-loading the same skill on turns 3..10 and dying with MaxTurnsExceeded
+        without ever producing an answer. Because the repeat was free, nothing
+        bounded the loop — at max_turns=40 it burned all 40. The refusal path
+        below only fires on DISTINCT skills, so it never saw this at all.
+        """
         if name in self.loaded:
-            return None  # dedup — repeat load is free
+            self.loaded.move_to_end(name)  # LRU refresh, unchanged
+            return (
+                f"'{name}' is already loaded in this turn's context — its full "
+                "instructions are above. Do not call load_skill for it again. "
+                "Answer the user now with what you have."
+            )
         if self._first_load_at is not None and (
             time.monotonic() - self._first_load_at > self.deadline_s
         ):
@@ -236,6 +316,18 @@ class _BodyLoadBudget:
 # concurrent agent runs must not share a turn budget. build_prompt_fragment
 # resets it at each prompt build (= turn start); load_skill lazily creates
 # one if the tool fires without a prior fragment build in this context.
+#: Handoff slot for the `content_hash` of the body `get_skill_body` just
+#: fetched, read by `load_skill` on the SAME thread one line later.
+#:
+#: Thread-local and not a ContextVar, deliberately: a ContextVar set inside a
+#: framework's tool executor may be written into a COPIED context that never
+#: propagates back to the reader (the reality documented all over this module's
+#: rails), while `get_skill_body` and `load_skill` are plain synchronous calls on
+#: one thread and a thread-local always survives between them. Not state — it is
+#: only ever read on the line after it is written, and is cleared before the
+#: write it describes.
+_body_hash_tls = _thread_local()
+
 _body_budget_ctx: ContextVar[Optional[_BodyLoadBudget]] = ContextVar(
     "decimalai_skill_router_body_budget", default=None,
 )
@@ -630,6 +722,11 @@ class SkillRouter:
         # reality behind the `_last_budget` fallback above. Adapters drain
         # this off their router singleton via `consume_loaded_names()`.
         self._loaded_names: List[str] = []
+        # name -> content_hash for every body this router actually loaded.
+        # Parallel to `_loaded_names` rather than folded into it: the rails are
+        # drained by five adapters and a shape change there is a much wider blast
+        # radius than capturing the hash. Read it via `loaded_skill_hash()`.
+        self._loaded_hashes: Dict[str, Optional[str]] = {}
         # Per-run twin of `_loaded_names`. `load_skill`'s docstring has always
         # promised "the loaded-names rail [is] kept per scope"; until this
         # existed, `scope` reached only the turn budget and the rail itself was
@@ -637,6 +734,22 @@ class SkillRouter:
         # got every concurrent run's loads. Bounded LRU, same discipline and
         # same cap as `_scoped_budgets`.
         self._scoped_loaded_names: "OrderedDict[str, List[str]]" = OrderedDict()
+        # name -> content_hash for the loads on THIS run's rail, drained by
+        # `consume_loaded_hashes(scope=...)` alongside the names. Separate from
+        # `_loaded_hashes` above, which is a persistent last-seen map serving
+        # `loaded_skill_hash()` and is never cleared: a persistent map cannot
+        # answer "what did THIS run read" once a concurrent run has loaded the
+        # same skill at another version. Same LRU cap and same lock as
+        # `_scoped_loaded_names`, so the two stay evictable together.
+        self._scoped_loaded_hashes: "OrderedDict[str, Dict[str, Optional[str]]]" = (
+            OrderedDict()
+        )
+        # The unscoped rail's twin of the above: hashes for the loads sitting on
+        # `_loaded_names` right now, cleared when those names are drained. The
+        # unscoped rail is already documented as cross-contaminating concurrent
+        # runs' NAMES; this at least keeps it from inventing a VERSION for a name
+        # it got right — see `_record_window_hash` for the ambiguity rule.
+        self._loaded_hashes_window: Dict[str, Optional[str]] = {}
         # Instance mirror of the routing decision — routing_id + offered +
         # delivered names — for the same reason `_loaded_names` exists, one
         # step earlier in the run: prompt assembly also happens in a copied
@@ -673,6 +786,11 @@ class SkillRouter:
         # `get` -> `move_to_end` -> `popitem` sequences below are not atomic.
         # Never held across a network call or a resolver callback.
         self._rail_lock = Lock()
+        # NOTE: transport is still module-level `httpx.request`, so every call pays a
+        # fresh TCP+TLS handshake. Pooling it is a real win but moves the patch point
+        # the whole suite mocks (`httpx.request`), so it is deliberately a separate
+        # change rather than a rider on the availability fixes.
+        self._http_lock = Lock()
         # Full-menu cache (single slot, force-refresh to invalidate).
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
@@ -724,6 +842,14 @@ class SkillRouter:
             {k: v for k, v in params.items() if v is not None} if params else None
         )
 
+        hot = _is_hot_path(path)
+        if hot and _hot_path_breaker.is_open():
+            # Short-circuit rather than pay the timeout again. See _CircuitBreaker.
+            raise SkillRouterError(
+                f"SkillRouter circuit open for {method} {path} — skipping the call "
+                "while the platform is unreachable. Skills are unavailable this turn."
+            )
+
         try:
             resp = httpx.request(
                 method,
@@ -731,12 +857,22 @@ class SkillRouter:
                 params=clean_params,
                 json=json,
                 headers=self._headers(),
-                timeout=30.0,
+                # A hot-path call runs INSIDE the user's turn. A 30s budget there
+                # turns a platform brownout into a 30s stall on every request the
+                # customer's own service handles — measured at 30.3s per turn —
+                # i.e. an outage of THEIR product caused by an optional vendor.
+                # Fail fast instead; the caller already degrades to an empty menu.
+                # Non-hot paths (CLI, publish, body reads outside a turn) keep 30s.
+                timeout=_HOT_PATH_TIMEOUT if hot else _COLD_PATH_TIMEOUT,
             )
         except httpx.HTTPError as e:
+            if hot:
+                _hot_path_breaker.record_failure()
             raise SkillRouterError(
                 f"SkillRouter transport error on {method} {path}: {e}"
             ) from e
+        if hot:
+            _hot_path_breaker.record_success()
 
         if resp.status_code >= 400:
             # Surface the server's structured error body (FastAPI ``detail``) —
@@ -892,6 +1028,46 @@ class SkillRouter:
         ``max_chars`` asks the server to trim (body guardrail); ``agent_name``
         resolves the exact version that agent was offered (Use pins).
         Returns the body text or None if not found.
+
+        Prefer :meth:`get_skill_body_record` when you also want the version the
+        body came from — this wrapper drops it.
+        """
+        # Cleared FIRST, so a miss or a raise below can never leave the previous
+        # body's hash on this thread for `load_skill` to pick up.
+        _body_hash_tls.value = None
+        result = self.get_skill_body_record(
+            skill_name, version, max_chars=max_chars, agent_name=agent_name,
+        )
+        if not result:
+            return None
+        content_hash = result.get("content_hash")
+        if isinstance(content_hash, str) and content_hash:
+            # Two readers, on purpose. `_loaded_hashes` is the persistent
+            # last-seen map behind `loaded_skill_hash()`; the thread-local is
+            # the race-free handoff to `load_skill`, which needs the hash of the
+            # body IT just fetched and not whichever version another thread
+            # stored last. See the comment at that call site.
+            _body_hash_tls.value = content_hash
+            with self._rail_lock:
+                self._loaded_hashes[skill_name] = content_hash
+        return result.get("body")
+
+    def get_skill_body_record(
+        self,
+        skill_name: str,
+        version: Optional[int] = None,
+        *,
+        max_chars: Optional[int] = None,
+        agent_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Like :meth:`get_skill_body` but returns the whole server record.
+
+        The platform hands back ``content_hash`` and ``version`` alongside ``body``
+        precisely so no client has to recompute the hash. Until 2026-08-28 this
+        method did not exist and ``get_skill_body`` discarded both one line after
+        receiving them, so every activation the SDK reported carried
+        ``skill_hash: null`` — breaking the join that attributes a measured lift to
+        the skill VERSION the model actually read.
         """
         params: Dict[str, Any] = {}
         if version is not None:
@@ -910,7 +1086,17 @@ class SkillRouter:
         except SkillRouterError as e:
             logger.warning("get_skill_body(%s) failed: %s", skill_name, e)
             return None
-        return result.get("body") if result else None
+        return result if isinstance(result, dict) else None
+
+    def loaded_skill_hash(self, name: str) -> Optional[str]:
+        """The ``content_hash`` of a body this router loaded, if it saw one.
+
+        Populated by :meth:`load_skill`. Adapters that report activations can
+        pass this as ``log_skill_activation(hash=...)`` so the activation is
+        attributable to a specific skill version.
+        """
+        with self._rail_lock:
+            return self._loaded_hashes.get(name)
 
     def load_skill(
         self,
@@ -963,11 +1149,31 @@ class SkillRouter:
         if refusal is not None:
             return refusal
 
+        # Still `get_skill_body`, deliberately. It is a public method, and
+        # tests, subclasses and conformance drivers all stub it; switching this
+        # call to `get_skill_body_record` to get at the hash would leave every
+        # one of those stubs uncalled — 19 tests went red proving it.
+        #
+        # So the hash comes back on a thread-local instead. `get_skill_body`
+        # runs on THIS thread, synchronously, between the two lines below, which
+        # makes the handoff race-free without changing any signature. Re-reading
+        # `_loaded_hashes[name]` after the call would NOT be: it is a persistent
+        # last-seen map, and a concurrent run loading the same skill at another
+        # version overwrites it in between — attributing this activation to a
+        # version the model never read. A wrong version is worse than none. NULL
+        # already means "no known hash" everywhere downstream; a wrong hash
+        # resolves to a real, wrong row.
+        #
+        # A stub leaves the thread-local at the None set here, so a stubbed
+        # `get_skill_body` reports the load with no hash — exactly what every
+        # load reported before this rail existed.
+        _body_hash_tls.value = None
         body = self.get_skill_body(
             name,
             max_chars=self.per_body_char_limit,
             agent_name=agent_name or self.agent_name,
         )
+        content_hash = getattr(_body_hash_tls, "value", None)
         if body is None or not body.strip():
             return (
                 f"load_skill: no skill named {name!r} is available. Use the exact "
@@ -1013,11 +1219,21 @@ class SkillRouter:
         # silently reset the per-turn caps mid-run.
         rail_scope = scope if scope is not None else _ambient_scope()
         self._note_unscoped_writer(rail_scope)
+        # The hash goes onto BOTH rails, for the same reason the name does: an
+        # adapter drains whichever one it can reach, and the unscoped rail is
+        # the only one a framework with no run identity ever writes to.
+        self._record_window_hash(name, content_hash)
         if rail_scope is not None:
-            self._record_scoped_load(rail_scope, name)
+            self._record_scoped_load(rail_scope, name, content_hash)
         try:
             from .generic import log_skill_loaded
-            log_skill_loaded(name=name)
+            try:
+                log_skill_loaded(name=name, hash=content_hash)
+            except TypeError:
+                # A caller that monkey-patched this function with the old
+                # one-argument signature. The LOAD still has to be recorded —
+                # losing the activation to gain a hash would be a bad trade.
+                log_skill_loaded(name=name)
         except Exception:
             logger.debug("load_skill: no active trace to record the load", exc_info=True)
 
@@ -1078,11 +1294,44 @@ class SkillRouter:
             while len(self._scoped_budgets) > self._MAX_SCOPED_BUDGETS:
                 self._scoped_budgets.popitem(last=False)
 
-    def _record_scoped_load(self, scope: str, name: str) -> None:
+    @staticmethod
+    def _merge_hash(
+        store: Dict[str, Optional[str]], name: str, content_hash: Optional[str],
+    ) -> None:
+        """Record one load's hash, degrading a CONFLICT to None.
+
+        Callers hold ``_rail_lock``.
+
+        The conflict is real: the same skill name loaded twice against one rail
+        with two different hashes means two versions were read and the rail can
+        name only one. Whichever we picked would be a claim we cannot support
+        for the other, so we keep neither — ``None`` is exactly "activation with
+        no known hash", which every downstream reader already handles
+        (`_resolve_managed_skill` skips the version lookup, the analytics
+        service skips falsy hashes). A gap is not a lie; a wrong version is.
+        """
+        if name in store and store[name] != content_hash:
+            store[name] = None
+            return
+        store[name] = content_hash
+
+    def _record_window_hash(self, name: str, content_hash: Optional[str]) -> None:
+        """Record a hash on the UNSCOPED rail's current drain window."""
+        with self._rail_lock:
+            self._merge_hash(self._loaded_hashes_window, name, content_hash)
+
+    def _record_scoped_load(
+        self, scope: str, name: str, content_hash: Optional[str] = None,
+    ) -> None:
         """Note that THIS run loaded a body. Only reached from `load_skill`,
         and only after the body was actually served — a budget refusal or a
         not-found returns before here, so the rail never names a skill whose
-        body did not reach the model."""
+        body did not reach the model.
+
+        ``content_hash`` defaults to None so an older in-tree caller that passes
+        two arguments still records the name; the hash rail then reports this
+        load as version-unknown rather than dropping it.
+        """
         with self._rail_lock:
             bucket = self._scoped_loaded_names.get(scope)
             if bucket is None:
@@ -1091,8 +1340,20 @@ class SkillRouter:
             if name not in bucket:
                 bucket.append(name)
             self._scoped_loaded_names.move_to_end(scope)
+            hashes = self._scoped_loaded_hashes.get(scope)
+            if hashes is None:
+                hashes = {}
+                self._scoped_loaded_hashes[scope] = hashes
+            self._merge_hash(hashes, name, content_hash)
+            self._scoped_loaded_hashes.move_to_end(scope)
             while len(self._scoped_loaded_names) > self._MAX_SCOPED_RAILS:
                 self._evict_rail_overflow(self._scoped_loaded_names, "loaded")
+            # Evicted on its own key order rather than following the names
+            # store: the two are written together and so evict together, but
+            # tying one's eviction to the other's popitem would drop a
+            # DIFFERENT scope's hashes if they ever fell out of step.
+            while len(self._scoped_loaded_hashes) > self._MAX_SCOPED_RAILS:
+                self._scoped_loaded_hashes.popitem(last=False)
 
     def consume_loaded_names(self, scope: Optional[str] = None) -> List[str]:
         """Read + clear the names whose body `load_skill` served since the
@@ -1117,6 +1378,37 @@ class SkillRouter:
             self._loaded_names.clear()
         self._forget_unscoped_owners_if_drained()
         return drained
+
+    def consume_loaded_hashes(
+        self, scope: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Read + clear the ``name -> content_hash`` map for the same loads
+        :meth:`consume_loaded_names` drains, so an adapter can report the skill
+        VERSION the model actually read.
+
+        Deliberately a SEPARATE method rather than a wider return from
+        `consume_loaded_names`: that one is drained by three adapters at five
+        call sites and its list return is part of the shape older callers were
+        written against. A new method leaves every one of them working
+        untouched, and an adapter that never calls this simply keeps reporting
+        `skill_hash: null` — which is what all of them did before.
+
+        Pair it with the matching `consume_loaded_names(scope=...)` call. A
+        scope whose names are drained but whose hashes are not leaves one small
+        dict behind until the LRU reclaims it; it is bounded, never unbounded.
+
+        A name maps to ``None`` when no hash was available, or when the same
+        name was loaded twice at different versions against one rail — see
+        `_merge_hash`.
+        """
+        if scope is not None:
+            with self._rail_lock:
+                drained_map = self._scoped_loaded_hashes.pop(scope, None)
+            return dict(drained_map) if drained_map else {}
+        with self._rail_lock:
+            drained_map = dict(self._loaded_hashes_window)
+            self._loaded_hashes_window.clear()
+        return drained_map
 
     def _note_unscoped_writer(self, scope: Optional[str]) -> None:
         """Record who just wrote the unscoped rails. Takes `_rail_lock`.

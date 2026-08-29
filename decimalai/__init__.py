@@ -30,6 +30,9 @@ __version__ = "0.11.1"
 import atexit
 import logging
 import os
+import signal
+import socket
+import threading
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -40,6 +43,69 @@ logger = logging.getLogger("decimalai")
 # Ensures the atexit handler is only registered once even if init() is
 # called multiple times (e.g., re-init in a test or after a config change).
 _atexit_registered = False
+# Same, for the SIGTERM handler installed alongside it.
+_sigterm_registered = False
+
+
+def _register_sigterm_flush() -> None:
+    """Flush on SIGTERM as well as at exit.
+
+    Python's default SIGTERM disposition terminates the process WITHOUT running
+    atexit handlers. SIGTERM is exactly what Cloud Run, Kubernetes, ECS and
+    `docker stop` send, so before this every deploy, rolling restart and
+    scale-down silently destroyed the tail of the trace stream — measured at
+    0 of 40 traces delivered under SIGTERM against 40 of 40 on a clean exit.
+    Invisible on a laptop, where `python agent.py` exits normally and Ctrl-C
+    raises KeyboardInterrupt (which does run atexit).
+
+    Deliberately conservative:
+      * only on the main thread, where signal handlers can be installed at all;
+      * never clobbers a handler the user already installed — we chain to it;
+      * opt out with DECIMALAI_HANDLE_SIGTERM=0.
+    This is what the OpenTelemetry and Sentry SDKs do.
+    """
+    global _sigterm_registered
+    if _sigterm_registered:
+        return
+    if os.environ.get("DECIMALAI_HANDLE_SIGTERM", "").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+    try:
+        previous = signal.getsignal(signal.SIGTERM)
+    except (ValueError, AttributeError, OSError):
+        return
+
+    def _handler(signum: int, frame: Any) -> Any:
+        # Drain the BACKGROUND SENDER first, then the client buffer. Adapters
+        # hand traces to `_sender.submit(...)`, so a trace can be sitting in the
+        # executor's queue having never reached the client — flushing only the
+        # client leaves those behind. Measured: client-flush alone delivered 2 of
+        # 6 on SIGTERM; draining the sender first delivers all of them.
+        try:
+            from ._config import _sender
+            _sender.flush()
+        except Exception:  # noqa: BLE001 — a signal handler must not raise
+            pass
+        _atexit_flush()
+        if callable(previous) and previous not in (
+            signal.SIG_DFL, signal.SIG_IGN,
+        ):
+            return previous(signum, frame)
+        # Restore the default and re-raise so the process still dies of SIGTERM
+        # with the conventional 143 exit status rather than continuing to run.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return None
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+        _sigterm_registered = True
+    except (ValueError, OSError):
+        # Not the main thread of the main interpreter, or the platform refuses.
+        return
 
 
 def _atexit_flush() -> None:
@@ -307,6 +373,19 @@ def _verify_backend_at_init(
         )
         return
     except urllib.error.URLError as exc:
+        # A CONNECT-phase timeout arrives here, not in `except TimeoutError` below —
+        # urllib wraps it as URLError(reason=TimeoutError). That is the dominant shape
+        # when a host is slow, partitioned, or behind a black-holing firewall, so
+        # raising on it made the log-and-continue branch reachable only for read-phase
+        # timeouts and crash-looped containers on exactly the transient slowness both
+        # this function's docstring and init()'s promise to tolerate.
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            logger.warning(
+                "decimalai.init: verify probe timed out connecting to %s — continuing. "
+                "Trace failures will be surfaced via decimalai.export_status().",
+                url,
+            )
+            return
         # Connection refused, DNS failure, etc. The base_url is wrong
         # or the backend is down. Fail at init so the caller can fix it
         # before launching a long-running agent.
@@ -725,10 +804,21 @@ def init(
         )
         # Register the atexit flush handler exactly once. This prevents
         # silent trace loss when a script ingests <50 traces and exits.
+        # A re-init means a different key, workspace or base_url. A prompt cached
+        # under the previous one must not be served for the same agent name.
+        try:
+            from ._agent import _reset_prompt_cache
+            _reset_prompt_cache()
+        except Exception:  # noqa: BLE001 — never let cache hygiene break init()
+            logger.debug("prompt cache reset failed", exc_info=True)
+
         global _atexit_registered
         if not _atexit_registered:
             atexit.register(_atexit_flush)
             _atexit_registered = True
+        # atexit alone does not survive SIGTERM, which is how every container
+        # runtime stops a process. See _register_sigterm_flush.
+        _register_sigterm_flush()
 
         # Init-time health probe. Default-on because the failure mode
         # it prevents (a whole day of traces silently 401'd because of
@@ -1929,7 +2019,14 @@ def _auto_init_from_env() -> None:
     # want to control init themselves).
     if api_key and os.environ.get("DECIMAL_AUTOINIT", "").strip().lower() != "false":
         try:
-            init()
+            # verify=False is load-bearing. This runs at MODULE SCOPE, before the
+            # user's own init(base_url=...) line has executed, so a verifying bare
+            # auto-init sends `Authorization: Bearer <key>` to the DEFAULT
+            # api.decimal.ai even when the file explicitly configures a different
+            # host — a compliance problem for self-hosted or egress-allowlisted
+            # deployments, and a blocking round trip nobody asked for. The user's
+            # own init() call still verifies; this one has not been requested.
+            init(verify=False)
             logger.debug("DecimalAI auto-init from DECIMAL_API_KEY (bare mode)")
         except Exception:
             # Bare init was never explicitly requested (env-var presence is the

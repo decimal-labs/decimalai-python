@@ -540,6 +540,48 @@ def _drain_scoped_router_rails(
     return routing_id, offered, delivered, loaded
 
 
+def _drain_router_loaded_hashes(
+    scopes: "set[str]", *, include_unscoped: bool,
+) -> Dict[str, Optional[str]]:
+    """``name -> content_hash`` for the bodies load_skill served this run.
+
+    A SEPARATE drain from the four-tuple rails above rather than a fifth
+    element on them: those tuples are unpacked at four sites across this module
+    and `openai_agents.py`, and widening them to carry advisory metadata would
+    touch every one for no gain. A router that never heard of this method
+    answers `{}` and the trace reports what it always did — the name, with a
+    null hash.
+
+    ``include_unscoped`` carries this module's ownership rule down to the hash,
+    unchanged: the unscoped window is always DRAINED (an undrained rail leaks
+    into the next trace) but its values are only USED when
+    `_drain_unscoped_rails_for` already established that this run owns them.
+    Draining and discarding is exactly what the names do one call above.
+    """
+    router = _skill_router_singleton
+    if router is None or not (scopes or include_unscoped):
+        return {}
+    merged: Dict[str, Optional[str]] = {}
+    try:
+        unscoped = router.consume_loaded_hashes() or {}
+    except (AttributeError, TypeError):
+        return {}       # a router predating the hash rail, or one taking no scope
+    except Exception:
+        logger.debug("router hash-rail drain failed (non-fatal)", exc_info=True)
+        unscoped = {}
+    if include_unscoped:
+        merged.update(unscoped)
+    for scope in scopes:
+        try:
+            merged.update(router.consume_loaded_hashes(scope=scope) or {})
+        except Exception:
+            logger.debug(
+                "scoped router hash-rail drain failed (non-fatal)", exc_info=True,
+            )
+            continue
+    return merged
+
+
 def _discard_scoped_router_rails(state: "_RunState") -> None:
     """Release the Router rails of a run that will never build a trace.
 
@@ -560,6 +602,34 @@ def _discard_scoped_router_rails(state: "_RunState") -> None:
             router.consume_loaded_names(scope=scope)
         except Exception:
             return  # an older router keeps nothing scoped to release
+        # The hash bucket is a separate store, so releasing the names does not
+        # release it. Without this an abandoned run leaves one small dict
+        # behind until the LRU pushes it out — the same slow leak this
+        # function exists to prevent, one store over.
+        #
+        # In its OWN try, and outside the one above, deliberately. Folded into
+        # that block it would abort the whole LOOP on a router that has scoped
+        # names but no hash rail — releasing the first scope and leaking every
+        # later one, which is a worse leak than the one this line closes.
+        # Missing the hash bucket is survivable (the LRU still bounds it);
+        # skipping the remaining scopes entirely is not.
+        try:
+            router.consume_loaded_hashes(scope=scope)
+        except Exception:
+            logger.debug(
+                'router keeps no scoped hash rail to release', exc_info=True,
+            )
+        # The hash bucket is a separate store, so releasing the names does not
+        # release it. Without this an abandoned run leaves one small dict
+        # behind until the LRU pushes it out — the same slow leak this
+        # function exists to prevent, one store over.
+        #
+        # In its OWN try, and outside the one above, deliberately. Folded into
+        # that block it would abort the whole LOOP on a router that has scoped
+        # names but no hash rail — releasing the first scope and leaking every
+        # later one, which is a worse leak than the one this line closes.
+        # Missing the hash bucket is survivable (the LRU still bounds it);
+        # skipping the remaining scopes entirely is not.
 
 
 def _unscoped_rail_owners() -> Optional["set[str]"]:
@@ -614,7 +684,7 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
-            inject_body=getattr(config, "inject_skill_body", False),
+            inject_body=config.resolve_inject_body(has_tool_loop=False),
         )
         return _skill_router_singleton
     except Exception:
@@ -640,8 +710,35 @@ def _extract_query_from_messages(messages: Any) -> Optional[str]:
             content = getattr(msg, "content", None) or (
                 msg.get("content") if isinstance(msg, dict) else None
             )
-            if isinstance(content, str) and content.strip():
-                return content
+            text = _content_text(content)
+            if text:
+                return text
+    return None
+
+
+def _content_text(content: Any) -> Optional[str]:
+    """The routable text of a message's content, string or content blocks.
+
+    Multimodal messages carry a LIST of blocks — ``[{"type": "text", "text": ...},
+    {"type": "image_url", ...}]`` — which is the standard shape the moment a caller
+    attaches an image. Gating on ``isinstance(content, str)`` alone silently yielded
+    no query for those, and no query means no semantic routing AND no body injection
+    (the inject block requires ``smart_routed``), so a multimodal agent quietly ran
+    on the full menu with its skills undelivered and nothing logged.
+    """
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, (list, tuple)):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "\n".join(p for p in parts if p and p.strip()).strip()
+        return joined or None
     return None
 
 
@@ -2415,14 +2512,6 @@ class CallbackHandler(_CallbackBase):
 
         self._attach_tool_calls(state)
 
-        # Build active_skills list
-        active_skills_list: List[Dict[str, Any]] = []
-        for name, h in state.active_skills.items():
-            entry: Dict[str, Any] = {"name": name}
-            if h:
-                entry["hash"] = h
-            active_skills_list.append(entry)
-
         # ── the skills rails ────────────────────────────────
         # Three sources, in strict precedence order, and every one of them is
         # drained whether or not it is used — an undrained rail leaks forward
@@ -2495,6 +2584,39 @@ class CallbackHandler(_CallbackBase):
                     state.skills_loaded_by_agent.add(n.strip())
                     state.skills_offered_in_prompt.add(n.strip())
                     state.skills_delivered.add(n.strip())
+
+        # The VERSION of each body the model read, stamped onto names this run
+        # already claims as loaded.
+        #
+        # This CANNOT change which skills the trace reports as activated. Every
+        # name written here is already in `skills_loaded_by_agent`, which the
+        # backend unions into the activation set and dedupes by name with the
+        # `active_skills` entry winning (trace_service._record_skill_activations),
+        # so the entry replaces a string with a dict of the same name. The only
+        # observable difference is `TraceSkillActivation.skill_hash` — null until
+        # now, which is what broke the join from a measured lift back to the
+        # skill VERSION that produced it. A name with no hash is not written: it
+        # would carry nothing the plain string does not already carry.
+        loaded_hashes = _drain_router_loaded_hashes(
+            scopes, include_unscoped=bool(rail_loaded),
+        )
+        for n in state.skills_loaded_by_agent:
+            digest = loaded_hashes.get(n)
+            if digest and n not in state.active_skills:
+                state.active_skills[n] = digest
+
+        # Build active_skills list. STRICTLY AFTER the rails above, and that
+        # order is the whole point: this block used to run before them, so a
+        # hash stamped from the loaded rail was written to `state.active_skills`
+        # into a list that had already been built and never re-read. The trace
+        # shipped `active_skills: []` while the state said otherwise — silently,
+        # because nothing downstream compares the two.
+        active_skills_list: List[Dict[str, Any]] = []
+        for name, h in state.active_skills.items():
+            entry: Dict[str, Any] = {"name": name}
+            if h:
+                entry["hash"] = h
+            active_skills_list.append(entry)
 
         # Infer offered/delivered for DISK skills the SDK did not inject.
         # STRICTLY AFTER every rail merge above, so the precedence rule sees

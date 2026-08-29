@@ -41,8 +41,10 @@ paying customers they were on the free plan.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Optional, Set, Tuple
+import time
+from dataclasses import dataclass, replace
+from threading import Lock
+from typing import Any, Dict, Optional, Set, Tuple
 
 logger = logging.getLogger("decimalai")
 
@@ -88,6 +90,14 @@ class AgentConfig:
     pinned_version_number: Optional[int] = None
     agent_id: Optional[str] = None
     resolved_from: Optional[str] = None
+    #: True when this config did NOT come from the platform on this call — it is
+    #: either a cached value served because the platform was unreachable, or the
+    #: caller's own `fallback=`. Log it. An agent silently running on a stale or
+    #: substitute prompt is exactly the thing that must not be invisible.
+    is_fallback: bool = False
+    #: Set only when `is_fallback` — how old the served value is, in seconds,
+    #: or None for a caller-supplied fallback that was never fetched.
+    stale_age_seconds: Optional[float] = None
 
     def __repr__(self) -> str:
         """Never dumps the prompt body — a prompt is up to 100,000 characters.
@@ -207,7 +217,43 @@ def _warn_if_renamed(config: AgentConfig) -> None:
     )
 
 
-def load_agent(agent_name: str, *, version: Optional[int] = None) -> AgentConfig:
+#: agent_name -> (config, fetched_at_monotonic). Process-local; a cached entry is
+#: served only while it is younger than `cache_ttl_seconds`, or — regardless of
+#: age — when the platform cannot be reached at all. See load_agent().
+_prompt_cache: Dict[str, "tuple[AgentConfig, float]"] = {}
+_prompt_cache_lock = Lock()
+
+#: Default: DO NOT serve a cached prompt in place of a live read.
+#:
+#: The cache exists for one job — surviving an outage — so by default it is only
+#: consulted when the platform cannot be reached. Serving a fresh read from cache
+#: would quietly cost the property Phase 3c exists for (edit the prompt in the
+#: dashboard, the next run picks it up) and would blunt fail-closed: a revoked key
+#: or a deleted agent would keep "working" until the TTL expired.
+#: `load_agent()` is documented as a once-per-process call, so there is nothing to
+#: optimise here. A caller who really does read per turn can opt in.
+_DEFAULT_PROMPT_CACHE_TTL_S = 0.0
+
+
+def _reset_prompt_cache() -> None:
+    """Drop every cached prompt.
+
+    Called by `init()`. Re-initialising points the SDK at a different key,
+    workspace or base_url, and serving the previous one's prompt for the same
+    agent name would be a cross-workspace read. Also what test suites use to
+    keep the process-local cache from leaking between cases.
+    """
+    with _prompt_cache_lock:
+        _prompt_cache.clear()
+
+
+def load_agent(
+    agent_name: str,
+    *,
+    version: Optional[int] = None,
+    fallback: Optional[str] = None,
+    cache_ttl_seconds: float = _DEFAULT_PROMPT_CACHE_TTL_S,
+) -> AgentConfig:
     """Read an agent's configuration from DecimalAI.
 
     Call it once, where the agent is built — it is one HTTP request, and it is
@@ -229,21 +275,34 @@ def load_agent(agent_name: str, *, version: Optional[int] = None) -> AgentConfig
             canonical, and a one-time warning says so.
         version: Read one historical version instead of the effective one.
             Rarely what you want: the effective prompt already honours a pin.
+        fallback: A prompt to use if the platform cannot be reached AND nothing
+            is cached. Supply it in anything that has to boot during an outage —
+            it is the difference between an agent that degrades and one that
+            does not start. The returned config carries `is_fallback=True`.
+        cache_ttl_seconds: Opt in to serving a previously-fetched config without
+            re-asking. Default 0 — every call reads the platform, so a dashboard
+            edit reaches the next run and a revoked key still fails. Regardless
+            of this setting, the last good value IS served when the platform is
+            unreachable: stale beats down.
 
     Returns:
-        A frozen :class:`AgentConfig`.
+        A frozen :class:`AgentConfig`. Check `is_fallback` if you care whether
+        it came from the platform on this call.
 
     Raises:
         DecimalConfigError: `decimalai.init()` has not been called.
         AgentNotFoundError: no such agent in this workspace.
         ValueError: `agent_name` is empty, or the response was not a prompt
             payload this SDK can read.
-        DecimalAPIError: any other HTTP failure (bad key, 5xx, unresolvable
-            pin). Transport failures surface as the `httpx` error.
+        DecimalAPIError: any other HTTP failure (bad key, unresolvable pin).
 
-    Every one of those is raised, not swallowed. A prompt that cannot be read
-    stops the process at the line that reads it, which is the only place the
-    problem is still cheap to see.
+    A prompt that cannot be read still stops the process — fail-closed is right
+    for a prompt, because substituting one silently makes the agent follow
+    instructions nobody wrote. What changed on 2026-08-28 is that there is now
+    something to fall back TO. Before, `load_agent()` had no cache, no retry and
+    no fallback, so an unreachable platform meant a generated agent could not
+    boot at all — which made the documented promise "turn DecimalAI off and your
+    agent still works" false for every agent `decimalai init` produces.
     """
     if not str(agent_name or "").strip():
         raise ValueError(
@@ -253,10 +312,68 @@ def load_agent(agent_name: str, *, version: Optional[int] = None) -> AgentConfig
 
     from ._config import _get_client
 
+    key = f"{agent_name}\x00{version if version is not None else ''}"
+
+    # A fresh cached value short-circuits the network entirely.
+    if cache_ttl_seconds > 0:
+        with _prompt_cache_lock:
+            entry = _prompt_cache.get(key)
+        if entry is not None:
+            cached, fetched_at = entry
+            if time.monotonic() - fetched_at < cache_ttl_seconds:
+                return cached
+
     client = _get_client()
-    payload = client.get_agent_prompt(agent_name, version=version)
+    try:
+        payload = client.get_agent_prompt(agent_name, version=version)
+    except Exception as exc:
+        # Only availability failures may be softened. A 404 (no such agent) or a
+        # 409 (unresolvable pin) is a real answer from a reachable platform and
+        # must still raise — serving a stale prompt for a deleted agent would be
+        # worse than stopping.
+        if not _is_availability_failure(exc):
+            raise
+        with _prompt_cache_lock:
+            entry = _prompt_cache.get(key)
+        if entry is not None:
+            cached, fetched_at = entry
+            age = time.monotonic() - fetched_at
+            logger.warning(
+                "decimalai.load_agent(%r): platform unreachable (%s) — serving the "
+                "cached prompt, %.0fs old. config.is_fallback is True.",
+                agent_name, exc, age,
+            )
+            return replace(cached, is_fallback=True, stale_age_seconds=age)
+        if fallback is not None:
+            logger.warning(
+                "decimalai.load_agent(%r): platform unreachable (%s) and nothing "
+                "cached — using the fallback prompt. config.is_fallback is True.",
+                agent_name, exc,
+            )
+            return AgentConfig(
+                agent_name=str(agent_name),
+                system_prompt=fallback,
+                is_fallback=True,
+            )
+        raise
+
     # `get_agent_prompt` only returns None for a 304, which needs a conditional
     # request this call never makes.
     config = AgentConfig._from_payload(payload, requested_name=str(agent_name))
     _warn_if_renamed(config)
+    with _prompt_cache_lock:
+        _prompt_cache[key] = (config, time.monotonic())
     return config
+
+
+def _is_availability_failure(exc: BaseException) -> bool:
+    """Whether this failure means "could not reach the platform" rather than
+    "the platform answered, and the answer was no"."""
+    import httpx
+
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    return status in (500, 502, 503, 504)

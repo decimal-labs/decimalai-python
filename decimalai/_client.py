@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, cast
@@ -340,6 +341,23 @@ class DecimalAIClient:
             timeout=timeout,
         )
         self._trace_buffer: List[RunTrace] = []
+        # Guards EVERY read and write of `_trace_buffer`, `_flush_cooldown_until`
+        # and `_dropped_while_buffer_full`. Never held across the HTTP send:
+        # `flush` SWAPS the buffer out under the lock and posts the detached
+        # list, so a `buffer_trace` racing the in-flight request appends to a
+        # fresh list instead of one that is about to be cleared.
+        #
+        # Both halves are load-bearing, and both were measured broken over 8
+        # threads x 20 traces before this existed: without the lock two threads
+        # crossing the auto-flush threshold together each called `flush()` on
+        # the SAME list and the batch went twice (~5x write amplification);
+        # without the swap, `flush` cleared the buffer AFTER the post, so every
+        # trace appended during the request was destroyed unsent (~15% lost).
+        # No shipped adapter reaches this path — they all use `_sender.submit` —
+        # but this class documents `buffer_trace` as usable standalone, and a
+        # documented API that loses data under concurrency is a defect whether
+        # or not our own code is the caller.
+        self._buffer_lock = threading.Lock()
         # Monotonic deadline before which `buffer_trace` will not auto-flush.
         # Set only when a flush fails in a way a later flush could still fix;
         # an explicit flush()/close()/atexit ignores it. See
@@ -360,7 +378,13 @@ class DecimalAIClient:
     # ── Retry logic ────────────────────────────────────────────
 
     def _request_with_retry(
-        self, method: str, url: str, *, idempotent: bool = False, **kwargs: Any
+        self,
+        method: str,
+        url: str,
+        *,
+        idempotent: bool = False,
+        no_raise_statuses: Optional[frozenset] = None,
+        **kwargs: Any,
     ) -> httpx.Response:
         """Make an HTTP request, retrying the failures a retry can actually fix.
 
@@ -450,6 +474,12 @@ class DecimalAIClient:
                 )
                 time.sleep(delay)
                 continue
+
+            # A caller that gives a status its own meaning (a conditional GET's
+            # 304, a lookup's 404) gets the response back unraised, so it can
+            # answer that status itself. Everything else keeps the old behaviour.
+            if no_raise_statuses and resp.status_code in no_raise_statuses:
+                return resp
 
             # Success, a 4xx, or a retryable 5xx whose attempts are spent. In the
             # failure cases _raise_for_status raises a DecimalAPIError carrying
@@ -591,24 +621,33 @@ class DecimalAIClient:
         """
         if not self._should_send_traces("buffer_trace"):
             return
-        self._trace_buffer.append(trace)
-        if len(self._trace_buffer) < _AUTO_FLUSH_THRESHOLD:
-            return
-        if time.monotonic() >= self._flush_cooldown_until:
-            self.flush()
-        if len(self._trace_buffer) > _AUTO_FLUSH_THRESHOLD:
-            # Only reachable when the cooldown above suppressed the flush — a
-            # flush that ran and preserved has already trimmed to the cap. The
-            # buffer is a full batch the backend just refused, so drop the
-            # OLDEST to hold the bound and COUNT it rather than logging once per
-            # trace: a per-trace warning through an outage is its own kind of
-            # damage. The running total is reported on the next flush, whichever
-            # way that one goes.
-            del self._trace_buffer[0]
-            self._dropped_while_buffer_full += 1
+        with self._buffer_lock:
+            self._trace_buffer.append(trace)
+            if len(self._trace_buffer) < _AUTO_FLUSH_THRESHOLD:
+                return
+            if time.monotonic() < self._flush_cooldown_until:
+                # The cooldown suppressed the flush, which is the ONLY way the
+                # buffer exceeds the cap. Drop the OLDEST to hold the bound and
+                # COUNT it rather than logging once per trace: a per-trace
+                # warning through an outage is its own kind of damage. The
+                # running total is reported on the next flush, either way.
+                #
+                # Trimmed under the lock, with the append: two threads that both
+                # got here would otherwise each drop one for a single overflow.
+                if len(self._trace_buffer) > _AUTO_FLUSH_THRESHOLD:
+                    del self._trace_buffer[0]
+                    self._dropped_while_buffer_full += 1
+                return
+        # OUTSIDE the lock — flush does network I/O, and it takes the lock
+        # itself for the swap. Two threads arriving here together is fine and
+        # is the point of the swap: the first takes the whole buffer, the
+        # second finds it empty and returns without sending anything twice.
+        self.flush()
 
-    def _preserve_buffer_after_failed_flush(self, reason: str) -> None:
-        """Keep the buffered traces for a later flush — bounded, and logged.
+    def _preserve_buffer_after_failed_flush(
+        self, reason: str, batch: List[RunTrace],
+    ) -> None:
+        """Put an undelivered batch BACK for a later flush — bounded, and logged.
 
         For the failures a later flush could still fix. The bound is the other
         half of that promise: ``buffer_trace`` auto-flushes at
@@ -618,39 +657,52 @@ class DecimalAIClient:
         someone is about to go looking for sit next to the symptom, not at the
         start of the incident — and say plainly how many were lost, because a
         dropped trace never comes back.
+
+        ``batch`` is the list ``flush`` swapped out, so it goes back in FRONT of
+        whatever arrived during the request: it is older, and "most recent" has
+        to mean the same thing here as it does everywhere else.
         """
-        overflow = max(0, len(self._trace_buffer) - _AUTO_FLUSH_THRESHOLD)
-        if overflow:
-            del self._trace_buffer[:overflow]
-            self._dropped_while_buffer_full += overflow
-        self._flush_cooldown_until = time.monotonic() + _FLUSH_RETRY_COOLDOWN
-        if self._dropped_while_buffer_full:
+        with self._buffer_lock:
+            merged = list(batch) + self._trace_buffer
+            overflow = max(0, len(merged) - _AUTO_FLUSH_THRESHOLD)
+            if overflow:
+                del merged[:overflow]
+                self._dropped_while_buffer_full += overflow
+            self._trace_buffer = merged
+            self._flush_cooldown_until = time.monotonic() + _FLUSH_RETRY_COOLDOWN
+            kept, dropped = len(merged), self._dropped_while_buffer_full
+        if dropped:
             logger.warning(
                 "%s — preserving the %d most recent trace(s) for the next flush. "
                 "The buffer is at its %d-trace cap, so %d trace(s) have been "
                 "DROPPED since the last successful flush. They are gone.",
-                reason, len(self._trace_buffer), _AUTO_FLUSH_THRESHOLD,
-                self._dropped_while_buffer_full,
+                reason, kept, _AUTO_FLUSH_THRESHOLD, dropped,
             )
         else:
             logger.warning(
                 "%s — preserving %d buffered trace(s) for the next flush",
-                reason, len(self._trace_buffer),
+                reason, kept,
             )
 
     def _drop_buffer_after_failed_flush(self, exc: BaseException) -> None:
-        """Clear the buffer for a failure no retry can fix — and make it visible.
+        """Give up on the in-flight batch for a failure no retry can fix.
 
-        This is a permanent trace loss, so it is also recorded on the background
-        sender: ``export_status().last_error`` / ``last_send_error()`` is where a
+        The batch itself is already detached — ``flush`` swapped it out before
+        sending — so dropping it means simply not putting it back. Traces that
+        arrived DURING the failed request stay: the server judged the bytes it
+        was shown, and these are not those bytes. Before the swap this method
+        cleared the whole buffer, which destroyed them too.
+
+        A permanent trace loss, so it is also recorded on the background sender:
+        ``export_status().last_error`` / ``last_send_error()`` is where a
         production health check looks, and the batch path used to drop traces
         without ever touching either — the same silence that made the original
         bug take weeks to notice. Mirrors ``otel._submit_or_send_inline``, which
         already records failures from a foreground send.
         """
-        self._trace_buffer.clear()
-        self._flush_cooldown_until = 0.0
-        self._dropped_while_buffer_full = 0
+        with self._buffer_lock:
+            self._flush_cooldown_until = 0.0
+            self._dropped_while_buffer_full = 0
         try:
             from . import _config
 
@@ -675,26 +727,39 @@ class DecimalAIClient:
         local serialization failure. Holding a permanently-rejected batch would
         wedge every later trace behind it — an unbounded buffer is its own bug.
 
+        SWAP, then send. The buffer is detached under the lock and the detached
+        list is what goes over the wire, so a trace buffered during the request
+        lands on a fresh list rather than one about to be cleared. Clearing
+        AFTER the post is what destroyed ~15% of traces under 8 concurrent
+        writers; two threads posting the same list is what sent the rest ~5x.
+
         Never raises: a failed flush must not take down the caller's agent.
         """
-        if not self._trace_buffer:
-            return
+        with self._buffer_lock:
+            batch = self._trace_buffer
+            if not batch:
+                return
+            # A concurrent flush now finds an empty buffer and returns — one
+            # batch, one POST, no matter how many callers arrive together.
+            self._trace_buffer = []
         try:
-            self.ingest_traces_batch(self._trace_buffer)
-            self._trace_buffer.clear()
-            self._flush_cooldown_until = 0.0
-            if self._dropped_while_buffer_full:
+            self.ingest_traces_batch(batch)
+            with self._buffer_lock:
+                self._flush_cooldown_until = 0.0
+                dropped, self._dropped_while_buffer_full = (
+                    self._dropped_while_buffer_full, 0,
+                )
+            if dropped:
                 # Close the loop on the outage: the recovery log is the last
                 # chance to say how much never made it, and it is the line
                 # someone reads when the trace count looks short.
                 logger.warning(
                     "Flush recovered, but %d trace(s) were dropped while the "
                     "buffer sat at its %d-trace cap during the failure.",
-                    self._dropped_while_buffer_full, _AUTO_FLUSH_THRESHOLD,
+                    dropped, _AUTO_FLUSH_THRESHOLD,
                 )
-                self._dropped_while_buffer_full = 0
         except DecimalRateLimitError:
-            self._preserve_buffer_after_failed_flush("Rate limited")
+            self._preserve_buffer_after_failed_flush("Rate limited", batch)
         except DecimalAPIError as exc:
             # The one branch this whole change exists for. `status_code` is the
             # server's, not a guess: 5xx means "try again", 4xx means "these
@@ -702,26 +767,31 @@ class DecimalAIClient:
             if exc.status_code >= 500:
                 self._preserve_buffer_after_failed_flush(
                     f"Server error (HTTP {exc.status_code}) after "
-                    f"{_MAX_RETRIES} retries — {exc}"
+                    f"{_MAX_RETRIES} retries — {exc}",
+                    batch,
                 )
             else:
+                # `len(batch)`, not `len(self._trace_buffer)`: the buffer is
+                # already empty here (swapped out above), so reading it would
+                # report "Failed to flush 0 traces" for a real loss.
                 logger.exception(
                     "Failed to flush %d traces — the server rejected them with "
                     "HTTP %d, which a retry cannot fix. Dropping the batch.",
-                    len(self._trace_buffer), exc.status_code,
+                    len(batch), exc.status_code,
                 )
                 self._drop_buffer_after_failed_flush(exc)
         except httpx.RequestError as exc:
             # Never reached the server at all (DNS, refused connection, read
             # timeout). Same reasoning as a 5xx: the payload is not implicated.
             self._preserve_buffer_after_failed_flush(
-                f"Transport error ({type(exc).__name__}: {exc})"
+                f"Transport error ({type(exc).__name__}: {exc})",
+                batch,
             )
         except Exception as exc:
             # Everything else — a quota (terminal until the billing period rolls
             # over), a serialization failure, a bug. Dropping is the honest
             # outcome; the log and export_status() carry the cause.
-            logger.exception("Failed to flush %d traces", len(self._trace_buffer))
+            logger.exception("Failed to flush %d traces", len(batch))
             self._drop_buffer_after_failed_flush(exc)
 
     # ── Trace queries ──────────────────────────────────────────
@@ -802,8 +872,19 @@ class DecimalAIClient:
             params["version"] = version
         headers = {"If-None-Match": if_none_match} if if_none_match else None
 
-        resp = self._http.get(
-            f"/api/v1/agents/{quoted}/prompt", params=params, headers=headers,
+        # `_request_with_retry`, not a bare `_http.get`. This is the most
+        # availability-critical read in the SDK — a generated agent makes it at
+        # import, in a worker's boot path — and it was the one call that skipped
+        # the retry ladder, so a single 503 from a load balancer with no healthy
+        # instance (exactly what `_RETRYABLE_STATUSES` exists for) crashed the
+        # process. In a container that is a crash loop, not a blip.
+        # 304 and 404 are answered below, so they are handed back unraised.
+        resp = self._request_with_retry(
+            "GET",
+            f"/api/v1/agents/{quoted}/prompt",
+            params=params,
+            headers=headers,
+            no_raise_statuses=frozenset({304, 404}),
         )
         # 304 is not `is_success`, so it has to be answered before
         # `_raise_for_status` turns a correct conditional response into an error.
@@ -1905,23 +1986,30 @@ class DecimalAIClient:
         be a promise nobody is left to keep. Say the traces were lost, plainly,
         at the one moment it becomes true.
         """
-        if not self._trace_buffer:
-            return
+        # Read and clear in ONE critical section, then log. Reading the counts
+        # outside the lock would report a number that had already changed by the
+        # time the buffer was cleared — the last thing a caller sees about lost
+        # traces should not itself be a race.
+        with self._buffer_lock:
+            lost = len(self._trace_buffer)
+            if not lost:
+                return
+            dropped = self._dropped_while_buffer_full
+            self._trace_buffer = []
+            self._dropped_while_buffer_full = 0
         logger.warning(
             "%s with %d buffered trace(s) that never reached the platform — "
             "the last flush failed and there is no later attempt.%s Call "
             "decimalai.export_status() for the cause.",
             when,
-            len(self._trace_buffer),
+            lost,
             (
-                f" A further {self._dropped_while_buffer_full} trace(s) were "
+                f" A further {dropped} trace(s) were "
                 "dropped earlier at the buffer cap."
-                if self._dropped_while_buffer_full
+                if dropped
                 else ""
             ),
         )
-        self._trace_buffer.clear()
-        self._dropped_while_buffer_full = 0
 
     def close(self) -> None:
         """Flush remaining traces and close the HTTP client."""

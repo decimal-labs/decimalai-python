@@ -109,7 +109,7 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
-            inject_body=getattr(config, "inject_skill_body", False),
+            inject_body=config.resolve_inject_body(has_tool_loop=_load_skill_tool_enabled()),
         )
         return _skill_router_singleton
     except Exception:
@@ -150,7 +150,15 @@ def _handle_load_skill(name: str) -> str:
             if served:
                 try:
                     from .otel import record_skill_rail
-                    record_skill_rail(loaded=served)
+                    # Drained in the same breath as the names and from the same
+                    # scope, so the hash describes the body THIS run just read.
+                    # `{}` on a router that predates the hash rail, which is the
+                    # pre-existing behaviour: the name, with a null hash.
+                    try:
+                        digests = router.consume_loaded_hashes(scope=scope) or {}
+                    except (AttributeError, TypeError):
+                        digests = {}
+                    record_skill_rail(loaded=served, loaded_hashes=digests)
                 except Exception:
                     logger.debug(
                         "skill rail recording failed (non-fatal)", exc_info=True
@@ -161,15 +169,66 @@ def _handle_load_skill(name: str) -> str:
         return f"load_skill error: could not load {name!r} (transient error)."
 
 
+def _run_query(ctx: Any) -> Optional[str]:
+    """The turn's user text from a RunContext, or None.
+
+    Best-effort and never raises: this runs inside a system-prompt hook, and an
+    adapter that crashes a user's agent to improve its own routing has made
+    things worse. `prompt` is the current turn; `messages` is the fallback for
+    shapes that put the text there instead. A None result is a real answer —
+    the caller degrades to full-menu mode.
+    """
+    try:
+        prompt = getattr(ctx, "prompt", None)
+        text = _content_text(prompt)
+        if text:
+            return text
+        for msg in reversed(list(getattr(ctx, "messages", None) or [])):
+            for part in (getattr(msg, "parts", None) or []):
+                if type(part).__name__ == "UserPromptPart":
+                    text = _content_text(getattr(part, "content", None))
+                    if text:
+                        return text
+    except Exception:  # noqa: BLE001 — routing must never break the run
+        logger.debug("could not read the turn's query from RunContext", exc_info=True)
+    return None
+
+
+def _content_text(content: Any) -> Optional[str]:
+    """Text of a prompt that may be a string or a list of content parts."""
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, (list, tuple)):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                if isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+        joined = "\n".join(x for x in parts if x and x.strip()).strip()
+        return joined or None
+    return None
+
+
 async def _skills_system_prompt(ctx: Any) -> str:
     """Async system-prompt function registered on every Agent.
 
-    The user message isn't directly available on RunContext, so we
-    default to full-menu mode (query=None) — every active skill's
-    name + description is added to the prompt. Users who want smart
-    routing can disable the loader and call
-    `SkillRouter.build_prompt_fragment()` themselves with explicit
-    context.
+    Routes on the turn's user message when `RunContext` carries one.
+
+    It used to pass `query=None` unconditionally, on the documented belief that
+    "the user message isn't directly available on RunContext". That was true
+    once and is not now — `RunContext` exposes both `prompt` and `messages`
+    (checked against pydantic_ai 2.36). The cost of the stale belief was not
+    merely worse routing: `SkillRouter` gates body injection on
+    `smart_routed = bool(query) and ...`, so with no query the injected channel
+    is DEAD. With the documented kill switch `DECIMALAI_LOAD_SKILL_TOOL=0` that
+    left this adapter with zero body channels — the same arithmetic that
+    shipped broken on langchain, found by the conformance delivery matrix
+    (8/8 runs, `skills_delivered: []`, only `GET /skills/menu` on the wire).
+
+    Falls back to full-menu mode when no text can be read, which is the honest
+    answer for a turn that genuinely has none.
     """
     router = _get_skill_router()
     if router is None:
@@ -180,7 +239,7 @@ async def _skills_system_prompt(ctx: Any) -> str:
         if agent_obj is not None:
             agent_name = getattr(agent_obj, "name", None)
         fragment, routing_id = router.build_prompt_fragment(
-            query=None, agent_name=agent_name, scope=_scope(),
+            query=_run_query(ctx), agent_name=agent_name, scope=_scope(),
         )
         # Drain the per-call contextvar rails NOW, one statement after the
         # router wrote them and on the same thread, so these are this call's
