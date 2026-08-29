@@ -89,6 +89,88 @@ print("PROCESSORS:", len(_ours))
 print("BOUND:", _ours[0].default_agent_name if _ours else "<no processor>")
 """,
     },
+    "pydantic-ai": {
+        "requires": "pydantic_ai",
+        # `infer_model` is where the MODEL string becomes a model object, so
+        # patching it swaps the provider and leaves everything else — the real
+        # Agent, the real tool loop, the real adapter patches — on the path.
+        # Patching `Agent.run_sync` instead (the openai-agents shape) would skip
+        # the loop, and the loop is the body channel on this framework.
+        "stub": """
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
+_sent = []
+
+
+def _reply(messages, info):
+    # The whole request, verbatim: this is the evidence the canary is read from.
+    _sent.append((messages, info))
+    tools = {t.name for t in (info.function_tools or [])}
+    # A tool result already came back → this is the answering turn. Derived from
+    # the REQUEST rather than from a call counter, so the script does not have
+    # to know how many turns the adapter takes.
+    answered = any(
+        type(p).__name__ == "ToolReturnPart"
+        for m in messages for p in (getattr(m, "parts", None) or [])
+    )
+    if "load_skill" in tools and not answered:
+        return ModelResponse(parts=[
+            ToolCallPart("load_skill", {"name": "restocking-policy"}),
+        ])
+    return ModelResponse(parts=[TextPart("stubbed answer")])
+
+
+_stack.enter_context(patch(
+    "pydantic_ai.models.infer_model", return_value=FunctionModel(_reply),
+))
+""",
+        "probe": """
+import decimalai.pydantic_ai as adapter
+print("LOADER:", adapter._skill_loader_installed)
+# The name the RUN SCOPE will stamp, computed by the adapter's own resolver
+# against the Agent the template built — not the literal from the template and
+# not the module global either. Pydantic AI fills a missing name from the local
+# variable (`agent = Agent(...)` runs as the agent "agent"), so this is the one
+# reading that can tell a bound name from an invented one.
+print("BOUND:", adapter._run_agent_name(_mod["agent"]))
+
+# Every part the model was handed, across every request, flattened. Parts carry
+# their text under `content` whatever their kind (system prompt, user turn, tool
+# return), so one accessor covers all three.
+def _texts():
+    for messages, _info in _sent:
+        for m in messages:
+            for p in (getattr(m, "parts", None) or []):
+                c = getattr(p, "content", None)
+                if isinstance(c, str):
+                    yield type(p).__name__, c
+
+_parts = list(_texts())
+
+# The agent's own prompt, told apart from the rail's system parts by their
+# headings — same filter the langchain probe uses, and for the same reason: the
+# rail registers a system_prompt function, so "the first system part" stopped
+# being "the agent's prompt" the moment the loader was on.
+_system = [
+    c for kind, c in _parts
+    if kind == "SystemPromptPart"
+    and not c.lstrip().startswith(("## Available Skills", "## Skill:"))
+]
+print("PROMPT_SEEN:", _system[0] if _system else "<none>")
+
+# The load_skill tool was really registered — the body channel on this
+# framework IS the tool, so a run without it can only ever offer a menu.
+print("TOOL_REGISTERED:", any(
+    "load_skill" in {t.name for t in (info.function_tools or [])}
+    for _m, info in _sent
+))
+print("TURNS:", len(_sent))
+
+_all = "\\n".join(c for _kind, c in _parts)
+print("SKILL_OFFERED:", "restocking-policy" in _all)
+print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
+""",
+    },
     "langchain": {
         "requires": "langchain",
         "stub": """
@@ -158,6 +240,26 @@ print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
 CANARY = "Opened boxes carry a 23.5% restocking fee."
 CANARY_SKILL = "restocking-policy"
 
+#: Frameworks whose stub leaves the model on the call path, so the canary can be
+#: read off what the model was handed — and, for each, which channel the body was
+#: supposed to arrive by. Two different channels, both graded by one assertion:
+#: langchain has no tool loop so injection is all it has, pydantic-ai owns one so
+#: the body comes back as a tool result and injection stays OFF
+#: (`DecimalConfig.resolve_inject_body(has_tool_loop=True)`).
+#:
+#: A dict rather than a set because the failure message has to name the channel:
+#: "the body never arrived" is a different investigation on each.
+BODY_CHANNEL_OBSERVABLE = {
+    "langchain": (
+        "On an adapter with no tool loop, prompt injection is the only body "
+        "channel."
+    ),
+    "pydantic-ai": (
+        "This adapter registers a real load_skill tool and Pydantic AI owns the "
+        "loop, so the body should have come back as a tool result mid-turn."
+    ),
+}
+
 #: The shape `SkillRouter._request` sees from the real backend, reduced to the
 #: keys the client actually reads. Patched in rather than reached over HTTP so
 #: this test needs no network and no live model.
@@ -223,6 +325,28 @@ with _stack:
 """
 
 
+#: The environment every subprocess in this module runs under. One copy, because
+#: three tests were already carrying four identical keys and the fourth key below
+#: has to reach all of them.
+_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "PYTHONPATH": str(REPO_ROOT),
+    "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
+    # The generated file legitimately turns the loader on; inside a
+    # disk-runtime harness that prints a duplicate-skills warning to
+    # stderr, which is correct advice and noise here.
+    "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
+    "DECIMAL_AUTOINIT": "false",
+    # Port 9 (discard) refuses instantly, which is what makes this hermetic
+    # rather than merely fast. The pydantic-ai template calls `init(otel=True)`
+    # — the only way that adapter traces at all — and a real span exporter with
+    # the hosted default would spend the subprocess's exit trying to POST this
+    # run's prompts to api.decimal.ai with a fake key. The router is patched;
+    # the exporter is not, and is not the thing under test.
+    "DECIMAL_BASE_URL": "http://127.0.0.1:9",
+}
+
+
 def _have(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
@@ -245,16 +369,7 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     proc = subprocess.run(
         [sys.executable, str(driver)],
         capture_output=True, text=True, cwd=tmp_path, timeout=120,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(REPO_ROOT),
-            "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
-            # The generated file legitimately turns the loader on; inside a
-            # disk-runtime harness that prints a duplicate-skills warning to
-            # stderr, which is correct advice and noise here.
-            "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
-            "DECIMAL_AUTOINIT": "false",
-        },
+        env=_ENV,
     )
     assert proc.returncode == 0, (
         f"generated {framework} file failed to run:\n"
@@ -293,37 +408,55 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     else:
         assert f"PROMPT_SEEN: {prompt}" in out, out
 
+    # THE CANARY — the assertion this whole file existed without.
+    #
+    # Every other check here proves a rail was INSTALLED or a name was BOUND.
+    # None of them proved the thing the product promises: that a skill's
+    # knowledge reaches the model. On 2026-08-28 a real agent built by
+    # `decimalai init` answered a customer with one sentence about its own
+    # tooling, because LangChain owns no tool loop and body injection defaulted
+    # off — so the model got a menu of titles it could not read. The suite was
+    # green throughout.
+    #
+    # Offered-but-not-delivered is the exact failure state, so assert both rungs
+    # separately: a test that only checked "the skill was mentioned" would have
+    # passed against the bug.
+    #
+    # Asserted for every framework whose stub keeps the model on the call path.
+    # openai-agents is the exception and it is a limit of ITS STUB, not of the
+    # adapter: replacing `Runner.run_sync` removes the loop, and on that
+    # framework the loop IS the body channel. Named here rather than left as a
+    # silent gap in an `if`.
+    if framework in BODY_CHANNEL_OBSERVABLE:
+        assert "SKILL_OFFERED: True" in out, out
+        assert "SKILL_BODY_DELIVERED: True" in out, (
+            f"the {framework} template offered the skill and never delivered its "
+            f"BODY — the model was handed a menu row it has no way to read. "
+            f"{BODY_CHANNEL_OBSERVABLE[framework]}\n" + out
+        )
+
     # The question stays the last turn: the skills rail routes on the trailing
     # human message, and langchain_anthropic raises on a system message placed
     # after any human/AI turn.
     if framework == "langchain":
         assert "LAST_TURN: human" in out, out
 
-        # THE CANARY — the assertion this whole file existed without.
-        #
-        # Every other check here proves a rail was INSTALLED or a name was
-        # BOUND. None of them proved the thing the product promises: that a
-        # skill's knowledge reaches the model. On 2026-08-28 a real agent built
-        # by `decimalai init` answered a customer with one sentence about its
-        # own tooling, because LangChain owns no tool loop and body injection
-        # defaulted off — so the model got a menu of titles it could not read.
-        # The suite was green throughout.
-        #
-        # Offered-but-not-delivered is the exact failure state, so assert both
-        # rungs separately: a test that only checked "the skill was mentioned"
-        # would have passed against the bug.
-        assert "SKILL_OFFERED: True" in out, out
-        assert "SKILL_BODY_DELIVERED: True" in out, (
-            "The skill's BODY never reached the model — it was offered as a menu "
-            "row the model has no way to read. On an adapter with no tool loop, "
-            "prompt injection is the only body channel.\n" + out
-        )
-
     # Exactly one DecimalAI processor. Two would mean every span is sent
     # twice — the failure `init(openai_agents=True)` plus `instrument()`
     # produces, and the reason the template passes a bare `init()`.
     if framework == "openai-agents":
         assert "PROCESSORS: 1" in out, out
+
+    if framework == "pydantic-ai":
+        # The tool is the body channel here, so its absence explains a missing
+        # body — and its presence rules out the interpretation that the canary
+        # arrived by injection instead. Both channels reaching the model at once
+        # is the duplicate-delivery state `resolve_inject_body(has_tool_loop=…)`
+        # exists to prevent.
+        assert "TOOL_REGISTERED: True" in out, out
+        # Two model requests: ask for the body, then answer with it. One would
+        # mean the loop never closed — the shape a bare model call has.
+        assert "TURNS: 2" in out, out
 
 
 # ── the langchain template must be an AGENT, not a chat completion ───
@@ -470,13 +603,7 @@ def test_langchain_template_survives_a_bound_tool(tmp_path):
     proc = subprocess.run(
         [sys.executable, str(driver)],
         capture_output=True, text=True, cwd=tmp_path, timeout=SLOW_TIMEOUT,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(REPO_ROOT),
-            "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
-            "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
-            "DECIMAL_AUTOINIT": "false",
-        },
+        env=_ENV,
     )
     assert proc.returncode == 0, (
         f"the generated langchain file died once a tool was added:\n"
@@ -525,13 +652,7 @@ def test_langchain_template_emits_no_deprecation_warnings(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-W", "error::DeprecationWarning", str(driver)],
         capture_output=True, text=True, cwd=tmp_path, timeout=SLOW_TIMEOUT,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": str(REPO_ROOT),
-            "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
-            "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
-            "DECIMAL_AUTOINIT": "false",
-        },
+        env=_ENV,
     )
     # Match on the class name rather than the module: langchain and langgraph
     # each subclass DeprecationWarning under their own name, and -W error

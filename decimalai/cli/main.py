@@ -135,17 +135,23 @@ def _scaffold_agent_file(
     from .scaffold import (
         DEFAULT_OUTPUT,
         UnknownFramework,
+        UnusableModel,
         env_vars,
         install_command,
         normalize_framework,
+        normalize_model,
         render_agent_file,
     )
 
-    # Framework first: it needs no key and no network, so a typo fails in
-    # milliseconds instead of after two round trips.
+    # Framework and model first: neither needs a key or the network, so a bad
+    # flag fails in milliseconds instead of after two round trips — and the
+    # model check has to happen BEFORE the file is written, because a model this
+    # framework cannot resolve produces a file that dies on the line building
+    # the agent while the command prints "✓ Wrote agent.py".
     try:
         framework = normalize_framework(framework)
-    except UnknownFramework as e:
+        normalize_model(framework, model)
+    except (UnknownFramework, UnusableModel) as e:
         import textwrap
         click.echo("")
         first = True
@@ -401,7 +407,10 @@ def _scaffold_agent_file(
     # loudly refused. The default is applied below instead.
     "--framework",
     default=None,
-    help="Framework to generate for: langchain (default) or openai-agents",
+    help=(
+        "Framework to generate for: langchain (default), openai-agents or "
+        "pydantic-ai"
+    ),
 )
 @click.option("--out", "out_path", default=None,
               help="Where to write (default: ./agent.py)")

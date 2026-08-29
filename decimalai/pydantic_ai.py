@@ -39,6 +39,21 @@ under whichever agent happened to run first in the process. `instrument()`
 patches `Agent.iter` (the one place `run`/`run_sync`/`run_stream` all funnel
 through) to open an `agent.run` span around each run, which gives those calls a
 real parent to nest under and puts the Agent's own name on the trace.
+
+The provider pairing is not the only route, and `decimalai init --framework
+pydantic-ai` takes the other one::
+
+    decimalai.init(otel=True)                 # the DecimalAI OTel exporter
+    Agent.instrument_all()                    # Pydantic AI's OWN OTel spans
+    decimalai.pydantic_ai.instrument(...)     # skills + the run boundary
+
+Pydantic AI has native OpenTelemetry instrumentation, off by default, and it
+covers every provider — so this route needs no per-provider instrumentor
+package and works unchanged for `google:…` models. Pick ONE: with both, an
+OpenInference span and a Pydantic AI span describe the same model call. Neither
+is installed from in here, deliberately — turning `instrument_all()` on inside
+this adapter would double up for every caller who already pairs a provider
+instrumentor.
 """
 
 from __future__ import annotations
@@ -347,6 +362,68 @@ def _install_skill_loader() -> None:
     logger.info("DecimalAI SkillRouter loader installed (Pydantic AI)")
 
 
+# ── agent name ──────────────────────────────────────────────
+#: The name `instrument(agent_name=...)` was called with, used for runs of an
+#: Agent that carries no explicit one. None means "never set", which is the
+#: pre-2026-08-29 behaviour exactly.
+_default_agent_name: Optional[str] = None
+
+#: Where the patched ``Agent.__init__`` stashes the name the CALLER passed.
+#:
+#: Read rather than ``Agent.name`` because those stop being the same thing the
+#: moment a run starts: Pydantic AI's ``_infer_name`` fills a missing ``name``
+#: from the local VARIABLE the Agent was assigned to (``agent = Agent(...)`` runs
+#: as agent name ``"agent"``, measured on 2.36). By the time ``iter`` opens,
+#: ``self.name`` is that invented name and nothing distinguishes it from one the
+#: user chose — so the distinction has to be captured at construction.
+_CONSTRUCTED_NAME_ATTR = "_decimalai_constructed_name"
+
+_name_capture_installed = False
+
+
+def _install_name_capture() -> None:
+    """Patch ``Agent.__init__`` to remember whether the caller named the Agent."""
+    global _name_capture_installed
+    if _name_capture_installed:
+        return
+    try:
+        from pydantic_ai import Agent
+    except ImportError:
+        return
+
+    original_init = Agent.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        try:
+            # `name` is keyword-only on Agent.__init__, so kwargs is the whole
+            # story — there is no positional spelling to miss.
+            setattr(self, _CONSTRUCTED_NAME_ATTR, kwargs.get("name"))
+        except Exception:  # noqa: BLE001 — naming must never break construction
+            logger.debug("could not record the constructed agent name",
+                         exc_info=True)
+
+    Agent.__init__ = patched_init  # type: ignore[method-assign]
+    _name_capture_installed = True
+
+
+def _run_agent_name(agent: Any) -> Optional[str]:
+    """Whose run this is, most specific answer first.
+
+    1. the name the caller passed to ``Agent(name=...)`` — per-agent, and the
+       only one that stays right in a process running two agents;
+    2. ``instrument(agent_name=...)`` — the process-wide binding, which is what
+       `decimalai init` writes so that dropping ``name=`` from the generated
+       Agent does not silently move the traces;
+    3. ``agent.name`` as Pydantic AI left it, which after ``_infer_name`` is the
+       variable name. Last, because it is a guess about a local variable, but
+       still ahead of nothing: it is what this adapter used before there was
+       anything else to prefer.
+    """
+    constructed = getattr(agent, _CONSTRUCTED_NAME_ATTR, None)
+    return constructed or _default_agent_name or getattr(agent, "name", None)
+
+
 # ── run scope ───────────────────────────────────────────────
 _run_scope_installed = False
 
@@ -402,9 +479,10 @@ def _install_run_scope() -> None:
     async def patched_iter(self, *args, **kwargs):
         from .providers import agent_run
 
-        # The Agent's own name, per run — not a module global. run()/run_sync()
-        # have already inferred it by the time they open iter().
-        with agent_run(getattr(self, "name", None)):
+        # The Agent's own name, per run — resolved rather than read, because
+        # by now `self.name` may be one Pydantic AI invented from a local
+        # variable. See _run_agent_name.
+        with agent_run(_run_agent_name(self)):
             async with original_iter(self, *args, **kwargs) as run:
                 yield run
 
@@ -413,7 +491,12 @@ def _install_run_scope() -> None:
     logger.info("DecimalAI run scope installed (Pydantic AI)")
 
 
-def instrument(*, enable_skill_loader: bool = False, trace_runs: bool = True) -> None:
+def instrument(
+    *,
+    agent_name: Optional[str] = None,
+    enable_skill_loader: bool = False,
+    trace_runs: bool = True,
+) -> None:
     """Install DecimalAI integration for Pydantic AI.
 
     Pydantic AI does no tracing of its own, so the *content* of a trace still
@@ -430,6 +513,13 @@ def instrument(*, enable_skill_loader: bool = False, trace_runs: bool = True) ->
     risk.
 
     Args:
+        agent_name: The DecimalAI agent runs of an UNNAMED Agent are filed
+            under. An ``Agent(name=...)`` always wins — this is the fallback,
+            and it exists because Pydantic AI's own fallback is worse:
+            ``_infer_name`` fills a missing name from the local variable, so
+            ``agent = Agent(...)`` traces as the agent ``"agent"`` and the
+            dashboard page for the agent you configured stays empty. Leave it
+            None to keep exactly that pre-existing behaviour.
         enable_skill_loader: When True, monkey-patch Agent so new
             instances auto-load skills into the system prompt.
         trace_runs: When True (the default), wrap every agent run in a parent
@@ -437,14 +527,24 @@ def instrument(*, enable_skill_loader: bool = False, trace_runs: bool = True) ->
             the run — a second one would be a redundant layer in the waterfall,
             not a wrong one.
     """
+    global _default_agent_name
     if enable_skill_loader:
         from .skill_router import _warn_if_disk_runtime_detected
         _warn_if_disk_runtime_detected("pydantic_ai")
         _install_skill_loader()
+    if agent_name is not None:
+        _default_agent_name = agent_name
     if trace_runs:
+        # Installed whenever the run scope is, not only when a name was given:
+        # the capture is what tells an explicit ``Agent(name=…)`` apart from an
+        # inferred one, and a LATER instrument(agent_name=…) call must not find
+        # that Agents built in between were never recorded.
+        _install_name_capture()
         _install_run_scope()
     logger.info(
-        "DecimalAI Pydantic AI integration installed (skill_loader=%s, trace_runs=%s)",
+        "DecimalAI Pydantic AI integration installed "
+        "(agent_name=%s, skill_loader=%s, trace_runs=%s)",
+        agent_name,
         enable_skill_loader,
         trace_runs,
     )

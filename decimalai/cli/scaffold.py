@@ -10,7 +10,7 @@ We generate; they run. Nothing here executes the agent, ships a runtime, or
 phones home at run time beyond the SDK the file imports — the model is
 `create-next-app`, not hosting.
 
-FOUR THINGS THIS TEMPLATE EXISTS TO GET RIGHT
+FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 ---------------------------------------------
 
 0. The agent's own SYSTEM PROMPT is what it runs on. Until 2026-08-25 the
@@ -66,6 +66,46 @@ FOUR THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    `create_agent`, and cannot be what resolves here: `decimalai[langchain]`
    floors `langchain-core>=1.3.3`, which 0.3.x caps below 1.0.
 
+4. TRACING IS NOT AUTOMATIC ON EVERY ADAPTER, and the pydantic-ai template is
+   where that bites. `decimalai init` ends by printing "The trace appears at →
+   /agents/<name>", which is a promise about the file it just wrote. The
+   langchain and openai-agents adapters keep it themselves — their `instrument()`
+   installs a callback handler / a trace processor. `decimalai.pydantic_ai`
+   deliberately does not: Pydantic AI emits no spans of its own, so that adapter
+   ships the skills rail and the run BOUNDARY and leaves the span content to
+   whatever tracing you paired with it. `init()` with no flags installs no
+   exporter at all (see `decimalai/__init__.py` — the exporter is built inside
+   the `if otel or crewai or autogen:` branch), so a pydantic-ai file that called
+   a bare `init()` would run, deliver its skills, and leave the user staring at
+   an empty traces page having done everything right.
+
+   The template therefore pairs ONE exporter — `init(otel=True)` — with Pydantic
+   AI's own OpenTelemetry instrumentation (`Agent.instrument_all()`), rather than
+   the provider-instrumentor pairing the docs show for adding DecimalAI to an
+   agent you already have (`init(openai=True)` +
+   `openinference-instrumentation-openai`). Three reasons, in the order they
+   decided it:
+
+     * it is provider-agnostic. `Agent.instrument_all()` emits the same spans for
+       `openai:…`, `google:…` and `anthropic:…`, so `--model google:gemini-…`
+       needs no second install line and no different init flag. The provider
+       route would need one instrumentor package per provider, chosen by the
+       model string — and the fleet that walks this journey is Gemini-only.
+     * one install line. `opentelemetry-sdk` is already a core dependency of
+       `decimalai`, so `pip install "decimalai[pydantic-ai]"` is the whole
+       requirement. The provider route adds a package whose import name
+       (`openinference.instrumentation.openai`) does not match its distribution
+       name, which is exactly the shape that makes an automated requirement check
+       give up.
+     * it is ONE exporter, which is the same one-install rule points 1-3
+       protect. Adding `init(openai=True)` on top would put an OpenInference
+       span and a Pydantic AI span on the same model call.
+
+   `Agent.instrument_all()` lives in the generated file rather than inside
+   `decimalai.pydantic_ai.instrument()` on purpose: turning it on inside the
+   adapter would silently double up for every existing user who already pairs a
+   provider instrumentor, which is the failure this point is about.
+
 RELATIONSHIP TO THE DASHBOARD'S COPY-PASTE SNIPPETS
 ---------------------------------------------------
 The snippets the dashboard hands out and these templates must not contradict each other, and they
@@ -85,13 +125,21 @@ share is identical, deliberately:
     `add_trace_processor()` unconditionally, which appends rather than
     dedupes. `init(openai_agents=True)` followed by `instrument()` registers
     two processors and double-sends every trace.
+  * pydantic-ai: the same `instrument(agent_name=..., enable_skill_loader=True)`
+    — but `init(otel=True)`, not a bare `init()`. That is not a contradiction of
+    the rule above, it is the same rule: exactly one span source per file. On
+    the other two the adapter IS the span source; here it is not (point 4).
 
-One difference is intentional: the openai-agents snippet awaits
+Two differences are intentional. The openai-agents snippet awaits
 `Runner.run(...)` because it is being pasted into an async app, while the
-generated file is a standalone script and uses `Runner.run_sync(...)`.
+generated file is a standalone script and uses `Runner.run_sync(...)`. And the
+pydantic-ai snippet stops at `Agent(...)` without a `name=`, because it is being
+pasted into an agent that already has one — the template passes a name, because
+an unnamed Pydantic AI Agent is named after the local variable it is assigned to
+and would file its traces under `agent`.
 
-WHY ONLY TWO FRAMEWORKS
------------------------
+WHY ONLY THESE FRAMEWORKS
+-------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
 loader can use. `enable_skill_loader` exists on exactly four adapters
@@ -100,6 +148,11 @@ claude_agent_sdk, crewai/autogen/otel, adk — trace and version but have no
 loader, and generating a file for them would hand someone a program that looks
 correct and quietly ignores every skill they picked. `--framework` names the
 reason rather than printing a bare "invalid choice".
+
+Of the four, three are scaffolded. `anthropic` is the holdout and the reason is
+not "nobody got to it": that adapter patches one `messages.create()` call, so it
+owns no tool loop — a generated file there would be a hand-rolled while-loop this
+template would have to invent, and the body could only arrive by injection.
 """
 
 from __future__ import annotations
@@ -114,17 +167,28 @@ if TYPE_CHECKING:  # keeps this module pure — it imports nothing at run time
 # CLI's --model default and the template cannot drift apart.
 DEFAULT_MODEL = "gpt-4o-mini"
 
+#: Per-framework overrides of `DEFAULT_MODEL`, for frameworks whose model
+#: identifier is not the bare OpenAI name.
+#:
+#: Pydantic AI resolves `provider:model` and REFUSES a bare one —
+#: `infer_model("gpt-4o-mini")` raises `UserError: Unknown model`, checked
+#: against pydantic-ai 2.36. So the shared default would have produced a file
+#: that dies on the line that builds the Agent, every run, for the default
+#: invocation of the command.
+_FRAMEWORK_DEFAULT_MODELS: Dict[str, str] = {
+    "pydantic-ai": "openai:gpt-4o-mini",
+}
+
 DEFAULT_OUTPUT = "agent.py"
 
 #: Frameworks `init` can scaffold, in the order they are offered.
-SUPPORTED_FRAMEWORKS: tuple = ("langchain", "openai-agents")
+SUPPORTED_FRAMEWORKS: tuple = ("langchain", "openai-agents", "pydantic-ai")
 
 #: Frameworks whose adapter carries `enable_skill_loader` but which have no
 #: template yet. Named separately from the seamless ones because the answer to
 #: "why not?" is different, and so is what we'd have to do to add them.
 UNSCAFFOLDED_WITH_SEAM: Dict[str, str] = {
     "anthropic": "The Anthropic Messages adapter",
-    "pydantic-ai": "The Pydantic AI adapter",
 }
 
 #: Frameworks deliberately NOT offered: their adapters have no prompt seam, so
@@ -145,6 +209,16 @@ class UnknownFramework(ValueError):
 
     Carries a message that says WHY, because the three reasons (typo,
     seam-but-no-template, no-seam-at-all) have three different fixes.
+    """
+
+
+class UnusableModel(ValueError):
+    """`--model` named something this framework cannot resolve.
+
+    Same contract as `UnknownFramework` and refused in the same place, one
+    round trip before anything is written: a `--model` this framework will
+    reject at run time produces a file that dies on the line building the
+    agent, EVERY run, reported as `✓ Wrote agent.py`.
     """
 
 
@@ -310,17 +384,24 @@ def _header_lines(
     return lines
 
 
-def _init_call(base_url: Optional[str]) -> str:
+def _init_call(base_url: Optional[str], *flags: str) -> str:
     """`decimalai.init(...)` — with a base_url only when one is needed.
 
     The key is read from the environment by `init()` itself, so no generated
     file ever contains one. A non-default base_url IS baked in: it is not a
     secret, and someone who scaffolded against a local or self-hosted backend
     gets a file that points at production otherwise.
+
+    `flags` names init keywords to set True. Only the pydantic-ai template
+    passes any (`otel`), and only because that adapter installs no exporter of
+    its own — see point 4 in the module docstring. A template that can trace
+    without one must not pass one: a second exporter double-sends every span.
     """
+    args = []
     if base_url:
-        return f"decimalai.init(base_url={_py(base_url)})"
-    return "decimalai.init()"
+        args.append(f"base_url={_py(base_url)}")
+    args += [f"{flag}=True" for flag in flags]
+    return f"decimalai.init({', '.join(args)})"
 
 
 # ── templates ────────────────────────────────────────────────────────
@@ -498,9 +579,127 @@ def _render_openai_agents(
     ]
 
 
+def _render_pydantic_ai(
+    agent_name: str, model: str, base_url: Optional[str]
+) -> List[str]:
+    return [
+        "import decimalai",
+        "from decimalai.pydantic_ai import instrument",
+        "from pydantic_ai import Agent",
+        "from pydantic_ai.exceptions import UsageLimitExceeded",
+        "from pydantic_ai.usage import UsageLimits",
+        "",
+        "# Pydantic AI resolves a PROVIDER-QUALIFIED model string and refuses a",
+        "# bare one, so the provider half is not optional here. Any of:",
+        '#   "openai:gpt-4o-mini" · "google:gemini-3.6-flash"',
+        '#   "anthropic:claude-sonnet-4-6"',
+        "# all three ship with the pydantic-ai install; the key each one reads is",
+        "# named in the `Set:` list `decimalai init` printed for your model.",
+        f"MODEL = {_py(model)}",
+        f"AGENT_NAME = {_py(agent_name)}",
+        "# Pydantic AI's own default is 50 model requests. Lower, because a",
+        "# runaway loop here costs real tokens; raise it if your agent legitimately",
+        "# chains many tool calls.",
+        "MAX_REQUESTS = 20",
+        "",
+        "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
+        "# file you are going to commit.",
+        "#",
+        "# otel=True is what makes this agent's traces exist. Unlike the LangChain",
+        "# and OpenAI-Agents adapters, decimalai.pydantic_ai installs no exporter:",
+        "# Pydantic AI emits no spans of its own, so that adapter ships the skills",
+        "# rail and the run boundary and leaves the tracing to whatever you pair.",
+        "# A bare init() here would run fine, deliver every skill, and leave your",
+        "# traces page empty forever.",
+        _init_call(base_url, "otel"),
+        "",
+        "# Pydantic AI's own OpenTelemetry instrumentation, which is where the",
+        "# spans come from. It is a global switch and it is provider-agnostic —",
+        "# swapping MODEL to a Gemini or Claude string changes nothing here.",
+        "#",
+        "# Keep it BELOW init(): init(otel=True) is what installs the DecimalAI",
+        "# exporter on the process's tracer provider, and these spans have nowhere",
+        "# to go until it has.",
+        "Agent.instrument_all()",
+        "",
+        "# enable_skill_loader=True is what actually delivers this agent's skills.",
+        "# It defaults to False, and tracing alone does not deliver them. This",
+        "# adapter registers a real load_skill tool on every Agent, and Pydantic AI",
+        "# owns its tool loop — so the model reads the menu, asks for the one it",
+        "# needs, and the body comes back mid-turn.",
+        "#",
+        "# agent_name is the fallback for an Agent built without a name=. Pydantic",
+        "# AI infers one from the VARIABLE it was assigned to in that case, so",
+        "# without this line an agent you renamed files its traces under 'agent'.",
+        "#",
+        "# This call must stay ABOVE the Agent(...) below: the loader works by",
+        "# wrapping Agent.__init__, so an Agent constructed earlier gets neither",
+        "# the skills prompt nor the load_skill tool.",
+        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "",
+        "# Your agent's system prompt, as it stands in the dashboard right now.",
+        "# It is handed to you as data and passed to the Agent by the line YOU can",
+        "# see below — nothing injects it behind your back, so what this file sends",
+        "# is what this file says. (Skills are the other way round: instrument()",
+        "# delivers those for you, because a menu is additive and a prompt is not.)",
+        "#",
+        "# Read at run time, so editing the prompt in the dashboard changes the",
+        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
+        f"config = decimalai.load_agent({_py(agent_name)})",
+        "",
+        "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
+        "# loop runs, the skills rail delivers, and adding a tool later needs no",
+        "# other change to this file.",
+        "TOOLS: list = []",
+        "",
+        "agent = Agent(",
+        "    MODEL,",
+        "    # Bound, not inferred. Pydantic AI reads the name off the variable",
+        "    # this Agent is assigned to when you leave it out, and the DecimalAI",
+        "    # run scope stamps whatever it finds onto the trace — so an unnamed",
+        "    # Agent files under 'agent' and your dashboard page stays empty.",
+        "    name=AGENT_NAME,",
+        "    # `or ()` because None is a REAL state (this agent has no prompt set;",
+        "    # a failed read raises instead) and Pydantic AI's system_prompt takes a",
+        "    # string or a sequence, never None. An empty tuple sends no system",
+        "    # prompt at all, rather than one this file invented.",
+        "    system_prompt=config.system_prompt or (),",
+        "    tools=TOOLS,",
+        ")",
+        "",
+        "",
+        "def run(question: str) -> str:",
+        '    """One turn: the loop runs until the model answers.',
+        "",
+        "    Add tools to TOOLS above — the skills rail rides on the Agent's own",
+        "    system prompt and its load_skill tool, so it survives them.",
+        '    """',
+        "    try:",
+        "        return agent.run_sync(",
+        "            question, usage_limits=UsageLimits(request_limit=MAX_REQUESTS),",
+        "        ).output",
+        "    except UsageLimitExceeded:",
+        "        # The model kept calling tools without answering. Usually it is",
+        "        # chasing a tool the prompt names but this file does not define —",
+        "        # check the Tools line in your system prompt against TOOLS above.",
+        "        return (",
+        "            f\"[{AGENT_NAME}] stopped after {MAX_REQUESTS} model requests \"",
+        '            "without an answer. See the comment in run()."',
+        "        )",
+        "",
+        "",
+        'if __name__ == "__main__":',
+        '    print(run("What can you help me with?"))',
+        "    # Short-lived scripts exit before the background sender drains. init()",
+        "    # registers an atexit flush; this makes it explicit.",
+        "    decimalai.flush()",
+    ]
+
+
 _RENDERERS = {
     "langchain": _render_langchain,
     "openai-agents": _render_openai_agents,
+    "pydantic-ai": _render_pydantic_ai,
 }
 
 #: What the user has to install and export for the generated file to run.
@@ -510,11 +709,18 @@ _RENDERERS = {
 INSTALL: Dict[str, str] = {
     "langchain": 'pip install "decimalai[langchain]" langchain langchain-openai',
     "openai-agents": 'pip install "decimalai[openai-agents]"',
+    # One line, whatever the model. The `pydantic-ai` distribution (which is what
+    # `decimalai[pydantic-ai]` resolves to — not `pydantic-ai-slim`) bundles the
+    # openai, google and anthropic provider bindings, and the OpenTelemetry SDK
+    # the template's tracing needs is already a core dependency of decimalai.
+    # A provider outside those three adds a token; see _PYDANTIC_AI_PROVIDERS.
+    "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
 }
 
 ENV_VARS: Dict[str, tuple] = {
     "langchain": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
     "openai-agents": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
+    "pydantic-ai": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
 }
 
 #: LangChain's `init_chat_model` takes a `provider:model` string. The provider
@@ -535,6 +741,38 @@ _PROVIDER_REQUIREMENTS: Dict[str, tuple] = {
 }
 
 
+#: Pydantic AI's own provider prefixes — a DIFFERENT vocabulary from LangChain's
+#: above, which is why this is a second table rather than a shared one:
+#: LangChain spells Gemini `google_genai` and reads `GOOGLE_API_KEY`, Pydantic AI
+#: spells it `google` and reads `GEMINI_API_KEY` first
+#: (`pydantic_ai.providers.google`, checked on 2.36). Sharing one table would
+#: have printed a key the run does not read for exactly the model the fleet uses.
+#:
+#: The extra is empty for the three providers the `pydantic-ai` distribution
+#: already carries; the rest are `pydantic-ai-slim` extras it does not.
+_PYDANTIC_AI_PROVIDERS: Dict[str, tuple] = {
+    # provider prefix -> (extra pip requirement, model-provider env var)
+    "openai": ("", "OPENAI_API_KEY"),
+    "openai-chat": ("", "OPENAI_API_KEY"),
+    "openai-responses": ("", "OPENAI_API_KEY"),
+    "azure": ("", "AZURE_OPENAI_API_KEY"),
+    "google": ("", "GEMINI_API_KEY"),
+    # The spelling every pydantic-ai before 2.x used for the same provider.
+    # Accepted so a model string copied from an older project prints the right
+    # key rather than silently falling back to OpenAI's.
+    "google-gla": ("", "GEMINI_API_KEY"),
+    "google-vertex": ("", "GOOGLE_API_KEY"),
+    "anthropic": ("", "ANTHROPIC_API_KEY"),
+    "groq": ('"pydantic-ai[groq]"', "GROQ_API_KEY"),
+    "mistral": ('"pydantic-ai[mistral]"', "MISTRAL_API_KEY"),
+    "cohere": ('"pydantic-ai[cohere]"', "CO_API_KEY"),
+    "huggingface": ('"pydantic-ai[huggingface]"', "HF_TOKEN"),
+    "openrouter": ('"pydantic-ai[openrouter]"', "OPENROUTER_API_KEY"),
+    "deepseek": ("", "DEEPSEEK_API_KEY"),
+    "ollama": ("", ""),  # local, no key
+}
+
+
 def model_provider(model: str) -> str:
     """The provider half of a `provider:model` string; "openai" when bare.
 
@@ -545,7 +783,59 @@ def model_provider(model: str) -> str:
     return raw.split(":", 1)[0].strip().lower() if ":" in raw else "openai"
 
 
-def install_command(framework: str, model: str = DEFAULT_MODEL) -> str:
+def normalize_model(framework: str, model: Optional[str]) -> str:
+    """This framework's MODEL line for `--model`, or raise `UnusableModel`.
+
+    Only pydantic-ai has anything to check, and it checks the one thing that is
+    fatal rather than merely suboptimal. `pydantic_ai.models.infer_model` splits
+    on `provider:model` and raises `UserError: Unknown model` when there is no
+    provider half — so `--model gpt-4o-mini --framework pydantic-ai` writes a
+    file whose `Agent(MODEL, ...)` line cannot run, while `decimalai init`
+    reports success.
+
+    Not rewritten to `openai:gpt-4o-mini` silently. A model string is a choice
+    with a bill attached, and a command that quietly picks a different provider
+    than the one asked for is the same class of surprise as a scaffold that
+    delivers no skills. The message names the corrected string; the user types it.
+
+    `"test"` is exempt because `infer_model` exempts it — it is Pydantic AI's own
+    built-in `TestModel`, and refusing it would be this function inventing a rule
+    the framework does not have.
+
+    STRICTER THAN THE OLDEST SUPPORTED PYDANTIC AI, deliberately, and this is the
+    one place that is worth stating. `pydantic-ai` 0.1.0 (the floor
+    `decimalai[pydantic-ai]` declares) still inferred OpenAI from a bare name;
+    2.x removed that. So on an ancient pin this refuses something that would have
+    run — but the fix it names, `openai:<model>`, resolves on BOTH (checked by
+    running `infer_model` under 0.1.0 and 2.36), so nobody is ever pushed off a
+    working configuration and onto a broken one. The alternative, gating on the
+    installed version, would make `decimalai init` behave differently on two
+    machines with the same command.
+    """
+    model = (model or "").strip() or default_model(framework)
+    if framework != "pydantic-ai" or model == "test" or ":" in model:
+        return model
+    raise UnusableModel(
+        f"Pydantic AI needs a provider-qualified model, and {model!r} has no "
+        f"provider half — `Agent({model!r})` raises `UserError: Unknown model` "
+        f"on the line that builds the agent.\n"
+        f"Try --model openai:{model}, or name the provider you meant "
+        f"(google:… · anthropic:…)."
+    )
+
+
+def default_model(framework: str) -> str:
+    """The MODEL line this framework gets when `--model` was not passed.
+
+    Not a single constant, because `DEFAULT_MODEL` is an OpenAI model NAME and
+    Pydantic AI wants a provider-qualified IDENTIFIER. The two differ by a
+    prefix and the difference is fatal rather than cosmetic: `Agent("gpt-4o-mini")`
+    raises `UserError: Unknown model` on the line that builds the agent.
+    """
+    return _FRAMEWORK_DEFAULT_MODELS.get(framework, DEFAULT_MODEL)
+
+
+def install_command(framework: str, model: Optional[str] = None) -> str:
     """The pip line for this (framework, model) pair.
 
     Keyed on the pair, not on the framework: until 2026-08-28 this was a dict
@@ -553,22 +843,34 @@ def install_command(framework: str, model: str = DEFAULT_MODEL) -> str:
     `pip install langchain-openai` and `export OPENAI_API_KEY` — the wrong
     package and the wrong key, while the key the user actually needed went
     unmentioned.
+
+    `model=None` means "whatever this framework's default is", which is what the
+    CLI passes when `--model` was not given.
     """
-    if framework != "langchain":
-        return INSTALL[framework]
-    package, _ = _PROVIDER_REQUIREMENTS.get(
-        model_provider(model), _PROVIDER_REQUIREMENTS["openai"]
-    )
-    return f'pip install "decimalai[langchain]" langchain {package}'
+    model = model or default_model(framework)
+    if framework == "langchain":
+        package, _ = _PROVIDER_REQUIREMENTS.get(
+            model_provider(model), _PROVIDER_REQUIREMENTS["openai"]
+        )
+        return f'pip install "decimalai[langchain]" langchain {package}'
+    if framework == "pydantic-ai":
+        extra, _ = _PYDANTIC_AI_PROVIDERS.get(
+            model_provider(model), _PYDANTIC_AI_PROVIDERS["openai"]
+        )
+        return INSTALL[framework] + (f" {extra}" if extra else "")
+    return INSTALL[framework]
 
 
-def env_vars(framework: str, model: str = DEFAULT_MODEL) -> tuple:
+def env_vars(framework: str, model: Optional[str] = None) -> tuple:
     """The env vars this (framework, model) pair needs, DECIMAL_API_KEY first."""
-    if framework != "langchain":
+    model = model or default_model(framework)
+    table = {
+        "langchain": _PROVIDER_REQUIREMENTS,
+        "pydantic-ai": _PYDANTIC_AI_PROVIDERS,
+    }.get(framework)
+    if table is None:
         return ENV_VARS[framework]
-    _, key = _PROVIDER_REQUIREMENTS.get(
-        model_provider(model), _PROVIDER_REQUIREMENTS["openai"]
-    )
+    _, key = table.get(model_provider(model), table["openai"])
     return ("DECIMAL_API_KEY", key) if key else ("DECIMAL_API_KEY",)
 
 
@@ -593,7 +895,7 @@ def render_agent_file(
         framework: Already normalized by `normalize_framework`.
         skills: Rows from `GET /api/v1/agents/{name}/skills`. Named in a
             comment so the file shows what it will use.
-        model: Overrides `DEFAULT_MODEL` on the generated MODEL line.
+        model: Overrides `default_model(framework)` on the generated MODEL line.
         base_url: Baked in only when it is not the hosted default.
         prompt: The agent's prompt config, from `client.get_agent_prompt`.
             COMMENT ONLY — it decides one header line about whether a prompt
@@ -605,7 +907,9 @@ def render_agent_file(
     if not str(agent_name).strip():
         raise ValueError("agent_name is required")
 
-    body = _RENDERERS[framework](agent_name, model or DEFAULT_MODEL, base_url)
+    body = _RENDERERS[framework](
+        agent_name, normalize_model(framework, model), base_url
+    )
     lines = (
         _header_lines(agent_name, framework, skills or [], prompt) + [""] + body
     )

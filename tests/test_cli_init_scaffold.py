@@ -38,9 +38,14 @@ from decimalai import AgentConfig
 from decimalai._client import AgentNotFoundError, DecimalAPIError
 from decimalai.cli.main import cli
 from decimalai.cli.scaffold import (
+    NO_PROMPT_SEAM,
     SUPPORTED_FRAMEWORKS,
+    UNSCAFFOLDED_WITH_SEAM,
     UnknownFramework,
+    UnusableModel,
+    default_model,
     normalize_framework,
+    normalize_model,
     render_agent_file,
 )
 
@@ -127,6 +132,7 @@ class TestTemplateIsCode:
         expected = {
             "langchain": "decimalai.langchain",
             "openai-agents": "decimalai.openai_agents",
+            "pydantic-ai": "decimalai.pydantic_ai",
         }[framework]
         assert expected in mods, f"{framework} must import {expected}"
 
@@ -148,14 +154,78 @@ class TestTemplateIsCode:
         assert len(assigns) == 1
         assert isinstance(ast.literal_eval(assigns[0].value), str)
 
+    #: A `--model` each framework can actually resolve. Not one string for all
+    #: three: Pydantic AI splits `provider:model` and raises on a bare name, so
+    #: the shared "gpt-5-mini" was a value the product refuses — the override
+    #: would have been asserted to "reach the file" for a file that cannot run.
+    OVERRIDE_MODEL = {
+        "langchain": "gpt-5-mini",
+        "openai-agents": "gpt-5-mini",
+        "pydantic-ai": "openai:gpt-5-mini",
+    }
+
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_model_override_reaches_the_file(self, framework):
-        source = render_agent_file(AGENT, framework, SKILLS, model="gpt-5-mini")
+        model = self.OVERRIDE_MODEL[framework]
+        source = render_agent_file(AGENT, framework, SKILLS, model=model)
         tree = parse(source)
         assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == "MODEL"
                            for t in n.targets)]
-        assert ast.literal_eval(assigns[0].value) == "gpt-5-mini"
+        assert ast.literal_eval(assigns[0].value) == model
+
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    def test_the_default_model_is_one_this_framework_can_resolve(self, framework):
+        """The zero-flag invocation must produce a file that runs.
+
+        `DEFAULT_MODEL` is an OpenAI model NAME; Pydantic AI wants a
+        provider-qualified IDENTIFIER, and the gap is fatal rather than
+        cosmetic. Checked through `normalize_model`, which is the same gate
+        `--model` goes through — so a framework whose default its own gate would
+        reject cannot ship.
+        """
+        source = render_agent_file(AGENT, framework, SKILLS)   # no --model
+        tree = parse(source)
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "MODEL"
+                           for t in n.targets)]
+        rendered = ast.literal_eval(assigns[0].value)
+        assert normalize_model(framework, rendered) == rendered
+        assert rendered == default_model(framework)
+
+    def test_a_bare_model_name_is_refused_for_pydantic_ai(self):
+        """RED before 2026-08-29: this wrote a file that died on line one.
+
+        Pydantic AI's `infer_model` needs the provider half. Without this the
+        command printed `✓ Wrote agent.py` and every run of that file raised
+        `UserError: Unknown model` — the shape of failure this whole module
+        exists to keep out of generated files.
+        """
+        with pytest.raises(UnusableModel) as e:
+            render_agent_file(AGENT, "pydantic-ai", SKILLS, model="gpt-4o-mini")
+        # Names the fix, and names it as a string that works.
+        assert "openai:gpt-4o-mini" in str(e.value)
+        assert normalize_model("pydantic-ai", "openai:gpt-4o-mini") == (
+            "openai:gpt-4o-mini"
+        )
+
+    def test_the_frameworks_that_take_a_bare_model_name_still_do(self):
+        """The refusal is Pydantic AI's rule, not a new house style.
+
+        LangChain's `init_chat_model("gpt-4o-mini")` infers OpenAI from the
+        model name and the OpenAI Agents SDK takes the bare name directly, so
+        refusing one there would break a spelling both frameworks document.
+        """
+        for framework in ("langchain", "openai-agents"):
+            assert normalize_model(framework, "gpt-4o-mini") == "gpt-4o-mini"
+
+    def test_pydantic_ais_own_test_model_is_not_refused(self):
+        """`infer_model` special-cases "test"; so does the gate.
+
+        A gate stricter than the framework it guards refuses something that
+        works, which is how a check earns a `# noqa` instead of a fix.
+        """
+        assert normalize_model("pydantic-ai", "test") == "test"
 
 
 # ── 2. the flag that makes the whole thing worth shipping ────────────
@@ -172,19 +242,47 @@ class TestSkillLoaderIsOn:
         assert len(instruments) == 1, "expected exactly one instrument() call"
         assert kwarg(instruments[0], "enable_skill_loader") is True
 
+    #: Every `init()` keyword that installs a span source, and — per framework —
+    #: the ONE this template is allowed to carry.
+    #:
+    #: An allow-list of one rather than a blanket ban, because "no flag" and
+    #: "exactly one flag" are the same rule seen from two adapters. On langchain
+    #: and openai-agents `instrument()` installs the span source itself, so any
+    #: flag here is a SECOND one: `init(langchain=True)` installs tracing with
+    #: the loader off and the later `instrument()` cannot undo the disk-mirror
+    #: decision it already made, and `init(openai_agents=True)` registers a
+    #: second trace processor that double-sends every trace. On pydantic-ai
+    #: `instrument()` installs NO span source (that adapter ships the skills rail
+    #: and the run boundary; Pydantic AI emits no spans of its own), so `otel=True`
+    #: is the first one rather than the second — and without it the generated file
+    #: runs, delivers every skill, and traces nothing at all.
+    #:
+    #: What both halves forbid is the same thing: two span sources on one file.
+    TRACING_FLAGS = (
+        "langchain", "openai_agents", "crewai", "otel", "adk", "llamaindex",
+        "claude_agent_sdk", "autogen", "openai", "anthropic", "google",
+    )
+    ALLOWED_TRACING_FLAG = {
+        "langchain": None,
+        "openai-agents": None,
+        "pydantic-ai": "otel",
+    }
+
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
-    def test_init_does_not_also_pass_a_framework_flag(self, framework):
-        """`init(langchain=True)` installs tracing with the loader OFF and the
-        later instrument() cannot undo the disk-mirror decision; on
-        openai-agents it registers a SECOND trace processor and double-sends
-        every trace. Either way the one-install shape is load-bearing."""
+    def test_init_carries_at_most_the_one_tracing_flag_this_template_needs(
+        self, framework
+    ):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         init_calls = calls(tree, "init")
         assert len(init_calls) == 1
-        for flag in ("langchain", "openai_agents", "crewai", "otel", "adk"):
-            assert kwarg(init_calls[0], flag) is None, (
-                f"init() must not carry {flag}=True — see scaffold.py"
-            )
+        allowed = self.ALLOWED_TRACING_FLAG[framework]
+        carried = [f for f in self.TRACING_FLAGS
+                   if kwarg(init_calls[0], f) is not None]
+        assert carried == ([allowed] if allowed else []), (
+            f"{framework}: init() carries {carried}, expected "
+            f"{[allowed] if allowed else []} — see scaffold.py. Two span "
+            f"sources on one file means every span is sent twice."
+        )
 
     def test_openai_agents_instruments_before_constructing_the_agent(self):
         """The loader wraps `Agent.__init__`, so an Agent built above the
@@ -436,13 +534,35 @@ class TestFrameworkSelection:
         assert "no prompt seam" in msg
         assert "langchain" in msg
 
-    @pytest.mark.parametrize("framework", ["anthropic", "pydantic-ai"])
+    @pytest.mark.parametrize("framework", sorted(UNSCAFFOLDED_WITH_SEAM))
     def test_seamed_but_unscaffolded_frameworks_get_a_different_reason(
         self, framework
     ):
+        """Read off the ledger, never a list typed here.
+
+        The day a framework gains a template it leaves `UNSCAFFOLDED_WITH_SEAM`,
+        and this case has to disappear with it rather than start asserting that
+        the product refuses something it now does. A hardcoded
+        `["anthropic", "pydantic-ai"]` did exactly that on 2026-08-29.
+        """
         with pytest.raises(UnknownFramework) as e:
             normalize_framework(framework)
         assert "no scaffold for it yet" in str(e.value)
+
+    def test_no_framework_is_in_two_ledgers_at_once(self):
+        """Scaffoldable, seam-but-no-template, and no-seam are exclusive.
+
+        A name in two of them makes `normalize_framework` answer by dict order
+        rather than by fact — and the fact decides whether the user gets a file,
+        a "not yet" or a refusal.
+        """
+        supported, seam, no_seam = (
+            set(SUPPORTED_FRAMEWORKS), set(UNSCAFFOLDED_WITH_SEAM),
+            set(NO_PROMPT_SEAM),
+        )
+        assert not supported & seam
+        assert not supported & no_seam
+        assert not seam & no_seam
 
     def test_cli_refuses_unknown_framework_before_touching_the_network(
         self, tmp_path, monkeypatch
