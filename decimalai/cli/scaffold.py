@@ -200,6 +200,24 @@ NO_PROMPT_SEAM: Dict[str, str] = {
     "crewai": "CrewAI",
     "autogen": "AutoGen / AG2",
     "otel": "The generic OpenTelemetry rail",
+    # ⚠ ADK IS HERE FOR A NARROWER REASON THAN THE OTHERS, and the difference matters
+    # to whoever picks this up next. The seam is NOT missing — that was measured false
+    # on 2026-08-29. ADK's `before_model` plugin hook receives the SAME LlmRequest the
+    # model is then called with (google-adk 2.8.0, flows/llm_flows/base_llm_flow.py:1735
+    # -> :1801, by reference), `LlmRequest.append_instructions` is public API, and ADK's
+    # own global_instruction_plugin mutates system_instruction from that exact hook.
+    # `decimalai/adk.py` now carries `enable_skill_loader` and puts a skill BODY into the
+    # system_instruction, verified by intercepting a real `Runner.run_async`.
+    #
+    # Two things are still missing, and it stays listed here until BOTH land, because
+    # advertising a framework this command cannot scaffold is worse than under-claiming:
+    #   1. the template itself;
+    #   2. an end-to-end proof at C14's bar — the model's ANSWER carrying the skill's
+    #      fact. The only run so far used a stub model whose answer was hardcoded, which
+    #      is circular. That needs a live Gemini key, which this machine does not have.
+    # The conformance driver also still declares `has_skills_rail=False`, and
+    # `test_rail_declarations_match_the_scaffold_seam_ledger` will refuse any move of
+    # this line until the driver is wired to match — which is the guard working.
     "adk": "Google ADK",
 }
 

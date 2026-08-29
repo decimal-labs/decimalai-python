@@ -126,7 +126,6 @@ DELIVERY_NA_BUDGET = 2
 #: leaves a line here that must be deleted.
 DECLARED_JOURNEY_NA: Dict[str, str] = {
     "anthropic:J1": "UNSCAFFOLDED_WITH_SEAM",
-    "pydantic-ai:J1": "UNSCAFFOLDED_WITH_SEAM",
     "llamaindex:J1": "NO_PROMPT_SEAM",
     "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
     "crewai:J1": "NO_PROMPT_SEAM",
@@ -136,7 +135,7 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
 
 #: The number above, written down — same reason as ``NA_BUDGET``. It should go
 #: DOWN: every entry is a framework whose users get no scaffold today.
-JOURNEY_NA_BUDGET = 7
+JOURNEY_NA_BUDGET = 6
 
 # ── skips ────────────────────────────────────────────────────────────────────
 
