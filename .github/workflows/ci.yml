@@ -6,9 +6,16 @@ name: CI
 # Keep this `pull_request`, never `pull_request_target`: on a public repo
 # `pull_request` runs a fork's PR WITHOUT repository secrets, which is what
 # makes drive-by PRs safe to run. `pull_request_target` would hand them the
-# secret context. (There is nothing to steal today — no `secrets.*` reference
-# exists anywhere under .github/ — so this is belt-and-braces against the first
-# workflow that adds one.)
+# secret context.
+#
+# This used to add "there is nothing to steal today — no `secrets.*` reference
+# exists anywhere under .github/". That stopped being true on 2026-08-29:
+# conformance-live.yml reads OPENAI_API_KEY / GEMINI_API_KEY /
+# DECIMAL_CONFORMANCE_*. The rule above is what keeps that safe rather than
+# belt-and-braces, so it is now load-bearing. conformance-live.yml has NO
+# pull_request trigger of any kind, deliberately; a fork's PR cannot reach those
+# secrets from anywhere. Before adding a secret to a workflow, check that no
+# fork-triggerable event can reach the job that reads it.
 on:
   pull_request:
     branches: [main]

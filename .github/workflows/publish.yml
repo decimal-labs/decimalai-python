@@ -36,11 +36,106 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests
+        # This selects ZERO conformance tests, by design and by construction:
+        # pyproject.toml addopts is
+        #   -m 'not integration and not live_llm and not conformance_live and not conformance'
+        # so every one of the framework-adapter contract tests is deselected here.
+        # That is correct for THIS job — `.[dev]` installs three of the eleven
+        # frameworks, so running the matrix here would report eight adapters NOT
+        # RUN and still exit 0. The adapters are gated by `conformance-graded`
+        # below, which reads the result of the job that has the full install set.
+        # Do not "fix" this by dropping `-m` here; that produces a partial matrix
+        # that reads as coverage and is not.
         run: pytest tests/ -v
+
+  conformance-graded:
+    # WHY THIS EXISTS
+    # Before 2026-08-29 the whole publish gate was `pytest tests/ -v`, which
+    # selects zero of the 165 conformance tests (deselected by the addopts marker
+    # expression above). A release could therefore ship without a single framework
+    # adapter ever being graded — which is the exact shape of the 2026-08-28
+    # defect, where the langchain adapter shipped with zero body channels and the
+    # generated agent could not read any of its skills.
+    #
+    # WHY IT READS A CHECK RUN INSTEAD OF RUNNING THE MATRIX
+    # Running it here would mean duplicating the `conformance-tests` install set
+    # (eleven frameworks, multi-minute install) into a second workflow, where it
+    # would drift from ci.yml the first time somebody adds a framework. ci.yml
+    # already runs that matrix as a required job on every push and PR. So the
+    # cheaper and drift-proof claim is: the commit being released must CARRY a
+    # green run of it.
+    name: Conformance graded this commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read  # the ONLY extra grant; no id-token, no write of any kind
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install PyYAML
+        run: pip install PyYAML
+
+      - name: The released commit must carry a GREEN conformance run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > /tmp/conformance_gate.py <<'PY'
+          import json, os, subprocess, sys, yaml
+
+          # Read the conformance job's DISPLAY NAME out of ci.yml at the released
+          # commit, rather than hardcoding it here. A check run is named after its
+          # job's `name:`, so this is the one form that survives a rename: rename
+          # the job and the gate follows it in the same commit. A hardcoded string
+          # would turn a rename into a permanently red release gate, and the fix
+          # for a red release gate is always to delete it.
+          WF = ".github/workflows/ci.yml"
+          with open(WF) as fh:
+              jobs = (yaml.safe_load(fh) or {}).get("jobs") or {}
+          if "conformance" not in jobs:
+              sys.exit(
+                  f"::error::{WF} has no `conformance` job. This gate exists to prove "
+                  "the released commit was graded against every framework adapter; if "
+                  "the job moved, point this gate at its new home rather than deleting it."
+              )
+          want = jobs["conformance"].get("name") or "conformance"
+
+          repo, sha = os.environ["REPO"], os.environ["SHA"]
+          out = subprocess.run(
+              ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"],
+              capture_output=True, text=True,
+          )
+          if out.returncode != 0:
+              sys.exit(f"::error::could not read check runs for {sha}: {out.stderr.strip()[:400]}")
+          runs = (json.loads(out.stdout) or {}).get("check_runs") or []
+
+          mine = [r for r in runs if r.get("name") == want]
+          if not mine:
+              seen = "\n".join(f"    - {r.get('name')}: {r.get('conclusion')}" for r in runs) or "    (none)"
+              sys.exit(
+                  f"::error::No check run named {want!r} on {sha}.\n"
+                  f"  The conformance matrix never graded this commit, so this release\n"
+                  f"  would ship eleven framework adapters that nothing verified.\n"
+                  f"  `pytest tests/` in the job above selects ZERO of them.\n"
+                  f"  Cut the release from a commit CI has actually run. Seen:\n{seen}"
+              )
+          bad = [r for r in mine if r.get("status") != "completed" or r.get("conclusion") != "success"]
+          if bad:
+              detail = "\n".join(
+                  f"    - {r.get('status')}/{r.get('conclusion')}  {r.get('html_url')}" for r in bad
+              )
+              sys.exit(f"::error::{want!r} did not pass on {sha}:\n{detail}")
+
+          print(f"✅ {want!r} passed on {sha} ({len(mine)} run(s)) — adapters were graded")
+          PY
+          python /tmp/conformance_gate.py
 
   publish:
     name: Publish to PyPI
-    needs: test  # Only publish if tests pass
+    # Both gates, not just the unit suite: `test` proves the library works,
+    # `conformance-graded` proves the adapters that carry it were graded.
+    needs: [test, conformance-graded]
     runs-on: ubuntu-latest
     environment: pypi  # Optional: use GitHub Environment for approvals
     permissions:

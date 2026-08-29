@@ -1,0 +1,130 @@
+name: Conformance Tier B (live)
+
+# THE LANE THIS FILE IS FOR
+# tests/conformance grades ONE contract against every framework adapter, in two
+# tiers. Tier A (`conformance`) is hermetic — stub model, local probe server, no
+# keys — and ci.yml runs it on every push and PR. Tier B (`conformance_live`) is
+# the SAME contract functions against a real provider and a real backend. Its
+# marker has been registered in pyproject.toml since the suite was built and
+# tests/conformance/README.md §Tiers describes exactly how to build it, but as of
+# 2026-08-29 NO .py file carries the marker:
+#
+#     $ grep -rl conformance_live --include='*.py' .      # → nothing
+#
+# So `pytest -m conformance_live` selects zero tests and exits 5.
+#
+# WHY THE SCHEDULE IS COMMENTED OUT AND NOT SIMPLY ENABLED
+# Two of this repo's own standing rules collide here, and only one arrangement
+# satisfies both:
+#   * A job that grades nothing must not report green. That is why ci.yml's
+#     conformance step passes `-m conformance` and sets
+#     DECIMAL_CONFORMANCE_REQUIRE_ALL, and why pyproject's addopts comment calls a
+#     silent skip "the exact 'green job that graded nothing' this suite exists to
+#     remove."
+#   * A gate that is red by default is one people learn to ignore. That is
+#     verbatim why ci.yml's mypy step is still `continue-on-error` at 37 errors.
+# A nightly on an empty marker must be one or the other. So the lane ships
+# CORRECT and DISPATCHABLE but not scheduled: it hard-fails on an empty
+# selection (below), and turning it into a real nightly is uncommenting the four
+# `schedule:` lines the day the first test carries the marker. Nothing else in
+# this file changes at that point.
+#
+# ⚠ FIRST USE OF `secrets.*` IN THIS REPO
+# Before this file, no workflow under .github/ referenced a repository secret —
+# ci.yml's header says so and treats it as belt-and-braces for the `pull_request`
+# (never `pull_request_target`) choice. That reasoning is preserved here, not
+# broken: this workflow has NO pull_request trigger of any kind, so a fork's PR
+# can never reach these secrets. Do not add one. If Tier B ever needs to run on a
+# PR, it needs a different design, not a trigger added to this file.
+on:
+  # Uncomment to make this a real nightly — see "WHY THE SCHEDULE IS COMMENTED
+  # OUT" above. 07:40 UTC keeps it clear of conformance-latest.yml's slot.
+  # schedule:
+  #   - cron: "40 7 * * *"
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Which provider key to grade against"
+        type: choice
+        options: [openai, gemini]
+        default: openai
+
+concurrency:
+  group: conformance-live
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Contract vs a real provider and a real backend
+    runs-on: ubuntu-latest
+    # Generous: a real provider is being called once per adapter per contract
+    # function, and rate limits are the usual reason a leg stalls rather than
+    # fails. A hung step must still end the job — see --timeout in ci_local.py
+    # for the same reasoning locally.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install SDK (no frameworks yet)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: The marker must actually select something
+        # DELIBERATELY FIRST, and deliberately before the multi-minute framework
+        # install and before any secret is read. `pytest` exits 5 for "no tests
+        # collected", and without this check that 5 would be the only signal that
+        # a whole tier is missing — easy to read as a flake, easy to `|| true`
+        # away. On an unbuilt tier this is the step that fires, in seconds, with
+        # the reason.
+        run: |
+          set +e
+          python -m pytest tests/conformance -m conformance_live --collect-only -q
+          rc=$?
+          set -e
+          if [ "$rc" = "5" ]; then
+            echo "::error::Tier B is UNBUILT: no test carries the \`conformance_live\` marker,"
+            echo "  so this lane would grade zero adapters and still exit 0."
+            echo "  tests/conformance/README.md §Tiers has the intended mechanism:"
+            echo "  give Probe a forward_to=<real backend base_url> mode that records and"
+            echo "  validates exactly as it does now and then PROXIES the request onward,"
+            echo "  and give the drivers a real model instead of a stub. Ctx already carries"
+            echo "  base_url and api_key, so nothing else changes."
+            echo "  Do NOT build it by reading traces back through GET /api/v1/traces —"
+            echo "  that grades what the backend stored, not what the adapter sent, and the"
+            echo "  two differ exactly where the bugs are."
+            exit 1
+          fi
+          exit "$rc"
+
+      - name: Install every framework the drivers drive
+        # Same single source as ci.yml's Tier A job — the `conformance-tests`
+        # extra. Never retype the list here; a second copy is how a framework
+        # gets added in one lane and silently ungraded in the other.
+        run: pip install -e ".[conformance-tests]"
+
+      - name: Run the contract against a real provider and a real backend
+        env:
+          # No pull_request trigger reaches this job, so a fork cannot read these.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DECIMAL_API_KEY: ${{ secrets.DECIMAL_CONFORMANCE_API_KEY }}
+          DECIMAL_BASE_URL: ${{ secrets.DECIMAL_CONFORMANCE_BASE_URL }}
+          DECIMAL_CONFORMANCE_PROVIDER: ${{ inputs.provider || 'openai' }}
+          # Same reason as Tier A: turn "a driver could not import its framework"
+          # from a silent skip into a failure. Without it a broken install set
+          # produces a green job that graded nothing.
+          DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
+        # -m conformance_live is REQUIRED. pyproject's addopts deselects the
+        # marker from the default run, so without it this command selects zero
+        # tests and passes green.
+        run: python -m pytest tests/conformance -q -rs -m conformance_live
