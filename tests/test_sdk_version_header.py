@@ -270,6 +270,29 @@ class TestNoVersionDrift:
                 # The one legitimate site: `__version__ = "<current>"`.
                 if py.name == "__init__.py" and node.value == current:
                     continue
+                # ...and one illegitimate match, which is ANOTHER package's version.
+                #
+                # The docstring above already names this failure class — `0.10.3`
+                # matching inside `pre-0.10.30` — and going AST-based fixed it only
+                # for docstrings. It recurred on the 0.12.0 bump in a real literal:
+                # llamaindex.py's install hint says `llama-index-core>=0.12.0`,
+                # which has nothing to do with our version and does not go stale
+                # when we bump. A version preceded by a comparison operator or a
+                # hyphen belongs to whatever package name sits in front of it.
+                #
+                # Only skip when EVERY occurrence is qualified that way, so a
+                # literal that mentions both a dependency pin and a bare copy of
+                # our own version still fails.
+                starts = []
+                at = node.value.find(current)
+                while at != -1:
+                    starts.append(at)
+                    at = node.value.find(current, at + 1)
+                if all(
+                    node.value[:s].rstrip().endswith((">=", "<=", "==", "~=", "!=", ">", "<", "-"))
+                    for s in starts
+                ):
+                    continue
                 offenders.append(f"{py.relative_to(pkg)}:{node.lineno}: {node.value!r}")
 
         assert not offenders, (

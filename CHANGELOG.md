@@ -4,6 +4,59 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.12.0] — 2026-08-30
+
+### Fixed
+
+- **`decimalai init` produced an agent that could not read any of its skills.**
+  On `langchain` — the framework you get by default — `inject_skill_body`
+  defaulted to `False` and the adapter registers no `load_skill` tool, so both
+  body channels were off. The model received a menu of skill *titles* with no
+  mechanism to read them: asked a question only a skill body could answer, it
+  invented a confident 15% where the body said 23.5%. `inject_skill_body` is now
+  tri-state and resolved per adapter — no tool loop means inject, because it is
+  the only channel; a tool loop means don't double-deliver; an explicit setting
+  always wins. `openai_agents` infers this from the registration *outcome*
+  rather than the config flag, because a flag saying "register the tool" plus a
+  registration that failed adds up to zero channels again.
+- **A single 5xx could destroy 50 buffered traces.** `_request_with_retry`
+  returned or raised immediately for every non-429, so 500/502/503/504 got zero
+  retries, and `flush()`'s bare `except Exception` cleared a buffer that
+  auto-flushes at 50. `502/503/504` are now retried on the existing ladder,
+  `500` is opt-in per call site (passed by the four trace-ingest POSTs and
+  nothing else), and the buffer survives 5xx and `httpx.RequestError` — it is
+  cleared only on 4xx and serialization failures.
+- **The generated `langchain` file was not an agent.** It emitted
+  `agent = init_chat_model(MODEL)` — a chat completion named `agent`, with no
+  tool loop — under a docstring inviting you to add tools. Binding a tool to a
+  bare chat model returns `tool_calls` and empty `.content`, so following that
+  advice produced an empty string. It now emits `create_agent(...)` with a real
+  loop. It uses `langchain.agents.create_agent`, not
+  `langgraph.prebuilt.create_react_agent`, which raises
+  `LangGraphDeprecatedSinceV10` on every call and is removed in langgraph 2.0.
+- **The generated `openai-agents` file died with `MaxTurnsExceeded`** on a
+  realistic ticket. It now passes an explicit `max_turns` and names the cause.
+- **Google ADK can deliver a skill body.** It was listed as having no prompt
+  seam and refused a scaffold on that basis; the entry was wrong.
+
+### Added
+
+- **`decimalai init --framework pydantic-ai`** writes a runnable agent — the
+  third scaffoldable framework. Pydantic AI owns a real tool loop, so it sits at
+  the top delivery tier: a live run of the generated file answered with a figure
+  that exists only in the skill body the model pulled through `load_skill`.
+
+### Internal
+
+- Version floors are enforced rather than assumed: an unfloored dev dependency
+  resolved to a 2022 release whose top-level `tests/` package shadowed this
+  repo's own.
+- The post-publish smoke no longer asserts a defect it never observed — a
+  failure to *fetch* the artifact is now reported as inconclusive rather than as
+  a broken release.
+- The conformance and notebook advisory lanes close their own issues when they
+  go green, instead of only ever filing new ones.
+
 ## [0.11.1] — 2026-08-25
 
 ### Added
