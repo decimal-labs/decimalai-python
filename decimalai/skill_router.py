@@ -25,7 +25,8 @@ import warnings
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
-from threading import Lock, local as _thread_local
+from threading import Lock
+from threading import local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx

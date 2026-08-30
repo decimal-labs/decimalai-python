@@ -183,8 +183,26 @@ dev = [
     # permanent skip that read as a pass — so the framework 100% of `decimalai
     # init` users get by default was the one whose execution test never ran.
     # That is how the 2026-08-28 skill-delivery defect reached users green.
-    "langchain",
-    "langchain-openai",
+    # Floored, and the floors job is why. Added unfloored on 2026-08-29, these
+    # turned CI red the same day in a way that looked like an unrelated import
+    # bug: `uv pip install --resolution lowest-direct` resolves an unfloored
+    # requirement to its FIRST EVER release, and `langchain==0.0.1` (2022) ships
+    # a top-level `tests/` package — `tests/__init__.py` and all — straight into
+    # site-packages. A real package there beats this repo's namespace `tests`
+    # directory, so `from tests.conformance import contract` stopped resolving
+    # and the floors job died at collection with `No module named
+    # tests.conformance`. Nothing was wrong with the import; the floor was.
+    #
+    # The tempting fix was `tests/__init__.py`, which does silence it — and
+    # would have left this job asserting a langchain floor of 0.0.1 while the
+    # scaffold-execution tests directly above ran against a 2022 stub. This job
+    # exists to make the floors true, so the floor is the thing to fix.
+    #
+    # 1.0.0 is the first langchain 1.x and is what these floors CLAIM we support.
+    # If the floors job goes red on it, raise the floor to whatever it proves —
+    # that is the job working, not the job failing.
+    "langchain>=1.0.0",
+    "langchain-openai>=1.0.0",
     # openai-agents moved out of core deps into an extra; keep it in dev so the
     # default unit suite still exercises the openai_agents adapter.
     "openai-agents>=0.17.2",
