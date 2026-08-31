@@ -657,9 +657,29 @@ def test_langchain_template_emits_no_deprecation_warnings(tmp_path):
     # Match on the class name rather than the module: langchain and langgraph
     # each subclass DeprecationWarning under their own name, and -W error
     # surfaces whichever fires.
-    assert "Deprecat" not in proc.stderr, (
+    #
+    # Scoped to warnings THIS FILE causes, which is what the docstring above
+    # claims and what a template can actually control. A bare substring over
+    # stderr is broader than that, and on 2026-08-30 it turned the floors job
+    # red on a warning no template choice can avoid: at our declared floor,
+    # `from langchain.agents import create_agent` pulls langgraph 1.0.0, which
+    # pins `langgraph-checkpoint<3.0.0`, and every checkpoint below 4.1.0 emits
+    # `LangChainPendingDeprecationWarning: The default value of allowed_objects
+    # will change` on import. Raising our floor to dodge a third party's warning
+    # hygiene would be an arbitrary number that says nothing about our code.
+    #
+    # A real DeprecationWarning from the generated file is still caught, and by
+    # something stronger than this: `-W error::DeprecationWarning` above turns it
+    # into a non-zero exit, asserted below. This line remains for the Pending*
+    # subclasses that `-W error::DeprecationWarning` does not escalate — the
+    # class `create_react_agent` raises — so it must not be deleted.
+    ours = [
+        ln for ln in proc.stderr.splitlines()
+        if "Deprecat" in ln and "site-packages" not in ln and "dist-packages" not in ln
+    ]
+    assert not ours, (
         "the generated file emits a deprecation warning on a plain run:\n"
-        + proc.stderr
+        + "\n".join(ours)
     )
     assert proc.returncode == 0, (
         f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
