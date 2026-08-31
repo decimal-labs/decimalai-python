@@ -201,7 +201,7 @@ dev = [
     # 1.0.0 is the first langchain 1.x and is what these floors CLAIM we support.
     # If the floors job goes red on it, raise the floor to whatever it proves —
     # that is the job working, not the job failing.
-    "langchain>=1.0.0",
+    "langchain>=1.3.0",
     "langchain-openai>=1.0.0",
     # openai-agents moved out of core deps into an extra; keep it in dev so the
     # default unit suite still exercises the openai_agents adapter.
@@ -211,7 +211,7 @@ dev = [
     # is the compiled-graph tooling, not network).
     # Floored at 0.6.0 — the lowest langgraph that ships `langgraph._internal`,
     # which the modern langgraph-prebuilt imports (0.5.x and below break).
-    "langgraph>=0.6.0",
+    "langgraph>=1.2.0",
     # agentversion (the OSS manifest spec) is an OPTIONAL runtime import for
     # decimalai.export_manifest: present → canonical jcs-sha256 hash + a manifest
     # that validates with zero warnings; absent → the SDK's own surface hash
@@ -235,7 +235,7 @@ live-llm-tests = [
     "google-genai>=1.65.0",
     "langchain-google-genai>=4.2.2",
     "langchain-openai>=0.3.34",
-    "langgraph>=0.6.0",
+    "langgraph>=1.2.0",
     "openai>=2.26.0",
     "openai-agents>=0.17.2",
     # Anthropic/Claude provider lane: anthropic drives the native messages
