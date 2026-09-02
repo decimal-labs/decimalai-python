@@ -21,10 +21,16 @@ import decimalai
 from decimalai._agent import _reset_prompt_cache
 from decimalai.skill_router import (
     _COLD_PATH_TIMEOUT,
-    _HOT_PATH_TIMEOUT,
+    _DEFAULT_HOT_PATH_READ_S,
+    _HOT_PATH_READ_CEILING_S,
+    _HOT_PATH_READ_ENV,
+    _HOT_PATH_READ_FLOOR_S,
     SkillRouter,
     _CircuitBreaker,
+    _hot_path_read_budget,
+    _hot_path_timeout,
     _is_hot_path,
+    routing_status,
 )
 
 UNREACHABLE = "http://127.0.0.1:9"  # discard port: refuses immediately
@@ -130,9 +136,54 @@ class TestTheHotPathCannotHoldAUserTurn:
     def test_the_hot_path_read_budget_is_seconds_not_the_cold_30(self):
         """A 30s budget inside a user's turn turns a platform brownout into an
         outage of the CUSTOMER's product. Measured at 30.3s per turn before."""
-        assert _HOT_PATH_TIMEOUT.read is not None
-        assert _HOT_PATH_TIMEOUT.read <= 5.0
+        assert _hot_path_timeout().read is not None
+        assert _hot_path_timeout().read <= 10.0
         assert _COLD_PATH_TIMEOUT == 30.0
+
+    def test_the_budget_clears_what_a_healthy_platform_actually_serves(self):
+        """The OTHER half of the contract, and the half that was missing.
+
+        Shipped at 2.0s in 0.12.0. Prod serves /skills/route at p95 1.39s when
+        healthy (backend at cpu=2, same load), so 2.0s left 1.4x of headroom —
+        inside ordinary variance. The fleet went from delivering a skill body in
+        69.4% of sessions to 3.1% in the hour it restarted onto that release,
+        with `no_skill_offered` going 7.9% -> 77.6%.
+
+        A budget that fails on a healthy platform is not fail-fast, it is off.
+        2.0 must not be a legal default again.
+        """
+        assert _DEFAULT_HOT_PATH_READ_S >= 3.0, (
+            "the default must clear the measured healthy p95 (1.39s) with real "
+            "margin — see the fleet delivery collapse of 2026-09-01"
+        )
+        assert _DEFAULT_HOT_PATH_READ_S < _COLD_PATH_TIMEOUT
+
+    def test_the_budget_is_configurable_and_clamped(self, monkeypatch):
+        """An operator can tune it without a release; garbage cannot break a turn."""
+        monkeypatch.setenv(_HOT_PATH_READ_ENV, "7.5")
+        assert _hot_path_read_budget() == 7.5
+        assert _hot_path_timeout().read == 7.5
+
+        # Clamped at both ends: below the floor cannot succeed against a warm
+        # backend, above the ceiling is the 30s stall we removed.
+        monkeypatch.setenv(_HOT_PATH_READ_ENV, "0.01")
+        assert _hot_path_read_budget() == _HOT_PATH_READ_FLOOR_S
+        monkeypatch.setenv(_HOT_PATH_READ_ENV, "600")
+        assert _hot_path_read_budget() == _HOT_PATH_READ_CEILING_S
+
+        # Garbage and nonsense fall back rather than raising — this runs inside
+        # the customer's turn, so a bad env var must not be what breaks it.
+        for bad in ("", "abc", "-1", "0"):
+            monkeypatch.setenv(_HOT_PATH_READ_ENV, bad)
+            assert _hot_path_read_budget() == _DEFAULT_HOT_PATH_READ_S
+
+    def test_the_budget_is_read_per_call_not_frozen_at_import(self, monkeypatch):
+        """A module constant captures whatever the env was at first import,
+        which in a test suite is whichever test ran first."""
+        monkeypatch.setenv(_HOT_PATH_READ_ENV, "9")
+        assert _hot_path_timeout().read == 9.0
+        monkeypatch.setenv(_HOT_PATH_READ_ENV, "4")
+        assert _hot_path_timeout().read == 4.0
 
     def test_a_hung_platform_returns_in_seconds_and_the_turn_proceeds(self):
         class Hang(BaseHTTPRequestHandler):
@@ -166,6 +217,75 @@ class TestTheHotPathCannotHoldAUserTurn:
         breaker = _CircuitBreaker(threshold=1, cooldown_s=0.0)
         breaker.record_failure()
         assert breaker.is_open() is False  # cooldown elapsed -> half-open
+
+    def test_a_blip_costs_the_base_cooldown_not_the_ceiling(self):
+        """It was a flat 30s, so three slow calls bought a guaranteed half
+        minute of skill-less answers — and on a platform whose latency is
+        bursty, one slow minute suppressed routing through the next one."""
+        breaker = _CircuitBreaker(threshold=1, cooldown_s=5.0, max_cooldown_s=30.0)
+        breaker.record_failure()
+        assert breaker._current_cooldown() == 5.0
+
+    def test_repeated_opens_back_off_and_a_success_resets_the_ladder(self):
+        """A real outage must still back all the way off, or the breaker is
+        just a slower retry loop."""
+        breaker = _CircuitBreaker(threshold=1, cooldown_s=5.0, max_cooldown_s=30.0)
+        seen = []
+        for _ in range(5):
+            breaker.record_failure()
+            seen.append(breaker._current_cooldown())
+            breaker._opened_at = None  # force half-open without sleeping
+        assert seen == [5.0, 10.0, 20.0, 30.0, 30.0], seen
+
+        breaker.record_success()
+        breaker.record_failure()
+        assert breaker._current_cooldown() == 5.0, "one success must reset the ladder"
+
+
+class TestRoutingDegradationIsVisible:
+    """The 2026-09-01 failure ran for 21 hours across 93 agents with every
+    health signal green, because a hot-path timeout degrades to an empty menu
+    and a 200. Nothing reported that agents were answering without skills."""
+
+    def test_a_healthy_process_reports_healthy(self):
+        from decimalai import skill_router as sr
+
+        sr._hot_path_breaker = _CircuitBreaker()
+        assert routing_status().healthy is True
+        assert routing_status().breaker_open is False
+
+    def test_a_timeout_is_counted_and_flips_healthy(self):
+        from decimalai import skill_router as sr
+
+        sr._hot_path_breaker = _CircuitBreaker(threshold=3)
+        sr._hot_path_breaker.record_failure(httpx.ReadTimeout("too slow"))
+        st = routing_status()
+        assert st.healthy is False, "a timeout must not read as healthy"
+        assert st.timeouts == 1
+        assert "ReadTimeout" in (st.last_error or "")
+
+    def test_the_open_breaker_is_reported_with_a_count(self):
+        from decimalai import skill_router as sr
+
+        sr._hot_path_breaker = _CircuitBreaker(threshold=2, cooldown_s=60.0)
+        for _ in range(2):
+            sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
+        st = routing_status()
+        assert st.breaker_open is True
+        assert st.opens == 1
+        assert st.healthy is False
+
+    def test_a_success_restores_healthy(self):
+        from decimalai import skill_router as sr
+
+        sr._hot_path_breaker = _CircuitBreaker(threshold=2)
+        sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
+        sr._hot_path_breaker.record_success()
+        st = routing_status()
+        assert st.healthy is True
+        # The cumulative counter is NOT reset — a health check wants "has this
+        # ever degraded", not a gauge a recovery quietly zeroes.
+        assert st.timeouts == 1
 
 
 class TestInjectBodyResolvesPerAdapter:

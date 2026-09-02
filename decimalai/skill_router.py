@@ -184,11 +184,83 @@ LOAD_SKILL_PROMPT_HINT = (
 # "Hot path" = a call that happens INSIDE a user's turn, so its latency is the
 # customer's latency. Everything else (CLI, publish, scans) can afford to wait.
 _HOT_PATHS = ("/api/v1/skills/route", "/api/v1/skills/menu")
-# connect/read/write/pool. Read is the one that matters: a hung backend must not
-# hold a turn open. The caller degrades to an empty menu, which is correct —
-# the agent answers without skills rather than not answering at all.
-_HOT_PATH_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=2.0, pool=1.0)
+
+# WHY 5 SECONDS AND NOT 2 (changed 2026-09-02, and the old value was measured
+# doing real harm).
+#
+# Failing fast is right. The value was not. Shipped at read=2.0 in 0.12.0, and
+# on 2026-09-01 the DecimalAI fleet — 93 synthetic users on the public SDK —
+# went from delivering a skill body in 69.4% of sessions to 3.1%, in the same
+# hour it restarted onto that release. `no_skill_offered` went from 7.9% of
+# sessions to 77.6%. Nothing about the platform changed at that moment; the
+# budget did.
+#
+# The platform cannot meet 2 s and never could. Measured on prod:
+#   * healthy (backend at cpu=2, same fleet load): /skills/route p95 1.39 s,
+#     max 1.71 s. A 2 s budget is 1.4x that — inside normal jitter.
+#   * degraded (cpu=1, where it runs today): p95 7.35 s, and a live probe on
+#     2026-09-02 returned 16.9 s / 29.8 s / 8.3 s.
+# So 2 s failed on a bad day AND had no margin on a good one.
+#
+# 5 s is 3.6x the healthy p95, so ordinary variance stops costing the customer
+# their skills, and it is still a small share of an agent turn (commonly
+# 5-30 s) — which is the thing fail-fast exists to protect. The 30 s cold-path
+# budget this replaced was measured at 30.3 s per turn; 5 s keeps ~6x of that
+# improvement while actually completing.
+#
+# ⚠ THE FAILURE MODE THIS GUARDS IS SILENT. A timeout here does not raise —
+# `smart_route` returns an empty menu and the agent answers without skills. The
+# customer sees a worse answer and no error. That is why the budget must be
+# generous enough to succeed, why exceeding it is now counted rather than
+# shrugged at (`routing_status()`), and why the breaker opening logs at ERROR.
+_DEFAULT_HOT_PATH_READ_S = 5.0
+#: Env override, so an operator can tune without a release and a test can pin a
+#: value. Deliberately NOT read by the fleet: the fleet runs the customer
+#: default on purpose, because a budget only the fleet can meet tests nothing.
+_HOT_PATH_READ_ENV = "DECIMALAI_SKILL_ROUTE_TIMEOUT_S"
+#: Clamp. Below the floor the call cannot succeed even against a warm backend
+#: (healthy p95 is 1.39 s); above the ceiling we are back to holding a turn open
+#: for the length of a provider outage.
+_HOT_PATH_READ_FLOOR_S = 0.5
+_HOT_PATH_READ_CEILING_S = 30.0
 _COLD_PATH_TIMEOUT = 30.0
+
+
+def _hot_path_read_budget() -> float:
+    """The read budget for a hot-path call, honouring the env override.
+
+    Read per call rather than captured at import: a module-level constant is
+    fixed by whatever the environment looked like when the first import
+    happened, which in a test suite is whichever test ran first. The cost is a
+    dict lookup and a float parse against an HTTP request.
+
+    Garbage falls back to the default rather than raising — this sits inside a
+    customer's turn, and a malformed env var must not be the thing that breaks
+    their agent.
+    """
+    raw = os.environ.get(_HOT_PATH_READ_ENV)
+    if not raw:
+        return _DEFAULT_HOT_PATH_READ_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a number — using the %.1fs default.",
+            _HOT_PATH_READ_ENV, raw, _DEFAULT_HOT_PATH_READ_S,
+        )
+        return _DEFAULT_HOT_PATH_READ_S
+    if value <= 0:
+        return _DEFAULT_HOT_PATH_READ_S
+    return max(_HOT_PATH_READ_FLOOR_S, min(_HOT_PATH_READ_CEILING_S, value))
+
+
+def _hot_path_timeout() -> httpx.Timeout:
+    """connect/read/write/pool. Read is the one that matters: a hung backend
+    must not hold a turn open. The caller degrades to an empty menu, which is
+    correct — the agent answers without skills rather than not answering."""
+    return httpx.Timeout(
+        connect=1.0, read=_hot_path_read_budget(), write=2.0, pool=1.0,
+    )
 
 
 def _is_hot_path(path: str) -> bool:
@@ -203,45 +275,148 @@ class _CircuitBreaker:
     endpoint on the next turn, and the one after that. With a short timeout the
     per-turn cost is small; with a breaker it goes to zero for a cooldown window
     and the agent stops making a doomed call on every request it serves.
+
+    THE COOLDOWN BACKS OFF (2026-09-02). It was a flat 30 s, which meant three
+    slow calls in a row bought a full half-minute of guaranteed skill-less
+    answers — on a platform whose latency is bursty, so a single slow minute
+    suppressed routing through the next one. It now starts at 5 s and doubles
+    per consecutive open to a 30 s ceiling: a blip costs 5 s, a real outage
+    still backs all the way off, and one success resets the ladder.
     """
 
-    def __init__(self, threshold: int = 3, cooldown_s: float = 30.0):
+    def __init__(
+        self,
+        threshold: int = 3,
+        cooldown_s: float = 5.0,
+        max_cooldown_s: float = 30.0,
+    ):
         self.threshold = threshold
-        self.cooldown_s = cooldown_s
+        self.base_cooldown_s = cooldown_s
+        self.max_cooldown_s = max_cooldown_s
         self._consecutive_failures = 0
+        self._consecutive_opens = 0
         self._opened_at: Optional[float] = None
         self._lock = Lock()
+        # Counters for `routing_status()`. Monotonic for the life of the
+        # process — a health check wants "has this ever degraded", not a
+        # gauge that a recovery quietly resets to zero.
+        self.timeouts = 0
+        self.opens = 0
+        self.suppressed = 0
+        self.last_error: Optional[str] = None
+        self.last_error_at: Optional[float] = None
+        self.last_success_at: Optional[float] = None
+
+    def _current_cooldown(self) -> float:
+        """Caller holds the lock."""
+        step = max(0, self._consecutive_opens - 1)
+        return min(self.max_cooldown_s, self.base_cooldown_s * (2 ** step))
 
     def is_open(self) -> bool:
         with self._lock:
             if self._opened_at is None:
                 return False
-            if time.monotonic() - self._opened_at >= self.cooldown_s:
-                # Half-open: let one call through to test the water.
+            if time.monotonic() - self._opened_at >= self._current_cooldown():
+                # Half-open: let one call through to test the water. The open
+                # COUNT is deliberately not reset here — only a success clears
+                # it, so a platform that fails every probe keeps backing off
+                # instead of retrying every 5 s forever.
                 self._opened_at = None
                 self._consecutive_failures = 0
                 return False
+            self.suppressed += 1
             return True
 
-    def record_failure(self) -> None:
+    def record_failure(self, error: Optional[BaseException] = None) -> None:
         with self._lock:
             self._consecutive_failures += 1
+            self.timeouts += 1
+            if error is not None:
+                self.last_error = f"{type(error).__name__}: {error}"
+                self.last_error_at = time.time()
             if self._consecutive_failures >= self.threshold and self._opened_at is None:
                 self._opened_at = time.monotonic()
-                logger.warning(
+                self._consecutive_opens += 1
+                self.opens += 1
+                # ERROR, not warning. While this is open every agent in the
+                # process answers without skills and nothing else says so.
+                logger.error(
                     "SkillRouter: %d consecutive transport failures — pausing "
-                    "skill routing for %.0fs. Agents will run without skills "
-                    "until the platform is reachable.",
-                    self._consecutive_failures, self.cooldown_s,
+                    "skill routing for %.0fs. Agents will run WITHOUT SKILLS "
+                    "until the platform is reachable. Last error: %s. If this "
+                    "is slowness rather than an outage, raise %s (currently "
+                    "%.1fs).",
+                    self._consecutive_failures, self._current_cooldown(),
+                    self.last_error, _HOT_PATH_READ_ENV, _hot_path_read_budget(),
                 )
 
     def record_success(self) -> None:
         with self._lock:
             self._consecutive_failures = 0
+            self._consecutive_opens = 0
             self._opened_at = None
+            self.last_success_at = time.time()
 
 
 _hot_path_breaker = _CircuitBreaker()
+
+
+class RoutingStatus:
+    """Snapshot of skill routing's health. See ``decimalai.routing_status()``.
+
+    Exists because the failure this reports is otherwise invisible: a hot-path
+    timeout degrades to an empty menu, so the agent answers without skills and
+    returns 200. On 2026-09-01 that state ran for 21 hours across 93 agents
+    with every other health signal green.
+
+    Example::
+
+        st = decimalai.routing_status()
+        if not st.healthy:
+            alert_oncall(f"agents running without skills: {st.last_error!r}")
+    """
+
+    __slots__ = (
+        "healthy", "breaker_open", "consecutive_failures", "timeouts",
+        "opens", "suppressed", "read_budget_s", "last_error",
+        "last_error_at", "last_success_at",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"RoutingStatus(healthy={self.healthy}, breaker_open={self.breaker_open}, "
+            f"timeouts={self.timeouts}, opens={self.opens}, "
+            f"read_budget_s={self.read_budget_s})"
+        )
+
+
+def routing_status() -> RoutingStatus:
+    """Is skill routing actually working in this process?
+
+    `healthy` is False while the breaker is open OR after any hot-path timeout
+    that has not been followed by a success — i.e. it answers "are my agents
+    getting their skills right now", which is the question a 200 response
+    cannot.
+    """
+    b = _hot_path_breaker
+    with b._lock:
+        open_now = b._opened_at is not None
+        return RoutingStatus(
+            healthy=not open_now and b._consecutive_failures == 0,
+            breaker_open=open_now,
+            consecutive_failures=b._consecutive_failures,
+            timeouts=b.timeouts,
+            opens=b.opens,
+            suppressed=b.suppressed,
+            read_budget_s=_hot_path_read_budget(),
+            last_error=b.last_error,
+            last_error_at=b.last_error_at,
+            last_success_at=b.last_success_at,
+        )
 
 
 class _BodyLoadBudget:
@@ -864,11 +1039,16 @@ class SkillRouter:
                 # i.e. an outage of THEIR product caused by an optional vendor.
                 # Fail fast instead; the caller already degrades to an empty menu.
                 # Non-hot paths (CLI, publish, body reads outside a turn) keep 30s.
-                timeout=_HOT_PATH_TIMEOUT if hot else _COLD_PATH_TIMEOUT,
+                #
+                # See `_hot_path_read_budget` for why the hot budget is 5s and
+                # not the 2s this shipped with: 2s is below what the platform
+                # meets even when healthy, and the fleet measured skill delivery
+                # collapsing 69% -> 3% the hour it landed.
+                timeout=_hot_path_timeout() if hot else _COLD_PATH_TIMEOUT,
             )
         except httpx.HTTPError as e:
             if hot:
-                _hot_path_breaker.record_failure()
+                _hot_path_breaker.record_failure(e)
             raise SkillRouterError(
                 f"SkillRouter transport error on {method} {path}: {e}"
             ) from e

@@ -202,6 +202,33 @@ def export_status():
     return sender.status()
 
 
+def routing_status():
+    """Is skill routing actually working in this process?
+
+    The companion to :func:`export_status`, and it answers the question a 200
+    response cannot. When the platform is slow, a hot-path routing call times
+    out, `smart_route` degrades to an EMPTY menu, and the agent answers without
+    skills — successfully. Nothing raises, nothing 500s, and the only symptom is
+    that answers quietly get worse.
+
+    That state ran for 21 hours across 93 agents on 2026-09-01 with every other
+    health signal green. This is how you see it::
+
+        st = decimalai.routing_status()
+        if not st.healthy:
+            alert_oncall(f"agents running without skills: {st.last_error!r}")
+
+    Fields: ``healthy``, ``breaker_open``, ``consecutive_failures``,
+    ``timeouts``, ``opens``, ``suppressed``, ``read_budget_s``, ``last_error``,
+    ``last_error_at``, ``last_success_at``.
+
+    No-op safe: reports healthy before any routing call has been made.
+    """
+    from .skill_router import routing_status as _rs
+
+    return _rs()
+
+
 def on_export_error(callback) -> None:
     """Register a callback fired on each background trace-export failure.
 
@@ -1928,6 +1955,7 @@ __all__ = [
     "flush",
     "last_send_error",
     "export_status",
+    "routing_status",
     "on_export_error",
     "send",
     "eval",
