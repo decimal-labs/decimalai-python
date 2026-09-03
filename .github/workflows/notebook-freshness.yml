@@ -108,7 +108,10 @@ jobs:
           {
             echo '### Notebook freshness'
             echo '```'
-            sed -n '/^CHECKS PERFORMED/,/^VERDICT /p' freshness.out
+            # Digits stripped: this repo is PUBLIC, the run page is world-readable,
+            # and the roll-call carries live registry counts ("… — 46791 measured
+            # skills walked"). The summary's job is WHICH checks ran, not the figures.
+            sed -n '/^CHECKS PERFORMED/,/^VERDICT /p' freshness.out | sed -E 's/[0-9][0-9,.]*/…/g'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -157,9 +160,31 @@ jobs:
               '`examples/measure-a-skill/manifest.yaml` no longer back what the notebooks claim.\n\n' +
               'Every line below names the exact YAML key to change. The notebooks hardcode no ' +
               'numbers, so the fix is a one-line edit on `main` — already-open Colab tabs pick it ' +
-              'up on their next run.\n\n';
+              'up on their next run. Run `python scripts/check_notebook_manifest.py --disclosure` '  +
+              'locally for the current values.\n\n';
             try {
-              body += '```\n' + fs.readFileSync('freshness.out', 'utf8').slice(0, 55000) + '\n```\n';
+              // THIS REPO IS PUBLIC AND SO IS THIS ISSUE. `freshness.out` carries
+              // live registry composition — measured-skill and graded-case totals,
+              // and the per-source withheld split (platform vs github_import).
+              // Dumping it verbatim published a nightly, indexable disclosure of
+              // registry composition that nothing else on our public surface makes:
+              // issue #14 ran from 2026-08-30 with three such comments before anyone
+              // noticed. The maintainer needs the KEY that drifted, not the figure.
+              //
+              // So: keep the drifted key names and the problems, strip the numbers,
+              // and drop the per-check roll-call, which is noise once it is green.
+              const raw = fs.readFileSync('freshness.out', 'utf8');
+              const redacted = raw
+                .split('\n')
+                .filter(l => !/^\s*✓\s*\[(offline|network)\]/.test(l))
+                .filter(l => !/request\(s\).*rate-limited/.test(l))
+                .map(l => /registry_disclosure|withheld|measured_public_skills|graded[_ ]cases|skills \/|manifest .* · live/.test(l)
+                  ? l.replace(/\d[\d,.]*/g, '…')
+                  : l)
+                .join('\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+              body += '```\n' + redacted.slice(0, 20000) + '\n```\n';
             } catch (e) {
               body += '_(no output captured — the step failed before the checker ran)_\n';
             }
