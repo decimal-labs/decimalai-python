@@ -17,8 +17,8 @@ Custom path (per-call control)::
 from __future__ import annotations
 
 import logging
-import time
 import threading
+import time
 import warnings
 from contextvars import ContextVar
 from datetime import datetime, timezone
