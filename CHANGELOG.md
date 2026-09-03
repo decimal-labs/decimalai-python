@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.13.1] — 2026-09-03
 
 ### Fixed
 
@@ -26,6 +26,39 @@ and patch releases are fixes.
   from that agent re-attempts the registration instead of inheriting the
   failure. An empty run no longer adopts a failed registration's local id as
   the agent's manifest either.
+
+- **A sub-agent's trace was built and never sent.** `on_chain_end` closed a run
+  only when `parent_run_id is None`. That is the outermost callback of a
+  top-level `chain.invoke()`, and it is the right boundary for that case — but
+  it is not the only way a run finishes. The documented multi-agent pattern
+  gives a nested `.invoke()` its own `CallbackHandler`, and that inner invoke
+  runs inside the outer run tree: LangChain hands the sub-agent's handler
+  exactly ONE chain end, carrying `run_id == parent_run_id == root`, and never
+  one with a null parent. So every sub-agent trace, on every multi-agent run,
+  was assembled and dropped. Runs are now closed on an open-chain balance —
+  chain starts minus chain ends on that run — which reaches zero exactly when
+  the run is done and cannot be tripped early by langchain-core 1.5.x reusing
+  the root run_id for child steps.
+- **The ADK adapter left the entire system prompt out of its traces.** It built
+  `rendered_input` from `llm_request.contents` — the conversation turns — while
+  ADK keeps the agent's instruction, and every routed skill body the adapter
+  appends, in `config.system_instruction`. A separate field, and one nothing
+  recorded. The adapter could route a skill, append its BODY, verify the append
+  survived, and emit a trace with no skill text anywhere in it: delivery that
+  was real and unwitnessable, which is the one state indistinguishable from
+  never delivering at all. Every downstream signal reads that field — the SDK's
+  own prompt-rung inference, the platform's activation detection, and the
+  conformance contract's delivery items.
+
+### Added
+
+- **`decimalai.adk.instrument()` and `DecimalaiPlugin` accept
+  `enable_load_skill_tool`.** Accepted and DORMANT, as on the LangChain
+  adapter: ADK registers no `load_skill` tool, so the model cannot ask for a
+  body and the strongest rung this rail reaches is DELIVERED. Passing True logs
+  a warning naming the adapters that do have a tool loop and stays on prompt
+  injection. Accepted rather than rejected on purpose — a flag silently dropped
+  is how an adapter ends up credited with a channel it does not have.
 
 ## [0.13.0] — 2026-09-03
 
