@@ -13,6 +13,7 @@ import secrets
 import time
 import warnings
 from datetime import datetime, timezone
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -727,9 +728,27 @@ class ManifestTracker:
     and automatically register new versions.
     """
 
+    #: How many distinct hashes one process remembers. Bounded because a
+    #: long-lived worker could otherwise accumulate one entry per config change
+    #: for the life of the process; 64 is far more than any real agent produces
+    #: and costs a few KB.
+    _MAX_REMEMBERED = 64
+
     def __init__(self) -> None:
         self._last_hash: Optional[str] = None
         self._last_manifest: Optional[ManifestSnapshot] = None
+        # EVERY hash this process has already registered, not just the previous
+        # one. A single slot re-registers whenever the snapshot OSCILLATES —
+        # A -> B -> A sends three requests for two manifests, and the third is
+        # one the server already has. Measured on prod 2026-09-03:
+        # `POST /api/v1/manifests` is 17.9% of ALL backend traffic and ~99.4% of
+        # it dedupes server-side.
+        #
+        # ⚠ This does NOT suppress a genuinely new hash. An agent that discovers
+        # a tool mid-run has a different manifest and the platform must be told;
+        # re-registering there is the product working, not waste. Only the
+        # already-seen case is dropped.
+        self._seen_hashes: "OrderedDict[str, None]" = OrderedDict()
 
     @property
     def last_hash(self) -> Optional[str]:
@@ -745,14 +764,36 @@ class ManifestTracker:
         Returns True if the manifest is new or changed (should be registered).
         Returns False if it's the same as the last known version.
         """
-        if self._last_hash == snapshot.manifest_hash:
+        h = snapshot.manifest_hash
+        if self._last_hash == h or h in self._seen_hashes:
+            # Keep `last_*` truthful about what was most recently OFFERED, so a
+            # caller reading them after an oscillation sees the current shape.
+            self._last_hash = h
+            self._last_manifest = snapshot
+            self._seen_hashes.move_to_end(h, last=True)
             return False
 
-        self._last_hash = snapshot.manifest_hash
+        self._last_hash = h
         self._last_manifest = snapshot
+        self._seen_hashes[h] = None
+        while len(self._seen_hashes) > self._MAX_REMEMBERED:
+            self._seen_hashes.popitem(last=False)   # LRU
         return True
 
     def reset(self) -> None:
-        """Reset the tracker state."""
+        """Reset the tracker state — this process forgets everything it registered.
+
+        ⚠ `_seen_hashes` MUST be cleared here, and the first version of it was not.
+        `reset()` is the ROLLBACK the caller uses when a registration fails
+        (`generic.py`: "Roll back the tracker so a transient first-trace failure
+        does not suppress every later attempt"). A remembered hash that survived
+        the rollback would suppress the retry, and the next trace citing a
+        manifest the backend never stored is exactly the "manifest_id does not
+        exist" 400 this whole area exists to avoid.
+
+        Caught by test_failed_registration_does_not_poison_tracker and
+        test_reset, which is what they are for.
+        """
         self._last_hash = None
         self._last_manifest = None
+        self._seen_hashes.clear()

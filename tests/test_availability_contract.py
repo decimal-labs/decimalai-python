@@ -340,3 +340,84 @@ class TestDotenvResolvesFromTheProjectNotSitePackages:
 
         src = inspect.getsource(_config)
         assert "find_dotenv(usecwd=True)" in src
+
+
+class TestManifestRegistrationDoesNotRepeatItself:
+    """`POST /api/v1/manifests` is 17.9% of ALL backend traffic and ~99.4% of it
+    dedupes server-side (measured on prod, 2026-09-03: ~50,800 registrations a
+    day resolving to 200 distinct hashes).
+
+    The tracker kept a SINGLE hash slot, so an oscillating snapshot re-sent a
+    manifest the server already had.
+    """
+
+    def _snap(self, h):
+        from decimalai.schema.manifest import ManifestSnapshot
+
+        s = ManifestSnapshot(agent_name="bot")
+        s.manifest_hash = h
+        return s
+
+    def test_an_oscillating_snapshot_registers_each_hash_once(self):
+        from decimalai.schema.manifest import ManifestTracker
+
+        t = ManifestTracker()
+        assert t.check_and_update(self._snap("a")) is True
+        assert t.check_and_update(self._snap("b")) is True
+        # Back to a shape this process ALREADY registered. A single slot sent
+        # this one; remembering every hash does not.
+        assert t.check_and_update(self._snap("a")) is False
+        assert t.check_and_update(self._snap("b")) is False
+
+    def test_a_genuinely_new_hash_still_registers(self):
+        """The guard must not become a mute button. An agent that discovers a
+        tool mid-run HAS a new manifest and the platform must be told — that is
+        the product working, not waste."""
+        from decimalai.schema.manifest import ManifestTracker
+
+        t = ManifestTracker()
+        assert t.check_and_update(self._snap("a")) is True
+        assert t.check_and_update(self._snap("a")) is False
+        assert t.check_and_update(self._snap("c")) is True
+
+    def test_the_memory_is_bounded(self):
+        """A long-lived worker must not accumulate one entry per config change
+        for the life of the process."""
+        from decimalai.schema.manifest import ManifestTracker
+
+        t = ManifestTracker()
+        for i in range(ManifestTracker._MAX_REMEMBERED + 40):
+            t.check_and_update(self._snap(f"h{i}"))
+        assert len(t._seen_hashes) <= ManifestTracker._MAX_REMEMBERED
+        # And it evicts the OLDEST, so the recent shapes stay suppressed.
+        assert t.check_and_update(self._snap(f"h{ManifestTracker._MAX_REMEMBERED + 39}")) is False
+
+    def test_last_manifest_still_reports_what_was_most_recently_offered(self):
+        """Callers read `last_manifest` after the check. Suppressing a repeat
+        must not leave them looking at a stale shape."""
+        from decimalai.schema.manifest import ManifestTracker
+
+        t = ManifestTracker()
+        t.check_and_update(self._snap("a"))
+        t.check_and_update(self._snap("b"))
+        t.check_and_update(self._snap("a"))
+        assert t.last_hash == "a"
+        assert t.last_manifest is not None and t.last_manifest.manifest_hash == "a"
+
+    def test_reset_forgets_everything_so_a_failed_registration_retries(self):
+        """`reset()` is the ROLLBACK the caller uses when registration fails.
+
+        The first version of the remembered-hash set did not clear here, and a
+        hash surviving the rollback suppresses the retry — leaving the next trace
+        citing a manifest the backend never stored, which is the
+        "manifest_id does not exist" 400 this area exists to avoid. Caught by the
+        existing failure-retry tests; pinned here so the reason is written down.
+        """
+        from decimalai.schema.manifest import ManifestTracker
+
+        t = ManifestTracker()
+        assert t.check_and_update(self._snap("a")) is True
+        assert t.check_and_update(self._snap("a")) is False
+        t.reset()
+        assert t.check_and_update(self._snap("a")) is True, \
+            "reset() left a hash remembered — a failed registration would never retry"
