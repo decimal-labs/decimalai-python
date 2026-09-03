@@ -17,6 +17,7 @@ Custom path (per-call control)::
 from __future__ import annotations
 
 import logging
+import time
 import threading
 import warnings
 from contextvars import ContextVar
@@ -95,6 +96,13 @@ _installed = False
 # Global manifest state — shared across all handler instances
 _manifest_tracker = ManifestTracker()
 _manifest_id: Optional[str] = None  # Most recent successful registration
+# Agents whose id in `_manifest_ids` is the snapshot's LOCAL id because the
+# platform refused the registration — see `_register_snapshot`. Such an id is
+# stamped on the trace that is about to ship (so `export_status()` can name
+# the registration failure as the cause of the 400 that follows) but it is
+# NOT a registration: nothing that decides "already registered" may read it
+# as one, or a single refused POST silences this agent for the whole process.
+_unregistered_agents: set = set()
 _manifest_lock = threading.Lock()  # Thread safety for manifest registration
 
 # Per-AGENT manifest state. `_manifest_id` alone is a single process-global
@@ -267,6 +275,25 @@ def _forget_manifests_if_tracker_reset() -> None:
     if _manifest_tracker.last_hash is None and (_manifest_ids or _manifest_hashes):
         _manifest_ids.clear()
         _manifest_hashes.clear()
+        _unregistered_agents.clear()
+
+
+# Same ladder as `generic._maybe_register_manifest`: registration runs on the
+# caller's thread at root-run end, so the whole budget is 0.6s and only spent
+# while the platform is refusing. A Cloud Run admission abort answers in ~0ms;
+# a few hundred ms later is a different admission decision.
+_REGISTER_BACKOFFS_S = (0.0, 0.1, 0.5)
+
+
+def _is_permanent_registration_failure(exc: BaseException) -> bool:
+    """401/403: the key is wrong or forbidden, and retrying cannot change that."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        return True
+    if status is not None:
+        return False
+    msg = str(exc)
+    return "401" in msg or "403" in msg
 
 
 def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
@@ -291,26 +318,71 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
         # "what did we last register" surface, and `reset()` on it is what
         # `_forget_manifests_if_tracker_reset` listens for.
         _manifest_tracker.check_and_update(snapshot)
-        try:
-            client = _config._get_client()
-            result = client.register_manifest(snapshot)
+        client = _config._get_client()
+        manifest_id: Optional[str] = None
+        last_exc: Optional[BaseException] = None
+        for attempt, delay in enumerate(_REGISTER_BACKOFFS_S):
+            if delay:
+                time.sleep(delay)
+            try:
+                result = client.register_manifest(snapshot)
+            except Exception as exc:
+                last_exc = exc
+                if _is_permanent_registration_failure(exc):
+                    break  # 401/403 will not come back to life; do not burn the budget.
+                continue
             manifest_id = _registered_manifest_id(result, snapshot)
             logger.info(
-                "Registered manifest %s for %s (hash=%s, components=%d)",
+                "Registered manifest %s for %s (hash=%s, components=%d, attempt=%d)",
                 manifest_id,
                 agent_name,
                 snapshot.manifest_hash[:12],
                 len(snapshot.components),
+                attempt + 1,
             )
-        except Exception:
+            break
+
+        if manifest_id is None:
+            # THE REFUSAL MUST NOT BECOME THIS AGENT'S REGISTRATION. This branch
+            # used to write the snapshot's local id into `_manifest_ids` AND the
+            # hash into `_manifest_hashes`, which is exactly the pair the dedupe
+            # check above reads as "already registered". One refused POST — a
+            # backend restart, a Cloud Run "no available instance" abort — then
+            # stamped every later trace from this agent with an id the platform
+            # never stored, and ingest answered "manifest_id does not exist" for
+            # the life of the process. Measured on prod 2026-09-03: 9% of the
+            # fleet's trace POSTs were that 400. The other adapters roll back on
+            # failure (generic/adk/otel/llamaindex reset the tracker, the Claude
+            # Agent SDK adapter leaves the hash unset); this one did neither.
+            #
+            # The local id is still stamped on the trace about to ship — the
+            # platform's answer to it names the real cause, and
+            # `export_status().last_manifest_error` carries the exception —
+            # but it is recorded as UNREGISTERED, so the next trace from this
+            # agent re-attempts the registration.
             logger.warning(
-                "Failed to register manifest for %s, continuing without",
-                agent_name, exc_info=True,
+                "Failed to register manifest for %s after %d attempt(s); this trace "
+                "ships with a local id and the next trace retries. Last error: %s: %s",
+                agent_name,
+                len(_REGISTER_BACKOFFS_S),
+                type(last_exc).__name__,
+                str(last_exc)[:200],
             )
-            # Still tag traces with the local id rather than shipping none.
+            if last_exc is not None:
+                try:
+                    _config._sender.record_manifest_error(last_exc)
+                except Exception:
+                    pass
             manifest_id = str(snapshot.id)
+            _manifest_ids[agent_name] = manifest_id
+            _manifest_hashes.pop(agent_name, None)
+            _unregistered_agents.add(agent_name)
+            _manifest_id = manifest_id
+            return manifest_id
+
         _manifest_ids[agent_name] = manifest_id
         _manifest_hashes[agent_name] = snapshot.manifest_hash
+        _unregistered_agents.discard(agent_name)
         _manifest_id = manifest_id
         return manifest_id
 
@@ -2924,7 +2996,7 @@ class CallbackHandler(_CallbackBase):
         adopted: Optional[str] = None
         with _manifest_lock:
             _forget_manifests_if_tracker_reset()
-            if _manifest_ids.get(agent_name):
+            if _manifest_ids.get(agent_name) and agent_name not in _unregistered_agents:
                 return  # Already have one — never regress it to an empty manifest.
             probe = agent_name not in _manifest_adoption_probed
             if probe:
@@ -2933,7 +3005,13 @@ class CallbackHandler(_CallbackBase):
             adopted = _adopt_active_manifest(agent_name)
         if adopted:
             with _manifest_lock:
-                _manifest_ids.setdefault(agent_name, adopted)
+                if agent_name in _unregistered_agents:
+                    # What this agent "has" is a refused registration's local
+                    # id — not a manifest. The platform's active one replaces it.
+                    _manifest_ids[agent_name] = adopted
+                    _unregistered_agents.discard(agent_name)
+                else:
+                    _manifest_ids.setdefault(agent_name, adopted)
                 _manifest_id = adopted
             logger.debug(
                 "Adopted the platform's active manifest %s for %s "

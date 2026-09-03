@@ -4,6 +4,29 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **The LangChain adapter turned one refused manifest registration into a
+  process-long outage for that agent.** `_register_snapshot` made a single
+  `POST /api/v1/manifests` attempt and, on any failure, cached the snapshot's
+  LOCAL id together with its hash — the exact pair its own dedupe check reads
+  as "already registered". Every later trace from that agent then cited an id
+  the platform had never stored, and ingest answered
+  `manifest_id '…' does not exist` until the process restarted. Measured on
+  production 2026-09-03, with the backend refusing requests at admission: 9% of
+  all trace POSTs were that 400.
+
+  The adapter now retries a refused registration on the same short ladder the
+  generic adapter uses (three attempts, 0.6s in total, none for a 401/403), and
+  a registration that still fails is recorded as UNREGISTERED: the trace about
+  to ship still carries the local id and `routing_status()`'s sibling
+  `export_status().last_manifest_error` names the cause, but the next trace
+  from that agent re-attempts the registration instead of inheriting the
+  failure. An empty run no longer adopts a failed registration's local id as
+  the agent's manifest either.
+
 ## [0.13.0] — 2026-09-03
 
 ### Fixed
