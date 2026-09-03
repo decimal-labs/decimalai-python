@@ -92,6 +92,41 @@ def common_options(func):
 _DEFAULT_BASE_URL = "https://api.decimal.ai"
 
 
+# Admission aborts, not rate limits. A single-instance Cloud Run backend answers HTTP 429 with
+# "The request was aborted because there was no available instance" in ~0 ms and with no
+# Retry-After the moment all its request slots are busy; 502/503/504 are the same class from a
+# load balancer. Measured on production 2026-09-03: 84-92% of requests in a ten-minute window.
+# `decimalai init` made ONE verify call and exited on any non-2xx, so a customer running the
+# quickstart while the platform was busy was told "Server returned HTTP 429 ... try again" and
+# the scaffold never got written. A few hundred milliseconds later is a different admission
+# decision, and a 401/403/404 is a real answer that is never retried.
+_ADMISSION_STATUSES = frozenset({429, 502, 503, 504})
+_ADMISSION_RETRY_DELAYS_S = (0.5, 1.5)
+_ADMISSION_MAX_RETRY_AFTER_S = 5.0
+
+
+def _get_past_admission_aborts(http, path):
+    """``http.get(path)``, retried on an admission abort. Returns the LAST response; the caller
+    still does its own ``raise_for_status``, so a 429 that outlasts the schedule reads exactly as
+    it did before — this only changes how many tries it takes to give up."""
+    import time as _time
+
+    resp = http.get(path)
+    for delay in _ADMISSION_RETRY_DELAYS_S:
+        if resp.status_code not in _ADMISSION_STATUSES:
+            return resp
+        header = resp.headers.get("retry-after") if getattr(resp, "headers", None) else None
+        try:
+            hinted = float(header) if header is not None else None
+        except (TypeError, ValueError):
+            hinted = None
+        if hinted is not None and 0 <= hinted <= _ADMISSION_MAX_RETRY_AFTER_S:
+            delay = hinted
+        _time.sleep(delay)
+        resp = http.get(path)
+    return resp
+
+
 def _http_die(exc, base_url):
     """Turn a failed platform call into the right one-line diagnosis.
 
@@ -488,7 +523,7 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     from .._client import DecimalAIClient
     client = DecimalAIClient(api_key=resolved_key, base_url=base_url)
     try:
-        resp = client._http.get("/api/v1/auth/verify")
+        resp = _get_past_admission_aborts(client._http, "/api/v1/auth/verify")
         resp.raise_for_status()
         data = resp.json()
         workspace_id = data.get("workspace_id")

@@ -4,6 +4,19 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **`decimalai init` gave up on the first admission abort.** A single-instance
+  backend at its concurrency limit answers HTTP 429 in ~0 ms with no Retry-After
+  (Cloud Run's "no available instance"); measured on production 2026-09-03 that
+  was 84-92% of requests in a ten-minute window. `init` made one
+  `/api/v1/auth/verify` call and exited on any non-2xx, so the quickstart failed
+  outright for anyone who ran it while the platform was busy. The verify call now
+  retries a 429/502/503/504 twice (0.5 s, then 1.5 s; a short `Retry-After` wins)
+  before reporting the status. A 401/403 is a real answer and is never retried.
+
 ## [0.13.1] — 2026-09-03
 
 ### Fixed
