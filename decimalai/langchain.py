@@ -1470,7 +1470,7 @@ class _RunState:
 
     __slots__ = (
         "root_run_id", "member_ids", "rail_scopes", "opened_at", "is_leaf_root",
-        "agent_hint",
+        "open_chains", "agent_hint",
         "detected_agent_name", "trace_id", "spans", "llm_calls", "tool_calls",
         "tool_requests",
         "span_stack", "trace_started_at", "user_input_preview",
@@ -1502,6 +1502,12 @@ class _RunState:
         # a bare `llm.invoke()` emits no chain callbacks at all, so nothing
         # else will ever close or send this run.
         self.is_leaf_root = is_leaf_root
+        # Chain starts seen for this run minus chain ends — i.e. how many
+        # chain callbacks are still open. Zero means the run is genuinely
+        # finished, which is the ONLY reliable close signal when this handler's
+        # root is not the outermost run in the process (a sub-agent invoked
+        # from inside an orchestrator's tool). See `on_chain_end`.
+        self.open_chains: int = 0
         self.agent_hint: Optional[str] = None
         # The name auto-detected from THIS run's root chain. Per-run because
         # the detection used to be written back onto `handler.agent_name`,
@@ -1867,6 +1873,12 @@ class CallbackHandler(_CallbackBase):
             state = self._new_run_state(span_id)
             state.agent_hint = str(name) or None
 
+        # Count the open chain BEFORE the skip check below. A skipped wrapper
+        # still gets an `on_chain_end`, which decrements unconditionally, so
+        # counting only the un-skipped ones would leave the balance negative
+        # and close the run early.
+        state.open_chains += 1
+
         # Skip noisy internal LangChain wrappers
         if any(name.startswith(skip) for skip in _SKIP_CHAIN_TYPES):
             return
@@ -1942,15 +1954,39 @@ class CallbackHandler(_CallbackBase):
 
         state.final_output_preview = _preview(outputs)
 
-        # Auto-send at the true outermost end — the only callback that
-        # carries parent_run_id=None. Matching on `span_id ==
-        # self._root_run_id` broke on langchain-core 1.5.x, which reuses the
-        # root run_id for child steps (ChatPromptTemplate's events arrive
-        # with run_id == parent_run_id == root), so the old check fired at
-        # the PROMPT step's end and sent the trace before the LLM call
-        # existed. The emptiness guard keeps all-skipped runs (e.g. a bare
-        # RunnablePassthrough) from sending empty traces.
-        if parent_run_id is None:
+        # ── When is this run finished? ──
+        #
+        # `parent_run_id is None` marks the true outermost callback and is kept
+        # as-is, because it is what every top-level `chain.invoke()` produces.
+        # Matching instead on `span_id == self._root_run_id` broke on
+        # langchain-core 1.5.x, which reuses the root run_id for child steps
+        # (ChatPromptTemplate's events arrive with run_id == parent_run_id ==
+        # root), so that check fired at the PROMPT step's end and sent the
+        # trace before the LLM call existed. Do not reintroduce it.
+        #
+        # But `parent_run_id is None` is not SUFFICIENT, and that is a real bug
+        # rather than a theoretical one. A sub-agent invoked from inside an
+        # orchestrator's tool — the documented multi-agent pattern, its own
+        # CallbackHandler passed to the nested `.invoke()` — runs inside the
+        # outer run tree. LangChain hands that handler exactly ONE chain end,
+        # carrying `run_id == parent_run_id == root`, and never one with a null
+        # parent. So the sub-agent's trace was built, held, and never sent: on
+        # 2026-09-03, journey C saw the orchestrator trace land and
+        # `spec_trace=None` on every run, and the in-repo live test hit the
+        # same wall while its "timed out" message got misread as a provider
+        # quota skip.
+        #
+        # `open_chains` closes both cases without guessing from ids: it is the
+        # number of chain callbacks still open on THIS state, so zero means
+        # every chain that started has ended. The 1.5.x prompt step cannot
+        # trigger it — that step ends while its enclosing chain is still open,
+        # so the balance is >= 1 there — and a nested sub-agent root reaches
+        # zero exactly when its own run is done.
+        #
+        # The emptiness guard in `_close_run` still keeps all-skipped runs
+        # (e.g. a bare RunnablePassthrough) from sending empty traces.
+        state.open_chains = max(0, state.open_chains - 1)
+        if parent_run_id is None or state.open_chains == 0:
             self._close_run(state)
 
     def on_chain_error(
@@ -1976,9 +2012,14 @@ class CallbackHandler(_CallbackBase):
         if state.span_stack and state.span_stack[-1] == span_id:
             state.span_stack.pop()
 
-        # Auto-send on the outermost error too — same parent_run_id=None
-        # boundary as on_chain_end (see the note there).
-        if parent_run_id is None:
+        # Auto-send on the outermost error too — same boundary as
+        # on_chain_end, including the open-chain balance (see the note there),
+        # so a sub-agent whose run ERRORS still ships its trace instead of
+        # being held forever. Without the balance here, the failure mode is
+        # worse than a lost success: the run that most needs a trace is the
+        # one that does not get one.
+        state.open_chains = max(0, state.open_chains - 1)
+        if parent_run_id is None or state.open_chains == 0:
             self._close_run(state)
 
     def _close_run(self, state: _RunState) -> None:

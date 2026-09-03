@@ -322,6 +322,30 @@ def get_trace_detail(trace_id: str) -> dict:
         return json.loads(r.read())
 
 
+class TraceNeverArrived(AssertionError):
+    """The model call succeeded and the trace never reached the backend.
+
+    A DISTINCT TYPE ON PURPOSE, and it must never be downgraded to a skip.
+    `is_provider_unavailable_error` matches substrings, and one of them is
+    "timed out" — which also matches this assertion's own message. On
+    2026-09-03 that laundered a real defect into a clean run:
+    `test_langchain_multi_agent_handoff` reported
+
+        SKIPPED — provider unavailable (quota/rate-limit):
+        Timed out waiting for 1 trace(s) on agent=live-langchain-specialist-...
+
+    while the actual cause was a sub-agent handler that built its trace and
+    never sent it (langchain.py `on_chain_end`, fixed the same day). The live
+    matrix read 21 passed / 0 failed through the whole thing, and the defect
+    was only caught because journey C asserts the same property and has no
+    quota hook to hide behind.
+
+    A trace that never arrives is the product's core observable failing. It is
+    never an excuse the provider can be given: by the time we poll, the model
+    call has already returned.
+    """
+
+
 def poll_for_trace(agent_name: str, expected_count: int = 1) -> list[dict]:
     deadline = time.time() + POLL_TIMEOUT_S
     last = []
@@ -330,9 +354,10 @@ def poll_for_trace(agent_name: str, expected_count: int = 1) -> list[dict]:
         if len(last) >= expected_count:
             return last
         time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(
+    raise TraceNeverArrived(
         f"Timed out waiting for {expected_count} trace(s) on agent={agent_name}; "
-        f"last saw {len(last)}."
+        f"last saw {len(last)}. This is a TRACE INGEST failure, not a provider "
+        f"one — the model call already returned."
     )
 
 
@@ -475,6 +500,14 @@ def is_provider_unavailable_error(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        # Never launder a missing trace into a provider excuse. The marker
+        # list below contains "timed out" for hung sockets, and that substring
+        # also appears in `TraceNeverArrived`'s message — see that class for
+        # the run where this masked a real sub-agent defect behind a green
+        # matrix. Checked on every link of the chain, not just the outermost,
+        # so wrapping it does not defeat the check.
+        if isinstance(cur, TraceNeverArrived):
+            return False
         text = f"{type(cur).__name__}: {cur}".lower()
         if any(m in text for m in _PROVIDER_UNAVAILABLE_MARKERS):
             return True

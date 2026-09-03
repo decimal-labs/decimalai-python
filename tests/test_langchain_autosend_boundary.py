@@ -94,6 +94,104 @@ class TestAutoSendBoundarySimulated:
         assert len(traces[0].llm_calls) == 1
         assert traces[0].llm_calls[0].model_name == "gpt-4o"
 
+    def test_subagent_handler_ships_without_ever_seeing_a_null_parent(self):
+        """A sub-agent invoked INSIDE an orchestrator's tool still ships.
+
+        THE BUG (2026-09-03). `parent_run_id is None` was not just the
+        boundary, it was the ONLY boundary. The documented multi-agent
+        pattern gives the nested `.invoke()` its own CallbackHandler:
+
+            @tool
+            def consult_specialist(q):
+                h = CallbackHandler(agent_name=SPEC,
+                                    parent_trace_id=orch_h.get_trace_id())
+                return specialist.invoke(..., config={"callbacks": [h]})
+
+        That inner invoke runs inside the outer run tree, so LangChain hands
+        the specialist's handler exactly ONE chain end and it carries
+        `run_id == parent_run_id == root` — never a null parent. The
+        specialist's trace was therefore built, held, and never sent. Journey
+        C caught it as `spec_trace=None` on every run; the in-repo live test
+        hit the same wall but its "Timed out waiting for 1 trace(s)" message
+        matched the `"timed out"` provider marker and was reported as a QUOTA
+        SKIP, so the live matrix stayed green through it.
+
+        Note the shape below is byte-identical to the 1.5.x reused-run_id case
+        above except for what is MISSING: no final `parent_run_id=None` end.
+        That is the whole difference, and it is why the fix could not simply
+        re-match on the root run_id — both shapes look the same by id, so the
+        close signal has to be the open-chain balance instead.
+        """
+        from decimalai.langchain import CallbackHandler
+
+        handler = CallbackHandler(agent_name="refund-specialist", auto_send=True)
+        root = uuid4()
+
+        handler.on_chain_start(
+            {"name": "LangGraph"}, {"messages": []},
+            run_id=root, parent_run_id=root,      # nested: never None
+        )
+        handler.on_chat_model_start(
+            {"id": ["langchain", "chat_models", "openai", "ChatOpenAI"]},
+            [[MagicMock(type="human")]],
+            run_id=root, parent_run_id=root,
+            invocation_params={"model_name": "gpt-4o"},
+        )
+        handler.on_llm_end(
+            MagicMock(generations=[], llm_output={}), run_id=root, parent_run_id=root,
+        )
+        handler.on_chain_end({"output": "refund is 100%"}, run_id=root, parent_run_id=root)
+
+        traces = _sent_traces()
+        assert len(traces) == 1, (
+            "the sub-agent's trace was never sent — its only chain end carries "
+            "a non-null parent_run_id, so a `parent_run_id is None` boundary "
+            "never fires for it"
+        )
+        assert traces[0].agent_name == "refund-specialist"
+        assert len(traces[0].llm_calls) == 1
+
+    def test_subagent_does_not_ship_before_its_own_work_finishes(self):
+        """The balance must not close on an INNER step of the sub-agent's run.
+
+        The counterpart to the test above: having removed the null-parent
+        requirement, the close must still wait for the sub-agent's own nested
+        steps. A prompt step ending inside the specialist's run leaves one
+        chain open, so nothing ships until the outer one ends.
+        """
+        from decimalai.langchain import CallbackHandler
+
+        handler = CallbackHandler(agent_name="refund-specialist", auto_send=True)
+        root, inner = uuid4(), uuid4()
+
+        handler.on_chain_start(
+            {"name": "LangGraph"}, {"messages": []}, run_id=root, parent_run_id=root,
+        )
+        handler.on_chain_start(
+            {"name": "ChatPromptTemplate"}, {}, run_id=inner, parent_run_id=root,
+        )
+        handler.on_chain_end({"output": "prompt"}, run_id=inner, parent_run_id=root)
+
+        assert _sent_traces() == [], (
+            "shipped at the sub-agent's INNER step — the model call had not "
+            "happened yet, which is the 1.5.x early-send bug in a new place"
+        )
+
+        handler.on_chat_model_start(
+            {"id": ["langchain", "chat_models", "openai", "ChatOpenAI"]},
+            [[MagicMock(type="human")]],
+            run_id=root, parent_run_id=root,
+            invocation_params={"model_name": "gpt-4o"},
+        )
+        handler.on_llm_end(
+            MagicMock(generations=[], llm_output={}), run_id=root, parent_run_id=root,
+        )
+        handler.on_chain_end({"output": "done"}, run_id=root, parent_run_id=root)
+
+        traces = _sent_traces()
+        assert len(traces) == 1
+        assert len(traces[0].llm_calls) == 1
+
     def test_distinct_run_ids_sends_one_complete_trace(self):
         """Pre-1.5 shape: skipped RunnableSequence root, distinct child run_ids.
 
