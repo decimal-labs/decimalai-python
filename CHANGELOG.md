@@ -4,6 +4,59 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.13.0] — 2026-09-03
+
+### Fixed
+
+- **The hot-path routing budget was below what the platform can serve, so agents
+  silently ran without skills.** 0.12.0 capped `/skills/route` and `/skills/menu`
+  at a 2-second read. Measured against production: healthy, that endpoint serves
+  p95 1.39s — so 2s left 1.4x of headroom, inside ordinary variance — and
+  degraded it serves 8-30s. The DecimalAI fleet, 93 synthetic users driving this
+  SDK, went from delivering a skill body in 69.4% of sessions to 3.1% in the hour
+  it restarted onto 0.12.0, with `no_skill_offered` going 7.9% to 77.6%.
+
+  The failure is silent by design and that is the sharp edge: a hot-path timeout
+  does not raise. `smart_route` returns an empty menu, the agent answers without
+  skills, and the request succeeds. No exception, no 5xx — answers just quietly
+  get worse. That state ran for 21 hours across 93 agents with every other health
+  signal green.
+
+  The budget is now **5 seconds** (3.6x the healthy p95, still a small share of an
+  agent turn), overridable with `DECIMALAI_SKILL_ROUTE_TIMEOUT_S`, clamped to
+  [0.5, 30], and read per call rather than frozen at import.
+
+- **The circuit breaker turned a slow minute into a silent one.** Its cooldown was
+  a flat 30s, so three slow calls bought a guaranteed half-minute of skill-less
+  answers on a platform whose latency is bursty. It now starts at 5s and doubles
+  per consecutive open to a 30s ceiling; one success resets the ladder. Opening
+  logs at ERROR, not WARNING — while it is open, every agent in the process is
+  answering without its skills.
+
+- **`ManifestTracker` re-registered manifests this process had already
+  registered.** It kept a single hash slot, so a snapshot that oscillates
+  (A -> B -> A) sent three requests for two manifests. It now remembers every hash
+  it has registered, in a bounded LRU. A genuinely new hash still registers —
+  an agent that discovers a tool mid-run has a different manifest and the platform
+  must be told.
+
+### Added
+
+- **`decimalai.routing_status()`** — the companion to `export_status()`, and the
+  answer to a question a 200 cannot give you: are my agents actually getting their
+  skills right now?
+
+  ```python
+  st = decimalai.routing_status()
+  if not st.healthy:
+      alert_oncall(f"agents running without skills: {st.last_error!r}")
+  ```
+
+  Reports `healthy`, `breaker_open`, `consecutive_failures`, `timeouts`, `opens`,
+  `suppressed`, `read_budget_s`, `last_error`, `last_error_at`,
+  `last_success_at`. Counters are cumulative for the process — a health check
+  wants "has this ever degraded", not a gauge a recovery quietly resets.
+
 ## [0.12.0] — 2026-08-30
 
 ### Fixed
