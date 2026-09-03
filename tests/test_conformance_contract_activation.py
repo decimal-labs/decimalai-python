@@ -483,7 +483,15 @@ def test_turning_the_loader_flag_off_without_a_reason_is_refused() -> None:
 
 
 def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
-    """The two prompt-injection rails must print a reason, not skip silently."""
+    """Every prompt-injection rail must print a reason, not skip silently.
+
+    The set is pinned rather than derived on purpose: it is the one line a
+    reviewer sees move when an adapter's activation story changes. `adk` joined
+    on 2026-09-03 — not because it lost a loader, but because its rail started
+    being GRADED at all (it had been declared `has_skills_rail=False` for five
+    days after the rail shipped). What is absent there is the loader, which is
+    the narrower and permanent fact this set records.
+    """
     from tests.conformance.drivers import all_drivers
 
     off = {
@@ -491,7 +499,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
         for d in all_drivers()
         if not d.capabilities.model_can_load_skill_bodies
     }
-    assert set(off) == {"langchain", "anthropic"}, off
+    assert set(off) == {"langchain", "anthropic", "adk"}, off
     for name, reason in off.items():
         assert "prompt-injection" in reason, name
         assert "load_skill" in reason, name

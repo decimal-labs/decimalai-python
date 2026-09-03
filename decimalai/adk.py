@@ -463,8 +463,22 @@ def _plugin_class() -> Any:
             project: Optional[str] = None,
             parent_trace_id: Optional[str] = None,
             enable_skill_loader: Optional[bool] = None,
+            enable_load_skill_tool: bool = False,
         ):
             super().__init__(name=name)
+            # Accepted and DORMANT — see `instrument()`'s docstring. Refused
+            # here too, not only there, because the documented
+            # `plugins=[DecimalaiPlugin(...)]` form never calls instrument(),
+            # and a flag that is silently dropped on one of two documented
+            # paths is the same silent no-op this adapter's own comments keep
+            # warning about.
+            if enable_load_skill_tool:
+                logger.warning(
+                    "enable_load_skill_tool is not supported on the adk adapter "
+                    "(no load_skill tool is registered, so the model cannot ask "
+                    "for a body); staying on prompt injection. Use openai_agents "
+                    "or pydantic_ai for the native load_skill tool."
+                )
             self.agent_name = agent_name
             self.project = project
             self.parent_trace_id = parent_trace_id
@@ -701,6 +715,32 @@ def _plugin_class() -> Any:
                     logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             model = getattr(llm_request, "model", None)
             rendered_input: List[Dict[str, Any]] = []
+            # The system instruction FIRST, and it is not optional bookkeeping.
+            #
+            # `llm_request.contents` holds the conversation turns only. ADK puts
+            # the agent's own `instruction` — and, three lines above, every
+            # routed skill body — in `config.system_instruction`, which is a
+            # separate field. Recording only `contents` meant the trace omitted
+            # the entire system prompt the model was actually shown.
+            #
+            # That is not a cosmetic gap. Every delivery signal downstream reads
+            # the rendered input: the SDK's own `infer_prompt_rungs`, the
+            # platform's skill-activation detection, and the conformance
+            # contract's C8/C14. So this adapter could route a skill, append its
+            # BODY to the system instruction, verify the append survived, stamp
+            # `skills_delivered` on the run — and then emit a trace in which no
+            # skill text appears anywhere. Delivery was real and unwitnessable,
+            # which is the one combination that cannot be distinguished from
+            # delivery never happening. It is why ADK was carried as a
+            # non-witnessable framework, and why C8/C14 read "claims to have
+            # offered [...] but those names are not in the prompt the model was
+            # shown" the first time the rail was graded (2026-09-03).
+            #
+            # Must stay AFTER `_inject_skills_into_request` above, or it records
+            # the instruction as it was before the skills were appended.
+            sys_text = _system_instruction_text(llm_request)
+            if sys_text:
+                rendered_input.append({"role": "system", "content": sys_text})
             for c in getattr(llm_request, "contents", None) or []:
                 txt = _content_to_text(c)
                 if txt:
@@ -961,6 +1001,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     project: Optional[str] = None,
     parent_trace_id: Optional[str] = None,
     enable_skill_loader: Optional[bool] = None,
+    enable_load_skill_tool: bool = False,
 ) -> Any:
     """Construct a DecimalAI ADK plugin to add to a ``Runner``.
 
@@ -976,15 +1017,30 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
             to answer for this plugin alone, which is what the explicit
             ``plugins=[DecimalaiPlugin(...)]`` path needs — it never calls
             ``instrument()``, so there is no module flag to inherit.
+        enable_load_skill_tool: Accepted and DORMANT — ADK registers no
+            ``load_skill`` tool, so the model cannot ask for a body. True logs
+            a warning naming the adapters that do have the tool loop and stays
+            on prompt injection. See ``instrument()`` for why it is accepted
+            rather than rejected.
+
+    ⚠ This factory's signature is a SECOND place every parameter must be
+    listed. It forwards by explicit keyword, so a parameter added to
+    ``_DecimalaiPlugin.__init__`` and not to this signature does not merely
+    get ignored — the call raises TypeError and the plugin is never built, so
+    the Runner traces NOTHING. That is not hypothetical: adding
+    ``enable_load_skill_tool`` to the class alone took every ADK conformance
+    item from green to "the documented snippet ran and NOTHING was POSTed".
     """
     return _plugin_class()(
         agent_name=agent_name, name=name, project=project,
         parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,
+        enable_load_skill_tool=enable_load_skill_tool,
     )
 
 
 def instrument(
     agent_name: Optional[str] = None, *, enable_skill_loader: bool = False,
+    enable_load_skill_tool: bool = False,
 ) -> None:
     """Install DecimalAI tracing globally for google-adk.
 
@@ -999,8 +1055,27 @@ def instrument(
             has no ``load_skill`` tool to fetch them on demand — are appended
             to ``llm_request.config.system_instruction`` before the request
             goes out. Off by default, like every other adapter's loader.
+        enable_load_skill_tool: Accepted and DORMANT, exactly as on the
+            langchain adapter. ADK registers no ``load_skill`` tool, so the
+            model has no way to ASK for a body and the strongest rung this rail
+            can reach is DELIVERED. Passing True logs a warning naming the
+            adapters that do have the tool loop, and stays on prompt injection.
+
+            It is accepted rather than rejected on purpose: silently ignoring
+            the flag is how an adapter ends up graded as if it had a channel it
+            does not have. The conformance suite ASKS for the tool loop in the
+            ``tool_loaded`` cell precisely so the refusal has to happen out
+            loud, on that run, instead of being excused by a sentence in a
+            table.
     """
     global _install_agent_name, _runner_patched, _skill_loader_enabled
+    if enable_load_skill_tool:
+        logger.warning(
+            "enable_load_skill_tool is not supported on the adk adapter "
+            "(no load_skill tool is registered, so the model cannot ask for a "
+            "body); staying on prompt injection. Use openai_agents or "
+            "pydantic_ai for the native load_skill tool."
+        )
     _install_agent_name = agent_name
     # Set BEFORE the idempotence return: a second instrument() call that turns
     # the loader on must take effect, and the shared plugin reads this flag per

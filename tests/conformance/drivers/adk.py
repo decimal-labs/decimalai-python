@@ -18,9 +18,13 @@ LiteLLM's custom-provider hook (``litellm.custom_provider_map``) wired to the
 shared stub script and reached through ``google.adk.models.lite_llm.LiteLlm`` —
 the exact escape hatch the docs name for non-Gemini models. No key, no network.
 
-There is no skills rail on this adapter: the docs capability table records
-ADK's skills-rail column as "—" and the page says so in words, so C8 is
-declared N/A with that reason.
+The skills rail IS graded here. It was declared absent until 2026-09-03, and
+that declaration outlived the fact by five days: `decimalai/adk.py` grew a real
+rail on 2026-08-29 (21cfcbc, "ADK can deliver a skill body — the 'no prompt
+seam' entry was wrong"), while this file was last touched 2026-08-18. What
+remains genuinely absent is the LOADER — ADK registers no ``load_skill`` tool,
+so the model cannot ask for a body and the strongest rung reachable here is
+DELIVERED. C13b is declared N/A for that narrower reason; C8 and C14 are graded.
 
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
@@ -34,6 +38,8 @@ import threading
 import uuid
 from typing import Any, Dict, Optional, Sequence
 
+from ..delivery import TOOL_LOADED
+
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
@@ -41,6 +47,7 @@ from . import (
     Ctx,
     Driver,
     DriverError,
+    FrameworkLimit,
     stub_script,
     tool_result,
     user_message,
@@ -229,7 +236,7 @@ def _agent(ctx: Ctx) -> Any:
     )
 
 
-def _runner(ctx: Ctx, agent: Any) -> Any:
+def _runner(ctx: Ctx, agent: Any, *, skills: bool = False) -> Any:
     from google.adk.runners import InMemoryRunner
 
     from decimalai.adk import DecimalaiPlugin
@@ -237,7 +244,15 @@ def _runner(ctx: Ctx, agent: Any) -> Any:
     return InMemoryRunner(
         agent=agent,
         app_name=_node_name(ctx),
-        plugins=[DecimalaiPlugin(agent_name=ctx.agent_name)],
+        plugins=[DecimalaiPlugin(
+            agent_name=ctx.agent_name,
+            enable_skill_loader=skills or None,
+            # In the tool_loaded cell the driver ASKS for the tool loop rather
+            # than quietly not asking, so the adapter has to refuse out loud on
+            # this run. Asking is not an assertion — contract.grade_delivery
+            # grades what comes back.
+            enable_load_skill_tool=skills and ctx.delivery_mode == TOOL_LOADED,
+        )],
     )
 
 
@@ -319,6 +334,33 @@ def run_degenerate(ctx: Ctx) -> Any:
     return asyncio.run(_drive(ctx, _runner(ctx, agent)))
 
 
+async def _gather_skills(ctxs: Sequence[Ctx]) -> Any:
+    return await asyncio.gather(
+        *(_drive(c, _runner(c, _agent(c), skills=True)) for c in ctxs),
+        return_exceptions=True,
+    )
+
+
+def run_skills(ctxs: Sequence[Ctx]) -> Any:
+    """The skills rail: routed skills appended to ``system_instruction``.
+
+    ADK's ``before_model`` plugin hook receives the SAME ``LlmRequest`` the
+    model is then called with (google-adk 2.8.0,
+    ``flows/llm_flows/base_llm_flow.py:1735 -> :1801``, by reference, no copy
+    in between), and ``LlmRequest.append_instructions`` is public API — ADK's
+    own ``global_instruction_plugin`` mutates ``system_instruction`` from that
+    exact hook. So the body genuinely reaches the model here.
+
+    One event loop with N concurrent invocations, for the same reason
+    ``run_concurrent`` uses one: ADK and LiteLLM are async-native and a thread
+    per lane gives each its own loop, which LiteLLM's process-global logging
+    worker then objects to for reasons unrelated to the adapter under test.
+    """
+    for ctx in ctxs:
+        _HANDLER.register(ctx)
+    return asyncio.run(_gather_skills(ctxs))
+
+
 DRIVER = Driver(
     name="adk",
     covers=frozenset({"google-adk"}),
@@ -328,22 +370,39 @@ DRIVER = Driver(
     run_concurrent=run_concurrent,
     run_error=run_error,
     run_degenerate=run_degenerate,
+    run_skills=run_skills,
     capabilities=Capabilities(
         has_tools=True,
-        has_skills_rail=False,
+        has_skills_rail=True,
+        model_can_load_skill_bodies=False,
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=True,
         reasons={
-            "has_skills_rail": (
-                "the adapter has no skills rail — the docs page says so in words "
-                "(\"No skills rail on this adapter yet\") and the capability table "
-                "records ADK's skills-rail column as '—'. Skills reach an ADK agent "
-                "only by hand, via SkillRouter.build_prompt_fragment(). This silences "
-                "the activation items (C13/C13b) as well as C8: with nothing offered "
-                "and no loader tool, there is no model action that could constitute an "
-                "activation, and recording one from prompt presence would be a "
-                "fabrication."
+            "model_can_load_skill_bodies": (
+                "this rail is prompt-injection only. ADK registers no load_skill "
+                "tool — decimalai/adk.py says so in as many words ('ADK registers no "
+                "`load_skill` tool, so prompt injection is the ONLY') — so the model "
+                "has no way to ASK for a body and the strongest rung observable here "
+                "is DELIVERED. Delivery is not activation. C13 still applies and is "
+                "graded: with no loader, a delivered body is exactly what is most "
+                "likely to be promoted to a fabricated activation."
+            ),
+        },
+        delivery_limits={
+            TOOL_LOADED: FrameworkLimit(
+                reason=(
+                    "ADK's plugin hooks observe a turn; they do not own a tool loop "
+                    "this adapter could route a load_skill RESULT back through, and "
+                    "no such tool is registered in the first place. The tool-loaded "
+                    "channel does not exist here at any setting of any flag. Prompt "
+                    "injection is the whole rail — which is why the injected cell is "
+                    "graded strictly and is not allowed to be N/A."
+                ),
+                adapter_module="decimalai/adk.py",
+                refusal_marker=(
+                    "enable_load_skill_tool is not supported on the adk adapter"
+                ),
             ),
         },
     ),

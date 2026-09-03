@@ -52,6 +52,11 @@ DECLARED_NA: Dict[str, str] = {
     # the correction that came out of the 2026-08-28 defect.
     "langchain:C13b": "model_can_load_skill_bodies",
     "anthropic:C13b": "model_can_load_skill_bodies",
+    # ADK moved here from `has_skills_rail` on 2026-09-03. The rail exists and
+    # is graded (C8, C13, C14); what is absent is the LOADER, which is a
+    # narrower and permanent fact — ADK registers no load_skill tool, so the
+    # model cannot ask for a body.
+    "adk:C13b": "model_can_load_skill_bodies",
     # No skills rail at all: nothing was ever offered, so nothing can be routed,
     # delivered or activated. Cross-checked against the SDK's own ledger of
     # seamless frameworks — see
@@ -60,10 +65,6 @@ DECLARED_NA: Dict[str, str] = {
     "llamaindex:C13": "has_skills_rail",
     "llamaindex:C13b": "has_skills_rail",
     "llamaindex:C14": "has_skills_rail",
-    "adk:C8": "has_skills_rail",
-    "adk:C13": "has_skills_rail",
-    "adk:C13b": "has_skills_rail",
-    "adk:C14": "has_skills_rail",
     "crewai:C8": "has_skills_rail",
     "crewai:C13": "has_skills_rail",
     "crewai:C13b": "has_skills_rail",
@@ -85,7 +86,11 @@ DECLARED_NA: Dict[str, str] = {
 #: The number above, written down. Redundant with ``len(DECLARED_NA)`` on
 #: purpose: the set comparison tells you WHICH exemption moved, and this tells a
 #: reviewer skimming a diff THAT the total moved, on one line, without counting.
-NA_BUDGET = 24
+# Lowered 24 -> 21 on 2026-09-03: ADK's C8, C13 and C14 stopped being N/A
+# and started being GRADED, because the adapter grew a real skills rail on
+# 2026-08-29 and this suite had not noticed. A budget that only ever goes up
+# is a ratchet on honesty; this is the direction it is supposed to move.
+NA_BUDGET = 21
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -101,9 +106,19 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # A patched `messages.create()` is one provider request; the tool loop is the
     # caller's own while-loop, which this adapter never sees.
     "anthropic:tool_loaded": "decimalai/anthropic.py",
+    # ADK's plugin hooks observe a turn and own no tool loop, and no load_skill
+    # tool is registered for a result to come back from.
+    "adk:tool_loaded": "decimalai/adk.py",
 }
 
-DELIVERY_NA_BUDGET = 2
+# Raised 2 -> 3 on 2026-09-03 when ADK's rail started being graded. The budget
+# exists to stop this list growing quietly; a rail that is genuinely
+# prompt-injection-only is the case it is FOR, and adk is the third such
+# adapter alongside langchain and anthropic. It is not a licence to add a
+# fourth without the same evidence: `contract._grade_framework_limit` still
+# refuses the N/A unless the adapter emits its documented refusal on the run
+# and delivers nothing by that channel.
+DELIVERY_NA_BUDGET = 3
 
 # ── journey-axis N/As ────────────────────────────────────────────────────────
 
@@ -129,7 +144,11 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
     "llamaindex:J1": "NO_PROMPT_SEAM",
     "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
     "crewai:J1": "NO_PROMPT_SEAM",
-    "adk:J1": "NO_PROMPT_SEAM",
+    # 2026-09-03: adk moved NO_PROMPT_SEAM -> UNSCAFFOLDED_WITH_SEAM. The seam
+    # is proven (conformance C14 + a live Gemini end-to-end test); the template
+    # is withheld until the hermetic journey can stand up a Gemini stub. See
+    # scaffold.py's UNSCAFFOLDED_WITH_SEAM entry for why, and what finishes it.
+    "adk:J1": "UNSCAFFOLDED_WITH_SEAM",
     "generic-otel:J1": "NO_PROMPT_SEAM",
 }
 

@@ -521,13 +521,18 @@ class TestFrameworkSelection:
         for f in SUPPORTED_FRAMEWORKS:
             assert f in str(e.value)
 
-    @pytest.mark.parametrize("framework", [
-        "llamaindex", "claude-agent-sdk", "crewai", "autogen", "otel", "adk",
-    ])
+    @pytest.mark.parametrize("framework", sorted(NO_PROMPT_SEAM))
     def test_seamless_frameworks_are_refused_with_the_reason(self, framework):
         """These adapters trace but have no prompt seam. A scaffold that
         silently delivers no skills is worse than no scaffold — so the refusal
-        has to say that, not just 'invalid choice'."""
+        has to say that, not just 'invalid choice'.
+
+        Read off the ledger, never a list typed here — the same rule the
+        sibling case below already follows, and for the same reason. This one
+        WAS a hardcoded list, and on 2026-09-03 it asserted that `adk` is
+        refused for having no prompt seam on the very commit that proved it has
+        one. A framework that changes category has to change cases with it.
+        """
         with pytest.raises(UnknownFramework) as e:
             normalize_framework(framework)
         msg = str(e.value)
