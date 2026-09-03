@@ -279,15 +279,75 @@ class TestTraceIngestionBouncer:
         manifest.manifest_hash = "h_abc"
         manifest.model_dump.return_value = {"id": "mfst_xyz"}
 
-        # Patch the HTTP layer; register_manifest uses _http.post directly
-        with patch.object(client._http, "post") as post_mock:
-            post_mock.return_value.json.return_value = {"manifest_id": "mfst_xyz"}
-            post_mock.return_value.raise_for_status = lambda: None
+        # Patch the TRANSPORT (`_http.request`), not `_http.post`.
+        #
+        # This used to patch `_http.post` with the comment "register_manifest
+        # uses _http.post directly" — which pinned the implementation, not the
+        # behaviour. When `register_manifest` moved onto the `_request_with_retry`
+        # ladder (so a 429 from someone else's CI no longer fails their build),
+        # this test broke with a real ConnectError while the behaviour it claims
+        # to protect was perfectly intact. `_http.request` is the seam BELOW the
+        # retry logic, so the assertions below now hold across either routing —
+        # and `test_strict_manifest_warning.py` already mocks at this level.
+        with patch.object(client._http, "request") as req_mock:
+            req_mock.return_value.status_code = 200
+            req_mock.return_value.is_success = True
+            req_mock.return_value.json.return_value = {"manifest_id": "mfst_xyz"}
+            req_mock.return_value.raise_for_status = lambda: None
             client.register_manifest(manifest)
 
         # The manifest endpoint WAS called — only traces are blocked, not manifests
-        post_mock.assert_called_once()
-        assert "/api/v1/manifests" in post_mock.call_args[0][0]
+        req_mock.assert_called_once()
+        method, url = req_mock.call_args[0][0], req_mock.call_args[0][1]
+        assert method == "POST"
+        assert "/api/v1/manifests" in url
+
+    def test_manifest_registration_retries_a_429_instead_of_failing_the_build(
+        self, clean_env
+    ):
+        """`flush_manifest_for_ci` runs in other people's CI. A 429 must not end it.
+
+        `register_manifest` used a bare `_http.post`, which has no retry ladder,
+        so a single rate-limited response surfaced as an unhandled
+        DecimalAPIError on the FIRST call of a CI run. decimal-labs's own
+        regression-check dogfood job failed exactly that way on two consecutive
+        runs (2026-09-03) while the backend was shedding load.
+
+        Fails against the pre-fix bare-post implementation.
+        """
+        clean_env.setenv("DECIMAL_API_KEY", "dai_sk_test")
+        clean_env.setenv("DECIMALAI_MODE", "manifest_only")
+        decimalai.init()
+
+        client = self._make_client()
+        from unittest.mock import MagicMock
+
+        manifest = MagicMock()
+        manifest.id = "mfst_xyz"
+        manifest.manifest_hash = "h_abc"
+        manifest.model_dump.return_value = {"id": "mfst_xyz"}
+
+        throttled = MagicMock()
+        throttled.status_code = 429
+        throttled.is_success = False
+        throttled.headers = {"Retry-After": "0"}
+
+        accepted = MagicMock()
+        accepted.status_code = 200
+        accepted.is_success = True
+        accepted.json.return_value = {"manifest_id": "mfst_xyz"}
+        accepted.raise_for_status = lambda: None
+
+        with patch.object(
+            client._http, "request", side_effect=[throttled, accepted]
+        ) as req_mock:
+            result = client.register_manifest(manifest)
+
+        assert req_mock.call_count == 2, (
+            "a 429 on manifest registration must be retried, not raised — a bare "
+            "post fails the caller's build on its first request"
+        )
+        assert result["manifest_id"] == "mfst_xyz"
 
 
 class TestFlushManifestForCi:

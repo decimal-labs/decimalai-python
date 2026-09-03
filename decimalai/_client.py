@@ -907,7 +907,27 @@ class DecimalAIClient:
             Registration response with manifest_id and compatibility info.
         """
         payload = _scrub_surrogates(manifest.model_dump(mode="json"))
-        resp = self._http.post("/api/v1/manifests", json=payload)
+
+        # `_request_with_retry`, not a bare `_http.post` — the same fix as the
+        # agent-prompt read above, for the same reason.
+        #
+        # This is the FIRST call `flush_manifest_for_ci` makes, and that helper
+        # exists to be run from someone else's CI. A bare post has no 429 ladder
+        # at all, so one rate-limited response is an unhandled DecimalAPIError
+        # that fails their build on its first request. It is not hypothetical:
+        # decimal-labs/regression-check's own dogfood job failed this way on two
+        # consecutive runs (2026-09-03) while the backend was shedding load —
+        # `DecimalAPIError: HTTP 429 Too Many Requests: Rate exceeded.` straight
+        # out of `register_manifest`.
+        #
+        # Registration is keyed on the manifest hash and answers "created" or
+        # "existing", so replaying it is safe. `idempotent=True` is deliberately
+        # NOT set: that flag only adds 500 to the retry set, and a 500 here means
+        # the write may have partly happened. 429 and the transient 502/503/504
+        # are retried without it, which is the whole gap being closed.
+        resp = self._request_with_retry(
+            "POST", "/api/v1/manifests", json=payload
+        )
         _raise_for_status(resp)
         logger.debug("Registered manifest %s (hash=%s)", manifest.id, manifest.manifest_hash)
         return cast(ManifestRegistrationResponse, resp.json())
