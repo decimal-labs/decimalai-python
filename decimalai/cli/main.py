@@ -1133,7 +1133,13 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
 
     actions = result.get("actions") or []
     by_action: dict[str, list[dict]] = {
-        "created": [], "pushed": [], "pulled": [], "no_change": [], "failed": [],
+        "created": [], "pushed": [], "pulled": [], "no_change": [],
+        # A frontmatter-only edit (description / title / category / skill-type /
+        # skill-scope / invocation) reconciles metadata without minting a new
+        # version. Counting it as `no_change` would tell the author their edit
+        # did nothing, which is the opposite of what happened.
+        "reconciled_metadata": [],
+        "failed": [],
     }
     for a in actions:
         by_action.setdefault(a.get("action", "failed"), []).append(a)
@@ -1141,6 +1147,8 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
     click.echo("")
     click.echo(f"  ✓ created     {len(by_action['created'])}")
     click.echo(f"  ✓ no_change   {len(by_action['no_change'])}")
+    if by_action["reconciled_metadata"]:
+        click.echo(f"  ✓ metadata    {len(by_action['reconciled_metadata'])}")
     click.echo(f"  ✓ pushed      {len(by_action['pushed'])}")
     click.echo(f"  ✓ pulled      {len(by_action['pulled'])}")
     if by_action["failed"]:
@@ -1150,6 +1158,8 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
         click.echo(f"    + {item.get('name')} (v{item.get('new_version_number')})")
     for item in by_action["pushed"]:
         click.echo(f"    ↑ {item.get('name')} → v{item.get('new_version_number')}")
+    for item in by_action["reconciled_metadata"]:
+        click.echo(f"    ~ {item.get('name')} (metadata only — no new version)")
     for item in by_action["failed"]:
         click.echo(f"    ✗ {item.get('name')}: {item.get('error')}", err=True)
 
