@@ -228,3 +228,56 @@ def test_the_generic_tracer_also_holds_the_trace(prod, generic_state):
     )
     assert len(prod.accepted) == 1, "the trace was lost instead of held"
     assert generic_state._manifest_id == "mf-real"
+
+
+# ── The other four adapters, extended 2026-09-05 ────────────────────────────────
+#
+# langchain and generic were fixed first because they are what the fleet runs. ADK,
+# LlamaIndex, OpenAI Agents and the Claude Agent SDK had the SAME defect with NO
+# retry ladder at all — a single attempt — so a customer on any of them lost a trace
+# one-for-one on any admission abort. ADK especially: this release is the one that
+# started writing ADK agents for people to run.
+#
+# Two shapes of loss, one cause. adk and llamaindex stamped the local snapshot id and
+# the platform answered `400 manifest_id ... does not exist`; openai_agents and
+# claude_agent_sdk shipped no manifest_id at all and a strict backend answered
+# `400 manifest_id is required`. Both lose the trace.
+
+import importlib
+
+import pytest
+
+
+@pytest.mark.parametrize("module_name", [
+    "decimalai.adk",
+    "decimalai.llamaindex",
+    "decimalai.openai_agents",
+    "decimalai.claude_agent_sdk",
+])
+def test_every_adapter_can_rereg_ister_on_the_sender_thread(module_name):
+    """Each adapter carries the hold: somewhere to remember a refused registration,
+    and a retry that runs off the caller's thread.
+
+    A static check on purpose. Driving four adapters' real registration paths needs
+    four framework fixtures; what must never silently disappear is the pair itself,
+    and its absence is exactly what the 1,315 lost traces were made of.
+    """
+    mod = importlib.import_module(module_name)
+    src = open(mod.__file__).read()
+
+    assert "_pending_manifests" in src, (
+        f"{module_name} has nowhere to remember a refused registration, so a trace "
+        f"ships under an id the platform never stored"
+    )
+    assert "_reregister_refused" in src, (
+        f"{module_name} cannot re-attempt a refused registration off the caller's thread"
+    )
+    assert "submit_trace_pending_manifest" in src, (
+        f"{module_name} does not hold the trace — it hands it to the plain sender, which "
+        f"posts it immediately under whatever id it has"
+    )
+    # The retry must not spin on a credential refusal: 401/403 will not become a
+    # different answer by waiting, and five jittered attempts of it is just latency.
+    assert '"401"' in src and '"403"' in src, (
+        f"{module_name} retries a credential refusal, which cannot succeed"
+    )

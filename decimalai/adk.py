@@ -75,6 +75,44 @@ _manifest_trackers: Dict[str, ManifestTracker] = {}
 _manifest_ids: Dict[str, str] = {}
 _manifest_lock = threading.Lock()
 
+#: agent -> (snapshot, refusing exception) for a registration the platform REFUSED.
+#: Without it the trace ships under `snapshot.id` — an id the platform never stored —
+#: and ingest answers 400 "manifest_id ... does not exist", losing the trace. The
+#: caller-thread ladder cannot outlast a Cloud Run revision with no available
+#: instance, so the retry belongs on the background sender. Same shape as
+#: langchain.py and generic.py; ADK needed it too the moment `decimalai init
+#: --framework adk` started writing agents people run.
+_pending_manifests: Dict[str, tuple] = {}
+
+
+def _reregister_refused(agent: str) -> Optional[str]:
+    """Re-attempt ONE agent's refused registration, on the sender's thread.
+
+    Returns the id the platform stored, or None to keep holding the trace.
+    """
+    # `_config` is imported per-function in this module, never at module level.
+    from . import _config
+
+    with _manifest_lock:
+        pending = _pending_manifests.get(agent)
+    if not pending:
+        return _manifest_ids.get(agent)
+    snapshot, exc = pending
+    # A credential refusal will not become a different answer by waiting.
+    if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+        return None
+    try:
+        result = _config._get_client().register_manifest(snapshot)
+    except Exception:  # noqa: BLE001 — the sender retries; a raise here would drop it
+        return None
+    manifest_id = result.get("manifest_id")
+    if not manifest_id:
+        return None
+    with _manifest_lock:
+        _manifest_ids[agent] = manifest_id
+        _pending_manifests.pop(agent, None)
+    return manifest_id
+
 # Set by instrument(); used as the fallback agent_name when a trace can't
 # resolve one from the ADK agent itself.
 _install_agent_name: Optional[str] = None
@@ -927,7 +965,14 @@ def _plugin_class() -> Any:
                     skills_offered_in_prompt=sorted(state.skills_offered),
                     skills_delivered=sorted(state.skills_delivered),
                 )
-                _config._sender.submit(client.ingest_trace, trace)
+                if state.agent_name in _pending_manifests:
+                    # Registration was refused: hold the trace, re-register on the
+                    # sender's thread, and stamp the real id before it ships.
+                    _config.submit_trace_pending_manifest(
+                        client, trace, lambda: _reregister_refused(state.agent_name)
+                    )
+                else:
+                    _config._sender.submit(client.ingest_trace, trace)
                 logger.debug(
                     "Queued ADK trace %s (%d spans, %d llm_calls, manifest=%s)",
                     trace.id, len(trace.spans), len(trace.llm_calls),
@@ -976,14 +1021,18 @@ def _plugin_class() -> Any:
                     client = _config._get_client()
                     result = client.register_manifest(snapshot)
                     _manifest_ids[agent] = result.get("manifest_id", snapshot.id)
+                    _pending_manifests.pop(agent, None)
                     logger.info(
                         "Registered ADK manifest %s for %s (hash=%s, components=%d)",
                         _manifest_ids[agent], agent, snapshot.manifest_hash[:12],
                         len(snapshot.components),
                     )
-                except Exception:
+                except Exception as exc:
                     logger.warning("Failed to register ADK manifest, continuing", exc_info=True)
                     _manifest_ids[agent] = snapshot.id
+                    # Hand the send side something to retry WITH, so the trace is held
+                    # rather than posted under an id the platform never stored.
+                    _pending_manifests[agent] = (snapshot, exc)
                     # The hash is already committed to this agent's tracker;
                     # without the reset every later run short-circuits on it and
                     # registration is never retried.

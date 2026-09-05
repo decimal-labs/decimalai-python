@@ -109,6 +109,8 @@ class DecimalSpanHandler:
         # the first agent's manifest_id stamped on its traces.
         self._manifest_trackers: Dict[str, ManifestTracker] = {}
         self._manifest_ids: Dict[str, str] = {}
+        #: agent -> (snapshot, refusing exception) for a REFUSED registration.
+        self._pending_manifests: Dict[str, tuple] = {}
         self._manifest_id: Optional[str] = None  # last registration, any agent
         self._manifest_lock = threading.Lock()
         # agent → the model config seen on ANY of its trees so far. Sticky:
@@ -777,8 +779,15 @@ class DecimalSpanHandler:
             manifest_id=manifest_id,
         )
 
-        # Send via background sender
-        _config._sender.submit(client.ingest_trace, trace)
+        # Send via background sender — unless registration was refused, in which case
+        # hold the trace until a real manifest id exists (see _pending_manifests).
+        _agent = trace.agent_name
+        if _agent in self._pending_manifests:
+            _config.submit_trace_pending_manifest(
+                client, trace, lambda: self._reregister_refused(_agent)
+            )
+        else:
+            _config._sender.submit(client.ingest_trace, trace)
         logger.debug(
             "LlamaIndex trace flushed: %s (%d spans, %d LLM calls)",
             str(trace.id)[:8], len(trace_spans), len(llm_calls),
@@ -861,6 +870,7 @@ class DecimalSpanHandler:
                 result = client.register_manifest(snapshot)
                 manifest_id = result.get("manifest_id", snapshot.id)
                 self._manifest_ids[agent_name] = manifest_id
+                self._pending_manifests.pop(agent_name, None)
                 self._manifest_confirmed.add(agent_name)
                 self._manifest_id = manifest_id
                 logger.info(
@@ -887,7 +897,36 @@ class DecimalSpanHandler:
                 tracker.reset()
                 self._manifest_ids[agent_name] = snapshot.id
                 self._manifest_id = snapshot.id
+                # Hand the send side something to retry WITH. Without it the trace
+                # ships under `snapshot.id`, an id the platform never stored, and
+                # ingest answers 400 "manifest_id ... does not exist" — the trace is
+                # lost. The caller-thread ladder cannot outlast a Cloud Run revision
+                # with no available instance, so the retry belongs on the sender.
+                self._pending_manifests[agent_name] = (snapshot, exc)
                 return snapshot.id
+
+    def _reregister_refused(self, agent_name: str) -> Optional[str]:
+        """Re-attempt ONE agent's refused registration, on the sender's thread."""
+        # `_config` is imported per-function in this module, never at module level.
+        from . import _config
+
+        pending = self._pending_manifests.get(agent_name)
+        if not pending:
+            return self._manifest_ids.get(agent_name)
+        snapshot, exc = pending
+        if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+            return None
+        try:
+            result = _config._get_client().register_manifest(snapshot)
+        except Exception:  # noqa: BLE001 — the sender retries; raising would drop it
+            return None
+        manifest_id = result.get("manifest_id")
+        if not manifest_id:
+            return None
+        self._manifest_ids[agent_name] = manifest_id
+        self._manifest_id = manifest_id
+        self._pending_manifests.pop(agent_name, None)
+        return manifest_id
 
     def _adopt_existing_manifest(self, agent_name: str) -> Optional[str]:
         """Ride the agent's current manifest instead of declaring a new one.

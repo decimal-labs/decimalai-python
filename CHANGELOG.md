@@ -46,6 +46,11 @@ and patch releases are fixes.
   exactly those in the 48 h to 2026-09-04, all from this SDK. Re-registration now happens on
   the background sender, where waiting costs the caller nothing: five jittered attempts,
   bounded, and the trace is held until an id exists rather than sent under one that does not.
+  Applies to every adapter that registers a manifest — langchain, the generic
+  `@decimalai.trace` path, ADK, LlamaIndex, OpenAI Agents and the Claude Agent SDK. The
+  last four had the same defect with no retry ladder at all, in two shapes: two stamped
+  the local id and took `400 manifest_id ... does not exist`, two sent no id and took
+  `400 manifest_id is required`. Both lose the trace.
 - `_poll_for_trace` in the framework end-to-end tests raises `TraceNeverArrived` instead of a
   bare `AssertionError` whose message contained "Timed out" — the substring the live-test
   helper matches to classify a failure as provider-unavailable and SKIP it. A lost trace was

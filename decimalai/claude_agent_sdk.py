@@ -72,6 +72,36 @@ _manifest_lock = threading.Lock()
 _manifest_ids: Dict[str, str] = {}
 _manifest_hashes: Dict[str, str] = {}
 
+#: agent -> (snapshot, refusing exception) for a registration the platform REFUSED.
+_pending_manifests: Dict[str, tuple] = {}
+
+
+def _reregister_refused(agent: str) -> Optional[str]:
+    """Re-attempt ONE agent's refused registration, on the sender's thread."""
+    # `_config` is imported per-function in this module, never at module level.
+    from . import _config
+
+    with _manifest_lock:
+        pending = _pending_manifests.get(agent)
+    if not pending:
+        return _manifest_ids.get(agent)
+    snapshot, exc = pending
+    if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+        return None
+    try:
+        result = _config._get_client().register_manifest(snapshot)
+    except Exception:  # noqa: BLE001 — the sender retries; raising would drop it
+        return None
+    manifest_id = result.get("manifest_id")
+    if not manifest_id:
+        return None
+    with _manifest_lock:
+        _manifest_ids[agent] = manifest_id
+        _manifest_hashes[agent] = snapshot.manifest_hash
+        _pending_manifests.pop(agent, None)
+    return manifest_id
+
+
 # Set by instrument(); the fallback agent_name when a wrapped stream supplies none.
 _install_agent_name: Optional[str] = None
 _query_patched = False
@@ -655,16 +685,24 @@ def _maybe_register_manifest(state: _RunState) -> Optional[str]:
             client = _config._get_client()
             result = client.register_manifest(snapshot)
             manifest_id = result.get("manifest_id", snapshot.id)
-        except Exception:
+        except Exception as exc:
             # Leave this agent's hash unset so the next trace retries; a
             # transient blip must not permanently stop it declaring a manifest.
             logger.warning(
                 "Failed to register Claude Agent SDK manifest for %s, continuing",
                 agent, exc_info=True,
             )
+            # Hand the send side something to retry WITH. Without it the trace goes
+            # out with no manifest_id at all and a strict backend answers 400
+            # "manifest_id is required" — the same loss the other adapters took under
+            # the other 400. The caller-thread attempt runs in front of the user's
+            # agent and cannot outlast a no-available-instance window, so the retry
+            # belongs on the background sender.
+            _pending_manifests[agent] = (snapshot, exc)
             return _manifest_ids.get(agent)
         _manifest_ids[agent] = manifest_id
         _manifest_hashes[agent] = snapshot.manifest_hash
+        _pending_manifests.pop(agent, None)
         _manifest_id = manifest_id
         logger.info(
             "Registered Claude Agent SDK manifest %s for %s (hash=%s, components=%d)",
@@ -729,7 +767,13 @@ def _finalize(state: _RunState) -> None:
             llm_calls=list(state.llm_calls),
             manifest_id=manifest_id,
         )
-        _config._sender.submit(client.ingest_trace, trace)
+        _agent = trace.agent_name
+        if _agent in _pending_manifests:
+            _config.submit_trace_pending_manifest(
+                client, trace, lambda: _reregister_refused(_agent)
+            )
+        else:
+            _config._sender.submit(client.ingest_trace, trace)
         logger.debug(
             "Queued Claude Agent SDK trace %s (%d spans, %d llm_calls, manifest=%s)",
             trace.id, len(trace.spans), len(trace.llm_calls), trace.manifest_id or "none",

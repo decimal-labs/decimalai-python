@@ -200,29 +200,55 @@ class TestLlmFreeTreeGetsManifest:
         assert cfg._client.register_manifest.call_count == 2
         assert all(t.manifest_id == "m1" for t in traces)
 
-    def test_registration_failure_is_surfaced_and_retried(self):
-        """A failed registration must (a) surface on export_status() as a
-        MANIFEST error, not just the confusing trace-side 400, and (b) reset
-        the hash tracker so the next tree retries — one blip must not poison
-        every later trace in the process."""
+    def test_a_refused_registration_is_surfaced_retried_and_does_not_cost_the_trace(self):
+        """A failed registration must (a) surface on export_status() as a MANIFEST
+        error, not just the confusing trace-side 400, (b) reset the hash tracker so
+        the next tree retries — one blip must not poison every later trace — and
+        (c) NOT cost the trace it happened on.
+
+        (c) is new on 2026-09-05. Before it, the first tree shipped under the local
+        snapshot id, which the platform answers `400 manifest_id ... does not exist`;
+        production lost 1,315 traces that way in the 48 h to 09-04. The trace is now
+        HELD and the registration re-attempted on the sender's thread, where waiting
+        costs the caller's agent nothing.
+
+        The mock raises once and then succeeds for every later call, rather than
+        answering from a two-item list: the re-registration is a real extra call, and
+        a fixed-length list made the test assert on which caller consumed which
+        answer rather than on the behaviour.
+        """
         import decimalai._config as cfg
 
         class Boom(Exception):
             pass
 
         boom = Boom("backend down")
-        cfg._client.register_manifest.side_effect = [boom, {"manifest_id": "m1"}]
+        calls = {"n": 0}
+
+        def _register(_snapshot):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise boom
+            return {"manifest_id": "m1"}
+
+        cfg._client.register_manifest.side_effect = _register
 
         h = DecimalSpanHandler(agent_name="rag")
         _retrieval_tree(h)
         _retrieval_tree(h, root="VectorIndexRetriever-2")
 
         traces = _flush_and_get_traces()
-        assert cfg._client.register_manifest.call_count == 2, (
+        assert calls["n"] >= 2, (
             "the tracker was not reset, so registration was never retried"
         )
-        assert traces[1].manifest_id == "m1"
         assert cfg._sender._last_manifest_error is boom
+        assert len(traces) == 2, (
+            "the trace whose registration was refused was dropped instead of held "
+            "and re-registered"
+        )
+        assert {t.manifest_id for t in traces} == {"m1"}, (
+            "a trace shipped under an id the platform never stored"
+        )
 
 
 # ── 2. Parent hierarchy survives the flush ───────────────────────────

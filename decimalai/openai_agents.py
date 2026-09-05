@@ -67,6 +67,34 @@ _manifest_lock = threading.Lock()  # Thread safety for manifest registration
 _manifest_ids: Dict[str, str] = {}
 _manifest_hashes: Dict[str, str] = {}
 
+#: agent -> (snapshot, refusing exception) for a registration the platform REFUSED.
+_pending_manifests: Dict[str, tuple] = {}
+
+
+def _reregister_refused(agent_name: str) -> Optional[str]:
+    """Re-attempt ONE agent's refused registration, on the sender's thread."""
+    # `_config` is imported per-function in this module, never at module level.
+    from . import _config
+
+    pending = _pending_manifests.get(agent_name)
+    if not pending:
+        return _manifest_ids.get(agent_name)
+    snapshot, exc = pending
+    if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+        return None
+    try:
+        result = _config._get_client().register_manifest(snapshot)
+    except Exception:  # noqa: BLE001 — the sender retries; raising would drop it
+        return None
+    manifest_id = result.get("manifest_id")
+    if not manifest_id:
+        return None
+    _manifest_ids[agent_name] = manifest_id
+    _manifest_hashes[agent_name] = snapshot.manifest_hash
+    _pending_manifests.pop(agent_name, None)
+    return manifest_id
+
+
 # Everything this process has ever observed about an agent's structure,
 # unioned across traces: ``agent_name -> {"tools": {...}, "models": {...},
 # "subagents": {...}, "prompts": {...}}``. See `_declare`.
@@ -1391,14 +1419,21 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
             client = _config._get_client()
             result = client.register_manifest(snapshot)
             manifest_id = result.get("manifest_id", snapshot.id)
-        except Exception:
+        except Exception as exc:
             # Leave the per-agent hash unset so the next trace retries; a
             # transient blip must not permanently stop this agent from ever
             # declaring a manifest.
             logger.warning("Failed to register manifest for %s", agent_name, exc_info=True)
+            # Hand the send side something to retry WITH. Returning None here ships the
+            # trace with no manifest_id, which a strict backend answers 400
+            # "manifest_id is required" — the trace is lost. The attempt above runs on
+            # the caller's thread in front of the user's agent and cannot outlast a
+            # no-available-instance window, so the retry belongs on the sender.
+            _pending_manifests[agent_name] = (snapshot, exc)
             return None
         _manifest_ids[agent_name] = manifest_id
         _manifest_hashes[agent_name] = snapshot.manifest_hash
+        _pending_manifests.pop(agent_name, None)
         _manifest_id = manifest_id
         logger.info(
             "Registered manifest %s for %s (hash=%s, components=%d)",
@@ -2265,7 +2300,13 @@ class DecimalTracingProcessor:
 
         try:
             client = _config._get_client()
-            _config._sender.submit(client.ingest_trace, trace)
+            _agent = trace.agent_name
+            if _agent in _pending_manifests:
+                _config.submit_trace_pending_manifest(
+                    client, trace, lambda: _reregister_refused(_agent)
+                )
+            else:
+                _config._sender.submit(client.ingest_trace, trace)
             logger.debug(
                 "Queued trace %s (%d spans, %d llm_calls, %d active_skills, manifest=%s) for agent %s",
                 trace.id,
