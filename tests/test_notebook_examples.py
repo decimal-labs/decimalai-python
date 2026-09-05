@@ -109,7 +109,7 @@ CREDENTIAL_VARS = (
 # probed and an outage in either one skips rather than fails.
 PROBE_URLS = (
     "https://api.decimal.ai/api/v1/registry/skills?measured=only&limit=1",
-    "https://app.decimal.ai/s/flsa-exemption-test@1/SKILL.md",
+    "https://app.decimal.ai/s/archive228-decision-record@1/SKILL.md",
 )
 
 # A notebook whose committed JSON deliberately differs from what its builder

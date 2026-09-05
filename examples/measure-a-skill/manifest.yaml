@@ -12,7 +12,19 @@
 # becoming a bad first impression.
 
 demo_skill:
-  slug: flsa-exemption-test
+  # RE-PINNED 2026-09-05. The previous pin (`flsa-exemption-test`, fallback
+  # `boundary-value-enumeration`) was not wrong about the skill — it was wrong about the
+  # DATA. Both runs completed on 2026-07-29, and the weekly payload sweep nulled their
+  # per-case outputs on 08-30, so all 23 A/B arms served empty and the notebook's central
+  # cell had nothing to show. The nightly check was red for that reason 7 of 8 nights and
+  # was right every time. The retention window is 180 days from 2026-09-05, which stops
+  # this happening again but cannot bring those arms back.
+  #
+  # This pin was chosen against the gates below AND against the editorial rule under
+  # `demo_case`: a skill whose suite contains at least one case the skill makes WORSE.
+  # Verified live 2026-09-05: +81.82 pts over 22 cases, judged, every prompt served,
+  # 0 unrecorded, outputs intact (not pruned), SKILL.md@1 serves 200.
+  slug: archive228-decision-record
 
   # IDENTITY PINS, not just existence. A slug that still resolves is not the
   # same as the skill you meant: `crisis-response-protocol` returns HTTP 200
@@ -20,45 +32,34 @@ demo_skill:
   # existence check goes green on that. These two fields are what make the
   # check mean something.
   #
-  # PIN THE UUID, NOT THE AUTHOR HANDLE. This used to pin
-  # `author_display_name` — a field the author can change from their profile at
-  # any time, and the name of a real third party, printed in a public notebook
-  # and asserted on in cell 0.3. Both problems go away with the immutable id:
-  # it is the only field that cannot be re-pointed at a different skill, and it
-  # names nobody. A rename now costs the reader nothing; before, it broke the
-  # notebook for everyone.
-  skill_id: 7ce7a476-606b-4768-a716-1c9cbf7b24b0
-  source_type: platform
-
-  # Pinned so cell 0.7 prints the body that was MEASURED, not whatever is
-  # latest. A suite can be updated in place without minting a new version, so
-  # "latest" and "what the number was measured on" drift apart.
+  # PIN THE UUID, NOT THE AUTHOR HANDLE. This used to pin `author_display_name` — a field
+  # the author can change from their profile at any time.
+  skill_id: 51f03735-9772-4550-bc59-c5089cfcb35c
+  source_type: github_import
   version: 1
 
-  # THE CASE WHERE OUR OWN SKILL LOSES. Deliberately.
+  # THE CASE WHERE THE SKILL WE ARE SELLING LOSES. Deliberately.
   #
-  # case-22 is a computer systems analyst paid $32.00/hour. Expected YES/none —
-  # 29 CFR 541.400(b) exempts an hourly computer employee at or above $27.63/hr,
-  # and the prompt invokes that exemption by name. The BARE model gets it right.
-  # The skill answers NO/salary_basis and is graded `fail_kept`. Our benchmark
-  # catches our own skill making an answer worse.
+  # This suite has exactly one: case-04, a payment-processing outage post-mortem. The
+  # skill's answer is graded worse than the bare model's, and our own benchmark is what
+  # says so. The notebook leads with it.
   #
-  # Why not the flip that flatters us. The obvious pick was case-01 — a software
-  # specialist at $80/hour where the skill flips YES to NO and the delta looks
-  # decisive. But case-01 is the SAME fact pattern as case-22: an hourly computer
-  # employee far above the $27.63 threshold. If case-22's expected answer is
-  # right, case-01's is wrong, and the "wrong" no-skill answer is the correct
-  # one. The suite contradicts itself, and a notebook whose entire thesis is
-  # "check our work" cannot lead with the case where our work does not survive
-  # being checked. Discovered 2026-08-10 while building Tier 1.
+  # Why not lead with a win. Nineteen of these 22 cases flip to pass; picking one of those
+  # is the arrangement that flatters us, and a notebook whose entire thesis is "check our
+  # work" cannot lead with the case where our work is never checked. "Here is a case where
+  # the skill makes the answer worse, and our own benchmark caught it" is a claim no
+  # competitor can copy, and it costs one case out of twenty-two.
   #
-  # This is the stronger cell anyway. "Here is a case where the skill we are
-  # selling makes the answer worse, and our own benchmark says so" is a claim no
-  # competitor can copy, and it costs one case out of twenty-three.
-  demo_case: case-22
+  # KEEP THIS A LOSING CASE ON THE NEXT RE-PIN. The check only asserts the two arms
+  # disagree — it deliberately does NOT require `flip_to_pass`, because encoding "always
+  # show a case that flatters us" as a CI rule would file a drift issue every day against
+  # a demo case chosen on purpose. The editorial choice lives here, in prose, on purpose.
+  demo_case: case-04
 
-  # The contested one, kept ONLY so the notebook can show the contradiction and
-  # so nobody re-promotes it to demo_case without reading the above.
+  # A representative case the skill WINS, shown beside the losing one so the cell is a
+  # comparison rather than an apology. (Under the previous pin this key held a case that
+  # CONTRADICTED the demo case — that suite disagreed with itself. This one does not, and
+  # the key is kept because the notebook renders it.)
   contested_case: case-01
 
 gates:
@@ -77,13 +78,13 @@ gates:
   require_all_prompts_served: true
 
 # A warm spare, gate-checked on the same cron so it is known-good on the day it
-# is needed rather than discovered broken at that moment. Verified live
-# 2026-08-10: +30.43 pts, 23 cases, judged, source_type platform.
+# is needed rather than discovered broken at that moment. Verified live 2026-09-05:
+# +88.46 pts, 26 cases, judged, every prompt served, outputs intact.
 # Pinned by identity for the same reason the demo skill is: falling through to a
 # slug that still resolves but is now something else is worse than falling over.
-fallback_slug: boundary-value-enumeration
-fallback_author_display_name: alderping
-fallback_source_type: platform
+fallback_slug: sickn33-hig-patterns
+fallback_author_display_name: sickn33
+fallback_source_type: github_import
 
 # HONESTY BUDGET — figures the notebook is allowed to quote about the registry
 # ITSELF (cell 0.6). Recomputed by the cron, because a number about how much
