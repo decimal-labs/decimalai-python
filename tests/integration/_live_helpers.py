@@ -496,22 +496,32 @@ def is_provider_unavailable_error(exc: BaseException) -> bool:
     quota / rate-limit / billing wall, or a transient 5xx overload, so the
     caller can SKIP rather than FAIL.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        # Never launder a missing trace into a provider excuse. The marker
-        # list below contains "timed out" for hung sockets, and that substring
-        # also appears in `TraceNeverArrived`'s message — see that class for
-        # the run where this masked a real sub-agent defect behind a green
-        # matrix. Checked on every link of the chain, not just the outermost,
-        # so wrapping it does not defeat the check.
-        if isinstance(cur, TraceNeverArrived):
-            return False
+    def _chain(e: BaseException):
+        """Walk cause/context, cycle-safe."""
+        seen: set[int] = set()
+        cur: BaseException | None = e
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            yield cur
+            cur = cur.__cause__ or cur.__context__
+
+    # PASS 1 — never launder a missing trace into a provider excuse. The marker
+    # list contains "timed out" for hung sockets, and that substring also
+    # appears in `TraceNeverArrived`'s message — see that class for the run
+    # where this masked a real sub-agent defect behind a green matrix.
+    # This is a SEPARATE pass over the WHOLE chain, ahead of any text matching,
+    # because the usual `raise Other(f"...: {e}") from e` copies the inner
+    # message into the wrapper: with the two checks interleaved, the WRAPPER's
+    # own text matched "timed out" and returned True before the walk ever
+    # reached the TraceNeverArrived cause.
+    if any(isinstance(cur, TraceNeverArrived) for cur in _chain(exc)):
+        return False
+
+    # PASS 2 — substring match on every link, not just the outermost.
+    for cur in _chain(exc):
         text = f"{type(cur).__name__}: {cur}".lower()
         if any(m in text for m in _PROVIDER_UNAVAILABLE_MARKERS):
             return True
-        cur = cur.__cause__ or cur.__context__
     return False
 
 

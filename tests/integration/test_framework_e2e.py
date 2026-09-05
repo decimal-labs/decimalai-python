@@ -37,6 +37,8 @@ from uuid import uuid4
 
 import pytest
 
+from ._live_helpers import TraceNeverArrived
+
 
 # ─── Config ──────────────────────────────────────────────────────────
 
@@ -87,9 +89,10 @@ def _poll_for_trace(agent_name: str, expected_count: int = 1) -> list[dict]:
         if len(last) >= expected_count:
             return last
         time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(
+    raise TraceNeverArrived(
         f"Timed out waiting for {expected_count} trace(s) on agent={agent_name}. "
-        f"Last poll saw: {len(last)} traces."
+        f"Last poll saw: {len(last)} traces. This is a TRACE INGEST failure, not "
+        f"a provider one — by the time we poll, the SDK call has already returned."
     )
 
 

@@ -645,6 +645,72 @@ def _extract_trace_id(args: tuple) -> Optional[str]:
 _sender = BackgroundSender()
 
 
+# ---- deferred manifest registration ------------------------------------
+#
+# A trace may only carry a manifest_id the platform actually STORED:
+# `require_manifest_on_ingest` is true on the hosted API, so an id it has never
+# seen is answered 400 "Trace validation failed: manifest_id '...' does not
+# exist" and the trace is LOST. Every adapter registers on the CALLER's thread
+# at root-run end, where the budget has to stay in the hundreds of milliseconds
+# or the customer's agent waits on us -- far too short to outlast a Cloud Run
+# revision with no available instance, which answers 429 for tens of seconds.
+# Measured on production: 1,315 of exactly those 400s in the 48 h to
+# 2026-09-04T09:33Z, every one from this SDK.
+#
+# So the long ladder lives HERE, on the background sender, where waiting costs
+# the customer's agent nothing. Five attempts, each jittered +/-50% so a fleet
+# of processes that lost their instance together does not re-attempt in
+# lockstep. `_request_with_retry` spends up to 7 s of its own 429 ladder inside
+# each attempt, so the whole thing is bounded at roughly 30-60 s: long enough to
+# bridge a restart, short enough that one trace cannot own the sender thread.
+# The tuple IS the bound -- there is no wall-clock cap to drift out of test.
+_MANIFEST_RETRY_BACKOFFS_S = (0.0, 1.0, 2.0, 4.0, 8.0)
+
+
+def submit_trace_pending_manifest(
+    client: Any, trace: Any, reregister: Callable[[], Optional[str]]
+) -> None:
+    """Queue one trace whose manifest registration was refused.
+
+    ``reregister`` re-attempts the adapter's own registration and returns the
+    id the platform stored, or None. The trace is HELD -- never posted under a
+    local id -- until it returns one.
+    """
+    _sender.submit(_ingest_when_manifest_lands, client, trace, reregister)
+
+
+def _ingest_when_manifest_lands(
+    client: Any, trace: Any, reregister: Callable[[], Optional[str]]
+) -> Any:
+    import random
+    import time as _time
+
+    for delay in _MANIFEST_RETRY_BACKOFFS_S:
+        if delay:
+            _time.sleep(delay * (0.5 + random.random()))
+        manifest_id = reregister()
+        if manifest_id:
+            trace.manifest_id = manifest_id
+            return client.ingest_trace(trace)
+
+    # Still refused. Do NOT post: the platform's answer to a local id is a
+    # certainty, and a certain 400 is only noise on top of a loss that has
+    # already happened. Raising here is what routes it through the sender's
+    # `_record_failure`, so `export_status().last_error` names the real cause
+    # next to `last_manifest_error` instead of the platform's confusing
+    # "manifest_id does not exist".
+    raise RuntimeError(
+        "decimalai: manifest registration for agent %r is still refused after "
+        "%d attempts; trace %s was NOT sent rather than shipped under an id the "
+        "platform never stored. See decimalai.export_status()."
+        % (
+            getattr(trace, "agent_name", "?"),
+            len(_MANIFEST_RETRY_BACKOFFS_S),
+            getattr(trace, "id", "?"),
+        )
+    )
+
+
 # ---- atexit summary ----------------------------------------------------
 
 def _emit_shutdown_summary() -> None:

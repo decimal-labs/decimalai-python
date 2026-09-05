@@ -37,6 +37,17 @@ and patch releases are fixes.
   stamping versions would have stayed green.
 
 ### Fixed
+- A refused manifest registration no longer costs the trace. The caller-thread registration
+  ladder is milliseconds by necessity, which cannot outlast a Cloud Run revision with no
+  available instance; the trace was then shipped carrying a LOCAL id the platform had never
+  stored and rejected with `400 manifest_id '...' does not exist`. Production took 1,315 of
+  exactly those in the 48 h to 2026-09-04, all from this SDK. Re-registration now happens on
+  the background sender, where waiting costs the caller nothing: five jittered attempts,
+  bounded, and the trace is held until an id exists rather than sent under one that does not.
+- `_poll_for_trace` in the framework end-to-end tests raises `TraceNeverArrived` instead of a
+  bare `AssertionError` whose message contained "Timed out" — the substring the live-test
+  helper matches to classify a failure as provider-unavailable and SKIP it. A lost trace was
+  being reported as a quota skip, the same defect class as the 2026-09-03 journeys finding.
 
 - **`decimalai init` gave up on the first admission abort.** A single-instance
   backend at its concurrency limit answers HTTP 429 in ~0 ms with no Retry-After

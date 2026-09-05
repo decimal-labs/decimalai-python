@@ -103,6 +103,12 @@ _manifest_id: Optional[str] = None  # Most recent successful registration
 # NOT a registration: nothing that decides "already registered" may read it
 # as one, or a single refused POST silences this agent for the whole process.
 _unregistered_agents: set = set()
+# The snapshot whose registration was refused, and the exception that refused
+# it, kept per agent so the BACKGROUND sender can re-attempt the registration
+# before it ships the trace. Without them the send side has nothing to retry
+# WITH, which is why the trace went out under the local id and 400ed.
+_pending_snapshots: Dict[str, Any] = {}
+_last_registration_error: Dict[str, BaseException] = {}
 _manifest_lock = threading.Lock()  # Thread safety for manifest registration
 
 # Per-AGENT manifest state. `_manifest_id` alone is a single process-global
@@ -276,6 +282,8 @@ def _forget_manifests_if_tracker_reset() -> None:
         _manifest_ids.clear()
         _manifest_hashes.clear()
         _unregistered_agents.clear()
+        _pending_snapshots.clear()
+        _last_registration_error.clear()
 
 
 # Same ladder as `generic._maybe_register_manifest`: registration runs on the
@@ -377,14 +385,45 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
             _manifest_ids[agent_name] = manifest_id
             _manifest_hashes.pop(agent_name, None)
             _unregistered_agents.add(agent_name)
+            # Hand the send side something to retry WITH. `_auto_send` now
+            # holds the trace and re-runs this registration on the background
+            # thread rather than posting an id the platform never stored.
+            _pending_snapshots[agent_name] = snapshot
+            if last_exc is not None:
+                _last_registration_error[agent_name] = last_exc
             _manifest_id = manifest_id
             return manifest_id
 
         _manifest_ids[agent_name] = manifest_id
         _manifest_hashes[agent_name] = snapshot.manifest_hash
         _unregistered_agents.discard(agent_name)
+        _pending_snapshots.pop(agent_name, None)
+        _last_registration_error.pop(agent_name, None)
         _manifest_id = manifest_id
         return manifest_id
+
+
+def _reregister_refused(agent_name: str) -> Optional[str]:
+    """Re-attempt one agent's REFUSED registration. Returns the stored id, or None.
+
+    Called from the background sender (see ``_config.submit_trace_pending_manifest``),
+    never from the caller's thread -- which is the whole point: the ladder in
+    ``_register_snapshot`` is 0.6 s because it runs at root-run end in front of
+    the user's agent, and 0.6 s cannot outlast a Cloud Run revision with no
+    available instance.
+    """
+    with _manifest_lock:
+        snapshot = _pending_snapshots.get(agent_name)
+        exc = _last_registration_error.get(agent_name)
+    if snapshot is None:
+        return None
+    if exc is not None and _is_permanent_registration_failure(exc):
+        return None  # 401/403 will not come back to life; do not burn the ladder.
+    _register_snapshot(agent_name, snapshot)
+    with _manifest_lock:
+        if agent_name in _unregistered_agents:
+            return None
+        return _manifest_ids.get(agent_name)
 
 
 def _adopt_active_manifest(agent_name: str) -> Optional[str]:
@@ -2879,8 +2918,19 @@ class CallbackHandler(_CallbackBase):
                 # Attach eval scores to trace payload
                 trace.eval_scores = eval_scores
 
-            # Use background sender for non-blocking send
-            _config._sender.submit(client.ingest_trace, trace)
+            # Use background sender for non-blocking send. When THIS agent's
+            # registration was refused, `trace.manifest_id` is the snapshot's
+            # local id -- an id the platform never stored, which ingest answers
+            # 400 "manifest_id ... does not exist", losing the trace. Hold it
+            # instead: the sender re-registers on its own thread (where waiting
+            # is free) and stamps the real id before posting.
+            if trace.agent_name in _unregistered_agents:
+                agent = trace.agent_name
+                _config.submit_trace_pending_manifest(
+                    client, trace, lambda: _reregister_refused(agent)
+                )
+            else:
+                _config._sender.submit(client.ingest_trace, trace)
             logger.debug(
                 "Queued trace %s (%d spans, %d llm_calls, %d eval_scores, manifest=%s)",
                 trace.id,

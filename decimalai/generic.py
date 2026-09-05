@@ -38,6 +38,13 @@ _current_trace: ContextVar[Optional["TraceContext"]] = ContextVar(
 # Global manifest state for the generic tracer
 _manifest_tracker = ManifestTracker()
 _manifest_id: Optional[str] = None
+# The snapshot whose registration was REFUSED, and the exception that refused
+# it. Kept so the background sender can re-attempt the registration before it
+# ships the trace: without them the send side has nothing to retry with, so the
+# trace went out under the synthetic id and ingest answered 400 "manifest_id
+# ... does not exist". See `_config.submit_trace_pending_manifest`.
+_pending_snapshot: Optional[Any] = None
+_last_registration_error: Optional[BaseException] = None
 _manifest_lock = __import__("threading").Lock()
 
 
@@ -402,8 +409,18 @@ class TraceContext:
         try:
             client = _config._get_client()
             trace = self.build_trace()
-            # Use background sender for non-blocking send
-            _config._sender.submit(client.ingest_trace, trace)
+            # Use background sender for non-blocking send. When registration
+            # was REFUSED, `trace.manifest_id` is the snapshot's synthetic id --
+            # one the platform never stored, which ingest answers 400
+            # "manifest_id ... does not exist", losing the trace. Hold it
+            # instead: the sender re-registers on its own thread (where waiting
+            # costs the customer's agent nothing) and stamps the real id first.
+            if _pending_snapshot is not None:
+                _config.submit_trace_pending_manifest(
+                    client, trace, _reregister_refused
+                )
+            else:
+                _config._sender.submit(client.ingest_trace, trace)
             logger.debug(
                 "Queued trace %s (%d spans, %d llm_calls, %d active_skills, manifest=%s)",
                 trace.id,
@@ -488,7 +505,7 @@ class TraceContext:
         Merges auto-detected tools/models with @decimalai.tool registry.
         Thread-safe via _manifest_lock.
         """
-        global _manifest_id
+        global _manifest_id, _pending_snapshot, _last_registration_error
         from . import _config
         from .decorators import get_registered_tools
 
@@ -553,6 +570,8 @@ class TraceContext:
                         attempt + 1,
                     )
                     registered = True
+                    _pending_snapshot = None
+                    _last_registration_error = None
                     break
                 except Exception as exc:
                     last_exc = exc
@@ -582,6 +601,11 @@ class TraceContext:
                 except Exception:
                     pass
                 _manifest_id = snapshot.id
+                # Hand the send side something to retry WITH: `_send` holds the
+                # trace and re-runs this registration on the background thread
+                # rather than posting an id the platform never stored.
+                _pending_snapshot = snapshot
+                _last_registration_error = last_exc
                 # Roll back the tracker so a transient first-trace failure
                 # doesn't permanently poison ingestion: check_and_update
                 # already committed this hash, so without a reset every
@@ -589,6 +613,42 @@ class TraceContext:
                 # and registration would never be re-attempted even after
                 # the backend recovers.
                 _manifest_tracker.reset()
+
+
+def _reregister_refused() -> Optional[str]:
+    """Re-attempt the REFUSED registration. Returns the stored id, or None.
+
+    Runs on the background sender (see `_config.submit_trace_pending_manifest`),
+    never on the caller's thread -- which is the point: the ladder in
+    `_maybe_register_manifest` is three attempts because it runs at trace end in
+    front of the user's agent, and that cannot outlast a Cloud Run revision with
+    no available instance.
+    """
+    global _manifest_id, _pending_snapshot, _last_registration_error
+    from . import _config
+
+    with _manifest_lock:
+        snapshot = _pending_snapshot
+        exc = _last_registration_error
+    if snapshot is None:
+        return None
+    if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+        return None  # Will not come back to life; do not burn the ladder.
+    try:
+        result = _config._get_client().register_manifest(snapshot)
+    except Exception as e:  # noqa: BLE001 -- the caller decides whether to retry
+        with _manifest_lock:
+            _last_registration_error = e
+        return None
+    mid = result.get("manifest_id", snapshot.id) if isinstance(result, dict) else snapshot.id
+    with _manifest_lock:
+        _manifest_id = str(mid)
+        _pending_snapshot = None
+        _last_registration_error = None
+        # Re-commit the hash the failure branch rolled back, so the NEXT trace
+        # with this shape dedupes instead of registering a second time.
+        _manifest_tracker.check_and_update(snapshot)
+    return str(mid)
 
 
 def _get_current_trace() -> Optional[TraceContext]:
