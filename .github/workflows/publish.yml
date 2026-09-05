@@ -102,13 +102,40 @@ jobs:
           want = jobs["conformance"].get("name") or "conformance"
 
           repo, sha = os.environ["REPO"], os.environ["SHA"]
-          out = subprocess.run(
-              ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"],
-              capture_output=True, text=True,
-          )
-          if out.returncode != 0:
-              sys.exit(f"::error::could not read check runs for {sha}: {out.stderr.strip()[:400]}")
-          runs = (json.loads(out.stdout) or {}).get("check_runs") or []
+
+          def check_runs():
+              out = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"],
+                  capture_output=True, text=True,
+              )
+              if out.returncode != 0:
+                  sys.exit(f"::error::could not read check runs for {sha}: {out.stderr.strip()[:400]}")
+              return (json.loads(out.stdout) or {}).get("check_runs") or []
+
+          # WAIT for a run that is still going. Publishing is triggered by
+          # `release: published`, which fires the moment the release is created — so the
+          # conformance matrix for that same commit is usually still queued or running
+          # when this looks. Treating `in_progress` as a failure (what this did before
+          # 2026-09-05) meant the publish was SKIPPED for a commit that went on to pass
+          # minutes later, and the recovery was a manual `gh run rerun --failed`. Poll up
+          # to ~20 minutes. "No run at all" stays an immediate failure: that is a commit
+          # CI never graded, and waiting cannot change it.
+          import time
+
+          DEADLINE_S, INTERVAL_S = 20 * 60, 20
+          waited = 0
+          runs = check_runs()
+          while True:
+              mine = [r for r in runs if r.get("name") == want]
+              if not mine or all(r.get("status") == "completed" for r in mine):
+                  break
+              if waited >= DEADLINE_S:
+                  print(f"::warning::{want!r} still running after {waited // 60} min — giving up the wait")
+                  break
+              print(f"⏳ {want!r} is {mine[0].get('status')} on {sha}; waited {waited}s of {DEADLINE_S}s")
+              time.sleep(INTERVAL_S)
+              waited += INTERVAL_S
+              runs = check_runs()
 
           mine = [r for r in runs if r.get("name") == want]
           if not mine:
