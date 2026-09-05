@@ -213,7 +213,21 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
 
     from decimalai.openai_agents import instrument
 
-    instrument(agent_name=ctxs[0].agent_name, exclusive=True, enable_skill_loader=True)
+    # `skills=` seeds the adapter's own skills registry, which is what makes the
+    # INFERRED rung path (`_infer_skill_rungs`) run at all — it returns early on an
+    # empty registry. Until 2026-09-05 every driver left it empty, so C13 ("nothing is
+    # recorded as activated that the model did not ask for") passed on all nine
+    # drivers by never seeing a candidate: its own message said "recorded no
+    # activation" every time. Measured that day by folding delivered names into
+    # `skills_loaded_by_agent` inside the adapter — the exact fabrication C13 forbids —
+    # and watching the whole matrix stay green, 155 passed. With the registry seeded,
+    # that mutation is graded.
+    instrument(
+        agent_name=ctxs[0].agent_name,
+        exclusive=True,
+        enable_skill_loader=True,
+        skills=[dict(sk) for ctx in ctxs for sk in ctx.skills],
+    )
 
     pairs = []
     for ctx in ctxs:
