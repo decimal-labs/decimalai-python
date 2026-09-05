@@ -263,6 +263,24 @@ def _hot_path_timeout() -> httpx.Timeout:
     )
 
 
+def _empty_menu_reason(e: "SkillRouterError") -> str:
+    """Why smart_route returned nothing, as one word the caller can count.
+
+    The fleet filed every empty menu as `no_skill_offered` and could not tell a
+    Cloud Run edge abort (a 0 s 429) from a slow read from an open breaker —
+    on 2026-09-03..04, 30% of its router-calling sessions, 58% of them 429s, all
+    with an empty detail. `http_<status>`, `timeout`, `circuit_open`, `transport`.
+    """
+    code = getattr(e, "status_code", None)
+    if code:
+        return f"http_{code}"
+    if isinstance(e.__cause__, httpx.TimeoutException):
+        return "timeout"
+    if "circuit open" in str(e):
+        return "circuit_open"
+    return "transport"
+
+
 def _is_hot_path(path: str) -> bool:
     return any(path.startswith(p) for p in _HOT_PATHS)
 
@@ -1194,7 +1212,8 @@ class SkillRouter:
             return self._request("POST", "/api/v1/skills/route", json=payload)
         except SkillRouterError as e:
             logger.warning("smart_route failed, returning empty: %s", e)
-            return {"skills": [], "prompt_fragment": "", "strategy": "none"}
+            return {"skills": [], "prompt_fragment": "", "strategy": "none",
+                    "degraded_reason": _empty_menu_reason(e)}
 
     def get_skill_body(
         self,

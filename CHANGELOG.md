@@ -7,6 +7,7 @@ and patch releases are fixes.
 ## [Unreleased]
 
 ### Added
+- `smart_route()` now names WHY it returned an empty menu: `degraded_reason` is `http_<status>` / `timeout` / `circuit_open` / `transport`, so a caller can tell a Cloud Run edge abort (a 0 s 429) from a slow read or an open breaker instead of filing every empty menu as "no skill offered".
 
 - **`decimalai init --framework adk`** writes a runnable Google ADK agent:
   Gemini by default (`gemini-3.5-flash`; a non-Gemini `--model` is refused up

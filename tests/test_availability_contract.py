@@ -421,3 +421,39 @@ class TestManifestRegistrationDoesNotRepeatItself:
         t.reset()
         assert t.check_and_update(self._snap("a")) is True, \
             "reset() left a hash remembered — a failed registration would never retry"
+
+
+class TestAnEmptyMenuNamesItsFailure:
+    """The fleet filed every empty menu as `no_skill_offered` with an empty detail;
+    58% of them were Cloud Run edge aborts it could not tell from a slow read."""
+
+    def _router(self):
+        from decimalai import skill_router as sr
+        from decimalai.skill_router import SkillRouter
+
+        sr._hot_path_breaker = _CircuitBreaker()
+        return SkillRouter(api_key="dai_sk_t", base_url="http://127.0.0.1:9")
+
+    def test_a_timeout_is_named(self, monkeypatch):
+        def boom(*a, **k):
+            raise httpx.ReadTimeout("slow")
+        monkeypatch.setattr(httpx, "request", boom)
+        assert self._router().smart_route("q")["degraded_reason"] == "timeout"
+
+    def test_an_edge_abort_429_is_named_by_status(self, monkeypatch):
+        class _Resp:
+            status_code = 429
+            headers: dict = {}
+            text = "The request was aborted because there was no available instance."
+            def json(self):
+                return {"detail": self.text}
+        monkeypatch.setattr(httpx, "request", lambda *a, **k: _Resp())
+        assert self._router().smart_route("q")["degraded_reason"] == "http_429"
+
+    def test_an_open_breaker_is_named(self):
+        from decimalai import skill_router as sr
+
+        r = self._router()
+        sr._hot_path_breaker = _CircuitBreaker(threshold=1, cooldown_s=30.0)
+        sr._hot_path_breaker.record_failure()
+        assert r.smart_route("q")["degraded_reason"] == "circuit_open"
