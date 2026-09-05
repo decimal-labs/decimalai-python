@@ -31,9 +31,11 @@ flip cleared it without any billing change — the same reason the OIDC path alr
 `decimalai-mcp 0.1.3`, `agentversion 0.2.3`, and `skillevaluation 0.7.1`, all of which were public
 first.
 
-So the precondition is met, and the OIDC path is available. Note what that does *not* prove: no
-release has yet been cut through it from this repository, so the first one should be watched rather
-than assumed.
+So the precondition is met, and the OIDC path is available. **Corrected 2026-09-05: it has been
+used.** Seven GitHub Releases have been cut from this repository — v0.10.3 (2026-08-17) through
+v0.13.1 (2026-09-03) — and `publish.yml` uploads by Trusted Publishing on `release: published`.
+PyPI's integrity endpoint answers 200 for the latest release of all four packages, so the
+attestations are there. The "watch the first one" caution is spent.
 
 If Actions ever stops starting again — jobs failing in seconds with `steps=0` — check org billing
 before changing any workflow file. The give-away is that the reason appears only in the check-run
@@ -72,8 +74,10 @@ Both costs are real, and both are why this reverts to CI as soon as the precondi
   this repo is configured correctly; Actions availability is the only thing missing.)
 - **Tagging is best-effort and fails quietly.** `scripts/release.sh` attempts `gh release create` as
   its last step with stderr suppressed, and treats failure as non-fatal because the upload already
-  happened. When it fails you get a shipped, untagged version. The repo has exactly one tag, `v0.10.0`,
-  and two versions in the 0.10 line went out without one:
+  happened. When it fails you get a shipped, untagged version. **Corrected 2026-09-05: the repo now
+  has eight tags** — `v0.10.0`, `v0.10.3`, `v0.10.4`, `v0.11.0`, `v0.11.1`, `v0.12.0`, `v0.13.0`,
+  `v0.13.1`, i.e. one per release since 0.10.3. The gap below is history, not the current state, and
+  it is the reason the verify-the-tag step stays:
   - **0.10.2** — on PyPI (uploaded 2026-08-15), never tagged;
   - **0.10.1** — never tagged *and never uploaded*; it has a CHANGELOG entry and a "Release 0.10.1"
     commit but no artifact on PyPI, so the version was skipped entirely.
@@ -88,7 +92,8 @@ never make real model calls. Only the *upload* moves.
 | Gate | Where | Checks | Blocks the release? |
 |---|---|---|---|
 | **Live-LLM** | **Local — `scripts/release.sh`** | real model calls through a clean-room wheel | yes — always run before publishing, in either regime |
-| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | yes — Actions runs again as of 2026-08-24, so this gate is live. ⚠ It runs a bare `pytest tests/`, and `addopts` deselects the conformance marker — so a RED conformance board does not block a publish. Check the board yourself. |
+| **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | yes — Actions runs again as of 2026-08-24, so this gate is live. |
+| **Conformance board** | CI — `publish.yml` `conformance-graded` job | the hermetic adapter matrix actually GRADED the adapters | yes, since `f606bc1` — `publish` declares `needs: [test, conformance-graded]`. **Corrected 2026-09-05: a red conformance board DOES block a publish now.** ⚠ The job reads the check-run for that commit, and a run still `in_progress` reads as a failure and skips the publish — wait for it, then `gh run rerun --failed`. |
 
 > **Run the no-model suite yourself anyway — `scripts/release.sh` does not.**
 > The script's step 2 only builds the wheel and smoke-tests it (import, `__version__`, CLI); it never
@@ -116,6 +121,21 @@ never make real model calls. Only the *upload* moves.
    maintainer-only tooling and is not part of this repo; point `DECIMAL_RELEASE_GATE_DIR` at your
    checkout of it. Without it, `scripts/release.sh` stops and tells you to either set that variable or
    pass `SKIP_LIVE_LLM_GATE=1` (see below).
+
+   **Point it at the harness repo's ROOT — the directory whose `Makefile` defines
+   `release-gate-cleanroom` — not at the `release_gate/` folder inside it** (corrected
+   2026-09-05). The script only checks that the path is a directory, so the deeper path passes
+   that check and then dies later at the `make` step, which has no target there:
+
+   ```bash
+   export DECIMAL_RELEASE_GATE_DIR=/path/to/harness-checkout   # the Makefile lives here
+   ```
+
+   Two more things that surprise people about the harness: its cleanroom target sources
+   `backend/.env`, which **overrides a `GEMINI_API_KEY` you exported yourself**; and since 2026-09-05
+   the script reads the gate's own verdict, not just its exit code — a run that SKIPPED a phase exits
+   0 and is labelled `pass-with-skips`, and only a clean `pass` releases. `ALLOW_GATE_SKIPS=1` is the
+   deliberate override, and it prints which phase never ran.
 
 ## Versioning model
 
@@ -223,6 +243,10 @@ For those there is an explicit escape hatch:
 ```bash
 SKIP_LIVE_LLM_GATE=1 ./scripts/release.sh
 ```
+
+> **Never pipe `yes` into this script.** The confirmation prompt is not the only thing reading stdin:
+> twine's token prompt reads it too, so `yes | ./scripts/release.sh` answers the token prompt with
+> `yes` and the upload 403s. Type the word.
 
 This bypasses **only** the real-model T2 check (step 3). The cheap structural gates — step 1
 (version/tag/remote) and step 2 (build, `twine check`, clean-env import + CLI + `__version__` parity) —

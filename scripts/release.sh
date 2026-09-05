@@ -120,6 +120,33 @@ else
   fi
   echo "==> Live-LLM release gate (clean-room wheel, providers: $PROVIDERS)"
   make -C "$GATE_DIR" release-gate-cleanroom ARGS="--providers $PROVIDERS"
+
+  # The gate exits 0 for a run that SKIPPED a phase — by design, because a missing
+  # key or a quota cap should not fail a canary. A publish is a different question:
+  # the 2026-08-18 report carried journeys ⏭️ SKIP under an overall ✅ PASS, and
+  # exit 0 was the only thing this script read. Since 2026-09-05 the gate writes a
+  # verdict of pass / pass-with-skips / inconclusive / fail; only a clean `pass`
+  # releases. ALLOW_GATE_SKIPS=1 is the deliberate, visible override.
+  REPORT="$(ls -1dt "$GATE_DIR"/release_gate/reports/*/release-report.json 2>/dev/null | head -1)"
+  if [[ -z "$REPORT" ]]; then
+    echo "ERROR: the gate wrote no release-report.json under $GATE_DIR/release_gate/reports." >&2
+    exit 1
+  fi
+  VERDICT="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("verdict","?"))' "$REPORT")"
+  SKIPPED="$(python3 -c 'import json,sys;print(", ".join(json.load(open(sys.argv[1])).get("skipped_phases") or []))' "$REPORT")"
+  echo "    gate verdict: $VERDICT${SKIPPED:+ (skipped: $SKIPPED)}"
+  echo "    report: $REPORT"
+  if [[ "$VERDICT" != "pass" ]]; then
+    if [[ "${ALLOW_GATE_SKIPS:-0}" == "1" ]]; then
+      echo "⚠ ALLOW_GATE_SKIPS=1 — releasing over a '$VERDICT' gate${SKIPPED:+ (skipped: $SKIPPED)}."
+    else
+      echo "ERROR: the release gate verdict is '$VERDICT', not 'pass'." >&2
+      [[ -n "$SKIPPED" ]] && echo "       phases that never ran: $SKIPPED" >&2
+      echo "       Fix the environment and re-run, or set ALLOW_GATE_SKIPS=1 to" >&2
+      echo "       release knowing which phase was not exercised." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # --- confirm, then the one irreversible step -------------------------------
