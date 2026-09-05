@@ -424,11 +424,41 @@ def test_c13b_fails_when_a_model_initiated_pull_is_dropped() -> None:
     assert "dropped on the floor" in r.message
 
 
+def _alpha_hash() -> str:
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(ALPHA_BODY.encode("utf-8")).hexdigest()
+
+
 def test_c13b_passes_when_the_pull_is_recorded() -> None:
-    t = _trace(messages=[_system(), _tool_result()], loaded=[ALPHA])
+    t = _trace(
+        messages=[_system(), _tool_result()], loaded=[ALPHA],
+        active_skills=[{"name": ALPHA, "hash": _alpha_hash()}],
+    )
     r = _c13b([t])
     assert r.status == contract.PASS
     assert ALPHA in r.message
+
+
+def test_c13b_fails_when_the_recorded_pull_carries_no_hash() -> None:
+    """The probe serves every body with a content_hash (as the platform does).
+    A model-pulled activation recorded with skill_hash null cannot be joined
+    back to the skill VERSION that produced the measured lift — an adapter that
+    stops stamping the version must go red, not stay quietly green."""
+    t = _trace(messages=[_system(), _tool_result()], loaded=[ALPHA])
+    r = _c13b([t])
+    assert r.status == contract.FAIL
+    assert "skill_hash null" in r.message
+
+
+def test_c13b_fails_when_the_recorded_hash_is_not_the_served_body() -> None:
+    t = _trace(
+        messages=[_system(), _tool_result()], loaded=[ALPHA],
+        active_skills=[{"name": ALPHA, "hash": "sha256:" + "0" * 64}],
+    )
+    r = _c13b([t])
+    assert r.status == contract.FAIL
+    assert "served body hashes to" in r.message
 
 
 def test_c13b_does_not_read_a_delivered_body_as_a_pull() -> None:

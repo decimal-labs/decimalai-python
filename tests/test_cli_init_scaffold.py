@@ -44,8 +44,10 @@ from decimalai.cli.scaffold import (
     UnknownFramework,
     UnusableModel,
     default_model,
+    env_vars,
     normalize_framework,
     normalize_model,
+    provider_key,
     render_agent_file,
 )
 
@@ -133,6 +135,7 @@ class TestTemplateIsCode:
             "langchain": "decimalai.langchain",
             "openai-agents": "decimalai.openai_agents",
             "pydantic-ai": "decimalai.pydantic_ai",
+            "adk": "decimalai.adk",
         }[framework]
         assert expected in mods, f"{framework} must import {expected}"
 
@@ -142,7 +145,10 @@ class TestTemplateIsCode:
         funcs = [n.name for n in ast.walk(tree)
                  if isinstance(n, ast.FunctionDef)]
         assert funcs == ["run"], f"expected exactly one entry point, got {funcs}"
-        assert len(calls(tree, "run")) == 1, "expected exactly one example call"
+        # A bare `run(...)` is the example call; `asyncio.run(...)` (the adk
+        # template's event-loop bridge) is an attribute call, not the entry point.
+        example_calls = [c for c in calls(tree, "run") if isinstance(c.func, ast.Name)]
+        assert len(example_calls) == 1, "expected exactly one example call"
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_model_is_a_named_constant_the_user_can_change(self, framework):
@@ -162,6 +168,7 @@ class TestTemplateIsCode:
         "langchain": "gpt-5-mini",
         "openai-agents": "gpt-5-mini",
         "pydantic-ai": "openai:gpt-5-mini",
+        "adk": "gemini-2.5-pro",
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -266,6 +273,7 @@ class TestSkillLoaderIsOn:
         "langchain": None,
         "openai-agents": None,
         "pydantic-ai": "otel",
+        "adk": None,
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -1069,3 +1077,57 @@ class TestConsistencyWithFrontendSnippets:
         assert len(inst) == 1
         assert kwarg(inst[0], "agent_name") == AGENT
         assert kwarg(inst[0], "enable_skill_loader") is True
+
+
+def test_a_non_gemini_model_is_refused_for_adk():
+    """`decimalai[adk]` installs google-adk and nothing else. ADK would resolve a
+    `gpt-*` name to its OpenAI shim and die on the first model call, after
+    `decimalai init` reported success — so the gate refuses it up front, and the
+    default can never silently become an OpenAI name."""
+    with pytest.raises(UnusableModel) as e:
+        normalize_model("adk", "gpt-4o-mini")
+    assert "gemini-3.5-flash" in str(e.value)
+    assert normalize_model("adk", "gemini-2.5-pro") == "gemini-2.5-pro"
+    assert normalize_model("adk", None).startswith("gemini-")
+
+
+class TestProviderKeyGuard:
+    """The generated file refuses to run without the provider key MODEL needs —
+    the same variable the CLI's `Set:` block prints — and never guesses."""
+
+    @pytest.mark.parametrize("framework,model,key", [
+        ("langchain", None, "OPENAI_API_KEY"),
+        ("langchain", "anthropic:claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
+        ("openai-agents", None, "OPENAI_API_KEY"),
+        ("pydantic-ai", "google:gemini-3.6-flash", "GEMINI_API_KEY"),
+    ])
+    def test_guard_names_the_var_the_set_block_prints(self, framework, model, key):
+        src = render_agent_file(AGENT, framework, SKILLS, model=model)
+        assert f'PROVIDER_KEY = "{key}"' in src
+        assert key == env_vars(framework, model)[1]      # same table as main.py's Set: block
+        assert provider_key(framework, model) == key
+
+    @pytest.mark.parametrize("framework,model", [
+        ("langchain", "ollama:llama3"), ("langchain", "azure_openai:gpt-4o"),
+        ("pydantic-ai", "test"), ("pydantic-ai", "bedrock:claude"),
+    ])
+    def test_no_guard_where_the_table_is_only_guessing(self, framework, model):
+        """env_vars() falls back to OPENAI_API_KEY as advice; a SystemExit keyed on
+        that guess would refuse an Azure or Bedrock user whose key IS set."""
+        assert provider_key(framework, model) is None
+        assert "PROVIDER_KEY" not in render_agent_file(AGENT, framework, SKILLS, model=model)
+
+    def test_adk_guards_google_api_key_its_own_way(self):
+        src = render_agent_file(AGENT, "adk", SKILLS)
+        assert "GOOGLE_API_KEY" in src and "PROVIDER_KEY" not in src
+
+
+def test_langchain_names_its_turn_cap_at_the_call_site():
+    """create_agent's real default is recursion_limit=9_999, not langchain-core's
+    25; the comment beside agent.invoke says so, as visibly as MAX_TURNS /
+    MAX_REQUESTS on the other templates."""
+    lines = render_agent_file(AGENT, "langchain", SKILLS).splitlines()
+    i = next(n for n, l in enumerate(lines) if "agent.invoke(" in l and "state =" in l)
+    window = lines[i - 10 : i + 1]
+    assert any("recursion_limit" in l for l in window)
+    assert any("9_999" in l or "9999" in l for l in window)

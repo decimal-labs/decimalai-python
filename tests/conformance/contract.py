@@ -1014,6 +1014,39 @@ def c13b_skills_activation_recorded(obs: Observation) -> Result:
                 f"{sorted(activated) or 'nothing'} as activated; a real activation "
                 f"dropped on the floor under-reports the skill that was actually used"
             )
+        # ── the activation carries the VERSION the model saw ──
+        # A tool-loaded body is served with a content_hash (the probe serves one
+        # the way the platform does). The activation row must record it, and it
+        # must be the hash of the body that was served — otherwise the measured
+        # lift cannot be joined back to the skill VERSION that produced it. Only
+        # names the model actually pulled: on a prompt-injection rail there is no
+        # activation row for a hash to live on, and stamping one there would be
+        # a fabricated activation (C13 fails that payload).
+        hashes = {
+            e.get("name"): e.get("hash")
+            for e in (t.get("active_skills") or [])
+            if isinstance(e, dict)
+        }
+        for name in sorted(pulled & activated):
+            expected = "sha256:" + hashlib.sha256(
+                (bodies.get(name) or "").encode("utf-8")
+            ).hexdigest()
+            got = hashes.get(name)
+            got_norm = (
+                got if not got or str(got).startswith("sha256:") else f"sha256:{got}"
+            )
+            if not got:
+                problems.append(
+                    f"the model pulled {name} and the router served its body with "
+                    f"content_hash {expected}, but the trace records the activation "
+                    f"with skill_hash null — the measured lift cannot be joined back "
+                    f"to the skill VERSION that produced it"
+                )
+            elif got_norm != expected:
+                problems.append(
+                    f"{name} activated with hash {got!r} but the served body hashes "
+                    f"to {expected}"
+                )
     if problems:
         return _fail(item, title, _summarize(problems))
     if not pulled_total:
@@ -1418,6 +1451,34 @@ def grade_journey(capture: Any) -> Result:
             f"{capture.run_stdout or 'none'}",
         )
 
+    # ── it survives a model that calls a tool it does not define ──
+    # The hostile second run. The template's contract is that run() returns a
+    # string and a misbehaving model is a MESSAGE, not a crash: exit 0, no
+    # traceback, and stdout carries either the model's answer (a framework whose
+    # loop self-heals — pydantic-ai retries; langchain offers no tool, so the
+    # branch is unreachable) or the template's own message naming the tool.
+    if capture.unknown_tool and capture.unknown_returncode is not None:
+        if capture.unknown_returncode != 0 or "Traceback" in capture.unknown_stderr:
+            return _fail(
+                item, title,
+                f"handed a call to a tool the file does not define "
+                f"({capture.unknown_tool!r}), the generated file exited "
+                f"{capture.unknown_returncode} with a traceback instead of "
+                f"answering — the fleet scaffold canary's 2026-09-04 red "
+                f"(ModelBehaviorError: Tool kb_search not found). run() must "
+                f"return a message, never raise. stderr: "
+                f"{capture.unknown_stderr or 'none'}",
+            )
+        out = capture.unknown_stdout
+        if capture.answer_sentinel not in out and capture.unknown_tool not in out:
+            return _fail(
+                item, title,
+                f"handed a call to {capture.unknown_tool!r}, the generated file "
+                f"exited 0 but printed neither the model's answer nor a message "
+                f"naming the tool — the user sees a blank where run() should have "
+                f"said what the prompt got wrong. stdout: {out or 'none'}",
+            )
+
     # ── what was actually in front of the model ──────────────
     shown = capture.model_context
     problems = []
@@ -1472,7 +1533,11 @@ def grade_journey(capture: Any) -> Result:
         item, title,
         f"`decimalai init` → {capture.out_path} → ran → {capture.model_requests} "
         f"model call(s) carrying the agent's stored prompt and the body of "
-        f"{delivered} → {len(traced)} trace(s) for {capture.agent_name}",
+        f"{delivered} → {len(traced)} trace(s) for {capture.agent_name}"
+        + (
+            f"; survives a call to an undefined tool ({capture.unknown_tool})"
+            if capture.unknown_tool else ""
+        ),
     )
 
 

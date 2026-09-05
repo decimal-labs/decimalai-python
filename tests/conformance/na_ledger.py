@@ -144,17 +144,14 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
     "llamaindex:J1": "NO_PROMPT_SEAM",
     "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
     "crewai:J1": "NO_PROMPT_SEAM",
-    # 2026-09-03: adk moved NO_PROMPT_SEAM -> UNSCAFFOLDED_WITH_SEAM. The seam
-    # is proven (conformance C14 + a live Gemini end-to-end test); the template
-    # is withheld until the hermetic journey can stand up a Gemini stub. See
-    # scaffold.py's UNSCAFFOLDED_WITH_SEAM entry for why, and what finishes it.
-    "adk:J1": "UNSCAFFOLDED_WITH_SEAM",
+    # adk left this ledger on 2026-09-05: the journey stub speaks Gemini's
+    # `:generateContent` and the template shipped (scaffold.py `_render_adk`).
     "generic-otel:J1": "NO_PROMPT_SEAM",
 }
 
 #: The number above, written down — same reason as ``NA_BUDGET``. It should go
 #: DOWN: every entry is a framework whose users get no scaffold today.
-JOURNEY_NA_BUDGET = 6
+JOURNEY_NA_BUDGET = 5
 
 # ── skips ────────────────────────────────────────────────────────────────────
 

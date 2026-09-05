@@ -6,16 +6,60 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **`decimalai init --framework adk`** writes a runnable Google ADK agent:
+  Gemini by default (`gemini-3.5-flash`; a non-Gemini `--model` is refused up
+  front, because `decimalai[adk]` installs no other provider), a `GOOGLE_API_KEY`
+  guard on line one, and skills delivered by prompt injection through
+  `instrument(agent_name=..., enable_skill_loader=True)`. The template was
+  withheld on the premise that the hermetic J1 journey could not stand in for
+  Gemini; that premise was false — google-genai honours `GOOGLE_GEMINI_BASE_URL`
+  (since v1.72, google-adk 2.0.0's own floor), so the journey stub now speaks
+  `:generateContent` and grades the ADK cell like the other three. Nothing in
+  the generated file knows about the stub.
+- **Every generated file refuses to run without the provider key its `MODEL`
+  needs**, naming the variable and the `Set:` block `decimalai init` printed.
+  Before, a missing `OPENAI_API_KEY` was a traceback from inside the provider
+  client — after `init()`, `instrument()` and `load_agent()` had already made
+  their network calls (on `openai-agents`, only at the first `Runner.run_sync`).
+  The guard is derived from the same tables as the `Set:` block and is omitted
+  where those tables only guess (a local provider, Pydantic AI's `test` model, an
+  unknown prefix such as `azure_openai:`), so it never refuses a correct setup.
+- The `langchain` template says at the call site that `create_agent` runs with
+  `recursion_limit=9_999` (not langchain-core's 25) and how to cap it once a tool
+  is added — as visible as `MAX_TURNS` / `MAX_REQUESTS` on the other templates.
+- The conformance probe serves a `content_hash` with every skill body, the way
+  the platform does, and C13b now requires a model-pulled activation to carry
+  that hash. Before, no conformance run ever saw a `skill_hash`, and the one
+  fidelity clause that existed skipped a null silently — an adapter that stopped
+  stamping versions would have stayed green.
+
 ### Fixed
 
 - **`decimalai init` gave up on the first admission abort.** A single-instance
   backend at its concurrency limit answers HTTP 429 in ~0 ms with no Retry-After
   (Cloud Run's "no available instance"); measured on production 2026-09-03 that
   was 84-92% of requests in a ten-minute window. `init` made one
-  `/api/v1/auth/verify` call and exited on any non-2xx, so the quickstart failed
-  outright for anyone who ran it while the platform was busy. The verify call now
-  retries a 429/502/503/504 twice (0.5 s, then 1.5 s; a short `Retry-After` wins)
-  before reporting the status. A 401/403 is a real answer and is never retried.
+  `/api/v1/auth/verify` call — and `decimalai init <agent>` one bare
+  `GET /api/v1/agents` and one `GET /api/v1/agents/{name}/skills` — and exited on
+  any non-2xx, so the quickstart failed outright, and the scaffold wrote no
+  `agent.py`, for anyone who ran it while the platform was busy (the fleet's
+  scaffold canary filed those as `decimalai_init_wrote_no_agent_file`). All three
+  calls now retry a 429/502/503/504 twice (0.5 s, then 1.5 s; a short
+  `Retry-After` wins) before reporting the status. A 401/403 is a real answer and
+  is never retried. The prompt read was already on the SDK's retry ladder and
+  still only costs a note in the file, never the file.
+- **The `openai-agents` scaffold died with a traceback when the model called a
+  tool the file does not define.** The Support pack's starter prompt named
+  `kb_search`; a model that called it raised
+  `agents.exceptions.ModelBehaviorError: Tool kb_search not found` out of
+  `Runner.run_sync` (the fleet's scaffold canary, 2026-09-04). `run()` now catches
+  `ModelBehaviorError` the way it already caught `MaxTurnsExceeded` and returns a
+  message naming the mismatch between the prompt's Tools line and the tools
+  attached to the Agent. The hermetic J1 journey now replays that class: a second
+  run of the generated file against a stub that calls an unknown tool must exit 0
+  without a traceback.
 
 ## [0.13.1] — 2026-09-03
 

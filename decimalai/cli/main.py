@@ -236,7 +236,7 @@ def _scaffold_agent_file(
         # ordering puts manifest-only agents last, so a truncation would
         # drop the never-traced UI-created agent this command exists to
         # find, and report it as "no such agent".
-        resp = client._http.get("/api/v1/agents")
+        resp = _get_past_admission_aborts(client._http, "/api/v1/agents")
         resp.raise_for_status()
         agents = resp.json().get("agents") or []
     except Exception as e:  # noqa: BLE001 — re-raised as a diagnosis
@@ -311,7 +311,7 @@ def _scaffold_agent_file(
     # 3. Fetch its skills, so the file can name what it will use.
     try:
         quoted = urllib.parse.quote(agent_name, safe="")
-        resp = client._http.get(f"/api/v1/agents/{quoted}/skills")
+        resp = _get_past_admission_aborts(client._http, f"/api/v1/agents/{quoted}/skills")
         resp.raise_for_status()
         skills = resp.json().get("skills") or []
     except Exception as e:  # noqa: BLE001
@@ -443,8 +443,8 @@ def _scaffold_agent_file(
     "--framework",
     default=None,
     help=(
-        "Framework to generate for: langchain (default), openai-agents or "
-        "pydantic-ai"
+        "Framework to generate for: langchain (default), openai-agents, "
+        "pydantic-ai or adk"
     ),
 )
 @click.option("--out", "out_path", default=None,

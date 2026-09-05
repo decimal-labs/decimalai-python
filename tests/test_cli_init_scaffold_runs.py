@@ -332,6 +332,9 @@ _ENV = {
     "PATH": "/usr/bin:/bin",
     "PYTHONPATH": str(REPO_ROOT),
     "DECIMAL_API_KEY": "dai_sk_not_a_real_key",
+    # The template's own provider-key guard runs before anything else; every
+    # model call below is stubbed, so this value is never sent anywhere.
+    "OPENAI_API_KEY": "sk-stub-for-the-guard-only",
     # The generated file legitimately turns the loader on; inside a
     # disk-runtime harness that prints a duplicate-skills warning to
     # stderr, which is correct advice and noise here.
@@ -684,3 +687,57 @@ def test_langchain_template_emits_no_deprecation_warnings(tmp_path):
     assert proc.returncode == 0, (
         f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     )
+
+
+def test_openai_agents_template_survives_an_unknown_tool_call(tmp_path):
+    """The Support pack's starter prompt named `kb_search`; a model that called it
+    raised `ModelBehaviorError: Tool kb_search not found` out of Runner.run_sync and
+    the generated file died with a traceback (fleet scaffold canary, 2026-09-04).
+    run() must answer with a message naming the mismatch, never raise."""
+    if not _have("agents"):
+        pytest.skip("agents not installed")
+    agent_py = tmp_path / "agent.py"
+    agent_py.write_text(render_agent_file(AGENT, "openai-agents", SKILLS))
+    stub = """
+import agents
+from agents.exceptions import ModelBehaviorError
+_stack.enter_context(patch.object(
+    agents.Runner, "run_sync",
+    side_effect=ModelBehaviorError("Tool kb_search not found in agent refund-bot"),
+))
+"""
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER.format(
+        stub=stub, probe="", path=str(agent_py), agent=AGENT, prompt=PROMPT,
+        router=ROUTER_FIXTURE,
+    ))
+    proc = subprocess.run(
+        [sys.executable, str(driver)], capture_output=True, text=True,
+        cwd=tmp_path, timeout=120, env=_ENV,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "does not define" in proc.stdout, proc.stdout
+    assert "kb_search" in proc.stdout, proc.stdout
+    assert "Traceback" not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("framework", sorted(RUNTIMES))
+def test_missing_provider_key_is_a_one_line_refusal(framework, tmp_path):
+    """Without the guard a missing OPENAI_API_KEY is a traceback from inside the
+    provider client — after init(), instrument() and load_agent() have all made
+    their network calls. The file must refuse on line one and point at the
+    `Set:` block `decimalai init` printed."""
+    spec = RUNTIMES[framework]
+    if not _have(spec["requires"]):
+        pytest.skip(f"{spec['requires']} not installed")
+    agent_py = tmp_path / "agent.py"
+    agent_py.write_text(render_agent_file(AGENT, framework, SKILLS))
+    env = {k: v for k, v in _ENV.items() if k != "OPENAI_API_KEY"}
+    proc = subprocess.run(
+        [sys.executable, str(agent_py)], capture_output=True, text=True,
+        cwd=tmp_path, timeout=120, env=env,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "OPENAI_API_KEY is not set" in proc.stderr, proc.stderr
+    assert "Traceback" not in proc.stderr, proc.stderr   # a refusal, not a stack
+    assert "decimalai init" in proc.stderr, proc.stderr

@@ -144,7 +144,7 @@ A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
 loader can use. `enable_skill_loader` exists on exactly four adapters
 (langchain, openai_agents, anthropic, pydantic_ai); the rest — llamaindex,
-claude_agent_sdk, crewai/autogen/otel, adk — trace and version but have no
+claude_agent_sdk, crewai/autogen/otel — trace and version but have no
 loader, and generating a file for them would hand someone a program that looks
 correct and quietly ignores every skill they picked. `--framework` names the
 reason rather than printing a bare "invalid choice".
@@ -157,6 +157,7 @@ template would have to invent, and the body could only arrive by injection.
 
 from __future__ import annotations
 
+import re
 import shlex
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
@@ -177,52 +178,29 @@ DEFAULT_MODEL = "gpt-4o-mini"
 #: invocation of the command.
 _FRAMEWORK_DEFAULT_MODELS: Dict[str, str] = {
     "pydantic-ai": "openai:gpt-4o-mini",
+    # Never an OpenAI name: `decimalai[adk]` installs google-adk only, and ADK
+    # would resolve `gpt-*` to its OpenAI shim and die on the first model call.
+    # `normalize_model` refuses non-Gemini names for adk so this stays true.
+    "adk": "gemini-3.5-flash",
 }
 
 DEFAULT_OUTPUT = "agent.py"
 
 #: Frameworks `init` can scaffold, in the order they are offered.
-SUPPORTED_FRAMEWORKS: tuple = ("langchain", "openai-agents", "pydantic-ai")
+SUPPORTED_FRAMEWORKS: tuple = ("langchain", "openai-agents", "pydantic-ai", "adk")
 
 #: Frameworks whose adapter carries `enable_skill_loader` but which have no
 #: template yet. Named separately from the seamless ones because the answer to
 #: "why not?" is different, and so is what we'd have to do to add them.
 UNSCAFFOLDED_WITH_SEAM: Dict[str, str] = {
     "anthropic": "The Anthropic Messages adapter",
-    # Moved out of NO_PROMPT_SEAM on 2026-09-03. That entry said a generated ADK
-    # file "would trace correctly and deliver none of the agent's skills", and
-    # named two things needed before it could move. The first — that the seam
-    # exists — is now PROVEN rather than argued:
-    #
-    #   * hermetically, by the conformance driver, whose C14 reads "8/8 rail
-    #     run(s) put a skill body in front of the model";
-    #   * end to end, by tests/integration/test_framework_live_adk_skill_delivery.py,
-    #     which mints a token that has never existed, puts it in a skill body,
-    #     and asserts a real Gemini-backed ADK agent QUOTES it back — with a
-    #     no-rail control run first, so a leak from anywhere else fails the test
-    #     instead of passing it. The earlier stub-model run was circular; this
-    #     is not. (Both needed a fix landed the same day: the adapter built
-    #     `rendered_input` from `llm_request.contents` alone and omitted
-    #     `system_instruction`, so the body reached the model and no trace
-    #     recorded it.)
-    #
-    # The second — the template — is deliberately NOT shipped yet, which is what
-    # UNSCAFFOLDED_WITH_SEAM means and why this is the honest destination rather
-    # than SUPPORTED_FRAMEWORKS. A template here becomes a graded J1 journey
-    # cell, and J1 is hermetic: it stands the model up as a local stub speaking
-    # the OpenAI wire protocol. ADK's native provider is Gemini, and the
-    # installed google-genai exposes NO base-url environment override
-    # (`google.adk.models.google_llm.Gemini` takes `base_url=` as a Python
-    # argument only), so an ADK-on-Gemini run cannot be pointed at that stub
-    # without putting test wiring into the file the product writes for users.
-    # Defaulting the template to an OpenAI model would make J1 pass and is
-    # worse: `decimalai[adk]` installs google-adk, not `openai`, so the default
-    # scaffold would fail on import for the people most likely to run it.
-    #
-    # To finish the move: give the journey stub a Gemini `:generateContent`
-    # route, or wait for a google-genai that honours a base-url env var. Then
-    # the template lands and `adk` moves to SUPPORTED_FRAMEWORKS.
-    "adk": "Google ADK",
+    # adk moved here from NO_PROMPT_SEAM on 2026-09-03 (seam proven by C14 and
+    # a live Gemini end-to-end test) and on to SUPPORTED_FRAMEWORKS on
+    # 2026-09-05: the premise that held the template back — "google-genai has no
+    # base-url environment override, so the hermetic J1 stub cannot stand in for
+    # Gemini" — was false. google-genai reads GOOGLE_GEMINI_BASE_URL (present
+    # since v1.72, google-adk 2.0.0's own floor) and the journey stub now speaks
+    # `:generateContent`. Nothing in the generated file knows about the stub.
 }
 
 #: Frameworks deliberately NOT offered: their adapters have no prompt seam, so
@@ -444,6 +422,8 @@ def _render_langchain(
     agent_name: str, model: str, base_url: Optional[str]
 ) -> List[str]:
     return [
+        "import os",
+        "",
         "import decimalai",
         "from decimalai.langchain import instrument",
         "from langchain.agents import create_agent",
@@ -456,6 +436,7 @@ def _render_langchain(
         "#  langchain-google-genai)",
         f"MODEL = {_py(model)}",
         "",
+        *_key_guard_lines("langchain", model),
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         _init_call(base_url),
@@ -518,6 +499,14 @@ def _render_langchain(
         "    # A HumanMessage object, not a (\"human\", \"...\") tuple: the skills rail",
         "    # reads the trailing human turn to route, and a tuple carries no role",
         "    # it can read — with tuples every call falls back to the full menu.",
+        "    # No turn cap here, unlike MAX_TURNS / MAX_REQUESTS on the other templates:",
+        "    # create_agent compiles its graph with recursion_limit=9_999 (langchain/",
+        "    # agents/factory.py) — effectively uncapped, NOT langchain-core's default of",
+        "    # 25. With TOOLS=[] the loop is one step and cannot run away; once you add",
+        "    # a tool, cap it — each turn is two graph steps (model, tools):",
+        "    #   agent.invoke(..., config={\"recursion_limit\": 2 * MAX_TURNS + 1})",
+        "    # and catch langgraph.errors.GraphRecursionError the way the openai-agents",
+        "    # template catches MaxTurnsExceeded.",
         "    state = agent.invoke({\"messages\": [HumanMessage(content=question)]})",
         "    # The LAST message, which after the loop is the model's answer. An",
         "    # intermediate tool-call turn has empty content; this one does not.",
@@ -536,9 +525,11 @@ def _render_openai_agents(
     agent_name: str, model: str, base_url: Optional[str]
 ) -> List[str]:
     return [
+        "import os",
+        "",
         "import decimalai",
         "from agents import Agent, Runner",
-        "from agents.exceptions import MaxTurnsExceeded",
+        "from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError",
         "from decimalai.openai_agents import instrument",
         "",
         "# Change this to any model your OpenAI key can reach.",
@@ -548,6 +539,7 @@ def _render_openai_agents(
         "# exceed. Raise it if your agent has many tools; lower it to fail faster.",
         "MAX_TURNS = 20",
         "",
+        *_key_guard_lines("openai-agents", model),
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         _init_call(base_url),
@@ -602,6 +594,16 @@ def _render_openai_agents(
         "            f\"[{AGENT_NAME}] stopped after {MAX_TURNS} turns without an answer. \"",
         "            \"See the comment in run().\"",
         "        )",
+        "    except ModelBehaviorError as exc:",
+        "        # The model asked for a tool this file does not define (or returned",
+        "        # something the SDK could not parse), and the SDK raises rather than",
+        "        # looping. Same check as above: the Tools line in your system prompt",
+        "        # names a tool this file does not define — compare it against the",
+        "        # tools actually attached to the Agent above.",
+        "        return (",
+        "            f\"[{AGENT_NAME}] the prompt names a tool this file does not define \"",
+        "            f\"({exc}). See the comment in run().\"",
+        "        )",
         "",
         "",
         'if __name__ == "__main__":',
@@ -616,6 +618,8 @@ def _render_pydantic_ai(
     agent_name: str, model: str, base_url: Optional[str]
 ) -> List[str]:
     return [
+        "import os",
+        "",
         "import decimalai",
         "from decimalai.pydantic_ai import instrument",
         "from pydantic_ai import Agent",
@@ -635,6 +639,7 @@ def _render_pydantic_ai(
         "# chains many tool calls.",
         "MAX_REQUESTS = 20",
         "",
+        *_key_guard_lines("pydantic-ai", model),
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         "#",
@@ -729,10 +734,115 @@ def _render_pydantic_ai(
     ]
 
 
+def adk_node_name(agent_name: str) -> str:
+    """ADK agent names must be Python identifiers (``base_agent.validate_name``);
+    a DecimalAI name need not be. Traces still file under the DecimalAI name —
+    ``instrument(agent_name=)`` carries it (decimalai/adk.py resolves the explicit
+    name ahead of the node's)."""
+    node = re.sub(r"\W", "_", str(agent_name))
+    if not node or node[0].isdigit() or node == "user":
+        node = "agent_" + node
+    return node
+
+
+def _render_adk(
+    agent_name: str, model: str, base_url: Optional[str]
+) -> List[str]:
+    return [
+        "import asyncio",
+        "import os",
+        "",
+        "import decimalai",
+        "from decimalai.adk import instrument",
+        "from google.adk.agents import LlmAgent",
+        "from google.adk.runners import InMemoryRunner",
+        "from google.genai import types",
+        "",
+        "# Any Gemini model your key can reach. ADK resolves a bare `gemini-*` name",
+        "# natively; for another provider wrap it: model=LiteLlm(\"openai/gpt-4o-mini\").",
+        f"MODEL = {_py(model)}",
+        f"AGENT_NAME = {_py(agent_name)}",
+        "# ADK node names must be Python identifiers; the DecimalAI name need not be.",
+        "# Traces still file under AGENT_NAME — instrument() below carries it.",
+        f"NODE_NAME = {_py(adk_node_name(agent_name))}",
+        "",
+        "# ADK's Gemini client reads GOOGLE_API_KEY (or GEMINI_API_KEY) at the FIRST",
+        "# model call, deep inside the run loop. Fail here, before anything runs.",
+        "if not (os.environ.get(\"GOOGLE_API_KEY\") or os.environ.get(\"GEMINI_API_KEY\")",
+        "        or os.environ.get(\"GOOGLE_GENAI_USE_VERTEXAI\", \"\").lower() in (\"1\", \"true\")):",
+        "    raise SystemExit(",
+        "        \"GOOGLE_API_KEY is not set. Run: export GOOGLE_API_KEY=...  (a Gemini API key; \"",
+        "        \"or GOOGLE_GENAI_USE_VERTEXAI=1 with Google Cloud credentials). The `Set:` \"",
+        "        \"block `decimalai init` printed lists every variable this file needs.\"",
+        "    )",
+        "",
+        "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
+        "# file you are going to commit.",
+        _init_call(base_url),
+        "",
+        "# enable_skill_loader=True is what actually delivers this agent's skills:",
+        "# every model turn is routed and the routed BODIES are appended to the",
+        "# request's system_instruction from the plugin's before_model hook. ADK",
+        "# registers no load_skill tool, so injection is the only body channel.",
+        "#",
+        "# This call patches Runner.__init__ to attach the DecimalAI plugin, so it",
+        "# must stay ABOVE the InMemoryRunner(...) below. Do not also pass adk=True",
+        "# to init() above — that installs the same plugin a second time.",
+        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "",
+        "# Your agent's system prompt, as it stands in the dashboard right now.",
+        "# Read at run time, so editing it in the dashboard changes the next run.",
+        f"config = decimalai.load_agent({_py(agent_name)})",
+        "",
+        "# Your tools go here. An empty list is a WORKING agent, not a stub.",
+        "TOOLS: list = []",
+        "",
+        "agent = LlmAgent(",
+        "    name=NODE_NAME,",
+        "    model=MODEL,",
+        "    # `or \"\"` because None is a REAL state (no prompt set; a failed read",
+        "    # raises instead) and ADK's instruction field takes a string, never None.",
+        "    instruction=config.system_prompt or \"\",",
+        "    tools=TOOLS,",
+        ")",
+        "",
+        "runner = InMemoryRunner(agent=agent, app_name=NODE_NAME)",
+        "",
+        "",
+        "async def _turn(question: str) -> str:",
+        "    session = await runner.session_service.create_session(",
+        "        app_name=runner.app_name, user_id=\"local\",",
+        "    )",
+        "    answer = \"\"",
+        "    async for event in runner.run_async(",
+        "        user_id=\"local\", session_id=session.id,",
+        "        new_message=types.Content(role=\"user\", parts=[types.Part(text=question)]),",
+        "    ):",
+        "        if event.content and event.content.parts:",
+        "            text = \"\".join(p.text or \"\" for p in event.content.parts)",
+        "            if text:",
+        "                answer = text",
+        "    return answer",
+        "",
+        "",
+        "def run(question: str) -> str:",
+        "    \"\"\"One turn: ADK runs the tool loop until the model answers.\"\"\"",
+        "    return asyncio.run(_turn(question))",
+        "",
+        "",
+        'if __name__ == "__main__":',
+        '    print(run("What can you help me with?"))',
+        "    # Short-lived scripts exit before the background sender drains. init()",
+        "    # registers an atexit flush; this makes it explicit.",
+        "    decimalai.flush()",
+    ]
+
+
 _RENDERERS = {
     "langchain": _render_langchain,
     "openai-agents": _render_openai_agents,
     "pydantic-ai": _render_pydantic_ai,
+    "adk": _render_adk,
 }
 
 #: What the user has to install and export for the generated file to run.
@@ -748,12 +858,16 @@ INSTALL: Dict[str, str] = {
     # the template's tracing needs is already a core dependency of decimalai.
     # A provider outside those three adds a token; see _PYDANTIC_AI_PROVIDERS.
     "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
+    "adk": 'pip install "decimalai[adk]"',
 }
 
 ENV_VARS: Dict[str, tuple] = {
     "langchain": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
     "openai-agents": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
     "pydantic-ai": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
+    # google-genai reads GOOGLE_API_KEY ahead of GEMINI_API_KEY; name the one
+    # that wins so the `Set:` block and the file's own guard agree.
+    "adk": ("DECIMAL_API_KEY", "GOOGLE_API_KEY"),
 }
 
 #: LangChain's `init_chat_model` takes a `provider:model` string. The provider
@@ -846,6 +960,18 @@ def normalize_model(framework: str, model: Optional[str]) -> str:
     machines with the same command.
     """
     model = (model or "").strip() or default_model(framework)
+    if framework == "adk":
+        # Mirrors google_llm.py's native patterns. `decimalai[adk]` installs no
+        # other provider, so a non-Gemini name is a file that dies on its first
+        # model call while `decimalai init` reports success.
+        if re.fullmatch(r"(gemini-.*|gemma-4.*|model-optimizer-.*|projects/.+)", model):
+            return model
+        raise UnusableModel(
+            f"Google ADK resolves Gemini names natively, and {model!r} is not one — "
+            f"`decimalai[adk]` installs no other provider, so the file would die on "
+            f"the first model call.\nTry --model gemini-3.5-flash, or wrap another "
+            f"provider in the file: model=LiteLlm(\"openai/{model}\")."
+        )
     if framework != "pydantic-ai" or model == "test" or ":" in model:
         return model
     raise UnusableModel(
@@ -905,6 +1031,55 @@ def env_vars(framework: str, model: Optional[str] = None) -> tuple:
         return ENV_VARS[framework]
     _, key = table.get(model_provider(model), table["openai"])
     return ("DECIMAL_API_KEY", key) if key else ("DECIMAL_API_KEY",)
+
+
+def provider_key(framework: str, model: Optional[str] = None) -> Optional[str]:
+    """The ONE provider variable the generated file refuses to run without, or None.
+
+    None where there is nothing safe to insist on: a local provider (ollama),
+    Pydantic AI's built-in ``"test"`` model, and any provider prefix the tables
+    do not know (azure_openai:, bedrock:, xai:, …). ``env_vars()`` falls back to
+    OPENAI_API_KEY for those as ADVICE in the ``Set:`` block; advice that is
+    sometimes wrong is fine printed, not as a SystemExit — a guard that refuses
+    an Azure user whose key IS set is the "stricter broke a working path" class.
+    """
+    model = model or default_model(framework)
+    table = {
+        "langchain": _PROVIDER_REQUIREMENTS,
+        "pydantic-ai": _PYDANTIC_AI_PROVIDERS,
+    }.get(framework)
+    if table is None:  # openai-agents: the default OpenAIProvider; adk: its own guard
+        vars_ = ENV_VARS[framework]
+        return vars_[1] if len(vars_) > 1 else None
+    if framework == "pydantic-ai" and model == "test":
+        return None
+    entry = table.get(model_provider(model))
+    return entry[1] if entry and entry[1] else None
+
+
+def _key_guard_lines(framework: str, model: str) -> List[str]:
+    """The two-line refusal at the top of a template, or nothing (see provider_key).
+
+    Without it a missing provider key is a traceback from inside the provider
+    client — after init(), instrument() and load_agent() have all made their
+    network calls (openai-agents: only on the first Runner.run_sync).
+    """
+    key = provider_key(framework, model)
+    if not key:
+        return []
+    return [
+        "# The key MODEL's provider reads, checked before anything talks to DecimalAI.",
+        "# Without this it is a traceback from inside the provider client after init(),",
+        "# instrument() and load_agent() have all run. Change this name if you change",
+        "# MODEL to another provider.",
+        f"PROVIDER_KEY = {_py(key)}",
+        "if not os.environ.get(PROVIDER_KEY):",
+        "    raise SystemExit(",
+        "        f\"{PROVIDER_KEY} is not set. Run: export {PROVIDER_KEY}=...  \"",
+        "        \"(the `Set:` block `decimalai init` printed lists every variable this file needs).\"",
+        "    )",
+        "",
+    ]
 
 
 def render_agent_file(

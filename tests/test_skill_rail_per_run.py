@@ -578,6 +578,12 @@ class TestAnthropicClaimsOnlyWhatItInjected:
         (trace,) = pipe.traces(_sdk_enabled)
         assert trace.routing_id == "rt_live"
         assert trace.skills_offered_in_prompt == ["alpha", "beta"]
+        # Injected is NOT an activation. The Anthropic adapter has no tool loop,
+        # so a body it injects is exactly what is most likely to be promoted to a
+        # fabricated activation; nothing may land in active_skills /
+        # skills_loaded_by_agent here (refused 2026-09-05, pinned).
+        assert trace.skills_loaded_by_agent == []
+        assert (getattr(trace, "active_skills", None) or []) == []
 
     def test_without_agent_run_the_skills_still_reach_the_model(self, _sdk_enabled):
         """A raw-SDK user who skips ``agent_run()`` still gets skills injected —

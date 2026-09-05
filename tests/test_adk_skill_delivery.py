@@ -341,6 +341,14 @@ class TestSeamWithoutAdk:
         assert trace.routing_id == ROUTING_ID
         assert trace.skills_offered_in_prompt == ["refund-policy", "returns-window"]
         assert trace.skills_delivered == ["refund-policy"]
+        # Delivered is NOT an activation. ADK has no load_skill tool, so nothing
+        # here can be a model-initiated pull; stamping the delivered body (or its
+        # hash) onto active_skills would fabricate an activation — the platform
+        # turns every active_skills entry into a TraceSkillActivation row, and
+        # conformance C13 fails that payload. Proposed on 2026-09-04 as "stamp
+        # drained hashes onto active_skills"; refused, and pinned here.
+        assert trace.active_skills == []
+        assert trace.skills_loaded_by_agent == []
 
     def test_the_router_is_scoped_to_this_run_and_named_for_this_agent(self, use_router):
         """Two concurrent runs sharing the singleton must not share a routing

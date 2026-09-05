@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,6 +110,60 @@ JOURNEY_SYSTEM_PROMPT = (
     f"{JOURNEY_PROMPT_SENTINEL}\n"
     "Answer from your skills."
 )
+
+#: A tool the generated file does NOT define, which the hostile second run of
+#: the journey has the model call. The fleet's scaffold canary went red on
+#: 2026-09-04T04:02Z with exactly this: the Support pack's prompt named
+#: `kb_search`, the model called it, and the openai-agents file died with
+#: `agents.exceptions.ModelBehaviorError: Tool kb_search not found`. run() must
+#: answer with a message, never raise — the hostile run grades that.
+JOURNEY_UNKNOWN_TOOL = "kb_search"
+
+
+def _gemini_turns_taken(body: Dict[str, Any]) -> int:
+    """Gemini's turn counter: one ``functionResponse`` part per completed tool turn."""
+    n = 0
+    for content in body.get("contents") or []:
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and "functionResponse" in part:
+                n += 1
+    return n
+
+
+def _gemini_offered_tools(body: Dict[str, Any]) -> Set[str]:
+    out: Set[str] = set()
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        for decl in tool.get("functionDeclarations") or []:
+            if isinstance(decl, dict) and isinstance(decl.get("name"), str):
+                out.add(decl["name"])
+    return out
+
+
+def _gemini_payload(model: str, turn: StubTurn) -> Dict[str, Any]:
+    """One ``GenerateContentResponse`` — what ADK's Gemini model reads."""
+    if turn.tool_call:
+        name, args = turn.tool_call
+        parts: List[Dict[str, Any]] = [{"functionCall": {"name": name, "args": args}}]
+    else:
+        parts = [{"text": turn.content}]
+    return {
+        "candidates": [{
+            "content": {"role": "model", "parts": parts},
+            "finishReason": "STOP",
+            "index": 0,
+        }],
+        "usageMetadata": {
+            "promptTokenCount": turn.input_tokens,
+            "candidatesTokenCount": turn.output_tokens,
+            "totalTokenCount": turn.input_tokens + turn.output_tokens,
+        },
+        "modelVersion": model,
+        "responseId": "resp-" + uuid.uuid4().hex[:12],
+    }
 
 #: What the stub model replies. The generated file prints ``run(...)``'s return
 #: value, so finding this on stdout is how the tier knows the file did not merely
@@ -215,10 +270,19 @@ def journey_requirements(framework: str) -> Tuple[str, ...]:
     )
     modules: Set[str] = set()
     for node in ast.parse(source).body:
+        # Google's namespace package: keep the dotted name, so a machine with
+        # google-genai but no google-adk SKIPS the cell instead of failing it
+        # (`_importable` accepts dotted names).
         if isinstance(node, ast.Import):
-            modules.update(a.name.split(".")[0] for a in node.names)
+            modules.update(
+                a.name if a.name.startswith("google.") else a.name.split(".")[0]
+                for a in node.names
+            )
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            modules.add(node.module.split(".")[0])
+            modules.add(
+                node.module if node.module.startswith("google.")
+                else node.module.split(".")[0]
+            )
     for token in scaffold.install_command(framework).split():
         token = token.strip('"').strip("'")
         if token in ("pip", "install") or "[" in token:
@@ -240,7 +304,8 @@ def missing_requirements(framework: str) -> List[str]:
 
 
 class JourneyModel:
-    """A real HTTP server speaking the OpenAI wire format — and the witness.
+    """A real HTTP server speaking the OpenAI wire format — and Gemini's
+    ``:generateContent`` — and the witness.
 
     Two differences from ``drivers/_openai_wire.py``, both forced by what the
     journey is:
@@ -261,8 +326,13 @@ class JourneyModel:
     graded on: what the model was actually handed.
     """
 
-    def __init__(self, skill_name: str) -> None:
+    def __init__(self, skill_name: str, unknown_tool: Optional[str] = None) -> None:
         self.skill_name = skill_name
+        #: When set, the model calls this tool ONCE, on the first turn after any
+        #: skill load, and only if the request offered at least one tool — a
+        #: model cannot call a tool with none bound, so a zero-tool framework
+        #: reduces to the happy path instead of failing on an unreachable class.
+        self.unknown_tool = unknown_tool
         self.requests: List[Dict[str, Any]] = []
         self._lock = threading.RLock()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -312,6 +382,11 @@ class JourneyModel:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/v1"
 
+    @property
+    def root_url(self) -> str:
+        """Host root, no ``/v1``: google-genai appends ``/v1beta/models/...`` itself."""
+        return self.base_url[: -len("/v1")]
+
     # ── answering ────────────────────────────────────────────
 
     @staticmethod
@@ -348,12 +423,25 @@ class JourneyModel:
         with self._lock:
             self.requests.append({"path": path, "body": body})
 
-        if "load_skill" in self._offered_tools(body) and _turns_taken(body) == 0:
+        offered = self._offered_tools(body) | _gemini_offered_tools(body)
+        taken = _turns_taken(body) + _gemini_turns_taken(body)
+        if "load_skill" in offered and taken == 0:
             turn = StubTurn(("load_skill", {"name": self.skill_name}), "", 17, 5)
+        elif (
+            self.unknown_tool
+            and offered
+            and taken == (1 if "load_skill" in offered else 0)
+        ):
+            # Once, and only on a framework that OFFERED tools.
+            turn = StubTurn((self.unknown_tool, {"query": "labels"}), "", 11, 3)
         else:
             turn = StubTurn(None, JOURNEY_ANSWER_SENTINEL, 23, 7)
 
         model_name = body.get("model") or "conformance-journey-stub"
+        if path.endswith(":generateContent"):
+            # /v1beta/models/{model}:generateContent — the model is in the PATH.
+            model_name = path.rsplit("/models/", 1)[-1].split(":", 1)[0]
+            return 200, _gemini_payload(model_name, turn)
         if path.endswith("/responses"):
             return 200, _responses_payload(model_name, turn, body)
         if path.endswith("/chat/completions"):
@@ -426,6 +514,14 @@ class JourneyCapture:
     model_requests: int = 0
     model_context: str = ""
 
+    #: The hostile second run: same file, a stub that calls a tool the file does
+    #: not define. Graded on exit code and stderr, not on the answer.
+    unknown_tool: str = ""
+    unknown_returncode: Optional[int] = None
+    unknown_stdout: str = ""
+    unknown_stderr: str = ""
+    unknown_model_requests: int = 0
+
 
 # ── running one journey ──────────────────────────────────────────────────────
 
@@ -472,6 +568,14 @@ def _base_env(probe: Probe) -> Dict[str, str]:
         "DECIMALAI_BASE_URL",
         "DECIMALAI_INJECT_SKILL_BODY",
         "DECIMALAI_LOAD_SKILL_TOOL",
+        # An inherited Vertex switch redirects google-genai to aiplatform and a
+        # different base-url variable; GEMINI_API_KEY is popped so the stub key
+        # set as GOOGLE_API_KEY is the only one the client can find.
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GEMINI_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
     ):
         env.pop(key, None)
     # Off, explicitly. Both default off, but an inherited `true` would ship every
@@ -554,6 +658,10 @@ def run_journey(driver_name: str, framework: str) -> JourneyCapture:
         # run to api.openai.com with a stub key.
         run_env["OPENAI_BASE_URL"] = model.base_url
         run_env["OPENAI_API_BASE"] = model.base_url
+        # google-genai (>=1.72, verified at google-adk 2.0.0's own floor) reads
+        # this for the Gemini API and appends /v1beta/models/... itself — host
+        # root only, no /v1.
+        run_env["GOOGLE_GEMINI_BASE_URL"] = model.root_url
         capture.run_command = [sys.executable, str(_RUNNER), str(out_path)]
         run = _run(capture.run_command, workdir, run_env)
         capture.run_returncode = run.returncode
@@ -563,6 +671,27 @@ def run_journey(driver_name: str, framework: str) -> JourneyCapture:
 
         capture.model_requests = len(model.requests)
         capture.model_context = model.shown_to_the_model()
+
+        # ── 3. run it again against a model that misbehaves ─────────
+        # Same file, a stub that calls a tool the file does not define. The
+        # template's contract is "run() returns a string; a misbehaving model is
+        # a MESSAGE, not a crash" — that is what its MaxTurnsExceeded branch
+        # already promises, and __main__ prints run(). Graded in the contract
+        # on exit code + stderr, never on the answer sentinel.
+        hostile = JourneyModel(skills[0]["name"], unknown_tool=JOURNEY_UNKNOWN_TOOL).start()
+        try:
+            hostile_env = dict(run_env)
+            hostile_env["OPENAI_BASE_URL"] = hostile.base_url
+            hostile_env["OPENAI_API_BASE"] = hostile.base_url
+            hostile_env["GOOGLE_GEMINI_BASE_URL"] = hostile.root_url
+            hostile_run = _run(capture.run_command, workdir, hostile_env)
+            capture.unknown_tool = JOURNEY_UNKNOWN_TOOL
+            capture.unknown_returncode = hostile_run.returncode
+            capture.unknown_stdout = _tail(hostile_run.stdout)
+            capture.unknown_stderr = _tail(hostile_run.stderr)
+            capture.unknown_model_requests = len(hostile.requests)
+        finally:
+            hostile.stop()
         return capture
     finally:
         model.stop()
@@ -572,7 +701,11 @@ def run_journey(driver_name: str, framework: str) -> JourneyCapture:
         # generated file is the whole artefact of a failed cell, and the failure
         # message names its path; deleting it would send the reader to a path
         # that no longer exists.
-        if capture.file_written and capture.run_returncode == 0:
+        if (
+            capture.file_written
+            and capture.run_returncode == 0
+            and capture.unknown_returncode == 0
+        ):
             shutil.rmtree(workdir, ignore_errors=True)
 
 

@@ -28,6 +28,7 @@ change cannot silently make this probe more permissive than production.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -531,7 +532,17 @@ class Probe:
             skill = self._skill(m.group(1))
             if skill is None:
                 return 404, {"detail": "skill not found"}, []
-            return 200, {"body": skill.get("body", "")}, []
+            # The platform serves the body with its version and content hash
+            # (`sha256:` + hex, the spelling the router records and C13b/C13's
+            # fidelity clause compare). Without it no conformance run ever
+            # carried a skill_hash, and the hash clauses were vacuous.
+            body_text = skill.get("body", "")
+            return 200, {
+                "body": body_text,
+                "version": 1,
+                "content_hash": "sha256:"
+                + hashlib.sha256(body_text.encode("utf-8")).hexdigest(),
+            }, []
 
         # The disk-sync surface. Modelled because an adapter that mirrors
         # platform skills to disk reaches these, and what it writes is exactly
