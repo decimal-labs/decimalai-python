@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-09-05
+
 ### Added
 - `smart_route()` now names WHY it returned an empty menu: `degraded_reason` is `http_<status>` / `timeout` / `circuit_open` / `transport`, so a caller can tell a Cloud Run edge abort (a 0 s 429) from a slow read or an open breaker instead of filing every empty menu as "no skill offered".
 
