@@ -220,8 +220,16 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     # drivers by never seeing a candidate: its own message said "recorded no
     # activation" every time. Measured that day by folding delivered names into
     # `skills_loaded_by_agent` inside the adapter — the exact fabrication C13 forbids —
-    # and watching the whole matrix stay green, 155 passed. With the registry seeded,
-    # that mutation is graded.
+    # and watching the whole matrix stay green, 155 passed.
+    #
+    # ⚠ SEEDING IS NECESSARY AND NOT SUFFICIENT, and an audit on the same day caught this
+    # comment claiming otherwise. With the registry seeded the path RUNS — 24 times in a
+    # full matrix — but it returns `offered=[] delivered=[]` every time, because
+    # `infer_prompt_rungs` suppresses names the router already accounted for and every rail
+    # here has the router reporting. So the matrix still does not grade that fabrication.
+    # What grades it is `tests/test_inference_never_writes_the_activation_rung.py`, which
+    # makes the router silent; two of its cases go red under the fold. Seeding is worth
+    # keeping because an unreachable line is a worse kind of green than an unexercised one.
     instrument(
         agent_name=ctxs[0].agent_name,
         exclusive=True,

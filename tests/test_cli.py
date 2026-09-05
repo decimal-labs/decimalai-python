@@ -331,3 +331,95 @@ class TestSkillsPullCli:
         assert result.exit_code == 0, result.output
         # No "API key" error in the output
         assert "api key" not in result.output.lower()
+
+
+class TestTracesImportWireFormat:
+    """`decimalai traces import` — the migration journey's documented trigger.
+
+    THE REGRESSION THIS EXISTS TO CATCH (2026-09-05). The JSONL branch posted the
+    file's bytes as a raw body with `Content-Type: application/x-ndjson`, while
+    the endpoint is declared `file: UploadFile = File(...)`,
+    `agent_name: … = Form(…)` — multipart only. Every invocation answered 422 and
+    died in `raise_for_status()`, including the exact command the endpoint's own
+    OpenAPI sample prints and the public LangSmith/Braintrust migration guide
+    gives.
+
+    The second half is subtler and is why "just send files=" was not enough:
+    `sdk_headers` pins `Content-Type: application/json` on the shared client, and
+    httpx only `setdefault`s the multipart content-type it computes — so the
+    pinned JSON type wins, the boundary never ships, and the server sees no form
+    fields. These assert the WIRE FORMAT (multipart, with a boundary, carrying
+    the file and the agent_name part), because a response-shape assertion passes
+    against either encoding as soon as a mock is involved.
+    """
+
+    def _run(self, args, captured):
+        from unittest.mock import MagicMock, patch
+        from click.testing import CliRunner
+
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"imported_count": 2, "error_count": 0}
+
+        real_client = __import__("httpx").Client
+
+        class RecordingClient(real_client):
+            def post(self, url, **kwargs):
+                captured.append({"url": url, **kwargs, "headers": dict(self.headers)})
+                return resp
+
+        with patch("httpx.Client", RecordingClient):
+            return CliRunner().invoke(cli, args)
+
+    def test_jsonl_is_sent_as_multipart_not_a_raw_body(self, tmp_path):
+        f = tmp_path / "legacy.jsonl"
+        f.write_text('{"input": "a", "output": "b"}\n')
+        captured: list = []
+        result = self._run(
+            ["traces", "import", str(f), "--agent-name", "acme-bot",
+             "--api-key", "dai_sk_x", "--base-url", "http://localhost:8000"],
+            captured,
+        )
+        assert result.exit_code == 0, result.output
+        upload = [c for c in captured if "files" in c]
+        assert upload, f"JSONL import sent no multipart request; calls were {captured}"
+        call = upload[-1]
+        assert call["url"] == "/api/v1/traces/import"
+        assert "file" in call["files"]
+        # The agent_name must ride as a FORM field — the server rejects the
+        # upload without it unless every row carries its own.
+        assert call["data"]["agent_name"] == "acme-bot"
+        # And the client must NOT be pinning a JSON content-type, or httpx's
+        # multipart boundary never reaches the server.
+        assert not any(k.lower() == "content-type" for k in call["headers"]), (
+            "the upload client still pins a Content-Type; httpx setdefault()s the "
+            f"multipart one, so the boundary is dropped: {call['headers']}"
+        )
+        assert "content" not in call, "the file must not be sent as a raw body"
+
+    def test_a_server_error_prints_what_the_server_said(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from click.testing import CliRunner
+        import httpx
+
+        f = tmp_path / "legacy.jsonl"
+        f.write_text('{"input": "a", "output": "b"}\n')
+        resp = MagicMock(status_code=400)
+        resp.json.return_value = {"detail": "No agent_name provided."}
+        resp.text = '{"detail": "No agent_name provided."}'
+
+        real_client = httpx.Client
+
+        class ErrClient(real_client):
+            def post(self, url, **kwargs):
+                return resp
+
+        with patch("httpx.Client", ErrClient):
+            result = CliRunner().invoke(
+                cli,
+                ["traces", "import", str(f),
+                 "--api-key", "dai_sk_x", "--base-url", "http://localhost:8000"],
+            )
+        # A user error must read as a sentence, not an httpx traceback.
+        assert result.exit_code != 0
+        assert "No agent_name provided." in result.output
+        assert "Traceback" not in result.output

@@ -1,6 +1,7 @@
 """DecimalAI CLI — command-line interface."""
 
 import logging
+import os
 import urllib.parse
 
 import click
@@ -652,10 +653,20 @@ def traces_stats(agent_name, api_key, base_url, project):
 @traces.command("import")
 @click.argument("file_path", type=click.Path(exists=True))
 @click.option("--format", "fmt", default="auto", help="Import format: auto, json, jsonl")
+@click.option(
+    "--agent-name",
+    default=None,
+    help=(
+        "Agent these traces belong to. Required for JSONL unless every row "
+        "carries its own `agent_name`."
+    ),
+)
 @common_options
-def traces_import(file_path, fmt, api_key, base_url, project):
+def traces_import(file_path, fmt, agent_name, api_key, base_url, project):
     """Import traces from a JSON or JSONL file."""
     import json as json_mod
+
+    import httpx
     client = _make_client(api_key, base_url, project)
 
     # Auto-detect format
@@ -665,16 +676,67 @@ def traces_import(file_path, fmt, api_key, base_url, project):
     try:
         with open(file_path) as f:
             if fmt == "jsonl":
-                resp = client._http.post(
-                    "/api/v1/import/jsonl",
-                    content=f.read(),
-                    headers={"Content-Type": "application/x-ndjson"},
-                )
+                # MULTIPART, not a raw body. `POST /api/v1/traces/import` is
+                # declared `file: UploadFile = File(...)`, `agent_name: … = Form(…)`
+                # — form-data is the only body it accepts, which /openapi.json
+                # confirms. Posting the file's bytes with an
+                # `application/x-ndjson` content-type answered 422 on every call,
+                # so `decimalai traces import <file>.jsonl` — the command the
+                # endpoint's own docs sample prints, and the one the public
+                # LangSmith/Braintrust migration guide gives — ended in a
+                # `raise_for_status()` traceback for every user who ran it
+                # (2026-09-05).
+                #
+                # The canonical path is `/api/v1/traces/import`; `/api/v1/import/jsonl`
+                # is the deprecated alias for the same handler.
+                #
+                # A SEPARATE CLIENT, and that is the second half of the fix.
+                # `sdk_headers` pins `Content-Type: application/json` on the
+                # shared client because every other endpoint takes JSON. httpx
+                # builds the multipart body and then `setdefault`s its own
+                # `multipart/form-data; boundary=…` header — so the pinned JSON
+                # type WINS, the boundary never reaches the server, and FastAPI
+                # answers 422 having seen no form fields at all. Reusing the
+                # client's auth and User-Agent while dropping just the
+                # content-type lets httpx set the boundary it computed.
+                upload_headers = {
+                    k: v
+                    for k, v in client._http.headers.items()
+                    if k.lower() != "content-type"
+                }
+                data = {"agent_name": agent_name} if agent_name else {}
+                with httpx.Client(
+                    base_url=str(client._http.base_url),
+                    headers=upload_headers,
+                    timeout=client._http.timeout,
+                ) as upload:
+                    resp = upload.post(
+                        "/api/v1/traces/import",
+                        files={
+                            "file": (
+                                os.path.basename(file_path),
+                                f.read(),
+                                "application/x-ndjson",
+                            ),
+                        },
+                        data=data,
+                    )
             else:
                 data = json_mod.load(f)
                 traces_data = data if isinstance(data, list) else data.get("traces", [data])
-                resp = client._http.post("/api/v1/import/traces", json={"traces": traces_data})
-            resp.raise_for_status()
+                # Canonical path; `/api/v1/import/traces` is the deprecated alias.
+                resp = client._http.post("/api/v1/traces/import-bulk", json={"traces": traces_data})
+            # The server explains user errors well ("No agent_name provided.
+            # Pass an `agent_name` form field, or include `agent_name` in each
+            # JSONL row."); `raise_for_status()` alone threw that away and
+            # printed an httpx traceback instead, which tells the user only a
+            # status code. Show what the server said, and exit non-zero.
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json().get("detail") or resp.text
+                except Exception:
+                    detail = resp.text
+                raise click.ClickException(f"Import failed (HTTP {resp.status_code}): {detail}")
             result = resp.json()
             click.echo(f"Imported {result.get('imported_count', 0)} traces ({result.get('error_count', 0)} failed)")
     finally:

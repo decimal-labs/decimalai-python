@@ -29,19 +29,32 @@ def test_the_installer_exists_and_writes_the_chained_hook():
     assert "ruff" in src
 
 
-def test_the_hook_reads_its_arguments_from_ci_rather_than_copying_them():
+def test_the_hook_lints_only_what_is_being_committed():
+    """Staged content, never the tree.
+
+    The first version checked all of `decimalai/`, and within hours it blocked one
+    session's commit over ANOTHER session's half-finished edit in a file the committer
+    had never opened — this worktree is shared by several sessions at once. A pre-commit
+    hook that fails on work outside the commit is a hook people learn to bypass.
+    """
     src = INSTALLER.read_text(encoding="utf-8")
-    assert "ci.yml" in src and "ruff check" in src, (
-        "the hook no longer derives its arguments from ci.yml, so local and CI lint "
-        "can drift — which is how a green local commit fails Lint on main"
+    assert "git diff --cached --name-only" in src, (
+        "the hook no longer selects staged files, so it lints other sessions' work"
     )
+    assert "$STAGED" in src, "the staged file list is computed and then not used"
 
 
-def test_the_fallback_arguments_match_what_ci_runs_today():
-    """The hook falls back to a literal list if ci.yml cannot be parsed. That literal
-    is the thing most likely to go stale, so pin it to the real command."""
+def test_the_hooks_flags_still_match_what_ci_runs():
+    """The flags are literal in the hook — deriving them from the YAML at run time split
+    `--select` from its value the first time it ran. Literal plus this test is the honest
+    trade: drift fails here rather than silently in CI."""
     ci_cmd = re.search(r"run:\s*ruff check ([^\n]+)", CI.read_text(encoding="utf-8"))
     assert ci_cmd, "ci.yml no longer runs `ruff check` — update the hook and this test"
-    fallback = re.search(r'args="(decimalai/[^"]+)"', INSTALLER.read_text(encoding="utf-8"))
-    assert fallback, "the hook has no literal fallback argument list"
-    assert fallback.group(1).split() == ci_cmd.group(1).strip().split()
+    ci_flags = [t for t in ci_cmd.group(1).split() if not t.startswith("decimalai")]
+
+    hook_cmd = re.search(r'"\$RUFF" check ([^\n]*?) \$STAGED',
+                         INSTALLER.read_text(encoding="utf-8"))
+    assert hook_cmd, "the hook no longer invokes ruff with a literal flag list"
+    assert hook_cmd.group(1).split() == ci_flags, (
+        f"hook flags {hook_cmd.group(1).split()} != ci.yml flags {ci_flags}"
+    )

@@ -20,14 +20,21 @@ cat > .git/hooks/pre-commit.pre-guard <<'HOOK'
 # Lint gate for decimalai-python, chained beneath commit-guard.sh.
 #
 # WHY: `Lint` failed on `main` twice on 2026-09-03 for import-order and unused-import
-# findings that take a second to catch locally. This repo's local hooks ran only the
-# secret gate, so ruff's verdict arrived from hosted CI minutes later, on a commit that
-# was already pushed.
+# findings ruff catches in under a second. The only local hook was the secret gate, so
+# ruff's verdict arrived from hosted CI minutes later, on a commit already pushed.
 #
-# It runs the EXACT arguments ci.yml's Lint job uses, read out of that file rather than
-# copied, so the two cannot drift: change the CI command and this gate changes with it in
-# the same commit. Bypass this hook alone with `git commit --no-verify` (the secret gate
-# above has its own explicit, visible escape hatch).
+# IT LINTS WHAT IS BEING COMMITTED, NOT THE TREE. This worktree is shared by several
+# sessions at once. The first version checked all of `decimalai/` and within hours blocked
+# one session's commit over ANOTHER session's half-finished edit, in a file the committer
+# had never opened. A pre-commit hook that fails on work outside the commit is a hook
+# people learn to bypass. Staged content only.
+#
+# The flags are literal, and `tests/test_local_lint_hook.py` asserts they still equal the
+# ones ci.yml's Lint job passes — parsing them out of the YAML at run time looked tidier
+# and split `--select` from its value the first time it ran.
+#
+# Bypass this hook alone with `git commit --no-verify` (the secret gate above has its own
+# explicit, visible escape hatch).
 set -uo pipefail
 root="$(git rev-parse --show-toplevel)"
 cd "$root" || exit 0
@@ -41,24 +48,19 @@ if [ -z "$RUFF" ]; then
   exit 0
 fi
 
-args="$(python3 - <<'PY'
-import re, sys
-try:
-    body = open(".github/workflows/ci.yml").read()
-except OSError:
-    sys.exit(0)
-m = re.search(r"run:\s*(ruff check [^\n]+)", body)
-print(m.group(1)[len("ruff check "):].strip() if m else "")
-PY
-)"
-[ -z "$args" ] && args="decimalai/ --select I,E,W,F --ignore E501,E402,F821,F841"
+# Staged, still-present .py files under the package ci.yml lints.
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^decimalai/.*\.py$' || true)
+if [ -z "$STAGED" ]; then
+  echo "[lint] no staged files under decimalai/ - nothing for ruff to check."
+  exit 0
+fi
 
 # shellcheck disable=SC2086
-if ! "$RUFF" check $args; then
-  echo "[lint] ruff failed - the same check ci.yml's Lint job runs." >&2
+if ! "$RUFF" check --select I,E,W,F --ignore E501,E402,F821,F841 $STAGED; then
+  echo "[lint] ruff failed on the files you are committing - the same checks ci.yml runs." >&2
   exit 1
 fi
-echo "[lint] ruff clean ($args)"
+echo "[lint] ruff clean ($(printf '%s\n' "$STAGED" | wc -l | tr -d ' ') staged file(s))"
 HOOK
 chmod +x .git/hooks/pre-commit.pre-guard
 
