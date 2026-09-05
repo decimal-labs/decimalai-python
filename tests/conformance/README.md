@@ -385,8 +385,9 @@ loop; neither is scripted for by name. A per-framework script would be a driver
 artifact in the one cell that exists to be channel-agnostic.
 
 **Which frameworks get a cell** is read off `decimalai/cli/scaffold.py`
-directly — `SUPPORTED_FRAMEWORKS` today is langchain and openai-agents. The other
-seven drivers are a declared N/A whose reason is the SDK's own
+directly — `SUPPORTED_FRAMEWORKS` today is langchain, openai-agents, pydantic-ai and
+adk (it was two until 2026-09-03; a doc test keeps this sentence honest). The other
+five drivers are a declared N/A whose reason is the SDK's own
 `UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM` classification, recomputed and
 compared by `test_coverage.test_every_journey_na_is_declared_and_counted`. Write
 a template and the exemption fails until the ledger line is deleted; the cell
@@ -595,7 +596,7 @@ Stated so nobody mistakes a green cell for a guarantee.
   differently for having it. That question needs a real model and belongs to
   the live end-to-end tier that runs against a real backend and a real model.
 - **The journey on a framework with no scaffold.** J1 only exists where
-  `decimalai init` writes a file — two frameworks today. The other seven are a
+  `decimalai init` writes a file — four frameworks today. The other five are a
   declared N/A, and the exemption is only as good as the day somebody writes
   their template.
 - **The journey's own install set.** J1's langchain cell needs `langchain` and

@@ -552,6 +552,25 @@ the first release of this package to carry a PyPI attestation.
 
 ## 0.10.1 — 2026-08-13
 
+### Removed
+
+Recorded retroactively on 2026-09-05. These three `skills` subcommands were dropped in
+`57d64a6` and shipped gone in this release with no entry, so a reader upgrading from
+0.10.0 found them missing and nothing said why:
+
+- `decimalai skills verify` — pushed a local benchmark bundle for the platform to
+  re-judge. It moved server-side: a fleet-attested or replayed run now carries its own
+  verification method, and a client-supplied bundle was a trust boundary in the wrong
+  place.
+- `decimalai skills attest` (hidden) — the fleet's own attestation path, never a
+  customer-facing command.
+- `decimalai skills spotcheck` — sampled a published run for re-grading; the same
+  server-side move covers it.
+
+Nothing replaced them in the CLI on purpose. Verification is a property of how a run
+was produced, not something a caller can assert about a run afterwards.
+
+
 ### Fixed
 
 - **`init(enabled=False)` is now a real kill switch.** The framework flags
