@@ -138,7 +138,7 @@ python app.py
 - **Agent versioning** — Auto-detects tool schemas, prompts, models, and graph topology
 - **Change detection** — Detects when your agent configuration drifts
 - **Inline evals** — Run eval functions on every trace with `@decimalai.evals.eval`
-- **Built-in deterministic scores** — `completion`, `has_output`, `tool_compliance`, `latency`, `token_efficiency` attached to every trace by the SDK (disable with `install(..., builtin_evals=False)`). These run **in your process**, not server-side — bare HTTP `POST /traces` does not auto-score.
+- **Built-in deterministic scores** — `completion`, `has_output`, `tool_compliance`, `latency`, `token_efficiency`, attached by the **LangChain adapter only**: `decimalai.langchain.instrument(...)`, disabled with `instrument(..., builtin_evals=False)`. No other adapter attaches them today. These run **in your process**, not server-side — bare HTTP `POST /traces` does not auto-score.
 - **Batch evals** — Run evals offline across historical traces
 - **Dataset pull** — One-liner to download versioned training data: `decimalai.pull_dataset("ds_abc", "./data.jsonl")`
 - **HuggingFace Hub** — Push datasets to HF Hub for instant Axolotl/Unsloth/TRL compatibility
@@ -243,7 +243,7 @@ instrument(enable_skill_loader=True)
 
 With the loader on, the router adds a ranked **menu** of relevant skills to the prompt (one short row per skill: name + when to use it). A menu row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
 
-- **Body injection** (opt-in) — `decimalai.init(inject_skill_body=True)` (or `DECIMALAI_INJECT_SKILL_BODY=1`) injects the top-routed skill's full body into the prompt, trimmed to a token budget. Works on adapters that route on the user query (`openai_agents`, `langchain`, `anthropic`); Pydantic AI builds its prompt in full-menu mode (no query available), so bodies arrive via `load_skill` there instead.
+- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt, trimmed to a token budget. The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins. Pydantic AI also builds its prompt in full-menu mode (no query available), so bodies arrive via `load_skill` there.
 - **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch any offered skill's body mid-turn. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
 - **Export to disk** — for runtimes that natively load skills from files (Claude Code, Cursor, ...), write them out with `router.export(...)` or `decimalai skills export` and let the runtime deliver them. Export takes no copy and needs no fork; you can export a skill you only linked.
 
@@ -254,6 +254,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | `decimalai.openai_agents` | ✅ | ✅ | tool auto-registers with the loader |
 | `decimalai.pydantic_ai` | ✅ menu / ❌ body injection | ✅ | full-menu mode (no query at prompt-build time) — bodies arrive via `load_skill` |
 | `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns) |
+| `decimalai.adk` | ✅ | ❌ injection-only | bodies appended to `system_instruction`; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ❌ injection-only | patches a single `messages.create()` — no loop to route a tool result back |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself from `.claude/skills/` |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; use disk install |
@@ -335,6 +336,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | OpenAI Agents SDK | ✅ | `init(openai_agents=True)` |
 | Google ADK | ✅ (native) | `init(adk=True)` |
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
+| Pydantic AI | ✅ | `from decimalai.pydantic_ai import instrument` (no `init()` flag) |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |

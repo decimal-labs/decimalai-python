@@ -32,8 +32,8 @@ flip cleared it without any billing change — the same reason the OIDC path alr
 first.
 
 So the precondition is met, and the OIDC path is available. **Corrected 2026-09-05: it has been
-used.** Seven GitHub Releases have been cut from this repository — v0.10.3 (2026-08-17) through
-v0.13.1 (2026-09-03) — and `publish.yml` uploads by Trusted Publishing on `release: published`.
+used.** Eight GitHub Releases have been cut from this repository — v0.10.3 (2026-08-17) through
+v0.13.2 (2026-09-05) — and `publish.yml` uploads by Trusted Publishing on `release: published`.
 PyPI's integrity endpoint answers 200 for the latest release of all four packages, so the
 attestations are there. The "watch the first one" caution is spent.
 
@@ -68,15 +68,18 @@ gh api repos/decimal-labs/decimalai-python/check-runs/$job/annotations -q '.[].m
 
 Both costs are real, and both are why this reverts to CI as soon as the precondition is met:
 
-- **No attestation.** A `twine` upload from a laptop cannot produce one. Of 22 published `decimalai`
-  files, only **2** carry provenance — `0.4.0`'s wheel and sdist, published 2026-06-08 through this
-  very workflow. Everything since has none. (That one success is also proof the PyPI publisher row for
-  this repo is configured correctly; Actions availability is the only thing missing.)
+- **No attestation.** A `twine` upload from a laptop cannot produce one — but that is the cost of the
+  fallback, not the current state. **Corrected 2026-09-05:** of 38 published `decimalai` files, **18**
+  carry provenance: `0.4.0`'s wheel and sdist (2026-06-08) plus every release from `0.10.3` through
+  `0.13.2`, all uploaded by `publish.yml` over OIDC. The unattested files are `0.3.0` and
+  `0.5.0`–`0.10.2`, the laptop-upload era — `pypi.org/integrity/decimalai/<v>/decimalai-<v>-py3-none-any.whl/provenance`
+  answers 404 for those and 200 for the rest. (The PyPI publisher row for this repo is therefore
+  configured correctly.)
 - **Tagging is best-effort and fails quietly.** `scripts/release.sh` attempts `gh release create` as
   its last step with stderr suppressed, and treats failure as non-fatal because the upload already
   happened. When it fails you get a shipped, untagged version. **Corrected 2026-09-05: the repo now
-  has eight tags** — `v0.10.0`, `v0.10.3`, `v0.10.4`, `v0.11.0`, `v0.11.1`, `v0.12.0`, `v0.13.0`,
-  `v0.13.1`, i.e. one per release since 0.10.3. The gap below is history, not the current state, and
+  has nine tags** — `v0.10.0`, `v0.10.3`, `v0.10.4`, `v0.11.0`, `v0.11.1`, `v0.12.0`, `v0.13.0`,
+  `v0.13.1`, `v0.13.2`, i.e. one per release since 0.10.3. The gap below is history, not the current state, and
   it is the reason the verify-the-tag step stays:
   - **0.10.2** — on PyPI (uploaded 2026-08-15), never tagged;
   - **0.10.1** — never tagged *and never uploaded*; it has a CHANGELOG entry and a "Release 0.10.1"
@@ -93,7 +96,7 @@ never make real model calls. Only the *upload* moves.
 |---|---|---|---|
 | **Live-LLM** | **Local — `scripts/release.sh`** | real model calls through a clean-room wheel | yes — always run before publishing, in either regime |
 | **No-model** | CI — `publish.yml` `test` job | unit + contract tests on Python 3.10–3.12 | yes — Actions runs again as of 2026-08-24, so this gate is live. |
-| **Conformance board** | CI — `publish.yml` `conformance-graded` job | the hermetic adapter matrix actually GRADED the adapters | yes, since `f606bc1` — `publish` declares `needs: [test, conformance-graded]`. **Corrected 2026-09-05: a red conformance board DOES block a publish now.** ⚠ The job reads the check-run for that commit, and a run still `in_progress` reads as a failure and skips the publish — wait for it, then `gh run rerun --failed`. |
+| **Conformance board** | CI — `publish.yml` `conformance-graded` job | the hermetic adapter matrix actually GRADED the adapters | yes, since `f606bc1` — `publish` declares `needs: [test, conformance-graded]`. **Corrected 2026-09-05: a red conformance board DOES block a publish now.** ⚠ The job reads the check-run for that commit. Since `a13203b` (2026-09-05) it **waits** on a run that is still `in_progress` — polling every 20 s for up to 20 minutes — so cutting the Release while the conformance matrix is still running no longer skips the publish. Two cases are still fatal: a commit with **no** conformance run at all (fails immediately, and waiting cannot help), and a run still unfinished after the 20-minute deadline — `gh run rerun --failed` recovers the second. |
 
 > **Run the no-model suite yourself anyway — `scripts/release.sh` does not.**
 > The script's step 2 only builds the wheel and smoke-tests it (import, `__version__`, CLI); it never
