@@ -901,13 +901,26 @@ def _read_skill_body(skill_dir: str) -> Optional[str]:
 
 def _local_updated_at_iso(skill_md_path: str) -> Optional[str]:
     """ISO-8601 last-modified time for a SKILL.md, preferring the git commit time
-    over the filesystem mtime.
+    over the filesystem mtime — but only while the file is CLEAN.
 
     A fresh ``git clone`` / CI checkout resets every file's mtime to "now", which
     makes an mtime-based ``newer_wins`` sync treat the local copy as newest and
     clobber a more-recent dashboard edit. The git commit time is stable across
     checkouts, so we use it when the file is tracked; otherwise fall back to the
     filesystem mtime. Best-effort — never raises.
+
+    The dirty check is load-bearing, not a nicety. Without it the commit time was
+    returned for a file with UNCOMMITTED edits, which inverted the failure this
+    function exists to prevent: the author's newest work reported as the OLDEST
+    state on disk. Reproduced end-to-end before the fix — commit at 10:00, sync
+    (mints remote v1, ``created_at`` 10:01), rewrite the body at 11:00 without
+    committing, re-sync: the backend's ``newer_wins`` conflict branch compared
+    10:00 >= 10:01, answered "remote wins", and the CLI — ``--apply-pulls``
+    defaults on — wrote the v1 body over the 11:00 edit. An hour of uncommitted
+    work, gone, with ``↓ <name> → SKILL.md (v1)`` as the only notice. A clean
+    clone's files are still clean, so the checkout protection is untouched.
+    Guarded by the git-repo cases in ``tests/test_skills_push_cli.py`` and by
+    the platform's own bidirectional-sync journey check.
     """
     import datetime as _dt
 
@@ -916,14 +929,22 @@ def _local_updated_at_iso(skill_md_path: str) -> Optional[str]:
     try:
         import subprocess
 
-        out = subprocess.run(
-            ["git", "log", "-1", "--format=%cI", "--", os.path.basename(skill_md_path)],
-            cwd=os.path.dirname(skill_md_path) or ".",
-            capture_output=True, text=True, timeout=3,
+        _cwd = os.path.dirname(skill_md_path) or "."
+        _rel = os.path.basename(skill_md_path)
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--", _rel],
+            cwd=_cwd, capture_output=True, text=True, timeout=3,
         )
-        ts = (out.stdout or "").strip()
-        if out.returncode == 0 and ts:
-            return ts
+        # Any porcelain output for this path means the working copy differs from
+        # HEAD (or is untracked) — the mtime is then the truthful timestamp.
+        if not (dirty.returncode == 0 and (dirty.stdout or "").strip()):
+            out = subprocess.run(
+                ["git", "log", "-1", "--format=%cI", "--", _rel],
+                cwd=_cwd, capture_output=True, text=True, timeout=3,
+            )
+            ts = (out.stdout or "").strip()
+            if out.returncode == 0 and ts:
+                return ts
     except Exception:  # pragma: no cover - git absent / not a repo / timeout
         pass
     try:

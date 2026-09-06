@@ -381,3 +381,59 @@ class TestBenchmarkQuotaHint:
         assert "benchmark_cases limit reached" in result.output
         assert "skillevaluation[runner]" in result.output
         assert "https://app.decimal.ai/billing" in result.output
+
+
+class TestBenchmarkNullDeltaAggregate:
+    """A run with NO measured lift must render "—", not crash and not a 0%.
+
+    Regression guard (2026-09-05): the backend ALWAYS emits the
+    pass_rate object and nulls its MEMBERS when nothing was measurable —
+    error-dominated runs and calibration-gated runs (every expectation
+    display-only, the normal outcome for a first-draft eval.yaml) both
+    produce it. The CLI guarded the CONTAINER (`if pr:`), so a truthy
+    object with delta_pts=None hit `None >= 0` and the command died with a
+    TypeError before printing the report URL. The old fixture here used
+    `"aggregate_metrics": {}`, which short-circuits `if pr:` and never
+    entered the block — which is why nothing caught it.
+    """
+
+    _NULL_AGG = {
+        "pass_rate": {"delta_pts": None, "with_skill": None, "without_skill": None},
+        "turns": {"delta_pct": None, "with_skill_avg": 0.0, "without_skill_avg": 0.0},
+        "tokens": {"delta_pct": None, "with_skill_avg": 0.0, "without_skill_avg": 0.0},
+        "errors": 1,
+        "error_dominated": True,
+    }
+
+    def _run(self, verdict="error"):
+        client = MagicMock()
+        client._http.post.side_effect = [
+            _mock_response({"results": []}),
+            _mock_response({
+                "passed_cases": 0, "total_cases": 1, "overall_verdict": verdict,
+                "aggregate_metrics": self._NULL_AGG,
+                "results": [{"test_case_id": "abcdef123456", "outcome": "error"}],
+            }),
+        ]
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            _write_skill_dir(eval_yaml=_EVAL_YAML_V2)
+            with patch("decimalai.cli.main._make_client", return_value=client):
+                return runner.invoke(cli, [
+                    "skills", "benchmark", "skills/s",
+                    "--api-key", "k", "--base-url", "http://localhost:8000",
+                ])
+
+    def test_null_members_do_not_crash_and_render_em_dash(self):
+        result = self._run()
+        assert result.exit_code == 0, result.output
+        assert not isinstance(result.exception, TypeError), result.output
+        assert "— (with)" in result.output
+        assert "0% (with)" not in result.output  # never fabricate a measurement
+        # The command must reach the end and hand the author the report URL.
+        assert "?tab=benchmark" in result.output
+
+    def test_errored_verdict_does_not_wear_a_check(self):
+        result = self._run(verdict="error")
+        assert "✗ 0/1 passed · verdict: error" in result.output
+        assert "✓ 0/1 passed" not in result.output

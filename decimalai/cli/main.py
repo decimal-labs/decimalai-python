@@ -2079,18 +2079,39 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
         # 3. Print results table.
         m = run.get("aggregate_metrics") or {}
         click.echo("")
+        verdict = run.get("overall_verdict") or "unknown"
+        # A run that ERRORED never measured anything — wearing the same ✓ as a
+        # passing run made "✓ 0/2 passed · verdict: error" read like a result.
         click.echo(
-            f"  ✓ {run['passed_cases']}/{run['total_cases']} passed "
-            f"· verdict: {run['overall_verdict']}"
+            f"  {'✗' if verdict in ('error', 'errored') else '✓'} "
+            f"{run['passed_cases']}/{run['total_cases']} passed "
+            f"· verdict: {verdict}"
         )
         pr = m.get("pass_rate") or {}
         if pr:
-            sign = "+" if pr.get("delta_pts", 0) >= 0 else ""
+            # Guard each MEMBER, not the container. The backend always emits the
+            # pass_rate object and NULLS its members when there is no measured
+            # lift — error-dominated runs (every case's LLM call refused) and
+            # calibration-gated runs (every expectation display-only, the normal
+            # first-draft eval.yaml outcome). `pr` is then truthy with
+            # delta_pts=None, so the old `pr.get("delta_pts", 0) >= 0` raised
+            # TypeError and killed the command before it printed the report URL.
+            # Same defect the web report already fixed — see the MetricCell
+            # guards in BenchmarkReport.tsx. Null must render "—": a fabricated
+            # 0% would report a measurement that never ran.
+            def _pct(v):
+                return "—" if v is None else f"{v * 100:.0f}%"
+
+            delta_pts = pr.get("delta_pts")
+            delta = (
+                "—" if delta_pts is None
+                else f"{'+' if delta_pts >= 0 else ''}{delta_pts:.0f} pts"
+            )
             click.echo(
                 f"    Pass rate:    "
-                f"{pr.get('with_skill', 0) * 100:.0f}% (with) "
-                f"vs {pr.get('without_skill', 0) * 100:.0f}% (without) "
-                f"= {sign}{pr.get('delta_pts', 0):.0f} pts"
+                f"{_pct(pr.get('with_skill'))} (with) "
+                f"vs {_pct(pr.get('without_skill'))} (without) "
+                f"= {delta}"
             )
         for key, label in [
             ("duration_ms", "Avg duration"),
