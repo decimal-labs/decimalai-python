@@ -2347,6 +2347,7 @@ class SkillRouter:
         stability: Optional[str] = None,
         trigger_phrases: Optional[List[str]] = None,
         is_active: Optional[bool] = None,
+        offer_scope: Optional[str] = None,
         change_summary: Optional[str] = None,
         author: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -2360,6 +2361,11 @@ class SkillRouter:
             stability: New stability level.
             trigger_phrases: New trigger phrases.
             is_active: Set active/inactive.
+            offer_scope: Who the trigger router offers the skill to.
+                ``"workspace"`` (the default) is every agent in the org;
+                ``"restricted"`` is only the agents it has been assigned to
+                (``POST /api/v1/agents/{name}/skills/{skill_id}``). Metadata
+                only: it does not create a new version.
             change_summary: Description of body changes (for version history).
             author: Author of the change.
 
@@ -2381,6 +2387,8 @@ class SkillRouter:
             payload["trigger_phrases"] = trigger_phrases
         if is_active is not None:
             payload["is_active"] = is_active
+        if offer_scope is not None:
+            payload["offer_scope"] = offer_scope
         if change_summary is not None:
             payload["change_summary"] = change_summary
         if author is not None:

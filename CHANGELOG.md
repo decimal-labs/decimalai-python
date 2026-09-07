@@ -6,6 +6,9 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added
+- `update_skill(offer_scope=...)`: set who the trigger router offers a skill to. `"workspace"` (the default) is every agent in the org; `"restricted"` is only the agents it has been assigned to. Until now a skill could not be taken off the ambient menu at all, so assigning it to one agent never stopped the router considering it for the others.
+
 ## [0.13.2] — 2026-09-05
 
 ### Added

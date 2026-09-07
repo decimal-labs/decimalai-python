@@ -200,6 +200,16 @@ class TestSkillRouterCRUD:
             assert payload["description"] == "New desc"
             assert payload["is_active"] is False
 
+    def test_update_skill_offer_scope(self):
+        """`offer_scope` rides in the PUT payload only when given: "restricted"
+        makes the router offer the skill solely to agents it is assigned to."""
+        router = self._router()
+        with patch.object(router, "_request", return_value={"status": "ok"}) as mock:
+            router.update_skill("skill-id-1", offer_scope="restricted")
+            assert mock.call_args[1]["json"] == {"offer_scope": "restricted"}
+            router.update_skill("skill-id-1", description="x")
+            assert "offer_scope" not in mock.call_args[1]["json"]
+
     def test_delete_skill(self):
         router = self._router()
         with patch.object(router, "_request", return_value={"deleted": True}) as mock:
