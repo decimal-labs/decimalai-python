@@ -6,8 +6,79 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.3] — 2026-09-08
+
+### Fixed
+- **A LangChain run inside a generic trace is now its child, not an unrelated root.** An app
+  can wear both tracers at once — `@decimalai.trace` / `start_trace()` around the call and the
+  LangChain adapter installed process-wide by `instrument()`, the composition the README
+  documents — but no adapter consulted the generic context, so one logical run shipped as TWO
+  root traces. The generic envelope only collects what `log_llm_call` puts in it, so with the
+  model calls going through LangChain it arrived with zero `llm_calls` and zero spans. Measured
+  on DecimalAI's own fleet (2026-09-07): 3,604 such traces in 3 days, 31.9% of the langchain
+  path against 0.00% on every other framework, each an empty envelope beside a full sibling.
+  Downstream, an empty envelope reads as having used no components and is graded `keep` at
+  score 1.0 against every manifest (100% keep, versus 80.1% for real traces), so those runs
+  could never be flagged for replay. The adapter now captures the live generic trace id when a
+  root run OPENS and sends it as `parent_trace_id`; the platform already walks children when
+  grading, so the envelope's grade becomes evidence-based with no server change. An explicit
+  sub-agent `parent_trace_id` still wins — the enclosing trace is a fallback, never an
+  override — and the probe is fail-open (a raise while labelling a trace is worse than an
+  unlabelled trace).
+  **Known limit:** the generic context is a `ContextVar`, and LangChain copies the context for
+  parallel work, so a run started through `.batch()`, `RunnableParallel` or an executor thread
+  cannot see the enclosing trace. Absent means "unlinked, exactly as before" — never a wrong
+  parent.
+- **`decimalai traces import <file>.jsonl` answered 422 on every call.** `POST /api/v1/traces/import`
+  takes multipart form-data (`file` + `agent_name`), and the CLI posted the raw bytes as
+  `application/x-ndjson` — the command the endpoint's own docs sample prints, and the one the
+  LangSmith/Braintrust migration guide gives, ended in an httpx traceback for everyone who ran
+  it. It now uploads as multipart through a client that drops the SDK's pinned
+  `Content-Type: application/json` (otherwise httpx's boundary never reaches the server),
+  posts to the canonical `/api/v1/traces/import` / `/api/v1/traces/import-bulk` paths instead
+  of the deprecated `/api/v1/import/*` aliases, gains `--agent-name` (required for JSONL unless
+  every row carries `agent_name`), and prints the server's `detail` on a 4xx/5xx instead of a
+  bare status code.
+- **`decimalai skills sync` could overwrite uncommitted edits with the remote copy.** The local
+  timestamp preferred git's commit time over the file mtime, which for a SKILL.md with
+  uncommitted edits reports the author's newest work as the oldest state on disk. `newer_wins`
+  then answered "remote wins" and — `--apply-pulls` defaults on — wrote the older body back over
+  the edit with `↓ <name> → SKILL.md (v1)` as the only notice. The commit time is now used only
+  while the file is clean; a dirty or untracked file reports its mtime. A fresh clone is still
+  clean, so the checkout protection this existed for is untouched.
+- **`decimalai skills sync` counted a frontmatter-only edit as nothing.** The backend reports
+  `reconciled_metadata` for a body whose hash matched but whose frontmatter diverged — a real
+  write that mints no new version. The summary knew five actions and not that one, so an author
+  who edited a description saw every counter read zero. It now prints a `metadata` count and
+  `~ <name> (metadata only — no new version)` per skill. Filing it under `no_change` would have
+  said the edit did nothing.
+- **`decimalai skills benchmark` crashed before printing the report URL on a run with no
+  measured lift.** The backend always emits `pass_rate` and nulls its members when nothing was
+  measured (every case's LLM call refused, or every expectation calibration-gated — the normal
+  first-draft `eval.yaml` outcome), so `delta_pts >= 0` raised `TypeError`. Null members now
+  render as `—`, and a run whose verdict is `error` wears `✗`, not the `✓` a passing run gets.
+
 ### Added
-- `update_skill(offer_scope=...)`: set who the trigger router offers a skill to. `"workspace"` (the default) is every agent in the org; `"restricted"` is only the agents it has been assigned to. Until now a skill could not be taken off the ambient menu at all, so assigning it to one agent never stopped the router considering it for the others.
+- `update_skill(offer_scope=...)`: set who the trigger router offers a skill to. `"workspace"` (the default) is every agent in the org; `"restricted"` is only the agents it has been assigned to. Until now a skill could not be taken off the ambient menu at all, so assigning it to one agent never stopped the router considering it for the others. Metadata only — it does not mint a new version.
+
+### Docs
+- README: the built-in deterministic scores (`completion`, `has_output`, `tool_compliance`,
+  `latency`, `token_efficiency`) are attached by the **LangChain adapter only** — the kill
+  switch is `instrument(..., builtin_evals=False)`, not `install(...)`; `inject_skill_body` is
+  documented as tri-state (defaults on for `langchain` / `anthropic` / `adk`, off for
+  `openai_agents` / `pydantic_ai`), and the delivery and framework tables gain their `adk` and
+  Pydantic AI rows.
+- RELEASING.md no longer says releases carry no attestation: every release since 0.10.3 is
+  uploaded by `publish.yml` over Trusted Publishing and carries provenance.
+
+### Internal
+- The pre-commit ruff hook (`scripts/install-git-hooks.sh`) lints the **staged** files under
+  `decimalai/` rather than the whole tree, so one session's half-finished edit no longer blocks
+  another session's commit in a shared worktree. Its flags are literal and pinned against
+  `ci.yml`'s Lint job by `tests/test_local_lint_hook.py`.
+- The `openai_agents` conformance driver's comment stops claiming that seeding the registry
+  grades the fabricated-activation mutation; what grades it is
+  `tests/test_inference_never_writes_the_activation_rung.py`.
 
 ## [0.13.2] — 2026-09-05
 
