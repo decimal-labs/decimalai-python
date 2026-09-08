@@ -127,7 +127,7 @@ else
   # exit 0 was the only thing this script read. Since 2026-09-05 the gate writes a
   # verdict of pass / pass-with-skips / inconclusive / fail; only a clean `pass`
   # releases. ALLOW_GATE_SKIPS=1 is the deliberate, visible override.
-  REPORT="$(ls -1dt "$GATE_DIR"/release_gate/reports/*/release-report.json 2>/dev/null | head -1)"
+  REPORT="$(ls -1dt "$GATE_DIR"/release_gate/reports/*/release-report.json "$GATE_DIR"/release_gate/reports/*/gate/release-report.json 2>/dev/null | head -1)"
   if [[ -z "$REPORT" ]]; then
     echo "ERROR: the gate wrote no release-report.json under $GATE_DIR/release_gate/reports." >&2
     exit 1
