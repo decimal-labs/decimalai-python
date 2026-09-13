@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.4] — 2026-09-13
+
 ### Added
 - **`skills sync` carries the bundle.** Text files one level under `references/`, `scripts/`,
   `templates/` and `assets/` beside a `SKILL.md` are sent as the sync item's `attachments`
