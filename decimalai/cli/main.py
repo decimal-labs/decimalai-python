@@ -1072,6 +1072,13 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
             except OSError as exc:
                 click.echo(f"  ⚠ could not read {eval_yaml_path}: {exc}", err=True)
 
+        # Bundle files (references/, scripts/, templates/, assets/) travel with the
+        # skill: the sync endpoint mirrors them onto the version (text-only,
+        # server-capped), so a later `skills pull` returns what was pushed.
+        from ..skills import collect_bundle_attachments
+        bundle = collect_bundle_attachments(str(skill_md.parent))
+        if bundle:
+            entry["attachments"] = bundle
         skills_payload.append(entry)
         discovered_paths[name] = skill_md
 

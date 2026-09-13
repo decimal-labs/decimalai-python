@@ -6,6 +6,14 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added
+- **`skills sync` carries the bundle.** Text files one level under `references/`, `scripts/`,
+  `templates/` and `assets/` beside a `SKILL.md` are sent as the sync item's `attachments`
+  and mirrored onto the new version (server caps: 50 files, 500 KB each, text only). Until
+  now the CLI synced `SKILL.md` and `eval.yaml` and silently left the bundle behind, while
+  `skills pull` delivered bundles an author had never been able to push. Programmatic
+  `sync_to_platform` does the same. (CUJ 27)
+
 ## [0.13.3] — 2026-09-08
 
 ### Fixed

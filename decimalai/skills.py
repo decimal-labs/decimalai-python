@@ -850,6 +850,9 @@ def sync_to_platform(
                 os.path.join(skill.get("source_path", ""), "SKILL.md")
             ),
         })
+        bundle = collect_bundle_attachments(skill.get("source_path", ""))
+        if bundle:
+            skills_payload[-1]["attachments"] = bundle
 
     if not skills_payload:
         return {"created": 0, "updated": 0, "unchanged": 0}
@@ -884,6 +887,63 @@ def sync_to_platform(
         len(skills_payload), result,
     )
     return result
+
+
+# ── bundle attachments ─────────────────────────────────────────────────────────
+# The sync endpoint accepts optional ``attachments`` on an item: bundle-relative path -> text,
+# exactly one level deep under one of the four attachment directories (the platform's
+# ``VALID_DIRECTORIES``), text only, capped server-side at 50 files / 500 KB each. Until
+# 2026-09-13 ``skills sync`` sent SKILL.md and eval.yaml and silently left references/ and
+# scripts/ behind — while ``skills pull`` delivered bundles the author had never been able to
+# push. Mirrors the platform's own disk loader.
+ATTACHMENT_DIRS = ("scripts", "references", "templates", "assets")
+MAX_ATTACHMENTS = 50
+MAX_ATTACHMENT_BYTES = 500 * 1024
+
+
+def collect_bundle_attachments(skill_dir: str) -> Dict[str, str]:
+    """Bundle files beside SKILL.md that a sync mirrors onto the new version.
+
+    Skipped, each with a logged reason: anything nested deeper than one level (the server
+    rejects the path), files over the size cap, and files that are not UTF-8 text (the
+    server is text-only; binaries upload via the dashboard). At most ``MAX_ATTACHMENTS``,
+    in path order so the payload is stable across runs.
+    """
+    out: Dict[str, str] = {}
+    if not skill_dir:
+        return out
+    base = Path(skill_dir)
+    for d in ATTACHMENT_DIRS:
+        dpath = base / d
+        if not dpath.is_dir():
+            continue
+        for f in sorted(dpath.iterdir()):
+            rel = f"{d}/{f.name}"
+            if f.is_dir():
+                logger.info("skills sync: skipping %s — attachments are one level deep", rel)
+                continue
+            if not f.is_file():
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if size > MAX_ATTACHMENT_BYTES:
+                logger.warning("skills sync: skipping %s — %d bytes exceeds the %d KB cap",
+                               rel, size, MAX_ATTACHMENT_BYTES // 1024)
+                continue
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                logger.info("skills sync: skipping %s — not UTF-8 text (binary attachments "
+                            "upload via the dashboard)", rel)
+                continue
+            if len(out) >= MAX_ATTACHMENTS:
+                logger.warning("skills sync: more than %d bundle files under %s — the rest are "
+                               "not synced", MAX_ATTACHMENTS, skill_dir)
+                return {k: out[k] for k in sorted(out)}
+            out[rel] = text
+    return {k: out[k] for k in sorted(out)}
 
 
 def _read_skill_body(skill_dir: str) -> Optional[str]:
