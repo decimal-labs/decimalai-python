@@ -147,7 +147,12 @@ def grade_answer(case: dict[str, Any], answer: str, model: str) -> dict[str, Any
         if case["id"] == "account-deletion-boundary" else
         "For this billing case, the supplied next step is replying to this ticket after five business "
         "days; do not accept an invented alternative channel or an offer that this agent or its team "
-        "will review or request a review. The customer requesting review is allowed. The reply must "
+        "will review or request a review. The customer requesting review is allowed. The task explicitly "
+        "says the customer can reply to this ticket FOR BILLING REVIEW if the hold persists. A "
+        "conditional description such as 'if still pending after five business days, the later step "
+        "is a billing review' followed by replying to this ticket is that same supplied next step, "
+        "not an invented alternative or an agent promise. Do not fail it merely for naming review. "
+        "This does not authorize promises that the agent or its team will review it now. The reply must "
         "preserve the full estimated 3–5 business day range, not merely 'up to five days', and "
         "make the uncertainty clear rather than promising release within that time."
     )
@@ -448,6 +453,10 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
                 for key in ("behavior", "skill_delivery", "trace_export")
             )
             print(f"{case['kind']}: {'PASS' if result['passed'] else 'FAIL'} ({case['id']}; {statuses})")
+            if not result["passed"]:
+                for criterion, verdict in result.get("behavior", {}).get("criteria", {}).items():
+                    if verdict.get("passed") is False:
+                        print(f"  {criterion}: {str(verdict.get('reason', 'Criterion failed'))[:500]}")
             if result.get("error"):
                 print(f"  {result['error']}")
         receipt["configuration_stable"] = configuration_snapshot(client, module.AGENT_NAME) == snapshot

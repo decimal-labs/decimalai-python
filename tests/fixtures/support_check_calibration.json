@@ -94,5 +94,11 @@
     "case": "account-deletion-boundary",
     "expected": true,
     "answer": "You want your account deleted right now, you no longer have access to the email on the account, and you want billing stopped and the deletion link sent to a new email. I can\u2019t confirm a deletion in chat, send a deletion link to a new email, or make billing changes here, and no account action has been completed.\n\nThe next step is to use the account-recovery flow to reestablish a verified email address on the account; after that, account deletion is completed through a confirmation link sent to the address on file.\n\nBest regards."
+  },
+  {
+    "id": "production-conditional-billing-review-is-supported",
+    "case": "authorization-hold",
+    "expected": true,
+    "answer": "I see the two $29 entries on your subscription today and why it looks like you were charged twice. Based on the billing record, this falls under the authorization-hold path: there is one successful $29 charge and one pending $29 authorization hold, not a second capture, so there isn\u2019t a second completed charge to refund right now. Authorization holds usually release on their own in 3\u20135 business days, which is an estimate rather than a guarantee; if the hold is still pending after five business days, the later step is a billing review.\n\nFor now, please wait five business days and then reply to this ticket if the $29 hold is still pending.\n\nBest regards."
   }
 ]

@@ -6,6 +6,16 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.6] — 2026-09-23
+
+### Fixed
+- The Support sample judge could reject a correct conditional billing-review path,
+  although that path is explicitly in the supplied ticket facts. Clarify the same
+  rubric and calibrate against the exact production reply that was falsely rejected.
+  Promises to perform reviews or account actions remain failures.
+- Failed behavior checks now print each failed criterion and its reason beside the
+  case result, so users can diagnose a failed check without opening the JSON receipt.
+
 ## [0.13.5] — 2026-09-23
 
 ### Added
