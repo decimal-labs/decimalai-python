@@ -22,7 +22,7 @@ import time
 import warnings
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID, uuid4
 
 # The one module-level framework import in this file, and it is deliberate: a base
@@ -781,6 +781,9 @@ def _unscoped_rail_owners() -> Optional["set[str]"]:
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
+_skill_body_top_k = 1
+_priority_skills: List[str] = []
+_runtime_policy: Optional[str] = None
 
 
 def _get_skill_router() -> Any:
@@ -793,6 +796,8 @@ def _get_skill_router() -> Any:
         from .skill_router import SkillRouter
         config = _get_config()
         _skill_router_singleton = SkillRouter(
+            inject_body_top_k=_skill_body_top_k,
+            priority_skills=_priority_skills,
             api_key=config.api_key,
             base_url=config.base_url,
             inject_body=config.resolve_inject_body(has_tool_loop=False),
@@ -983,6 +988,10 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     messages = _as_message_list(input_value)
     if messages is None:
         return input_value
+    if _runtime_policy:
+        # Rebuild our context on repeated invocation so old guidance cannot
+        # accumulate after the application's final capability reminder.
+        messages = [message for message in messages if not _is_sdk_injected(message)]
 
     router = _get_skill_router()
     if router is None:
@@ -1061,6 +1070,8 @@ def _inject_skills_into_input(input_value: Any) -> Any:
         injected.append(
             SystemMessage(content=tail, additional_kwargs=dict(_INJECTED_MARK))
         )
+    if _runtime_policy:
+        injected.append(SystemMessage(content=_runtime_policy, additional_kwargs=dict(_INJECTED_MARK)))
     return [*messages[:cut], *injected, *messages[cut:]]
 
 
@@ -1260,6 +1271,10 @@ def instrument(
     enable_skill_loader: bool = False,
     enable_load_skill_tool: bool = False,
     disk_sync: Optional[bool] = None,
+    on_trace: Optional[Callable[[RunTrace], None]] = None,
+    skill_body_top_k: int = 1,
+    priority_skills: Optional[List[str]] = None,
+    runtime_policy: Optional[str] = None,
 ) -> None:
     """Register DecimalAI tracing globally for all LangChain calls.
 
@@ -1281,6 +1296,15 @@ def instrument(
             prompts are auto-extracted from ChatPromptTemplate.
         models: Explicit model config dict. If omitted, model is
             auto-detected from LLM invocations.
+        on_trace: Optional observer of each completed trace before export.
+            Receives a copy. Observer errors are logged and do not stop export.
+        skill_body_top_k: Number of ranked skill bodies to inject (1–3), still
+            subject to the router's body and token budgets. Defaults to one.
+        priority_skills: Offered skill names that get body slots first, e.g.
+            reply format. Does not add skills the server did not offer.
+        runtime_policy: Optional application constraints repeated after skill
+            guidance. Requires enable_skill_loader. Does not grant capabilities
+            or replace application enforcement of tool permissions.
 
     Raises:
         ImportError: If ``langchain-core`` is not installed.
@@ -1298,6 +1322,14 @@ def instrument(
     """
     global _installed, _explicit_manifest_config, _evals, _builtin_evals_enabled
     global _install_agent_name
+    global _skill_body_top_k
+    global _priority_skills
+    global _runtime_policy
+
+    if type(skill_body_top_k) is not int or not 1 <= skill_body_top_k <= 3:
+        raise ValueError("skill_body_top_k must be an integer between 1 and 3")
+    if runtime_policy is not None and (not isinstance(runtime_policy, str) or not runtime_policy.strip() or not enable_skill_loader):
+        raise ValueError("runtime_policy requires a nonempty string and enable_skill_loader=True")
 
     if _installed:
         # Repeat calls do not reconfigure tracing, but the skill loader is an
@@ -1320,6 +1352,7 @@ def instrument(
                 ("skill_dirs", skill_dirs),
                 ("evals", evals),
                 ("disk_sync", disk_sync),
+                ("on_trace", on_trace),
             ) if value is not None
         ]
         if agent_name is not None and agent_name != _install_agent_name:
@@ -1328,6 +1361,12 @@ def instrument(
             ignored.append("builtin_evals")
         if enable_load_skill_tool:
             ignored.append("enable_load_skill_tool")
+        if skill_body_top_k != _skill_body_top_k:
+            ignored.append("skill_body_top_k")
+        if priority_skills is not None:
+            ignored.append("priority_skills")
+        if runtime_policy is not None:
+            ignored.append("runtime_policy")
         if ignored:
             logger.warning(
                 "DecimalAI LangChain tracing already installed; ignoring %s "
@@ -1346,6 +1385,11 @@ def instrument(
             "langchain-core is required for instrument() but is not installed. "
             "Install the LangChain extra with: pip install \"decimalai[langchain]\""
         )
+
+    _global_handler.on_trace = on_trace
+    _skill_body_top_k = skill_body_top_k
+    _priority_skills = list(priority_skills or [])
+    _runtime_policy = runtime_policy
 
     # Router authority (skill_authority): when None, derive disk_sync from config
     # — router-authoritative installs (loader active) default to NOT mirroring
@@ -1808,6 +1852,7 @@ class CallbackHandler(_CallbackBase):
         self.project = project
         self.parent_trace_id = parent_trace_id
         self.subagents = list(subagents) if subagents else None
+        self.on_trace: Optional[Callable[[RunTrace], None]] = None
 
         # Live root runs, keyed by their root run_id, plus the map from
         # every run_id we have seen to the root that owns it. Guarded by an
@@ -2974,6 +3019,12 @@ class CallbackHandler(_CallbackBase):
             if eval_scores:
                 # Attach eval scores to trace payload
                 trace.eval_scores = eval_scores
+
+            if self.on_trace is not None:
+                try:
+                    self.on_trace(trace.model_copy(deep=True))
+                except Exception:
+                    logger.exception("Trace observer failed for %s", trace.id)
 
             # Use background sender for non-blocking send. When THIS agent's
             # registration was refused, `trace.manifest_id` is the snapshot's

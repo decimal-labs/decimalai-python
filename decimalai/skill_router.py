@@ -869,6 +869,7 @@ class SkillRouter:
         body_token_budget: int = 6000,
         per_body_char_limit: int = 8192,
         body_load_deadline_s: float = 20.0,
+        priority_skills: Optional[List[str]] = None,
     ):
         self.api_key = api_key
         # Same resolution decimalai.init() uses (explicit → DECIMAL_BASE_URL
@@ -889,6 +890,9 @@ class SkillRouter:
         # existing callers are unchanged.
         self.inject_body = inject_body
         self.inject_body_top_k = max(1, int(inject_body_top_k))
+        # Reserve body slots for shared guidance such as reply format, but
+        # only when the server offered it to this agent. Never widen access.
+        self.priority_skills = list(dict.fromkeys(priority_skills or []))
         # Body guardrail (the progressive-disclosure path): caps for on-demand load_skill AND
         # the body-inject path (bodies injected un-trimmed before top-k). Defaults
         # mirror the backend's config (max_loaded_bodies=3, body_token_budget
@@ -2060,8 +2064,13 @@ class SkillRouter:
             bodies = []
             body_tokens = 0
             count_cap = min(self.inject_body_top_k, self.max_loaded_bodies)
-            for name in routed_names[:count_cap]:
-                body = self.get_skill_body(name, max_chars=self.per_body_char_limit)
+            prioritized = [name for name in self.priority_skills if name in routed_names]
+            body_names = prioritized + [name for name in routed_names if name not in prioritized]
+            for name in body_names[:count_cap]:
+                body_options: Dict[str, Any] = {"max_chars": self.per_body_char_limit}
+                if effective_agent is not None:
+                    body_options["agent_name"] = effective_agent
+                body = self.get_skill_body(name, **body_options)
                 if not (body and body.strip()):
                     continue
                 body = body.strip()

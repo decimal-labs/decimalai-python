@@ -153,6 +153,7 @@ def _http_die(exc, base_url):
 
 def _scaffold_agent_file(
     agent_name, api_key, base_url, framework, out_path, force, dry_run, model,
+    project_dir=None,
 ):
     """`decimalai init <agent-name>` — write a runnable file for a real agent.
 
@@ -216,7 +217,9 @@ def _scaffold_agent_file(
         click.echo(f"  Get one at {_dashboard_url(base_url)}/settings")
         raise SystemExit(1)
 
-    out_path = out_path or DEFAULT_OUTPUT
+    out_path = project_dir or out_path or DEFAULT_OUTPUT
+    if project_dir and not dry_run and os.path.lexists(project_dir):
+        raise click.ClickException(f"{project_dir} already exists; choose a new project directory.")
 
     from .._agent import AgentConfig
     from .._client import DecimalAIClient
@@ -357,6 +360,26 @@ def _scaffold_agent_file(
         prompt_unreadable = True
     client.close()
 
+    if project_dir:
+        from pathlib import Path
+
+        from .project import render_project, write_project
+
+        try:
+            if prompt_unreadable or prompt is None or not prompt.system_prompt:
+                raise ValueError("Support project checks require a readable, nonempty agent prompt.")
+            files = render_project(agent_name, skills, model, base_url, agent_id=prompt.agent_id)
+            if dry_run:
+                for name, content in files.items():
+                    click.echo(f"\n--- {name} ---\n{content}")
+            else:
+                write_project(Path(project_dir), files)
+                click.echo(f"Created {project_dir}: agent, Support checks, dependencies and instructions.")
+                click.echo(f"Open {project_dir}/README.md, then run python check_agent.py in that directory.")
+        except (ValueError, OSError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        return
+
     source = render_agent_file(
         agent_name,
         framework=framework,
@@ -450,12 +473,14 @@ def _scaffold_agent_file(
 )
 @click.option("--out", "out_path", default=None,
               help="Where to write (default: ./agent.py)")
+@click.option("--project", "project_dir", default=None,
+              help="Create a new Support project directory with agent, checks and instructions (LangChain)")
 @click.option("--model", default=None,
               help="Model for the generated file's MODEL line")
 @click.option("--force", is_flag=True, help="Overwrite an existing file")
 @click.option("--dry-run", is_flag=True, help="Print the file instead of writing it")
 @click.option("--test-trace/--no-test-trace", default=True, help="Send a test trace to verify connectivity")
-def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_run, test_trace):
+def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_run, test_trace, project_dir):
     """Verify your setup, or scaffold a runnable agent.
 
     With no argument: checks API key validity, shows workspace info, and
@@ -476,9 +501,13 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     import os
 
     if agent_name:
+        if project_dir and (out_path is not None or force):
+            raise click.UsageError("--project cannot be combined with --out or --force; choose a new directory.")
+        if project_dir and framework not in (None, "langchain"):
+            raise click.UsageError("Support project checks currently support --framework langchain.")
         return _scaffold_agent_file(
             agent_name, api_key, base_url, framework or "langchain", out_path,
-            force, dry_run, model,
+            force, dry_run, model, project_dir,
         )
 
     # Scaffold-only flags without a name would otherwise be silent no-ops,
@@ -488,6 +517,7 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
         name for name, used in (
             ("--framework", framework is not None),
             ("--out", out_path is not None),
+            ("--project", project_dir is not None),
             ("--model", model is not None),
             ("--force", force),
             ("--dry-run", dry_run),
@@ -3402,4 +3432,3 @@ def demo_reset(api_key, base_url, project):
 
 if __name__ == "__main__":
     cli()
-

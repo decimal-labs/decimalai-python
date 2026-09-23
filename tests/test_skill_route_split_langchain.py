@@ -264,3 +264,24 @@ class TestInjectedMessagesAreNotMistakenForTheCallersPrompt:
         )
         for m in out:
             assert "decimalai_injected" not in _text(m)
+
+
+def test_runtime_policy_follows_skill_guidance_and_stays_before_user(adapter, monkeypatch):
+    lc = adapter(_SplitRouter())
+    policy = 'No action tools are configured. Examples do not grant capabilities.'
+    monkeypatch.setattr(lc, '_runtime_policy', policy)
+    messages = [SystemMessage(content=CALLER), HumanMessage(content='refund my laptop')]
+    output = lc._inject_skills_into_input(messages)
+    assert output[-2].content == policy
+    assert isinstance(output[-2], SystemMessage)
+    assert output[-1].content == 'refund my laptop'
+    assert TAIL_MARKER in output[-3].content
+    # Re-invocation replaces our old context instead of multiplying constraints.
+    repeated = lc._inject_skills_into_input(output)
+    assert sum(message.content == policy for message in repeated) == 1
+
+
+def test_runtime_policy_cannot_silently_be_disabled():
+    import decimalai.langchain as lc
+    with pytest.raises(ValueError, match='enable_skill_loader'):
+        lc.instrument(runtime_policy='No tools')

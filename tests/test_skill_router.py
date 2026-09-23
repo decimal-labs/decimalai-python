@@ -699,3 +699,17 @@ class TestExactNameResolution:
         with patch.object(router, "_request", return_value={"items": []}):
             with pytest.raises(ValueError):
                 router.fork("nothing-at-all")
+
+
+def test_priority_body_slots_remain_offered_and_resolve_agent_pin():
+    router = SkillRouter(api_key="test", inject_body=True, inject_body_top_k=2,
+                         priority_skills=["unoffered-private", "format"])
+    route = {"prompt_fragment": "MENU", "routing_id": "r",
+             "skills": [{"name": "billing"}, {"name": "other"}, {"name": "format"}]}
+    with patch.object(router, "smart_route", return_value=route), \
+            patch.object(router, "get_skill_body", side_effect=lambda n, **kw: "body:" + n) as body:
+        fragment, _ = router.build_prompt_fragment(query="billing", agent_name="pinned-agent")
+    assert "body:format" in fragment and "body:billing" in fragment
+    assert "body:other" not in fragment and "unoffered-private" not in fragment
+    assert [c.args[0] for c in body.call_args_list] == ["format", "billing"]
+    assert all(c.kwargs["agent_name"] == "pinned-agent" for c in body.call_args_list)

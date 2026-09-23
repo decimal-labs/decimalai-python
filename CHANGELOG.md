@@ -6,6 +6,27 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.5] — 2026-09-23
+
+### Added
+- `decimalai init <agent> --project <new-directory>` generates a runnable LangChain
+  Support draft agent, two sample behavior checks, dependency pins and a deployment
+  handoff README. The generated agent and checks use the same prompt and selected
+  skill bodies. Requires the Support starters and a platform with setup checks enabled.
+- `python check_agent.py` records each attempt separately and confirms its exact
+  stored traces and delivered configuration. `--resume` retries delayed trace
+  confirmation without another model call; edited configuration makes evidence stale.
+- Optional LangChain `instrument(runtime_policy=...)` appends application constraints
+  after skill bodies. Generated draft agents use it with a bounded reply guard to
+  reject unsupported action promises. This is a narrow draft guard, not a general
+  safety guarantee or permission to take customer actions.
+
+### Scope
+- The new project defaults to `gpt-5.4-2026-03-05` and two clearly marked sample
+  support tickets. Passing these checks does not certify broader behavior, skill
+  lift, hosted deployment, or a five-minute onboarding claim. Existing single-file
+  scaffolds and other framework defaults are unchanged.
+
 ## [0.13.4] — 2026-09-13
 
 ### Added

@@ -306,3 +306,24 @@ class TestLcelChainEndToEnd:
         assert len(traces) == 2
         assert all(len(t.llm_calls) == 1 for t in traces)
         assert traces[0].id != traces[1].id
+
+
+@pytest.mark.parametrize("throws", [False, True])
+def test_trace_observer_gets_a_copy_and_cannot_break_export(throws):
+    from decimalai.langchain import CallbackHandler
+
+    handler = CallbackHandler(agent_name="observed-agent")
+    observed = []
+    def observe(trace):
+        observed.append(str(trace.id))
+        trace.agent_name = "observer-mutated-copy"
+        if throws:
+            raise RuntimeError("observer failure")
+    handler.on_trace = observe
+    root = uuid4()
+    handler.on_chain_start({"name": "agent"}, {"input": "hello"}, run_id=root)
+    handler.on_chain_end({"output": "answer"}, run_id=root)
+    sent = _sent_traces()
+    assert len(sent) == len(observed) == 1
+    assert str(sent[0].id) == observed[0]
+    assert sent[0].agent_name == "observed-agent"
