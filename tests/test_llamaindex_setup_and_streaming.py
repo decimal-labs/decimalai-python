@@ -597,3 +597,65 @@ class TestStreamedTokenUsage:
         finally:
             dispatcher.span_handlers = saved_span
             dispatcher.event_handlers = saved_event
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_lazy_synthesis_stays_in_its_query_when_streams_interleave(asynchronous):
+    """Core 0.14.25 starts LLM work after query() returns its live response."""
+    import asyncio
+    from decimalai.llamaindex import _stream_parent
+
+    h = DecimalSpanHandler(agent_name="lazy-rag")
+
+    def response(label):
+        h.new_span(label, SimpleNamespace(query_str=f"question {label}"), instance=QueryEngine())
+
+        def chunks():
+            child = f"model-{label}"
+            h.new_span(child, SimpleNamespace(arguments={"prompt": f"prompt {label}"}),
+                       instance=OpenAI(model="gpt-4o-mini"))
+            yield label
+            h.prepare_to_exit_span(child, None, result=SimpleNamespace(
+                text=label, additional_kwargs={"prompt_tokens": 3, "completion_tokens": 1}))
+
+        async def achunks():
+            for chunk in chunks():
+                await asyncio.sleep(0)
+                yield chunk
+
+        # The adapter recognizes the same response attributes as LlamaIndex.
+        from llama_index.core.base.response.schema import StreamingResponse, AsyncStreamingResponse
+        result = (AsyncStreamingResponse(response_gen=achunks()) if asynchronous
+                  else StreamingResponse(response_gen=chunks()))
+        h.prepare_to_exit_span(label, None, instance=QueryEngine(), result=result)
+        return result.response_gen
+
+    pytest.importorskip("llama_index.core")
+    a, b = response("a"), response("b")
+    if asynchronous:
+        async def consume():
+            assert await a.__anext__() == "a"
+            assert _stream_parent.get() is None
+            assert await b.__anext__() == "b"
+            assert _stream_parent.get() is None
+            async for _ in a:
+                pass
+            async for _ in b:
+                pass
+        asyncio.run(consume())
+    else:
+        assert next(a) == "a"
+        assert _stream_parent.get() is None
+        assert next(b) == "b"
+        assert _stream_parent.get() is None
+        assert list(a) == list(b) == []
+    traces = _flush_and_get_traces()
+    assert len(traces) == 2
+    by_input = {t.user_input_preview: t for t in traces}
+    for label in ("a", "b"):
+        trace = by_input[f"question {label}"]
+        assert trace.final_output_preview == label
+        assert len(trace.llm_calls) == 1
+        assert trace.llm_calls[0].input_tokens == 3
+        assert trace.llm_calls[0].output_tokens == 1
+        assert trace.llm_calls[0].rendered_input == [{"role": "user", "content": f"prompt {label}"}]

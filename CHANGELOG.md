@@ -21,6 +21,11 @@ and patch releases are fixes.
   reject unsupported action promises. This is a narrow draft guard, not a general
   safety guarantee or permission to take customer actions.
 
+### Fixed
+- LlamaIndex 0.14.25 starts streamed synthesis after `query()` returns. Lazy model
+  spans now stay in the original query's trace while each stream chunk is consumed,
+  retaining token counts and answer text without mixing interleaved requests.
+
 ### Scope
 - The new project defaults to `gpt-5.4-2026-03-05` and two clearly marked sample
   support tickets. Passing these checks does not certify broader behavior, skill

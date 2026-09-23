@@ -45,11 +45,17 @@ import inspect
 import logging
 import re
 import warnings
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 logger = logging.getLogger("decimalai.llamaindex")
+
+# Core 0.14.25 starts synthesis lazily while the caller consumes the response.
+# Scope that work to its retained query tree only during each iterator step;
+# no process-global fallback may attach another concurrent request to it.
+_stream_parent: ContextVar[Optional[Tuple[Any, str]]] = ContextVar("decimal_llama_stream_parent", default=None)
 
 # Span types that mean "this tree did agent work". A tree containing none of
 # them is index-time plumbing, not a run — see ``_is_setup_tree``.
@@ -276,6 +282,11 @@ class DecimalSpanHandler:
         Returns:
             The span ID (passthrough).
         """
+        if parent_span_id is None:
+            owner = _stream_parent.get()
+            if owner and owner[0] is self and owner[1] in self._spans:
+                parent_span_id = owner[1]
+
         span_data: Dict[str, Any] = {
             "id": id_,
             "parent_span_id": parent_span_id,
@@ -479,7 +490,7 @@ class DecimalSpanHandler:
 
         tee_cls = _AsyncStreamTee if inspect.isasyncgen(gen) else _StreamTee
         try:
-            result.response_gen = tee_cls(gen, _done)
+            result.response_gen = tee_cls(gen, _done, parent=(self, root_id))
         except Exception:  # pragma: no cover - read-only/exotic response object
             logger.debug("Could not wrap streamed response; flushing now", exc_info=True)
             return False
@@ -1331,9 +1342,10 @@ class _StreamTee:
     ``__del__`` fires either way.
     """
 
-    __slots__ = ("_gen", "_on_done", "_chunks", "_done")
+    __slots__ = ("_gen", "_on_done", "_chunks", "_done", "_parent")
 
-    def __init__(self, gen: Any, on_done: Any) -> None:
+    def __init__(self, gen: Any, on_done: Any, parent: Optional[Tuple[Any, str]] = None) -> None:
+        self._parent = parent
         self._gen = gen
         self._on_done = on_done
         self._chunks: List[str] = []
@@ -1343,11 +1355,14 @@ class _StreamTee:
         return self
 
     def __next__(self) -> Any:
+        token = _stream_parent.set(self._parent)
         try:
             chunk = next(self._gen)
         except BaseException:
             self._finish()
             raise
+        finally:
+            _stream_parent.reset(token)
         _collect_stream_chunk(self._chunks, chunk)
         return chunk
 
@@ -1382,11 +1397,14 @@ class _AsyncStreamTee(_StreamTee):
         return self
 
     async def __anext__(self) -> Any:
+        token = _stream_parent.set(self._parent)
         try:
             chunk = await self._gen.__anext__()
         except BaseException:
             self._finish()
             raise
+        finally:
+            _stream_parent.reset(token)
         _collect_stream_chunk(self._chunks, chunk)
         return chunk
 
