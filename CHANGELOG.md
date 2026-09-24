@@ -6,6 +6,18 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.13.7] — 2026-09-24
+
+- Generated Pydantic AI agents recover from temporary 429/503 provider failures
+  inside the model request, preserving completed tool results. Each request has
+  up to three attempts within 30 seconds; the generated turn has a 90-second limit.
+- The opt-in `decimalai.pydantic_ai.retry_model_requests` helper distinguishes
+  depleted billing from throttling, respects Retry-After, and propagates terminal
+  failures and cancellation. Provider SDK retries share the same time budget.
+  Streaming requests are passed through unchanged.
+- Request outcomes and attempt counts now survive OpenTelemetry export into
+  DecimalAI span attributes, including failed attempts that later recover.
+
 ## [0.13.6] — 2026-09-23
 
 ### Fixed

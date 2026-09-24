@@ -135,6 +135,21 @@ _UNDECLARED_LABEL = "undeclared"
 # name silently dropped.
 _DECIMAL_AGENT_NAME = "decimal.agent_name"
 
+
+def _model_recovery_attributes(span: Any) -> Dict[str, Any]:
+    """Carry our bounded, content-free recovery events through the wire schema.
+
+    Other OTel events may contain prompts or arbitrary exception bodies. Only
+    these explicit recovery fields belong in the exported span attributes.
+    """
+    attempts = []
+    for event in getattr(span, "events", ()) or ():
+        if event.name != "decimalai.model_request":
+            continue
+        fields = event.attributes or {}
+        attempts.append({k: fields[k] for k in ("attempt", "outcome", "failure_kind") if k in fields})
+    return {"decimalai.model_requests": attempts} if attempts else {}
+
 # The agent whose run is executing in THIS context (thread, or asyncio task
 # descended from it). A ContextVar rather than a module global on purpose: eight
 # concurrent runs of eight different agents in one process each need their own
@@ -1226,6 +1241,7 @@ class DecimalSpanExporter:
                     parent_span_id=parent_uuid,
                     span_type=SpanType.LLM,
                     name=f"llm:{model}",
+                    attributes=_model_recovery_attributes(otel_span),
                     status=llm_call.status,
                     started_at=started_at,
                     ended_at=ended_at,
@@ -1276,6 +1292,7 @@ class DecimalSpanExporter:
                     parent_span_id=parent_uuid,
                     span_type=span_type,
                     name=name,
+                    attributes=_model_recovery_attributes(otel_span),
                     status=span_status,
                     started_at=started_at,
                     ended_at=ended_at,

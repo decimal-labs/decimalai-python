@@ -63,6 +63,8 @@ import warnings
 from contextvars import ContextVar
 from typing import Any, Optional
 
+from decimalai._provider_recovery import retry_model_requests as retry_model_requests
+
 logger = logging.getLogger("decimalai.pydantic_ai")
 
 
