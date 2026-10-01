@@ -215,6 +215,23 @@ criteria and run IDs there. These two examples are a starter check, not general
 production certification or proof of skill lift. The synthetic connectivity canary
 (`decimalai init --test-trace`) is separate.
 
+## Returning work and public usage
+
+Reuse this project for new tickets, varying the customer's facts and missing
+information. Running another ticket does not require creating another agent.
+Keep the generated file and call run(question) for each request in your service.
+The scenario checks are a starting point: add cases from your own policy and
+review outcomes before sending any reply to a customer.
+
+In the public registry, read usage_scope and its computed_at timestamp before
+comparing counts. The event_time_source contract counts one activation per
+organization, trace and public source, including real fleet activity. Ordinary
+uninstall keeps historical credit; the 30 UTC-date window can expire old credit.
+Cumulative recorded usage describes known retained history, with unknown legacy
+origin shown separately. Publication is asynchronous. An activation is neither
+an install nor proof of a correct answer or measured skill lift. A page still
+reporting current_source_forks_and_links uses the legacy accounting contract.
+
 ## Versions and deployment
 
 The dashboard controls the system prompt and skill subscriptions. Latest prompt

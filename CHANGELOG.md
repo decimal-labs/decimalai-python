@@ -6,6 +6,10 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+- Generated Support project READMEs explain returning customer work and the
+  public usage contract, including fleet activity, publication timing and
+  incomplete historical coverage.
+
 ## [0.13.7] — 2026-09-24
 
 - Generated Pydantic AI agents recover from temporary 429/503 provider failures
