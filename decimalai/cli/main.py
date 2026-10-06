@@ -3430,5 +3430,10 @@ def demo_reset(api_key, base_url, project):
     click.echo("")
 
 
+from .starter import starter as _starter_command
+
+cli.add_command(_starter_command)
+
+
 if __name__ == "__main__":
     cli()

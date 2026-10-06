@@ -41,7 +41,10 @@ decimalai demo reset                  # removes all demo data
 The demo needs an API key (it seeds data into a workspace). Its numbers come from a seeded
 reference agent — illustrative, not customer traffic. Keyless commands: `decimalai skills pull
 <slug>` (fetch a published SKILL.md, no account) and the `agentversion` manifest diff flow
-(fully local).
+(fully local). `decimalai starter support --project <new-directory>` downloads a frozen
+public Support project without a DecimalAI key. Its Python-stdlib runtime uses the
+customer's OpenAI key locally and sends no platform telemetry; `--checks` makes two
+task calls and two semantic judge calls. It is separate from authenticated `init`.
 
 ## Core API surface
 
