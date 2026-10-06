@@ -49,14 +49,23 @@ with patch("langchain.chat_models.init_chat_model", return_value=model), patch("
 '''
 
 
-@pytest.mark.parametrize("failure", ["none", "quota", "wrong_answer", "missing_body", "missing_delivery", "missing_provider", "trace_rejected", "drift", "repair", "exhausted", "tool_call", "generic_opening"])
+@pytest.mark.parametrize("failure", ["none", "quota", "wrong_answer", "missing_body", "missing_delivery", "missing_provider", "trace_rejected", "drift", "repair", "exhausted", "tool_call", "generic_opening", "platform_admission"])
 def test_actual_generated_project_http(tmp_path, failure):
     pytest.importorskip("langchain")
     class CheckProbe(Probe):
         prompt_reads = 0
         check_results = {}
         ingested = []
+        admission_attempts = {}
         def route(self, method, path, query, body):
+            if failure == "platform_admission" and (
+                ("/setup/checks" in path and method in ("POST", "PUT"))
+                or (path.endswith("/body") and "max_chars" not in query)
+            ):
+                key = (method, path)
+                self.admission_attempts[key] = self.admission_attempts.get(key, 0) + 1
+                if self.admission_attempts[key] == 1:
+                    return 429, {"detail": "Rate limit exceeded"}, []
             if "/setup/checks" in path:
                 if method == "POST":
                     self.check_results[body["id"]] = None
@@ -99,7 +108,7 @@ def test_actual_generated_project_http(tmp_path, failure):
         check = subprocess.run([sys.executable, "-c", CHILD, str(dest)], env=env, cwd=tmp_path,
                                capture_output=True, text=True, timeout=45)
         receipt = json.loads((dest / "check-results.json").read_text())
-        success = failure in ("none", "repair", "tool_call", "generic_opening")
+        success = failure in ("none", "repair", "tool_call", "generic_opening", "platform_admission")
         assert check.returncode == (0 if success else 1), check.stdout + check.stderr + str(receipt)
         assert receipt["passed"] is success
         assert (dest / "agent.py").read_bytes() == source
@@ -110,8 +119,15 @@ def test_actual_generated_project_http(tmp_path, failure):
             assert receipt["check_id"] in probe.check_results
             assert all(c["input_hashes"] for c in probe.check_results[receipt["check_id"]]["cases"])
             assert "answer" not in json.dumps(probe.check_results[receipt["check_id"]])
-            assert all(len(r["input_hashes"]) == (1 if failure == "none" else 2) for r in receipt["cases"])
+            assert all(len(r["input_hashes"]) == (1 if failure in ("none", "platform_admission") else 2) for r in receipt["cases"])
             assert all("We can request" not in r["answer"] for r in receipt["cases"])
+            if failure == "platform_admission":
+                assert len(probe.check_results) == 1
+                assert len(probe.ingested) == 2
+                for method in ("POST", "PUT"):
+                    attempts = [r for r in probe.requests if r.method == method and "/setup/checks" in r.path]
+                    assert [r.status for r in attempts] == [429, 200]
+                    assert attempts[0].body == attempts[1].body
             if failure == "repair":
                 assert all("Revise the previous draft" in json.dumps(t["llm_calls"][-1]["rendered_input"])
                            for t in probe.ingested)

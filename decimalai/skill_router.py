@@ -24,6 +24,7 @@ import time
 import warnings
 from collections import OrderedDict
 from contextvars import ContextVar
+from copy import deepcopy
 from pathlib import Path
 from threading import Lock
 from threading import local as _thread_local
@@ -184,6 +185,8 @@ LOAD_SKILL_PROMPT_HINT = (
 # "Hot path" = a call that happens INSIDE a user's turn, so its latency is the
 # customer's latency. Everything else (CLI, publish, scans) can afford to wait.
 _HOT_PATHS = ("/api/v1/skills/route", "/api/v1/skills/menu")
+_ADMISSION_MAX_RETRIES = 2
+_ADMISSION_MAX_WAIT_S = 5.0
 
 # WHY 5 SECONDS AND NOT 2 (changed 2026-09-02, and the old value was measured
 # doing real harm).
@@ -1048,26 +1051,41 @@ class SkillRouter:
                 "while the platform is unreachable. Skills are unavailable this turn."
             )
 
+        # Freeze the caller's auth/scope and request inputs across admission
+        # retries. Only reads and the routing request qualify; publishing and
+        # other writes are not replayed. A positive Retry-After is required:
+        # an unmarked edge abort or plan quota must remain fail-fast.
+        admission_safe = method.upper() == "GET" or (
+            method.upper() == "POST" and path == "/api/v1/skills/route"
+        )
+        headers = dict(self._headers())
+        request_json = deepcopy(json)
+        request_params = deepcopy(clean_params)
+        started = time.monotonic()
+        waited = 0.0
         try:
-            resp = httpx.request(
-                method,
-                url,
-                params=clean_params,
-                json=json,
-                headers=self._headers(),
-                # A hot-path call runs INSIDE the user's turn. A 30s budget there
-                # turns a platform brownout into a 30s stall on every request the
-                # customer's own service handles — measured at 30.3s per turn —
-                # i.e. an outage of THEIR product caused by an optional vendor.
-                # Fail fast instead; the caller already degrades to an empty menu.
-                # Non-hot paths (CLI, publish, body reads outside a turn) keep 30s.
-                #
-                # See `_hot_path_read_budget` for why the hot budget is 5s and
-                # not the 2s this shipped with: 2s is below what the platform
-                # meets even when healthy, and the fleet measured skill delivery
-                # collapsing 69% -> 3% the hour it landed.
-                timeout=_hot_path_timeout() if hot else _COLD_PATH_TIMEOUT,
-            )
+            for attempt in range(_ADMISSION_MAX_RETRIES + 1):
+                resp = httpx.request(
+                    method, url, params=request_params, json=request_json, headers=headers,
+                    # Retain the existing per-request latency budgets. Admission
+                    # recovery never retries transport errors or generic 5xx.
+                    timeout=_hot_path_timeout() if hot else _COLD_PATH_TIMEOUT,
+                )
+                if not admission_safe or resp.status_code != 429 or attempt >= _ADMISSION_MAX_RETRIES:
+                    break
+                if resp.headers.get("X-Quota-Exceeded"):
+                    break
+                from ._client import _parse_retry_after
+                delay = _parse_retry_after(resp.headers.get("Retry-After"))
+                if (delay <= 0 or waited + delay > _ADMISSION_MAX_WAIT_S
+                        or time.monotonic() - started + delay > _ADMISSION_MAX_WAIT_S):
+                    break
+                logger.warning(
+                    "SkillRouter admission limited on %s %s; retrying in %.1fs (%d/%d)",
+                    method, path, delay, attempt + 1, _ADMISSION_MAX_RETRIES,
+                )
+                time.sleep(delay)
+                waited += delay
         except httpx.HTTPError as e:
             if hot:
                 _hot_path_breaker.record_failure(e)

@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from ._support_policy import unsupported_action_claim
@@ -86,11 +86,45 @@ def digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
-def error_diagnosis(exc: BaseException) -> str:
+def error_diagnosis(exc: BaseException, *, base_url: str | None = None) -> str:
     """Actionable errors without copying provider responses or credentials."""
+    from ._client import (
+        DecimalAPIError,
+        DecimalQuotaExceededError,
+        DecimalRateLimitError,
+    )
+    from .skill_router import SkillRouterError
+
+    if isinstance(exc, DecimalQuotaExceededError):
+        return "decimalai_quota: DecimalAI workspace plan quota is exhausted. Review workspace usage or wait for the quota to reset."
+    if isinstance(exc, DecimalRateLimitError):
+        return "decimalai_rate_limit: DecimalAI workspace request limit reached. Wait before retrying; provider credits were not assessed."
+
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    is_platform = isinstance(exc, (DecimalAPIError, SkillRouterError))
+    # A raw HTTP status can also escape a caller using the underlying transport.
+    # Match its origin to this project's backend, including local deployments;
+    # provider 429s have a different origin and need different next steps.
+    request = getattr(exc, "request", None)
+    if request is not None:
+        origin = urlsplit(str(request.url))
+        backend = urlsplit(base_url or os.environ.get("DECIMAL_BASE_URL", "https://api.decimal.ai"))
+        is_platform = is_platform or (origin.scheme == backend.scheme and origin.netloc == backend.netloc)
+    if is_platform:
+        if status == 429:
+            if response is not None and response.headers.get("X-Quota-Exceeded"):
+                return "decimalai_quota: DecimalAI workspace plan quota is exhausted. Review workspace usage or wait for the quota to reset."
+            return "decimalai_rate_limit: DecimalAI workspace request limit reached. Wait before retrying; provider credits were not assessed."
+        if status in (401, 403):
+            return "decimalai_credentials_rejected: Check the DecimalAI key and workspace access in .env."
+        return "decimalai_backend: Check DecimalAI backend connectivity, workspace access and server status."
+
     message = str(exc).lower()
-    if any(word in message for word in ("resource_exhausted", "quota", "credit balance", "credits are depleted", "429")):
+    if any(word in message for word in ("resource_exhausted", "quota", "credit balance", "credits are depleted")):
         return "provider_quota: Provider quota or credits are exhausted. Restore quota or select a funded model."
+    if status == 429 or "429" in message:
+        return "provider_rate_limit: Provider request limit reached. Wait before retrying or review the provider's request limits."
     if any(word in message for word in ("unauthorized", "authentication", "invalid api key", "401")):
         return "credentials_rejected: Check the provider and DecimalAI keys in .env."
     if isinstance(exc, ValueError):
@@ -185,7 +219,7 @@ def configuration_snapshot(client: Any, agent_name: str) -> dict[str, Any]:
     prompt = client.get_agent_prompt(agent_name)
     if not prompt.get("system_prompt") or not prompt.get("content_hash"):
         raise ValueError("A nonempty versioned system prompt is required for this check.")
-    response = client._http.get(f"/api/v1/agents/{quote(agent_name, safe='')}/skills")
+    response = client._request_with_retry("GET", f"/api/v1/agents/{quote(agent_name, safe='')}/skills")
     response.raise_for_status()
     skills = response.json().get("skills", [])
     if not skills:
@@ -193,7 +227,7 @@ def configuration_snapshot(client: Any, agent_name: str) -> dict[str, Any]:
     resolved = []
     for skill in skills:
         name = skill["skill_name"]
-        response = client._http.get(f"/api/v1/skills/{quote(name, safe='')}/body",
+        response = client._request_with_retry("GET", f"/api/v1/skills/{quote(name, safe='')}/body",
                                     params={"agent_name": agent_name})
         response.raise_for_status()
         body = response.json()
@@ -278,7 +312,9 @@ def _remote_result(receipt: dict[str, Any]) -> dict[str, Any]:
 
 def _confirm(client: Any, receipt: dict[str, Any], wait_seconds: float) -> None:
     path = f"/api/v1/agents/{quote(receipt['agent_name'], safe='')}/setup/checks/{receipt['check_id']}"
-    response = client._http.put(path + "/result", json=receipt["remote_result"])
+    # The backend stores one immutable result per check UUID. Resubmitting these
+    # exact bytes is safe and cannot rerun the agent or its provider calls.
+    response = client._request_with_retry("PUT", path + "/result", json=receipt["remote_result"])
     response.raise_for_status()
     deadline = time.monotonic() + wait_seconds
     while True:
@@ -288,7 +324,7 @@ def _confirm(client: Any, receipt: dict[str, Any], wait_seconds: float) -> None:
         if state["status"] != "pending_trace" or time.monotonic() >= deadline:
             break
         time.sleep(min(2, max(0, deadline - time.monotonic())))
-        response = client._http.get(path)
+        response = client._request_with_retry("GET", path)
         response.raise_for_status()
     print(f"Trace confirmation: {state['status']}. {receipt['dashboard_url']}")
     if state["status"] == "pending_trace":
@@ -329,9 +365,9 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
         except Exception as exc:
             if receipt is not None:
                 receipt["passed"] = False
-                receipt["confirmation_error"] = error_diagnosis(exc)
+                receipt["confirmation_error"] = error_diagnosis(exc, base_url=receipt.get("base_url"))
                 _write_receipt(resume_path, receipt)
-            print(f"Confirmation failed: {error_diagnosis(exc)}")
+            print(f"Confirmation failed: {error_diagnosis(exc, base_url=receipt.get('base_url') if receipt else None)}")
             return 1
         finally:
             if client:
@@ -365,10 +401,12 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
         receipt["base_url"] = os.environ.get("DECIMAL_BASE_URL", project["base_url"])
         client = DecimalAIClient(api_key=key, base_url=receipt["base_url"])
         check_id = str(uuid4())
-        response = client._http.post(f"/api/v1/agents/{quote(project['agent_name'], safe='')}/setup/checks", json={
+        # A retry preserves this client-generated UUID; the backend returns the
+        # same check instead of resetting its baseline or creating another.
+        response = client._request_with_retry("POST", f"/api/v1/agents/{quote(project['agent_name'], safe='')}/setup/checks", json={
             "id": check_id, "agent_id": project["agent_id"], "suite": CHECK_VERSION,
             "sdk_version": decimalai.__version__, "source": os.environ.get("DECIMAL_CHECK_SOURCE", "customer"),
-        })
+        }, no_raise_statuses=frozenset({404}))
         if response.status_code == 404:
             raise ValueError("This backend does not support project checks, or the agent is unavailable. Check the backend release and agent access.")
         response.raise_for_status()
@@ -436,7 +474,7 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
                 result["behavior"] = grade_answer(case, answer, judge)
                 result["passed"] = all(result[k]["passed"] for k in ("behavior", "skill_delivery", "trace_export"))
             except Exception as exc:
-                result["error"] = error_diagnosis(exc)
+                result["error"] = error_diagnosis(exc, base_url=receipt.get("base_url"))
             finally:
                 module.trace_observer = None
                 decimalai.flush()
@@ -464,7 +502,7 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
         receipt["passed"] = (receipt["configuration_stable"] and receipt["files_stable"]
                              and all(r["passed"] for r in receipt["cases"]))
     except (Exception, SystemExit) as exc:
-        receipt["error"] = error_diagnosis(exc)
+        receipt["error"] = error_diagnosis(exc, base_url=receipt.get("base_url"))
         print(f"Check failed: {receipt['error']}")
     finally:
         if module is not None:
@@ -480,7 +518,7 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
             try:
                 _confirm(client, receipt, wait_seconds)
             except Exception as exc:
-                receipt["confirmation_error"] = error_diagnosis(exc)
+                receipt["confirmation_error"] = error_diagnosis(exc, base_url=receipt.get("base_url"))
                 print(f"Could not confirm this check. Retry: python check_agent.py --resume --check-id {receipt['check_id']}")
         if client is not None:
             client.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 import urllib.parse
@@ -32,6 +33,7 @@ logger = logging.getLogger("decimalai")
 
 _MAX_RETRIES = 3
 _DEFAULT_RETRY_DELAY = 1.0  # seconds
+_MAX_RETRY_WAIT = 30.0  # total sleep per request; never retry before Retry-After
 
 # How many traces `buffer_trace` accumulates before auto-flushing — and, because
 # `flush()` now hangs on to a batch the backend was merely too sick to accept,
@@ -74,7 +76,8 @@ def _parse_retry_after(value: Optional[str]) -> float:
     if not value:
         return 0.0
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else 0.0
     except (TypeError, ValueError):
         pass
     try:
@@ -371,7 +374,7 @@ class DecimalAIClient:
 
     def verify_auth(self) -> VerifyAuthResponse:
         """Verify the API key and return project configuration."""
-        resp = self._http.get("/api/v1/auth/verify")
+        resp = self._request_with_retry("GET", "/api/v1/auth/verify")
         _raise_for_status(resp)
         return cast(VerifyAuthResponse, resp.json())
 
@@ -393,6 +396,8 @@ class DecimalAIClient:
         503 from a load balancer with no healthy instance). Uses the
         ``Retry-After`` header if present, otherwise exponential backoff
         (1s, 2s, 4s) — one ladder, shared by both.
+        Total retry sleep is capped at 30 seconds. If the next server-directed
+        wait exceeds that budget, raise instead of retrying too early.
 
         ``idempotent=True`` adds 500 to that set. It is opt-in per call site
         because a 500 means the application ran and failed part-way, so blindly
@@ -409,6 +414,7 @@ class DecimalAIClient:
         the internal numbers never showed the loss the SDK was taking.
         """
         last_exc: Optional[httpx.HTTPStatusError] = None
+        waited = 0.0
 
         for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2, 3
             resp = self._http.request(method, url, **kwargs)
@@ -443,18 +449,19 @@ class DecimalAIClient:
                     response=resp,
                 )
 
-                if attempt < _MAX_RETRIES:
+                if attempt < _MAX_RETRIES and waited + delay <= _MAX_RETRY_WAIT:
                     logger.warning(
                         "Rate limited (429). Retrying in %.1fs (attempt %d/%d)",
                         delay, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(delay)
+                    waited += delay
                     continue
 
                 raise DecimalRateLimitError(
                     retry_after=retry_after,
                     message=(
-                        f"Rate limit exceeded after {_MAX_RETRIES} retries. "
+                        f"Rate limit exceeded after {attempt} retries. "
                         f"Server says retry after {retry_after}s."
                     ),
                 )
@@ -468,11 +475,14 @@ class DecimalAIClient:
                 # above, so there is only ever one backoff scheme to reason about.
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                 delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+                if waited + delay > _MAX_RETRY_WAIT:
+                    _raise_for_status(resp)
                 logger.warning(
                     "Server error (HTTP %d) on %s %s. Retrying in %.1fs (attempt %d/%d)",
                     resp.status_code, method, url, delay, attempt + 1, _MAX_RETRIES,
                 )
                 time.sleep(delay)
+                waited += delay
                 continue
 
             # A caller that gives a status its own meaning (a conditional GET's

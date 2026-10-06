@@ -156,12 +156,15 @@ def test_resume_reuses_exact_id_and_never_imports_agent(tmp_path, monkeypatch):
                'files': {'agent.py': digest((tmp_path / 'agent.py').read_text())}, 'passed': False}
     (tmp_path / 'check-results.json').write_text(json.dumps(receipt))
     client = MagicMock()
-    client._http.put.return_value.json.return_value = {'status': 'pending_trace'}
-    client._http.get.return_value.json.return_value = {'status': 'passed'}
+    pending, passed = MagicMock(), MagicMock()
+    pending.json.return_value = {'status': 'pending_trace'}
+    passed.json.return_value = {'status': 'passed'}
+    client._request_with_retry.side_effect = [pending, passed]
     monkeypatch.setenv('DECIMAL_API_KEY', 'fixture')
     with patch('decimalai._client.DecimalAIClient', return_value=client), patch('decimalai.agent_checks.time.sleep'):
         assert run_project_checks(tmp_path, resume=True, wait_seconds=5) == 0
-    client._http.put.assert_called_once_with('/api/v1/agents/support/setup/checks/exact-check/result', json=receipt['remote_result'])
+    assert client._request_with_retry.call_args_list[0].args == ('PUT', '/api/v1/agents/support/setup/checks/exact-check/result')
+    assert client._request_with_retry.call_args_list[0].kwargs == {'json': receipt['remote_result']}
     assert json.loads((tmp_path / 'check-results.json').read_text())['passed']
     (tmp_path / 'agent.py').write_text('changed')
     with patch('decimalai._client.DecimalAIClient') as factory:
@@ -176,11 +179,11 @@ def test_pending_confirmation_is_not_a_pass(tmp_path, monkeypatch):
                'files': {}, 'passed': False}
     (tmp_path / 'check-results.json').write_text(json.dumps(receipt))
     client = MagicMock()
-    client._http.put.return_value.json.return_value = {'status': 'pending_trace'}
+    client._request_with_retry.return_value.json.return_value = {'status': 'pending_trace'}
     monkeypatch.setenv('DECIMAL_API_KEY', 'fixture')
     with patch('decimalai._client.DecimalAIClient', return_value=client):
         assert run_project_checks(tmp_path, resume=True, wait_seconds=0) == 1
-    client._http.get.assert_not_called()
+    client._request_with_retry.assert_called_once_with('PUT', '/api/v1/agents/support/setup/checks/exact-check/result', json=receipt['remote_result'])
     assert not json.loads((tmp_path / 'check-results.json').read_text())['passed']
 
 
