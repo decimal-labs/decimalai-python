@@ -64,6 +64,7 @@ Everything above comes from a **seeded reference agent — illustrative, run it 
 These commands work without a DecimalAI key:
 
 - `decimalai skills pull <slug>` — fetch any published SKILL.md to disk, no account.
+- `decimalai starter support --project ./support-agent` — download a frozen, runnable Support project. Its Python standard-library runtime uses your OpenAI key locally and uploads no traces; `python3 agent.py --check-setup` verifies the files and `--checks` makes two task and two judge calls. The [public builder](https://app.decimal.ai/skills/packs/support/build) downloads the same project without installing the SDK.
 - The [`agentversion`](https://pypi.org/project/agentversion/) manifest flow ([below](#open-standard-agentversion)) — diff and gate agent manifests fully locally.
 
 There's a second demo for the registry side:

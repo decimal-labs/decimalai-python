@@ -4,16 +4,19 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.13.8] — 2026-10-06
 
 - `decimalai starter support --project ./support-agent` downloads a frozen,
   runnable Support project without a DecimalAI account. The standard-library
   runtime uses your OpenAI key locally and uploads no traces;
   `python3 agent.py --check-setup` verifies files and `--checks` makes two task
   and two judge calls. When a selected skill can't be bundled, the error names
-  it and prints the command that builds the project without it. Needs the
-  platform's public starter endpoints, which are not deployed yet — restore the
-  README's no-key bullet for it when this ships.
+  it and prints the command that builds the project without it. Uses the
+  platform's public starter endpoint (live since 2026-10-06).
+- Platform requests retry within a 30-second total budget and never before a
+  server-directed `Retry-After`. Project checks name DecimalAI quota, rate-limit,
+  credential and backend errors separately from provider quota and provider
+  429s, so the suggested next step matches the cause.
 - Generated Support project READMEs explain returning customer work and the
   public usage contract, including fleet activity, publication timing and
   incomplete historical coverage.
