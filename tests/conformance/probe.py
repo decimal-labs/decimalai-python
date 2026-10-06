@@ -46,6 +46,7 @@ TRACE_SOURCE_TYPE_ALLOWED = frozenset({
     "production", "test", "evaluation", "sdk", "manual", "synthetic",
     "development", "sandbox", "distillation", "snapshot", "file", "url",
     "eval_replay", "sample", "demo",
+    "hosted_trial",  # 2026-10-06: platform 61a203be (server-funded starter trial runs)
 })
 TRACE_TIMESTAMP_MAX_PAST_DAYS = 365 * 5
 TRACE_TIMESTAMP_MAX_FUTURE_DAYS = 1
@@ -53,15 +54,16 @@ TRACE_TIMESTAMP_MAX_FUTURE_DAYS = 1
 # sha256 over the backend source of `validate_element_shapes` + `_validate_payload`
 # + the four allowlist/bound constants they read (see
 # test_conformance.py::test_backend_validator_has_not_drifted for the exact
-# recipe). Recorded 2026-08-15 against
-# the platform's trace-ingest validator.
+# recipe). Recorded 2026-08-15 against the platform's trace-ingest validator;
+# re-recorded 2026-10-06 after platform 61a203be added `hosted_trial` to
+# _TRACE_SOURCE_TYPE_ALLOWED (the only change inside the fingerprinted scope).
 #
 # Scope caveat, stated plainly: the manifest-exists / trace-id-shape /
 # duplicate-id rules ported at the bottom of validate_trace_payload live inside
 # the 200-line `ingest_trace`, so they are NOT covered by this fingerprint —
 # hashing that whole function would churn on every unrelated edit. Re-read them
 # by hand when the guard fires.
-BACKEND_VALIDATOR_SHA256 = "a319c8d1d8c8add38441f7eca043e75c74d79d5cfd07f5a7dc2b8ddf054af6b1"
+BACKEND_VALIDATOR_SHA256 = "9613295bccc04aac4a492f03783951d742b5773479b45df1861cc1b527901194"
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
