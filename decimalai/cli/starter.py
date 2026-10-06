@@ -6,6 +6,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import stat
 import tempfile
@@ -21,6 +23,34 @@ MAX_FILES = 512
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+_SKILL_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}")
+_SKILL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+
+
+def _incomplete_skill_hint(response, selected: list[str], project: Path, name: str) -> str | None:
+    """Name the skill a 409 says can't be bundled, and the command without it.
+
+    Only slug- and id-shaped values are echoed: the server's free text can carry
+    the user's own prompt, which this command never prints.
+    """
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(detail, dict) or detail.get("code") != "starter_skill_incomplete":
+        return None
+    skill, skill_id = detail.get("skill"), detail.get("skill_id")
+    if not (isinstance(skill, str) and _SKILL_SLUG.fullmatch(skill)):
+        return None
+    message = f"{skill} refers to files its published version doesn't include, so it can't run offline. No project was created."
+    others = [s for s in selected if s != skill_id and _SKILL_ID.fullmatch(s)]
+    if isinstance(skill_id, str) and skill_id in selected and others:
+        flags = " ".join(f"--skill-id {s}" for s in others)
+        message += (f"\nBuild it with the other {len(others)} skills:\n"
+                    f"  decimalai starter support --project {shlex.quote(str(project))} --name {shlex.quote(name)} {flags}")
+    return message
 
 
 def _safe_archive_name(value: str) -> str:
@@ -112,6 +142,7 @@ def starter(pack, project_dir, name, prompt_file, skill_ids, pack_revision, base
     if os.path.lexists(project):
         raise click.ClickException(f"{project} already exists; choose a new project directory.")
     url = f"{base_url.rstrip('/')}/api/v1/registry/packs/{pack}"
+    selected: list[str] = []
     try:
         # Explicitly no auth/client API key, cookies, or environment credentials.
         with httpx.Client(timeout=30, follow_redirects=False, trust_env=False) as http:
@@ -144,7 +175,8 @@ def starter(pack, project_dir, name, prompt_file, skill_ids, pack_revision, base
                 snapshot = extract_starter(b"".join(chunks), project, downloaded.headers.get("X-Decimal-Snapshot-Hash", ""))
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 409:
-            message = "The reviewed pack or a required skill file changed. Review your selection and retry; no project was created."
+            message = _incomplete_skill_hint(exc.response, selected, project, name) or (
+                "The reviewed pack or a required skill file changed. Review your selection and retry; no project was created.")
         else:
             message = f"Public starter download returned HTTP {exc.response.status_code}; no project was created."
         raise click.ClickException(message) from None

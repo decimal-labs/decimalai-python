@@ -6,6 +6,14 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+- `decimalai starter support --project ./support-agent` downloads a frozen,
+  runnable Support project without a DecimalAI account. The standard-library
+  runtime uses your OpenAI key locally and uploads no traces;
+  `python3 agent.py --check-setup` verifies files and `--checks` makes two task
+  and two judge calls. When a selected skill can't be bundled, the error names
+  it and prints the command that builds the project without it. Needs the
+  platform's public starter endpoints, which are not deployed yet — restore the
+  README's no-key bullet for it when this ships.
 - Generated Support project READMEs explain returning customer work and the
   public usage contract, including fleet activity, publication timing and
   incomplete historical coverage.

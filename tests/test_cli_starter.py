@@ -115,3 +115,43 @@ def test_stale_review_does_not_retry_with_new_selection(monkeypatch, tmp_path):
     assert result.exit_code == 1
     assert len(captured) == 1
     assert not (tmp_path / "new").exists()
+
+
+def _incomplete_skill_server(detail):
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={
+                "starter_selection_revision": "a" * 64, "starter_prompt": "Reviewed prompt",
+                "starter_skills": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}], "starter_skills_missing": []})
+        return httpx.Response(409, json={"detail": detail})
+    return handler
+
+
+def test_incomplete_skill_is_named_with_the_command_that_builds_without_it(monkeypatch, tmp_path):
+    # The default Support selection 409'd on one skill whose published version
+    # lacks the files its body cites, and the CLI said only "retry" — which can
+    # never succeed. It now names the skill and prints the way through.
+    handler = _incomplete_skill_server({
+        "code": "starter_skill_incomplete", "skill": "sla-breach-response", "skill_id": "s2",
+        "message": "ignored", "missing_paths": ["references/remedy-rules.md"]})
+    original = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    project = tmp_path / "new"
+    result = CliRunner().invoke(cli, ["starter", "support", "--project", str(project)])
+    assert result.exit_code == 1
+    assert "sla-breach-response refers to files" in result.output
+    assert "--skill-id s1 --skill-id s3" in result.output
+    assert "--skill-id s2" not in result.output
+    assert not project.exists()
+
+
+def test_incomplete_skill_hint_never_echoes_free_server_text(monkeypatch, tmp_path):
+    # Server text can carry the user's prompt; only slug-shaped values print.
+    handler = _incomplete_skill_server({
+        "code": "starter_skill_incomplete", "skill": "My secret prompt text", "skill_id": "s2"})
+    original = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    result = CliRunner().invoke(cli, ["starter", "support", "--project", str(tmp_path / "new")])
+    assert result.exit_code == 1
+    assert "secret prompt" not in result.output
+    assert "Review your selection and retry" in result.output
