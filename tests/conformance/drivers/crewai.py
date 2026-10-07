@@ -49,6 +49,19 @@ through a ``BatchSpanProcessor`` whose default schedule delay is five seconds,
 and without the flush the harness would be timing that instead of the adapter.
 For a real user the same flush happens at process exit.
 
+The skills rail IS graded here, since 2026-10-08. Until then this driver
+declared the rail absent, and that was true: nothing in the SDK could put a
+skill into a CrewAI prompt. ``decimalai/crewai.py`` now registers a
+``before_llm_call`` hook — CrewAI's public extension point, whose context hands
+over the executor's live message list, the same list ``llm.call`` then sends —
+and inserts the routed menu and bodies after CrewAI's own system prompt. The
+skills phase therefore adds the README's loader call,
+``decimalai.crewai.instrument(agent_name=..., enable_skill_loader=True)``, on top
+of the tracing pair every other phase runs. What remains absent is the LOADER:
+no ``load_skill`` tool is registered, so the model cannot ask for a body and the
+strongest rung reachable here is DELIVERED. C13b is N/A for that narrower
+reason; C8, C13 and C14 are graded, and so is the injected delivery cell.
+
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
 
@@ -56,14 +69,16 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
+from ..delivery import TOOL_LOADED
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
     Capabilities,
     Ctx,
     Driver,
+    FrameworkLimit,
     fanout_threads,
     tool_result,
     user_message,
@@ -208,6 +223,54 @@ def run_error(ctx: Ctx) -> Any:
         _flush()
 
 
+def _kickoff(ctx: Ctx) -> Any:
+    return _crew(ctx).kickoff()
+
+
+def run_skills(ctxs: Sequence[Ctx]) -> Any:
+    """The skills rail: instrument once, then N concurrent crews, one thread each.
+
+    Once, on the calling thread, because that is the documented shape — a
+    process calls ``instrument(agent_name=..., enable_skill_loader=True)`` at
+    startup and then serves its crews — and because the other order is a race in
+    the INSTRUMENTORS, not in the adapter: OpenTelemetry's ``BaseInstrumentor``
+    is a singleton with an unlocked "already instrumented?" check, so eight
+    threads instrumenting LiteLLM at once can each save another's wrapper as the
+    "original" and leave ``litellm.completion`` calling itself. In the delivery
+    cells the skills phase is the FIRST phase in the process, so nothing has
+    instrumented anything yet; observed on crewai 1.15.0, which still routes
+    ``openai/…`` models through LiteLLM, as unbounded recursion in
+    ``_completion_wrapper``.
+
+    Threads for the lanes, for the same reason ``run_concurrent`` uses them —
+    ``Crew.kickoff`` is synchronous, and a server running several crews at once
+    runs them on worker threads. Concurrency is the point of the phase: every
+    lane shares the router singleton and the hook, so a routing decision or a
+    skill block that leaked between runs would show up as one lane's trace
+    carrying another lane's routing_id.
+
+    In the ``tool_loaded`` delivery cell the driver ASKS for the tool loop rather
+    than quietly not asking, so the adapter has to refuse out loud on this run.
+    Asking is not an assertion — ``contract.grade_delivery`` grades what comes
+    back.
+    """
+    from decimalai.crewai import instrument
+
+    for ctx in ctxs:
+        _wire().register(ctx)
+    # One agent across the lanes (the harness derives them with rename=False).
+    _instrument(ctxs[0])
+    instrument(
+        agent_name=ctxs[0].agent_name,
+        enable_skill_loader=True,
+        enable_load_skill_tool=ctxs[0].delivery_mode == TOOL_LOADED,
+    )
+    try:
+        return fanout_threads(_kickoff)(ctxs)
+    finally:
+        _flush()
+
+
 DRIVER = Driver(
     name="crewai",
     covers=frozenset({"crewai"}),
@@ -221,24 +284,27 @@ DRIVER = Driver(
     ),
     entrypoint=(
         "decimalai.otel.instrument() + _activate_crewai_instrumentation() "
-        "(what init(crewai=True) runs) + LiteLLMInstrumentor"
+        "(what init(crewai=True) runs) + LiteLLMInstrumentor; the skills phase adds "
+        "decimalai.crewai.instrument(enable_skill_loader=True)"
     ),
     run=run,
     run_concurrent=fanout_threads(run),
     run_error=run_error,
+    run_skills=run_skills,
     capabilities=Capabilities(
-        has_skills_rail=False,
+        has_skills_rail=True,
+        model_can_load_skill_bodies=False,
         supports_degenerate=False,
         reasons={
-            "has_skills_rail": (
-                "CrewAI has no skills rail on this adapter — the docs capability table "
-                "records '—' for it, there is no loader tool and no prompt-fragment "
-                "injection point, and the OTel exporter underneath can only MATCH skill "
-                "text somebody else already rendered into the prompt. Nothing offers, so "
-                "no routing_id can exist — and with no loader tool there is no model "
-                "action that could constitute an activation either, so C13/C13b are "
-                "silenced too. Matching text somebody else rendered and calling the "
-                "result an activation would be a fabrication."
+            "model_can_load_skill_bodies": (
+                "this rail is prompt-injection only. decimalai/crewai.py inserts the "
+                "routed menu and bodies from a before_llm_call hook and registers no "
+                "load_skill tool — it says so when asked ('enable_load_skill_tool is "
+                "not supported on the crewai adapter') — so the model has no way to "
+                "ASK for a body and the strongest rung observable here is DELIVERED. "
+                "Delivery is not activation. C13 still applies and is graded: with no "
+                "loader, a delivered body is exactly what is most likely to be "
+                "promoted to a fabricated activation."
             ),
             "supports_degenerate": (
                 "CrewAI has no model-less run to make. Agent requires an llm, executing a "
@@ -246,6 +312,24 @@ DRIVER = Driver(
                 "so there is no crew shape in which the adapter could observe nothing and "
                 "fabricate an 'undeclared' manifest. C7's main+repeat clause still grades "
                 "manifest stability here."
+            ),
+        },
+        delivery_limits={
+            TOOL_LOADED: FrameworkLimit(
+                reason=(
+                    "The seam is a before_llm_call hook: it edits the messages of one "
+                    "model call and registers no tool, so there is no load_skill tool "
+                    "for a body to come back from and no RESULT for the hook to route "
+                    "back into the turn. CrewAI itself does run tools in a loop — a "
+                    "tool channel would need a load_skill tool attached to the Agent, "
+                    "which is a different seam this adapter does not use. Prompt "
+                    "injection is the whole rail, which is why the injected cell is "
+                    "graded strictly and is not allowed to be N/A."
+                ),
+                adapter_module="decimalai/crewai.py",
+                refusal_marker=(
+                    "enable_load_skill_tool is not supported on the crewai adapter"
+                ),
             ),
         },
     ),

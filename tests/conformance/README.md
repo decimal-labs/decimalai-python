@@ -309,7 +309,7 @@ off** in that process's environment.
 |---|---|---|
 | what carries the body | the router pastes it into the prompt | the model pulls it with `load_skill` |
 | what is switched off | `DECIMALAI_LOAD_SKILL_TOOL=0` | `DECIMALAI_INJECT_SKILL_BODY=0` |
-| langchain / anthropic | graded | N/A — framework limit, re-proven every run |
+| langchain / anthropic / adk / crewai | graded | N/A — framework limit, re-proven every run |
 | openai-agents / pydantic-ai | graded | graded |
 
 Why it exists: C14 asks whether a body reached the model **at all**, which closes
@@ -513,7 +513,7 @@ Support window, per framework, from the observed release cadence:
 | openai-agents | `>=0.18.1` | none | Minors are the breaking unit, every ~2.5 weeks; a meaningful cap would need editing fortnightly. Hold the line with conformance. |
 | llama-index-core | `>=0.12.0` | none | Verified at the floor after the previous one proved fictional. |
 | google-adk | `>=2.0.0` | none | 2.x is young; watch it. |
-| crewai | `>=1.15.3` for the test set | `<2` | Below 1.15 the conformance set silently resolved crewai back to 1.6.1 in an OTel fight with google-adk — so the job was grading a 2025 build users never see. Breaks in PATCH releases, so a major cap protects little. |
+| crewai | `>=1.15.3` | none | Was `>=1.6.1` in `pyproject.toml` until 2026-10-08, and fiction: 1.6.1 cannot trace (the OpenInference instrumentor only instruments crewai `>=1.10.1`), 1.7–1.14 pin `click<8.2` and cannot install beside decimalai, and 1.15.0 fails C4. 1.15.3 is the lowest that passes the whole column, skills rail and delivery cells included. The skill loader's hook API exists from 1.5.0, so tracing sets the floor. Breaks in PATCH releases, so a major cap would protect little — the nightly floating lane is the control. |
 | pydantic-ai, claude-agent-sdk | `>=0.1.0` | none | Both floors are unverified `>=0.1.0` — the shape of a floor nobody has run. Verify before claiming them. |
 
 ### When a new framework version breaks a row

@@ -4,6 +4,29 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+- CrewAI gets automatic skill delivery (crewai>=1.15.3).
+  `from decimalai.crewai import instrument;
+  instrument(agent_name="support", enable_skill_loader=True)` routes every agent
+  turn through `SkillRouter` and inserts the menu and skill bodies after CrewAI's
+  own system prompt, using CrewAI's public `before_llm_call` hook. Same telemetry
+  as the LangChain and ADK loaders: the trace carries the `routing_id`, the
+  skills offered in the prompt and the skills whose body was delivered, and
+  nothing is recorded as activated (there is no `load_skill` tool on this rail).
+  Routing uses the task description, so CrewAI's own wrapper text and reflection
+  prompts don't skew it; a task's later model calls replace the block instead of
+  stacking it. `instrument()` also turns on CrewAI tracing — the exporter
+  `init(crewai=True)` installs — once per process, so `init(crewai=True)`
+  followed by `instrument(enable_skill_loader=True)` adds only the loader. Calls
+  CrewAI makes outside an agent executor (output conversion, guardrails,
+  planning) are left alone. `decimalai init --framework crewai` now says there
+  is no template yet instead of "no prompt seam".
+- The `conformance-tests` extra's CrewAI floor moves from 1.6.1 to 1.15.3, the
+  lowest version that passes the CrewAI conformance column. 1.6.1 could not be
+  traced (the OpenInference instrumentor needs crewai>=1.10.1), and crewai
+  1.7–1.14 cannot be installed beside decimalai (they pin `click<8.2`).
+
 ## [0.13.8] — 2026-10-06
 
 - `decimalai starter support --project ./support-agent` downloads a frozen,

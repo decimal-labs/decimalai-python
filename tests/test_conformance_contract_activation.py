@@ -520,7 +520,9 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
     on 2026-09-03 — not because it lost a loader, but because its rail started
     being GRADED at all (it had been declared `has_skills_rail=False` for five
     days after the rail shipped). What is absent there is the loader, which is
-    the narrower and permanent fact this set records.
+    the narrower and permanent fact this set records. `crewai` joined on
+    2026-10-08 the same way, on the commit that shipped its rail (a
+    before_llm_call hook): graded on C8/C13/C14, and no load_skill tool.
     """
     from tests.conformance.drivers import all_drivers
 
@@ -529,7 +531,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
         for d in all_drivers()
         if not d.capabilities.model_can_load_skill_bodies
     }
-    assert set(off) == {"langchain", "anthropic", "adk"}, off
+    assert set(off) == {"langchain", "anthropic", "adk", "crewai"}, off
     for name, reason in off.items():
         assert "prompt-injection" in reason, name
         assert "load_skill" in reason, name

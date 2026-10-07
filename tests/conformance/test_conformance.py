@@ -111,10 +111,11 @@ def test_contract(
 
 # ── the delivery matrix ──────────────────────────────────────────────────────
 
-#: Only a framework with a rail has a body channel to vary. The four are
-#: langchain, anthropic, openai-agents and pydantic-ai — the same four the SDK's
-#: own scaffold ledger calls seam-carrying (``cli/scaffold.py``), cross-checked
-#: by ``test_coverage.test_rail_declarations_match_the_scaffold_seam_ledger``.
+#: Only a framework with a rail has a body channel to vary. The six are
+#: langchain, anthropic, openai-agents, pydantic-ai, adk and crewai — the same six
+#: the SDK's own scaffold ledger calls seam-carrying (``cli/scaffold.py``),
+#: cross-checked by
+#: ``test_coverage.test_rail_declarations_match_the_scaffold_seam_ledger``.
 RAIL_DRIVER_NAMES = [d.name for d in DRIVERS if d.capabilities.has_skills_rail]
 
 #: Delivery cells that are known-red today, as ``driver:mode``. Same contract as

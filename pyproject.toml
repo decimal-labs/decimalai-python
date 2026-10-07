@@ -363,7 +363,8 @@ providers-tests = [
 # 2.7.0, llama-index-core 0.14.23, claude-agent-sdk 0.2.139, pydantic-ai 2.31.0,
 # openai 2.54.0, langchain-core 1.5.5): all nine drivers import and run in one
 # venv. The floors below are NOT floor-verified — refine by installing at the
-# floor and running the tier.
+# floor and running the tier. Exception: crewai, floor-verified 2026-10-08 (its
+# note below says what was run).
 conformance-tests = [
     # Every runtime framework extra in one line: langchain, langgraph, openai,
     # openai-agents, claude-agent-sdk, pydantic-ai, adk, llamaindex, evals
@@ -382,11 +383,23 @@ conformance-tests = [
     # with `uv pip compile --universal`. This tier's CrewAI driver reaches its
     # model through the OPENAI SDK against a local stub (see the instrumentor
     # note below), so the google-genai provider binding is a live-lane need it
-    # does not have. The floor is lower than
-    # crewai-tests' 1.14.6 for the same reason the live lane's is higher: 1.6.1
-    # is what co-resolves with google-adk + litellm here, and it is what the
-    # tier was verified on.
-    "crewai>=1.6.1",
+    # does not have.
+    #
+    # 1.15.3, raised from 1.6.1 on 2026-10-08 when the driver started grading
+    # the skills rail (decimalai/crewai.py). Each step below was RUN, not read:
+    #   * 1.6.1 resolved (`--resolution lowest-direct` still picks it) and could
+    #     not trace: openinference-instrumentation-crewai >= 1.0, which includes
+    #     the 1.1.8 floor two lines down, only instruments crewai >= 1.10.1, so
+    #     the column failed C4/C6/C7/C9/C10 on the unmodified adapter.
+    #   * 1.7.0 - 1.14.x pin click~=8.1.7, and decimalai needs click>=8.2: not
+    #     installable beside this package at all.
+    #   * 1.15.0 fails C4 (no completion text on the llm_call), adapter unchanged.
+    #   * 1.15.3, 1.15.20 and 1.15.23 pass the whole column, skills rail and
+    #     both delivery cells included — 1.15.3 also with the crewai and litellm
+    #     instrumentor floors below, under lowest-direct resolution.
+    # The skill loader's own seam (crewai.hooks.register_before_llm_call_hook)
+    # exists from 1.5.0, so tracing, not the hook, is what sets this number.
+    "crewai>=1.15.3",
     "openinference-instrumentation-crewai>=1.1.8",
     # No AutoGen line, deliberately. Both lineages were retired as integrations
     # (2026-08-16): `init(autogen=True)` is now an alias for the generic OTel

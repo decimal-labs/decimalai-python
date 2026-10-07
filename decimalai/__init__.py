@@ -524,7 +524,9 @@ def _warn_on_near_miss_agent_name(
         )
 
 
-def _activate_crewai_instrumentation(tracer_provider: Any) -> None:
+def _activate_crewai_instrumentation(
+    tracer_provider: Any, agent_name: Optional[str] = None
+) -> None:
     """Activate CrewAI span emission onto the DecimalAI OTEL exporter.
 
     Installing the exporter alone is not enough for CrewAI: current CrewAI
@@ -542,6 +544,19 @@ def _activate_crewai_instrumentation(tracer_provider: Any) -> None:
     pins, in which case activation fails at import/instrument time and the
     warning below is the only signal.
     """
+    # Tell the CrewAI adapter its tracing half is in place, so a later
+    # `decimalai.crewai.instrument(enable_skill_loader=True)` adds the skill
+    # loader without building a second exporter — one no instrumentor would
+    # feed. Set before the attempt: a failed activation has already warned
+    # below, and repeating it would not change the answer. The agent name goes
+    # along for the same reason langchain's does: the traces are filed under
+    # it, so the skills must be routed for it — including on a worker thread,
+    # where the run-scoped name the OTel rail stamps does not reach.
+    from . import crewai as _crewai_adapter
+
+    _crewai_adapter._tracing_installed = True
+    if agent_name:
+        _crewai_adapter._install_agent_name = agent_name
     try:
         from openinference.instrumentation.crewai import CrewAIInstrumentor
     except ImportError:
@@ -700,7 +715,9 @@ def init(
             itself, so this activates the OpenInference CrewAI instrumentor
             (plus provider instrumentors for importable LLM SDKs); if
             ``openinference-instrumentation-crewai`` isn't installed, a
-            warning explains that no traces will be captured.
+            warning explains that no traces will be captured. Skill delivery
+            is a separate, explicit step:
+            ``decimalai.crewai.instrument(agent_name=..., enable_skill_loader=True)``.
         autogen: RETIRED. AutoGen / AG2 is no longer a supported integration —
             this flag now installs the generic OpenTelemetry exporter (exactly
             what ``otel=True`` does) and warns. Kept so existing code keeps
@@ -948,7 +965,7 @@ def init(
             from .otel import instrument as _otel_install
             _otel_provider = _otel_install(agent_name=agent_name)
             if crewai:
-                _activate_crewai_instrumentation(_otel_provider)
+                _activate_crewai_instrumentation(_otel_provider, agent_name=agent_name)
             if autogen:
                 from .autogen import _warn_autogen_not_supported
                 _warn_autogen_not_supported()

@@ -142,17 +142,19 @@ WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. `enable_skill_loader` exists on exactly four adapters
-(langchain, openai_agents, anthropic, pydantic_ai); the rest — llamaindex,
-claude_agent_sdk, crewai/autogen/otel — trace and version but have no
-loader, and generating a file for them would hand someone a program that looks
-correct and quietly ignores every skill they picked. `--framework` names the
-reason rather than printing a bare "invalid choice".
+loader can use. `enable_skill_loader` exists on six adapters (langchain,
+openai_agents, anthropic, pydantic_ai, adk, crewai); the rest — llamaindex,
+claude_agent_sdk, autogen/otel — trace and version but have no loader, and
+generating a file for them would hand someone a program that looks correct and
+quietly ignores every skill they picked. `--framework` names the reason rather
+than printing a bare "invalid choice".
 
-Of the four, three are scaffolded. `anthropic` is the holdout and the reason is
+Of the six, four are scaffolded. `anthropic` is a holdout and the reason is
 not "nobody got to it": that adapter patches one `messages.create()` call, so it
 owns no tool loop — a generated file there would be a hand-rolled while-loop this
 template would have to invent, and the body could only arrive by injection.
+`crewai` is the other, and that one IS "nobody got to it yet": its loader
+shipped on 2026-10-08, ahead of a template.
 """
 
 from __future__ import annotations
@@ -201,6 +203,12 @@ UNSCAFFOLDED_WITH_SEAM: Dict[str, str] = {
     # Gemini" — was false. google-genai reads GOOGLE_GEMINI_BASE_URL (present
     # since v1.72, google-adk 2.0.0's own floor) and the journey stub now speaks
     # `:generateContent`. Nothing in the generated file knows about the stub.
+    #
+    # crewai moved here from NO_PROMPT_SEAM on 2026-10-08: decimalai/crewai.py
+    # delivers skills through CrewAI's before_llm_call hook, graded by C8/C14 and
+    # the injected delivery cell. There is no template yet, so `decimalai init`
+    # says "not yet" instead of "no seam".
+    "crewai": "CrewAI",
 }
 
 #: Frameworks deliberately NOT offered: their adapters have no prompt seam, so
@@ -209,7 +217,6 @@ UNSCAFFOLDED_WITH_SEAM: Dict[str, str] = {
 NO_PROMPT_SEAM: Dict[str, str] = {
     "llamaindex": "LlamaIndex",
     "claude-agent-sdk": "The Claude Agent SDK",
-    "crewai": "CrewAI",
     "autogen": "AutoGen / AG2",
     "otel": "The generic OpenTelemetry rail",
 }

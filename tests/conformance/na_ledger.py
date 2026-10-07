@@ -57,6 +57,11 @@ DECLARED_NA: Dict[str, str] = {
     # narrower and permanent fact — ADK registers no load_skill tool, so the
     # model cannot ask for a body.
     "adk:C13b": "model_can_load_skill_bodies",
+    # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
+    # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
+    # graded; the model still cannot ASK for a body (no load_skill tool), so
+    # C13b has nothing to find.
+    "crewai:C13b": "model_can_load_skill_bodies",
     # No skills rail at all: nothing was ever offered, so nothing can be routed,
     # delivered or activated. Cross-checked against the SDK's own ledger of
     # seamless frameworks — see
@@ -65,10 +70,6 @@ DECLARED_NA: Dict[str, str] = {
     "llamaindex:C13": "has_skills_rail",
     "llamaindex:C13b": "has_skills_rail",
     "llamaindex:C14": "has_skills_rail",
-    "crewai:C8": "has_skills_rail",
-    "crewai:C13": "has_skills_rail",
-    "crewai:C13b": "has_skills_rail",
-    "crewai:C14": "has_skills_rail",
     "generic-otel:C8": "has_skills_rail",
     "generic-otel:C13": "has_skills_rail",
     "generic-otel:C13b": "has_skills_rail",
@@ -90,7 +91,9 @@ DECLARED_NA: Dict[str, str] = {
 # and started being GRADED, because the adapter grew a real skills rail on
 # 2026-08-29 and this suite had not noticed. A budget that only ever goes up
 # is a ratchet on honesty; this is the direction it is supposed to move.
-NA_BUDGET = 21
+# Lowered 21 -> 18 on 2026-10-08, the same move for CrewAI: its rail shipped
+# with this driver change on the same commit, so C8, C13 and C14 are graded.
+NA_BUDGET = 18
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -109,6 +112,10 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # ADK's plugin hooks observe a turn and own no tool loop, and no load_skill
     # tool is registered for a result to come back from.
     "adk:tool_loaded": "decimalai/adk.py",
+    # CrewAI's before_llm_call hook edits one call's messages and registers no
+    # tool. CrewAI itself runs a tool loop, so this is the SEAM's limit, the same
+    # kind langchain's invoke-layer patch and ADK's plugin hooks declare.
+    "crewai:tool_loaded": "decimalai/crewai.py",
 }
 
 # Raised 2 -> 3 on 2026-09-03 when ADK's rail started being graded. The budget
@@ -118,7 +125,11 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
 # fourth without the same evidence: `contract._grade_framework_limit` still
 # refuses the N/A unless the adapter emits its documented refusal on the run
 # and delivers nothing by that channel.
-DELIVERY_NA_BUDGET = 3
+# Raised 3 -> 4 on 2026-10-08 for crewai, the fourth prompt-injection-only rail,
+# on that same evidence: the driver asks for the tool loop in the tool_loaded
+# cell, and the N/A holds only while the adapter refuses on the run and no body
+# arrives by a tool. A load_skill tool on the Agent would retire this line.
+DELIVERY_NA_BUDGET = 4
 
 # ── journey-axis N/As ────────────────────────────────────────────────────────
 
@@ -143,7 +154,9 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
     "anthropic:J1": "UNSCAFFOLDED_WITH_SEAM",
     "llamaindex:J1": "NO_PROMPT_SEAM",
     "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
-    "crewai:J1": "NO_PROMPT_SEAM",
+    # Moved from NO_PROMPT_SEAM on 2026-10-08: the adapter delivers skills now,
+    # but `decimalai init` has no CrewAI template yet.
+    "crewai:J1": "UNSCAFFOLDED_WITH_SEAM",
     # adk left this ledger on 2026-09-05: the journey stub speaks Gemini's
     # `:generateContent` and the template shipped (scaffold.py `_render_adk`).
     "generic-otel:J1": "NO_PROMPT_SEAM",
