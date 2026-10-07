@@ -199,11 +199,17 @@ def _reset_sdk(monkeypatch):
         dict(adk._manifest_trackers),
         adk._skill_loader_enabled,
         adk._skill_router_singleton,
+        adk._instrument_config,
+        adk._runner_patched,
+        adk._install_agent_name,
     )
     adk._manifest_ids = {}
     adk._manifest_trackers = {}
     adk._skill_loader_enabled = False
     adk._skill_router_singleton = None
+    adk._instrument_config = adk._InstrumentationConfig()
+    adk._runner_patched = False
+    adk._install_agent_name = None
 
     if not HAS_REAL_ADK:
         # No real google-adk here: stub the one import `_plugin_class()` does.
@@ -237,6 +243,9 @@ def _reset_sdk(monkeypatch):
         adk._manifest_trackers,
         adk._skill_loader_enabled,
         adk._skill_router_singleton,
+        adk._instrument_config,
+        adk._runner_patched,
+        adk._install_agent_name,
     ) = saved
 
 
@@ -497,6 +506,144 @@ class TestSeamWithoutAdk:
         assert captured["inject_body"] is True
 
 
+class TestInvocationObserver:
+    def test_observer_gets_one_detached_delivery_snapshot_and_cannot_mutate_export(self, use_router):
+        from decimalai.adk import DecimalaiPlugin
+
+        use_router(_SplitRouter())
+        seen = []
+
+        def observe(trace):
+            seen.append(trace.model_copy(deep=True))
+            trace.skills_delivered.append("observer-mutation")
+            trace.agent_name = "observer-mutation"
+
+        plugin = DecimalaiPlugin(agent_name="support", enable_skill_loader=True, on_trace=observe)
+        _drive_one_turn(plugin, _FakeLlmRequest(CALLER_PROMPT))
+        asyncio.run(plugin.after_run_callback(invocation_context=SimpleNamespace(invocation_id="inv-1")))
+        asyncio.run(plugin.on_run_error_callback(
+            invocation_context=SimpleNamespace(invocation_id="inv-1"), error=RuntimeError("late"),
+        ))
+        sent = _flushed_traces()
+        assert len(seen) == len(sent) == 1
+        assert seen[0].id == sent[0].id
+        assert seen[0].skills_delivered == sent[0].skills_delivered == ["refund-policy"]
+        assert seen[0].active_skills == sent[0].active_skills == []
+        assert sent[0].agent_name == "support"
+
+    def test_an_error_invocation_observes_delivery_once_and_observer_failure_does_not_drop_it(self, use_router):
+        from decimalai.adk import DecimalaiPlugin
+        from decimalai.schema.common import Status
+
+        use_router(_SplitRouter())
+        seen = []
+
+        def broken_observer(trace):
+            seen.append(trace)
+            raise RuntimeError("observer failed")
+
+        plugin = DecimalaiPlugin(enable_skill_loader=True, on_trace=broken_observer)
+        ic = SimpleNamespace(agent=_agent(), invocation_id="error", user_content=USER_QUESTION)
+        cc = SimpleNamespace(invocation_id="error")
+        req = _FakeLlmRequest(CALLER_PROMPT)
+
+        async def drive():
+            await plugin.before_run_callback(invocation_context=ic)
+            await plugin.before_model_callback(callback_context=cc, llm_request=req)
+            await plugin.on_model_error_callback(callback_context=cc, llm_request=req, error=RuntimeError("429"))
+            await plugin.on_run_error_callback(invocation_context=ic, error=RuntimeError("429"))
+            await plugin.on_run_error_callback(invocation_context=ic, error=RuntimeError("late"))
+
+        asyncio.run(drive())
+        sent = _flushed_traces()
+        assert len(seen) == len(sent) == 1
+        assert seen[0].status == sent[0].status == Status.ERROR
+        assert seen[0].skills_delivered == ["refund-policy"]
+        assert seen[0].active_skills == []
+
+    def test_parent_is_captured_at_invocation_start_before_executor_finalization(self):
+        from decimalai.adk import DecimalaiPlugin
+        from decimalai.generic import start_trace
+
+        seen = []
+        plugin = DecimalaiPlugin(on_trace=seen.append)
+        ic = SimpleNamespace(agent=_agent(), invocation_id="parent", user_content=USER_QUESTION)
+        with start_trace(agent_name="outer", auto_send=False) as outer:
+            parent_id = outer.get_trace_id()
+            asyncio.run(plugin.before_run_callback(invocation_context=ic))
+        # The generic context has already closed; finalization's executor has no
+        # ContextVar inheritance. Reading the parent here would silently unlink.
+        asyncio.run(plugin.after_run_callback(invocation_context=ic))
+        assert seen[0].parent_trace_id == _flushed_traces()[0].parent_trace_id == parent_id
+
+    def test_explicit_parent_wins_and_standalone_invocations_stay_roots(self):
+        from uuid import uuid4
+        from decimalai.adk import DecimalaiPlugin
+        from decimalai.generic import start_trace
+
+        parent_id = str(uuid4())
+        seen = []
+        with start_trace(agent_name="outer", auto_send=False):
+            _drive_one_turn(DecimalaiPlugin(parent_trace_id=parent_id, on_trace=seen.append), _FakeLlmRequest())
+        _drive_one_turn(DecimalaiPlugin(on_trace=seen.append), _FakeLlmRequest(), inv_id="standalone")
+        assert [trace.parent_trace_id for trace in seen] == [parent_id, None]
+
+    def test_concurrent_generic_contexts_keep_their_own_parent(self):
+        from decimalai.adk import DecimalaiPlugin
+        from decimalai.generic import start_trace
+
+        seen, parents = [], {}
+        plugin = DecimalaiPlugin(on_trace=seen.append)
+
+        async def run(invocation_id):
+            with start_trace(agent_name=invocation_id, auto_send=False) as outer:
+                parents[invocation_id] = outer.get_trace_id()
+                ic = SimpleNamespace(agent=_agent(invocation_id), invocation_id=invocation_id)
+                await plugin.before_run_callback(invocation_context=ic)
+                await asyncio.sleep(0)  # overlap starts before either finalizes
+                await plugin.after_run_callback(invocation_context=ic)
+
+        async def drive():
+            await asyncio.gather(run("first"), run("second"))
+
+        asyncio.run(drive())
+        assert len(seen) == 2
+        assert {trace.agent_name: trace.parent_trace_id for trace in seen} == parents
+        assert len({trace.id for trace in seen}) == 2
+
+    def test_reinstrument_updates_new_invocations_without_moving_inflight_observers(self, monkeypatch):
+        import decimalai.adk as adk
+
+        runners = types.ModuleType("google.adk.runners")
+
+        class Runner:
+            def __init__(self, **kwargs):
+                self.plugins = kwargs["plugins"]
+
+        runners.Runner = Runner
+        monkeypatch.setitem(sys.modules, "google.adk.runners", runners)
+        first, second = [], []
+        adk.instrument(agent_name="first", on_trace=first.append)
+        plugin = Runner().plugins[0]
+        original_patch = Runner.__init__
+        ic1 = SimpleNamespace(agent=_agent(), invocation_id="first")
+        ic2 = SimpleNamespace(agent=_agent(), invocation_id="second")
+
+        async def drive():
+            await plugin.before_run_callback(invocation_context=ic1)
+            adk.instrument(agent_name="second", on_trace=second.append)
+            await plugin.before_run_callback(invocation_context=ic2)
+            await asyncio.gather(plugin.after_run_callback(invocation_context=ic2),
+                                 plugin.after_run_callback(invocation_context=ic1))
+
+        asyncio.run(drive())
+        assert Runner.__init__ is original_patch
+        assert Runner().plugins[0] is plugin
+        assert [trace.agent_name for trace in first] == ["first"]
+        assert [trace.agent_name for trace in second] == ["second"]
+        assert {trace.agent_name for trace in _flushed_traces()} == {"first", "second"}
+
+
 # ── layer 2: the real thing ─────────────────────────────────
 
 
@@ -515,7 +662,7 @@ class TestRealAdkRun:
     """
 
     @staticmethod
-    def _build(router, *, tools=(), turns=None):
+    def _build(router, *, tools=(), turns=None, on_trace=None):
         from google.adk.agents import LlmAgent
         from google.adk.models.base_llm import BaseLlm
         from google.adk.models.llm_response import LlmResponse
@@ -553,7 +700,7 @@ class TestRealAdkRun:
         svc = InMemorySessionService()
         runner = Runner(
             agent=agent, app_name="support", session_service=svc,
-            plugins=[adk.DecimalaiPlugin(agent_name="support")],
+            plugins=[adk.DecimalaiPlugin(agent_name="support", on_trace=on_trace)],
         )
 
         async def _run() -> str:
@@ -614,13 +761,22 @@ class TestRealAdkRun:
         def _turn1(types):
             return types.Content(role="model", parts=[types.Part(text="23.5%")])
 
-        _answer, seen = self._build(router, tools=[lookup_order], turns=[_turn0, _turn1])
+        observed = []
+        _answer, seen = self._build(
+            router, tools=[lookup_order], turns=[_turn0, _turn1], on_trace=observed.append,
+        )
         assert len(seen) == 2, f"expected a tool round-trip, got {len(seen)} model turns"
         for step, req in enumerate(seen):
             assert SENTINEL in (req.config.system_instruction or ""), (
                 f"model turn {step} of one invocation lost the skill body"
             )
         assert router.queries == [USER_QUESTION, USER_QUESTION], router.queries
+        exported = _flushed_traces()
+        assert len(observed) == len(exported) == 1
+        assert observed[0].id == exported[0].id
+        assert len(observed[0].llm_calls) == 2
+        assert observed[0].skills_delivered == ["refund-policy"]
+        assert observed[0].active_skills == []
 
     def test_the_synthetic_request_has_not_drifted(self):
         """Pin ``_FakeLlmRequest`` to the real ``LlmRequest``.

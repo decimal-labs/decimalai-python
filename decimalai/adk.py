@@ -48,8 +48,9 @@ import asyncio
 import logging
 import threading
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .schema.common import CallRole, FinishReason, SpanType, Status
@@ -130,6 +131,17 @@ _PluginClass: Any = None
 # overrides it for one explicitly-constructed plugin.
 _skill_loader_enabled = False
 _skill_router_singleton: Any = None
+
+
+@dataclass(frozen=True)
+class _InstrumentationConfig:
+    agent_name: Optional[str] = None
+    on_trace: Optional[Callable[[RunTrace], None]] = None
+    enable_skill_loader: bool = False
+
+
+_instrument_lock = threading.Lock()
+_instrument_config = _InstrumentationConfig()
 
 
 def _now() -> datetime:
@@ -437,11 +449,15 @@ class _RunState:
         "llm_calls", "spans", "pending_llm", "pending_tools", "agent_stack",
         "status", "error_code", "error_message", "manifest",
         "routing_id", "skills_offered", "skills_delivered",
+        "parent_trace_id", "on_trace", "enable_skill_loader",
     )
 
     def __init__(self, *, agent_name: Optional[str], started_at: datetime):
         self.trace_id: UUID = uuid4()
         self.agent_name = agent_name
+        self.parent_trace_id: Optional[str] = None
+        self.on_trace: Optional[Callable[[RunTrace], None]] = None
+        self.enable_skill_loader = False
         # The ADK root agent's own ``.name`` (a Python identifier). Distinct
         # from ``agent_name`` (the DecimalAI label, which an explicit plugin
         # name can override). Used only to detect when the *root* agent
@@ -502,6 +518,7 @@ def _plugin_class() -> Any:
             parent_trace_id: Optional[str] = None,
             enable_skill_loader: Optional[bool] = None,
             enable_load_skill_tool: bool = False,
+            on_trace: Optional[Callable[[RunTrace], None]] = None,
         ):
             super().__init__(name=name)
             # Accepted and DORMANT — see `instrument()`'s docstring. Refused
@@ -520,6 +537,8 @@ def _plugin_class() -> Any:
             self.agent_name = agent_name
             self.project = project
             self.parent_trace_id = parent_trace_id
+            self.on_trace = on_trace
+            self._follow_instrument_config = False
             # None = follow the module flag `instrument()` set. An explicit
             # bool is this plugin's own answer, for the documented
             # `plugins=[DecimalaiPlugin(...)]` path where no instrument() call
@@ -599,13 +618,25 @@ def _plugin_class() -> Any:
             if not _config._is_enabled():
                 return None
             agent = getattr(invocation_context, "agent", None)
-            # Explicit plugin agent_name wins over ADK's internal node name (a
-            # constrained Python identifier); global instrument() supplies no
-            # explicit name, so it falls back to the ADK agent's own name.
-            agent_name = (
-                self.agent_name or getattr(agent, "name", None) or _install_agent_name
-            )
+            # An explicit label wins over ADK's internal node name (a
+            # constrained Python identifier).
+            # Capture configuration and context at invocation START. Finalization
+            # runs on an executor thread, where the generic ContextVar is absent;
+            # reinstrumenting meanwhile must not move an in-flight observer.
+            with _instrument_lock:
+                settings = _instrument_config if self._follow_instrument_config else _InstrumentationConfig(
+                    self.agent_name, self.on_trace, self._skill_loader_on(),
+                )
+            agent_name = settings.agent_name or getattr(agent, "name", None) or _install_agent_name
             state = _RunState(agent_name=agent_name, started_at=_now())
+            state.on_trace = settings.on_trace
+            state.enable_skill_loader = settings.enable_skill_loader
+            state.parent_trace_id = self.parent_trace_id
+            if not state.parent_trace_id:
+                from .generic import _get_current_trace
+                enclosing = _get_current_trace()
+                if enclosing is not None:
+                    state.parent_trace_id = enclosing.get_trace_id()
             state.root_agent_name = getattr(agent, "name", None)
             state.user_input_preview = _content_to_text(
                 getattr(invocation_context, "user_content", None)
@@ -746,7 +777,7 @@ def _plugin_class() -> Any:
             # to push the one line that actually reaches the model off the end
             # of the callback. Never raises out — a Router failure degrades to
             # an unskilled turn, it does not break the caller's model call.
-            if self._skill_loader_on():
+            if state.enable_skill_loader:
                 try:
                     _inject_skills_into_request(state, llm_request)
                 except Exception:
@@ -944,7 +975,7 @@ def _plugin_class() -> Any:
                     id=state.trace_id,
                     project=self.project or (config.project if config else None),
                     agent_name=state.agent_name,
-                    parent_trace_id=self.parent_trace_id,
+                    parent_trace_id=state.parent_trace_id,
                     status=state.status,
                     source_type="production",
                     started_at=state.started_at,
@@ -965,6 +996,12 @@ def _plugin_class() -> Any:
                     skills_offered_in_prompt=sorted(state.skills_offered),
                     skills_delivered=sorted(state.skills_delivered),
                 )
+                if state.on_trace is not None:
+                    try:
+                        # Observers cannot mutate the trace that will be exported.
+                        state.on_trace(trace.model_copy(deep=True))
+                    except Exception:
+                        logger.exception("ADK trace observer failed for %s", trace.id)
                 if state.agent_name in _pending_manifests:
                     # Registration was refused: hold the trace, re-register on the
                     # sender's thread, and stamp the real id before it ships.
@@ -1051,6 +1088,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     parent_trace_id: Optional[str] = None,
     enable_skill_loader: Optional[bool] = None,
     enable_load_skill_tool: bool = False,
+    on_trace: Optional[Callable[[RunTrace], None]] = None,
 ) -> Any:
     """Construct a DecimalAI ADK plugin to add to a ``Runner``.
 
@@ -1060,6 +1098,9 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
         project: Optional project grouping for the traces.
         parent_trace_id: When this Runner runs as a sub-agent of another,
             the parent's trace id — links the child traces in the backend.
+        on_trace: Optional observer called once on the exporter worker thread
+            with a detached completed trace, before export. Exceptions are
+            isolated from tracing and execution.
         enable_skill_loader: Route this Runner's turns through SkillRouter and
             append the result to the system instruction. ``None`` (default)
             follows whatever ``instrument()`` was told; pass ``True``/``False``
@@ -1083,13 +1124,14 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     return _plugin_class()(
         agent_name=agent_name, name=name, project=project,
         parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,
-        enable_load_skill_tool=enable_load_skill_tool,
+        enable_load_skill_tool=enable_load_skill_tool, on_trace=on_trace,
     )
 
 
 def instrument(
     agent_name: Optional[str] = None, *, enable_skill_loader: bool = False,
     enable_load_skill_tool: bool = False,
+    on_trace: Optional[Callable[[RunTrace], None]] = None,
 ) -> None:
     """Install DecimalAI tracing globally for google-adk.
 
@@ -1097,8 +1139,12 @@ def instrument(
     auto-injected into every ``Runner`` created afterwards. Idempotent.
 
     Args:
-        agent_name: Default agent name for traces whose ADK agent doesn't
-            supply one of its own.
+        agent_name: Optional DecimalAI trace label. When omitted, uses the
+            ADK agent's own name.
+        on_trace: Optional observer called once per real invocation, including
+            failed invocations. Receives a detached trace with witnessed delivery
+            rails on the exporter worker thread. Exceptions are isolated from
+            tracing and execution. Updating instrument() affects new invocations only.
         enable_skill_loader: When True, every model turn is routed through
             ``SkillRouter`` and the routed skills — bodies included, since ADK
             has no ``load_skill`` tool to fetch them on demand — are appended
@@ -1117,7 +1163,7 @@ def instrument(
             loud, on that run, instead of being excused by a sentence in a
             table.
     """
-    global _install_agent_name, _runner_patched, _skill_loader_enabled
+    global _install_agent_name, _runner_patched, _skill_loader_enabled, _instrument_config
     if enable_load_skill_tool:
         logger.warning(
             "enable_load_skill_tool is not supported on the adk adapter "
@@ -1125,15 +1171,15 @@ def instrument(
             "body); staying on prompt injection. Use openai_agents or "
             "pydantic_ai for the native load_skill tool."
         )
-    _install_agent_name = agent_name
-    # Set BEFORE the idempotence return: a second instrument() call that turns
-    # the loader on must take effect, and the shared plugin reads this flag per
-    # turn rather than caching it at construction.
-    if enable_skill_loader:
-        _skill_loader_enabled = True
-
-    if _runner_patched:
-        return
+    with _instrument_lock:
+        _install_agent_name = agent_name
+        # Preserve the loader's existing sticky opt-in, and atomically publish
+        # the observer/name configuration for subsequent invocations.
+        if enable_skill_loader:
+            _skill_loader_enabled = True
+        _instrument_config = _InstrumentationConfig(agent_name, on_trace, _skill_loader_enabled)
+        if _runner_patched:
+            return
 
     try:
         from google.adk.runners import Runner
@@ -1145,18 +1191,22 @@ def instrument(
         )
         return
 
-    shared_plugin = DecimalaiPlugin(agent_name=agent_name)
-    original_init = Runner.__init__
+    with _instrument_lock:
+        if _runner_patched:
+            return
+        shared_plugin = DecimalaiPlugin()
+        shared_plugin._follow_instrument_config = True
+        original_init = Runner.__init__
 
-    def patched_init(self, **kwargs):  # Runner.__init__ is keyword-only
-        plugins = list(kwargs.pop("plugins", None) or [])
-        if not any(getattr(p, "name", None) == shared_plugin.name for p in plugins):
-            plugins.insert(0, shared_plugin)
-        kwargs["plugins"] = plugins
-        original_init(self, **kwargs)
+        def patched_init(self, **kwargs):  # Runner.__init__ is keyword-only
+            plugins = list(kwargs.pop("plugins", None) or [])
+            if not any(getattr(p, "name", None) == shared_plugin.name for p in plugins):
+                plugins.insert(0, shared_plugin)
+            kwargs["plugins"] = plugins
+            original_init(self, **kwargs)
 
-    Runner.__init__ = patched_init  # type: ignore[method-assign]
-    _runner_patched = True
+        Runner.__init__ = patched_init  # type: ignore[method-assign]
+        _runner_patched = True
     logger.info("DecimalAI ADK tracing installed globally (agent_name=%s)", agent_name)
 
 
