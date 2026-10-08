@@ -45,8 +45,9 @@ and patch releases are fixes.
   CrewAI tracing are unaffected.
 - The `conformance-tests` extra's CrewAI floor moves from 1.6.1 to 1.15.3, the
   lowest version that passes the CrewAI conformance column. 1.6.1 could not be
-  traced (the OpenInference instrumentor needs crewai>=1.10.1), and crewai
-  1.7–1.14 cannot be installed beside decimalai (they pin `click<8.2`).
+  traced (the OpenInference instrumentor needs crewai>=1.10.1), crewai
+  1.7–1.14.6 cannot be installed beside decimalai (they pin `click<8.2`), and
+  1.14.7 and 1.15.0–1.15.2 lose the model's reply text from the trace.
 - Long-running processes no longer start logging "skill rail overflow" after
   about 4,096 runs. The ADK, Anthropic, OpenAI Agents and Pydantic AI skill
   loaders each left a per-run entry on the skill router that nothing removed:
@@ -64,6 +65,11 @@ and patch releases are fixes.
   `init(crewai=True)` and `init(openai=True)` / `anthropic=` / `google=` turn
   on: a refused instrumentor is no longer reported as enabled or recorded as
   instrumented.
+- Test extras: `crewai-tests` floors crewai at 1.15.3 (was 1.14.6, which cannot
+  be installed beside decimalai), and `providers-tests` floors
+  `openinference-instrumentation-openai` at 0.1.45 (was 0.1.18). Every release
+  up to 0.1.44 fails to instrument under wrapt 2.x, which every fresh install now
+  gets, so no OpenAI call was traced.
 
 ## [0.13.8] — 2026-10-06
 

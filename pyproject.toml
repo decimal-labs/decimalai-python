@@ -253,8 +253,17 @@ live-llm-tests = [
 # CrewAI + its OpenInference bridges are heavy (~80 transitive pkgs) and pin a
 # native google-genai provider, so they live in their own extra rather than
 # bloating live-llm-tests. Install with: pip install -e ".[crewai-tests]"
+#
+# 1.15.3, raised from 1.14.6 on 2026-10-08. 1.14.6 could not be installed beside
+# decimalai at all (crewai 1.7.0-1.14.6 pin click~=8.1.7; decimalai needs
+# click>=8.2), so `--resolution lowest-direct` quietly took 1.14.7 — the first
+# release that relaxed that pin — and 1.14.7 fails conformance C4 (no completion
+# text on the llm_call), as do 1.15.0, 1.15.1 and 1.15.2. 1.15.3 passes the whole
+# CrewAI column in this extra's own environment (with [dev,providers-tests] for
+# the OpenAI instrumentor CrewAI 1.15 reaches its model through). Same floor, and
+# the same reason, as the conformance-tests line below.
 crewai-tests = [
-    "crewai[google-genai]>=1.14.6",
+    "crewai[google-genai]>=1.15.3",
     "openinference-instrumentation-crewai>=1.1.8",
     "openinference-instrumentation-google-genai>=1.0.2",
 ]
@@ -344,7 +353,15 @@ providers-tests = [
     "openai>=2.26.0",
     "anthropic>=0.40.0,<1.0.0",
     "google-genai>=1.65.0",
-    "openinference-instrumentation-openai>=0.1.18",
+    # 0.1.45, raised from 0.1.18 on 2026-10-08: every release up to 0.1.44 calls
+    # `wrap_function_wrapper(module=...)`, a keyword wrapt 2.x no longer accepts,
+    # so `instrument()` raises and no OpenAI call is traced — the pydantic-ai and
+    # crewai conformance columns lose every llm_call (C3). wrapt is not ours to
+    # pin, and every fresh resolve today takes 2.x. Not an openai 2.x break:
+    # 0.1.18 passes the pydantic-ai column on openai 2.54.0 once wrapt is 1.17.
+    # Bisected on wrapt 2.4.0 + openai 2.54.0: 0.1.44 fails, 0.1.45 passes both
+    # columns (and the crewai column on openai 2.26.0).
+    "openinference-instrumentation-openai>=0.1.45",
     "openinference-instrumentation-anthropic>=0.1.14,<2.0.0",
     "openinference-instrumentation-google-genai>=1.0.2",
 ]
@@ -391,9 +408,12 @@ conformance-tests = [
     #     not trace: openinference-instrumentation-crewai >= 1.0, which includes
     #     the 1.1.8 floor two lines down, only instruments crewai >= 1.10.1, so
     #     the column failed C4/C6/C7/C9/C10 on the unmodified adapter.
-    #   * 1.7.0 - 1.14.x pin click~=8.1.7, and decimalai needs click>=8.2: not
+    #   * 1.7.0 - 1.14.6 pin click~=8.1.7, and decimalai needs click>=8.2: not
     #     installable beside this package at all.
-    #   * 1.15.0 fails C4 (no completion text on the llm_call), adapter unchanged.
+    #   * 1.14.7 relaxes the click pin but pins opentelemetry-sdk~=1.34, which
+    #     google-adk>=2.0 (>=1.36) rules out of this extra; on its own it fails C4.
+    #   * 1.15.0 fails C4 (no completion text on the llm_call), adapter unchanged,
+    #     and so do 1.15.1 and 1.15.2 (checked 2026-10-08).
     #   * 1.15.3, 1.15.20 and 1.15.23 pass the whole column, skills rail and
     #     both delivery cells included — 1.15.3 also with the crewai and litellm
     #     instrumentor floors below, under lowest-direct resolution.
