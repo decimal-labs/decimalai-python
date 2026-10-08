@@ -477,10 +477,12 @@ def test_c13b_fails_with_no_trace() -> None:
 
 
 def test_the_items_are_registered_and_ordered_last() -> None:
+    """The skills-ladder items close the rail block; the caller's-side items
+    (C15/C16, 2026-10-08) follow them rather than splitting it."""
     assert contract.ITEMS["C13"] is contract.c13_skills_activation
     assert contract.ITEMS["C13b"] is contract.c13b_skills_activation_recorded
     assert contract.ITEMS["C14"] is contract.c14_skills_body_delivered
-    assert contract.ITEM_ORDER[-3:] == ["C13", "C13b", "C14"]
+    assert contract.ITEM_ORDER[-5:] == ["C13", "C13b", "C14", "C15", "C16"]
 
 
 def test_the_rail_flag_gates_both_items_and_the_loader_flag_gates_only_c13b() -> None:
@@ -595,6 +597,7 @@ def _delivery_driver(**limits: Any) -> Any:
         run_error=noop,
         run_degenerate=noop,
         run_skills=noop,
+        run_nested=noop,
         capabilities=Capabilities(delivery_limits=dict(limits)),
     )
 

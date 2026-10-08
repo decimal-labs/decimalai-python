@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -149,6 +150,78 @@ SYSTEM_PROMPT = "You are a conformance fixture. Use the tool, then answer."
 STUB_MODEL_NAME = "conformance-stub-1"
 
 
+# ── the caller's side of a run (C15, C16) ────────────────────────────────────
+#
+# An adapter that hands its caller each run's trace (``on_trace``) is graded on
+# what it hands over, and the only honest place to see that is the CALLER: what
+# the observer was given, set beside what crossed the wire. So the observer is
+# the suite's, never the driver's — a driver passes ``trace_observer(ctx)`` to
+# its adapter exactly as a user passes their own, and what it records is sliced
+# per phase by the harness and graded by ``contract.c15_invocation_observer``.
+
+#: What :func:`trace_observer` raises once it has recorded the trace. On purpose:
+#: an observer is the caller's code, and C15 holds every adapter to "an observer
+#: that raises costs neither the run nor its trace".
+OBSERVER_FAILURE = "conformance: the trace observer failed on purpose"
+
+#: Written into the trace the observer was handed, AFTER it was recorded. If an
+#: adapter handed over the trace it then exports instead of a copy, this text
+#: reaches the wire, and C15 reads the wire for it.
+OBSERVER_TAMPER = "conformance-observer-tamper"
+
+
+class ObserverError(RuntimeError):
+    """What the conformance observer raises — see :data:`OBSERVER_FAILURE`."""
+
+
+_OBSERVED: List[Dict[str, Any]] = []
+_OBSERVED_LOCK = threading.Lock()
+
+
+def trace_observer(ctx: Ctx) -> Callable[[Any], None]:
+    """The ``on_trace`` callable a driver hands its adapter in the ``nested`` phase.
+
+    Records what it was handed — the argument's type and the trace as JSON —
+    then edits the trace it holds and raises. Each of those three is a clause of
+    C15: the argument shape, the hand-over is a detached copy, and a failing
+    observer is isolated from the run and its export.
+    """
+
+    def _observe(trace: Any) -> None:
+        cls = type(trace)
+        try:
+            dump = trace.model_dump(mode="json")
+        except Exception:  # not a RunTrace at all — recorded, and C15 says so
+            dump = {"id": str(getattr(trace, "id", trace))}
+        entry = {
+            "lane": ctx.lane,
+            "type": f"{cls.__module__}.{cls.__qualname__}",
+            "trace": dump,
+        }
+        with _OBSERVED_LOCK:
+            _OBSERVED.append(entry)
+        try:
+            trace.user_input_preview = OBSERVER_TAMPER
+            trace.skills_delivered.append(OBSERVER_TAMPER)
+        except Exception:
+            pass
+        raise ObserverError(OBSERVER_FAILURE)
+
+    return _observe
+
+
+def observed_mark() -> int:
+    """A cursor into everything the conformance observer has recorded."""
+    with _OBSERVED_LOCK:
+        return len(_OBSERVED)
+
+
+def observed_since(mark: int) -> List[Dict[str, Any]]:
+    """What the observer recorded after ``mark`` — one phase's slice."""
+    with _OBSERVED_LOCK:
+        return [dict(entry) for entry in _OBSERVED[mark:]]
+
+
 # ── What a driver declares ───────────────────────────────────────────────────
 
 #: Every capability flag, and the contract items it gates. Declared here so a
@@ -176,6 +249,14 @@ CAPABILITY_ITEMS: Mapping[str, Tuple[str, ...]] = {
     # A driver may not actually set this False; see
     # test_coverage.test_no_rail_may_declare_it_cannot_deliver.
     "rail_can_deliver_bodies": ("C14",),
+    # One flag, both items, because they are one hand-over: the observer gives
+    # the caller the run's trace, and the parent link is what makes that trace
+    # safe to count — the router stamps a delivery onto the caller's enclosing
+    # trace too, and the platform credits it once only for a linked child. An
+    # adapter that grows an observer is graded on the link the same day.
+    # Not a judgement call per driver: test_coverage checks it against whether
+    # the adapter's instrument() takes on_trace.
+    "has_invocation_observer": ("C15", "C16"),
 }
 
 
@@ -257,6 +338,13 @@ class Capabilities:
     supports_concurrency: bool = True
     supports_error_path: bool = True
     supports_degenerate: bool = True
+    #: Whether the adapter hands its caller each run's trace — an ``on_trace``
+    #: observer on its ``instrument()`` — and so owes C15 (the observer's
+    #: contract) and C16 (that trace is filed under the caller's enclosing
+    #: ``decimalai.start_trace()``). False is not this suite's opinion:
+    #: ``test_coverage.test_observer_declarations_match_the_adapter_signatures``
+    #: reads it off the adapter's own signature.
+    has_invocation_observer: bool = True
     reasons: Mapping[str, str] = field(default_factory=dict)
     #: delivery mode -> the FrameworkLimit that makes it structurally
     #: impossible here. Empty for a framework that can do both channels.
@@ -330,6 +418,11 @@ class Driver:
     #: between runs is visible. Runs LAST, because on several adapters enabling
     #: the rail is an irreversible process-wide monkey-patch.
     run_skills: Optional[FanoutFn] = None
+    #: The documented snippet once more, with ``trace_observer(ctx)`` handed to
+    #: the adapter as its ``on_trace``. The HARNESS runs it inside a
+    #: ``decimalai.start_trace()`` it opens itself — the caller's enclosing
+    #: trace — so the driver neither opens nor sees it.
+    run_nested: Optional[RunFn] = None
 
     def __post_init__(self) -> None:
         """A claimed capability must come with the hook that exercises it.
@@ -344,6 +437,7 @@ class Driver:
             "supports_concurrency": "run_concurrent",
             "supports_error_path": "run_error",
             "supports_degenerate": "run_degenerate",
+            "has_invocation_observer": "run_nested",
         }
         for flag, hook in required.items():
             if getattr(self.capabilities, flag) and getattr(self, hook) is None:

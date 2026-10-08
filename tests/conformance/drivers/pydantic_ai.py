@@ -217,7 +217,20 @@ DRIVER = Driver(
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=False,
+        has_invocation_observer=False,
         reasons={
+            "has_invocation_observer": (
+                "decimalai/pydantic_ai.py hands its caller no run: instrument() takes "
+                "no on_trace, so C15 has no observer to grade. Its traces come from "
+                "the provider instrumentor on the OTel rail, which links a run to an "
+                "enclosing decimalai.start_trace() only where an adapter recorded that "
+                "link when the run started (decimalai/crewai.py does; this adapter "
+                "does not), so C16 is N/A with C15. A known gap: a run wrapped in "
+                "start_trace() ships unlinked, and a routed delivery is credited on "
+                "both traces. Not a framework limit and not this suite's opinion: "
+                "test_coverage reads this flag off instrument()'s own signature, so "
+                "the commit that gives it on_trace turns both items on."
+            ),
             "supports_degenerate": (
                 "this adapter does no tracing of its own — every trace it "
                 "produces is derived from a real provider-SDK call underneath. "

@@ -82,6 +82,28 @@ DECLARED_NA: Dict[str, str] = {
     # form for a manifest to be fabricated from.
     "crewai:C7b": "supports_degenerate",
     "pydantic-ai:C7b": "supports_degenerate",
+    # No invocation observer: the adapter's instrument() takes no on_trace, so a
+    # caller is never handed a run's trace (C15), and the parent link that makes
+    # a handed-over trace safe to count (C16) is graded with it. Added
+    # 2026-10-08 with the items. Unlike every line above, none of these is a
+    # judgement: test_coverage.test_observer_declarations_match_the_adapter_signatures
+    # reads has_invocation_observer off each adapter's signature, so the commit
+    # that adds on_trace to one of them fails until its two lines are deleted
+    # here and both items are graded. Three are rail adapters, and for them the
+    # missing link is a live gap the reasons name: a run wrapped in
+    # decimalai.start_trace() ships unlinked and a delivery is credited twice.
+    "openai-agents:C15": "has_invocation_observer",
+    "openai-agents:C16": "has_invocation_observer",
+    "anthropic:C15": "has_invocation_observer",
+    "anthropic:C16": "has_invocation_observer",
+    "pydantic-ai:C15": "has_invocation_observer",
+    "pydantic-ai:C16": "has_invocation_observer",
+    "llamaindex:C15": "has_invocation_observer",
+    "llamaindex:C16": "has_invocation_observer",
+    "generic-otel:C15": "has_invocation_observer",
+    "generic-otel:C16": "has_invocation_observer",
+    "claude-agent-sdk:C15": "has_invocation_observer",
+    "claude-agent-sdk:C16": "has_invocation_observer",
 }
 
 #: The number above, written down. Redundant with ``len(DECLARED_NA)`` on
@@ -93,7 +115,12 @@ DECLARED_NA: Dict[str, str] = {
 # is a ratchet on honesty; this is the direction it is supposed to move.
 # Lowered 21 -> 18 on 2026-10-08, the same move for CrewAI: its rail shipped
 # with this driver change on the same commit, so C8, C13 and C14 are graded.
-NA_BUDGET = 18
+# Raised 18 -> 30 on 2026-10-08 by two new ITEMS, not by new exemptions on old
+# ones: C15/C16 went live graded on the three adapters that hand their caller a
+# run (langchain, adk, crewai) and N/A on the six whose instrument() takes no
+# on_trace — a set read off the SDK's signatures rather than declared here.
+# Every one of the twelve comes off the day its adapter gains an observer.
+NA_BUDGET = 30
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 

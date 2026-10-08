@@ -265,5 +265,20 @@ DRIVER = Driver(
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=True,
+        has_invocation_observer=False,
+        reasons={
+            "has_invocation_observer": (
+                "decimalai/openai_agents.py hands its caller no run: instrument() "
+                "takes no on_trace, so C15 has no observer to grade, and a trace takes "
+                "a parent only from an explicit set_parent_trace() on its thread, "
+                "never from an enclosing decimalai.start_trace(). C16 grades that link "
+                "as the second half of the same hand-over, so it is N/A with C15 — "
+                "which leaves a known gap: a run wrapped in start_trace() ships "
+                "unlinked, and a routed delivery is credited on both traces. Not a "
+                "framework limit and not this suite's opinion: test_coverage reads "
+                "this flag off instrument()'s own signature, so the commit that gives "
+                "it on_trace turns both items on."
+            ),
+        },
     ),
 )

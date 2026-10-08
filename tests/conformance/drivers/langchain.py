@@ -29,6 +29,7 @@ from . import (
     fanout_threads,
     stub_script,
     tool_result,
+    trace_observer,
     user_message,
 )
 
@@ -133,6 +134,23 @@ def run(ctx: Ctx) -> Any:
     return graph.invoke({"messages": _messages(ctx)}, config={"callbacks": [handler]})
 
 
+def run_nested(ctx: Ctx) -> Any:
+    """The per-call-handler snippet, with the suite's observer on the handler.
+
+    ``handler.on_trace`` is the form ``decimalai init``'s generated Support
+    project uses (``decimalai/cli/project.py``), and the per-call handler is the
+    one form that adds no process-wide state — ``instrument(on_trace=...)``
+    would publish a global handler that traces every later phase a second time.
+    The harness runs this inside a ``decimalai.start_trace()`` of its own.
+    """
+    from decimalai.langchain import CallbackHandler
+
+    handler = CallbackHandler(agent_name=ctx.agent_name)
+    handler.on_trace = trace_observer(ctx)
+    graph = _graph(ctx, _stub_model(ctx))
+    return graph.invoke({"messages": _messages(ctx)}, config={"callbacks": [handler]})
+
+
 def run_error(ctx: Ctx) -> Any:
     """Same snippet, with the model raising partway through."""
     from decimalai.langchain import CallbackHandler
@@ -195,6 +213,7 @@ DRIVER = Driver(
     run_error=run_error,
     run_degenerate=run_degenerate,
     run_skills=run_skills,
+    run_nested=run_nested,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

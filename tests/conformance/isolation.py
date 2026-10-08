@@ -23,7 +23,9 @@ What crosses the boundary
 Everything ``contract.py`` reads, and nothing else:
 
 * every ``Phase`` — its ctxs, the probe's recorded requests (bodies and
-  responses verbatim), logs, warnings, new paths, export deltas;
+  responses verbatim), logs, warnings, new paths, export deltas, and the
+  caller's side of the run (what the conformance observer was handed, and the
+  enclosing trace the harness opened — C15, C16);
 * the probe state the contract queries — ``manifests`` (C6's
   ``manifest_owner``), ``skills`` (C8), ``routing_queries`` (C8's provenance
   check);
@@ -73,7 +75,8 @@ _DELIVERY_ENV_KEYS = frozenset(k for env in MODE_ENV.values() for k in env)
 #: Bumped when the payload shape changes. A child from a stale checkout then
 #: fails loudly instead of being graded on fields the parent misreads.
 #: 2 — ``Ctx`` gained ``delivery_mode`` (the body-channel axis).
-WIRE_VERSION = 2
+#: 3 — ``Phase`` gained ``observed`` and ``enclosing_trace_ids`` (C15, C16).
+WIRE_VERSION = 3
 
 #: Skills the probe's router offers when a driver declares a skills rail.
 #: Lives here rather than in ``conftest.py`` because the CHILD needs it and a

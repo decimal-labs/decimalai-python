@@ -31,10 +31,12 @@ C12         when the adapter cannot do what was asked, it says so
 C13         nothing is recorded as activated that the model did not ask for
 C13b        a body the model DID pull is not silently dropped
 C14         a skill's BODY reached the model, by any channel
+C15         the adapter hands its caller each run's trace: once, a copy, safely
+C16         a run inside the caller's decimalai.start_trace() ships as its child
 D1          …and each channel delivers ON ITS OWN (see the delivery axis below)
 ==========  ==========================================================
 
-C1–C14 are the per-driver matrix: one capture per driver, in the adapter's own
+C1–C16 are the per-driver matrix: one capture per driver, in the adapter's own
 resolved configuration. D1 is a second axis over the SAME contract style — one
 capture per (driver, body channel), with the other channel switched off — and is
 graded by :func:`grade_delivery` rather than by an entry in ``ITEMS``, because
@@ -67,6 +69,7 @@ from .delivery import (
     PROMPT_CHANNEL,
     TOOL_CHANNEL,
 )
+from .drivers import OBSERVER_TAMPER
 from .harness import Observation, Phase
 from .isolation import body_sentinel
 
@@ -1141,6 +1144,204 @@ def c14_skills_body_delivered(obs: Observation) -> Result:
     )
 
 
+# ── the caller's side of a run (C15, C16) ────────────────────────────────────
+#
+# An application wraps a framework run in work of its own — a request, a
+# session, a `decimalai.start_trace()` — and needs two things back from the
+# adapter that traces it. They fail independently, so they are two items:
+#
+#   C15 — the run's own trace, HANDED OVER (`on_trace`). The adapter mints that
+#         trace's id where the caller cannot see it (on the OTel rail, on the
+#         exporter's thread), and it is the trace the platform writes the run's
+#         usage receipt against. A caller that cannot name it cannot check that
+#         its use was counted.
+#   C16 — the run's trace FILED UNDER the caller's (`parent_trace_id`). The
+#         router stamps a delivery onto the caller's enclosing trace as well
+#         (`skill_router._stamp_active_trace`), and the platform credits the use
+#         once only when the run's trace is that trace's linked child (platform
+#         `public_skill_usage.suppress_wrapper_duplicates`). Unlinked, every
+#         delivery is credited twice.
+#
+# Both are graded on the `nested` phase: the documented snippet, run inside a
+# `decimalai.start_trace()` the HARNESS opens, with the suite's observer
+# (`drivers.trace_observer`) as the adapter's `on_trace`. That observer records
+# what it is handed, edits it, and raises — so one run grades the argument, the
+# copy and the isolation. Gated together on `has_invocation_observer`, which
+# test_coverage reads off each adapter's own `instrument()` signature.
+
+#: What an observer is handed, on every adapter that has one.
+OBSERVED_TRACE_TYPE = "decimalai.schema.trace.RunTrace"
+
+#: Fields the observed copy must agree with the wire on: the run's identity, as
+#: the caller will record it, and the receipt-bearing rails it will read.
+_OBSERVED_IDENTITY = (
+    "id", "parent_trace_id", "agent_name", "status", "routing_id",
+    "skills_delivered",
+)
+
+
+def _nested_runs(phase: Phase) -> List[Dict[str, Any]]:
+    """The run's own traces in the nested phase — all but the enclosing one."""
+    enclosing = set(phase.enclosing_trace_ids)
+    return [t for t in phase.attempted if str(t.get("id")) not in enclosing]
+
+
+def c15_invocation_observer(obs: Observation) -> Result:
+    """The adapter hands its caller each run's trace — once, as a copy, safely.
+
+    Three clauses, each a property the LangChain and ADK observers already have
+    and every adapter with an ``on_trace`` owes:
+
+    * **once per run, with that run's trace** — every run trace on the wire was
+      handed over exactly once, as a ``RunTrace``, agreeing with the wire on the
+      run's identity (id, parent, agent, status, routing id, delivered names);
+    * **a detached copy** — the observer's edit to what it was handed must not
+      reach the wire;
+    * **isolated** — the observer raises, and neither the caller's run nor the
+      trace's export may notice.
+    """
+    item, title = "C15", "invocation_observer"
+    phase = obs.phases["nested"]
+    if not phase.ran:
+        return _fail(
+            item, title,
+            f"the nested phase did not run ({phase.na_reason}) — there is no "
+            f"observed run to grade",
+        )
+    runs = _nested_runs(phase)
+    if not runs:
+        return _fail(
+            item, title,
+            "the run inside the enclosing decimalai.start_trace() had shipped no "
+            "trace of its own by the time decimalai.flush() returned, so there was "
+            "nothing to hand the observer — no trace at all, or one still queued "
+            "where flush() does not reach",
+        )
+    observed = phase.observed
+    if not observed:
+        return _fail(
+            item, title,
+            f"{len(runs)} run trace(s) reached the wire and the on_trace observer was "
+            f"never called — the caller cannot name the trace that carries this "
+            f"run's usage receipt",
+        )
+
+    problems: List[str] = []
+    if phase.exception is not None:
+        problems.append(
+            f"the run raised {phase.exception} — the observer is the caller's code, "
+            f"and one that fails must cost the caller's run nothing"
+        )
+    wrong_type = sorted({str(o.get("type")) for o in observed} - {OBSERVED_TRACE_TYPE})
+    if wrong_type:
+        problems.append(
+            f"the observer was handed {wrong_type}, not a {OBSERVED_TRACE_TYPE} — "
+            f"the argument every observer adapter hands over"
+        )
+    wire = {str(t.get("id")): t for t in runs}
+    handed: Dict[str, int] = {}
+    for entry in observed:
+        tid = str((entry.get("trace") or {}).get("id"))
+        handed[tid] = handed.get(tid, 0) + 1
+    for tid, count in handed.items():
+        if count > 1:
+            problems.append(
+                f"trace {tid} was handed to the observer {count} times — once per "
+                f"run is the contract"
+            )
+        if tid not in wire:
+            problems.append(
+                f"the observer was handed trace {tid}, and no trace with that id "
+                f"reached the wire — the caller recorded a run the platform never "
+                f"received (did the failing observer cost the run its export?)"
+            )
+    for tid in wire:
+        if tid not in handed:
+            problems.append(f"trace {tid} reached the wire and was never handed to the observer")
+    for entry in observed:
+        mine = entry.get("trace") or {}
+        shipped = wire.get(str(mine.get("id")))
+        if shipped is None:
+            continue
+        for name in _OBSERVED_IDENTITY:
+            if mine.get(name) != shipped.get(name):
+                problems.append(
+                    f"the observer was handed {name}={mine.get(name)!r} but the trace "
+                    f"that shipped says {shipped.get(name)!r} — the caller records a "
+                    f"different run from the one the platform received"
+                )
+    tampered = sorted(tid for tid, t in wire.items() if OBSERVER_TAMPER in _flat(t))
+    if tampered:
+        problems.append(
+            f"the observer's edit to the trace it was handed reached the wire on "
+            f"{tampered} — it was handed the trace being exported, not a copy, so "
+            f"caller code can rewrite what the platform receives"
+        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"{len(runs)} run trace(s), each handed to the observer once as a detached "
+        f"RunTrace matching the wire; the observer raised and the run and its "
+        f"export carried on",
+    )
+
+
+def c16_parent_link(obs: Observation) -> Result:
+    """A run made inside the caller's ``decimalai.start_trace()`` ships as its child.
+
+    The link the LangChain adapter makes from the enclosing generic context, and
+    ADK makes at invocation start: ``parent_trace_id`` is the enclosing trace's
+    id, on every trace the run produced, and the enclosing trace itself reached
+    the wire for it to point at.
+    """
+    item, title = "C16", "parent_link"
+    phase = obs.phases["nested"]
+    if not phase.ran:
+        return _fail(
+            item, title,
+            f"the nested phase did not run ({phase.na_reason}) — there is no "
+            f"enclosed run to grade",
+        )
+    if not phase.enclosing_trace_ids:
+        return _fail(
+            item, title,
+            "the harness recorded no enclosing trace for the nested phase — a "
+            "harness defect, not the adapter's: there is nothing to link against",
+        )
+    parent = phase.enclosing_trace_ids[0]
+    runs = _nested_runs(phase)
+    if not runs:
+        return _fail(
+            item, title,
+            f"the run inside decimalai.start_trace() {parent} had shipped no trace of "
+            f"its own by the time decimalai.flush() returned — there is nothing to "
+            f"link (no trace at all, or one still queued where flush() does not reach)",
+        )
+    problems: List[str] = []
+    if parent not in {str(t.get("id")) for t in phase.attempted}:
+        problems.append(
+            f"the enclosing decimalai.start_trace() trace {parent} never reached the "
+            f"wire, so a link would point at nothing the platform holds"
+        )
+    for t in runs:
+        got = t.get("parent_trace_id")
+        if got != parent:
+            problems.append(
+                f"trace {t.get('id')} ran inside decimalai.start_trace() {parent} and "
+                f"shipped parent_trace_id={got!r}. The router stamps a delivery onto "
+                f"the enclosing trace too, and the platform credits it once only for "
+                f"a LINKED child (public_skill_usage.suppress_wrapper_duplicates) — "
+                f"unlinked, every delivery is credited twice"
+            )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"{len(runs)} run trace(s) filed under the enclosing trace {parent}",
+    )
+
+
 # ── the delivery axis (D1) ───────────────────────────────────────────────────
 #
 # C14 asks "did a body reach the model AT ALL?". This asks the next question:
@@ -1560,6 +1761,8 @@ ITEMS: Dict[str, Callable[[Observation], Result]] = {
     "C13": c13_skills_activation,
     "C13b": c13b_skills_activation_recorded,
     "C14": c14_skills_body_delivered,
+    "C15": c15_invocation_observer,
+    "C16": c16_parent_link,
 }
 
 #: Display order — dict order is insertion order, but be explicit.

@@ -32,11 +32,15 @@ def _reset_sdk(monkeypatch):
     don't depend on what happens to be installed in the venv.
     """
     import decimalai._config as cfg
+    import decimalai.crewai as crewai_adapter
     import decimalai.providers as providers
     from decimalai._config import DecimalConfig
 
     saved_config = cfg._config
     saved_client = cfg._client
+    # A successful activation registers its provider for decimalai.flush(); a
+    # test's provider must not be flushed by every later test in the session.
+    saved_providers = list(crewai_adapter._tracer_providers)
 
     cfg._config = DecimalConfig(
         api_key="dai_sk_test", base_url="http://localhost:8000", enabled=True
@@ -45,6 +49,7 @@ def _reset_sdk(monkeypatch):
     cfg._client.register_manifest.return_value = {"manifest_id": "m1"}
     monkeypatch.setattr(providers, "_sdk_present", lambda _mod: False)
     yield
+    crewai_adapter._tracer_providers[:] = saved_providers
     cfg._config = saved_config
     cfg._client = saved_client
 

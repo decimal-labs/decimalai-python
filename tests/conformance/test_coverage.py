@@ -857,6 +857,79 @@ def test_rail_declarations_match_the_scaffold_seam_ledger() -> None:
     )
 
 
+#: Driver name -> the module whose ``instrument()`` is that driver's adapter
+#: surface: where an ``on_trace`` observer is, or would be. Every driver must be
+#: mapped — an unmapped one would slip past the cross-check below unread.
+OBSERVER_SURFACES: Dict[str, str] = {
+    "langchain": "decimalai.langchain",
+    "openai-agents": "decimalai.openai_agents",
+    "llamaindex": "decimalai.llamaindex",
+    "adk": "decimalai.adk",
+    "crewai": "decimalai.crewai",
+    "generic-otel": "decimalai.otel",
+    "claude-agent-sdk": "decimalai.claude_agent_sdk",
+    "anthropic": "decimalai.anthropic",
+    "pydantic-ai": "decimalai.pydantic_ai",
+}
+
+
+def _takes_on_trace(module: str) -> bool:
+    """Whether ``<module>.instrument`` takes a NAMED ``on_trace`` keyword.
+
+    ``**kwargs`` does not count: it would accept the observer and never call it,
+    so a caller checking for one has to read the named parameter too. Every
+    adapter imports its framework lazily, so this runs with none installed.
+    """
+    import importlib
+
+    fn = getattr(importlib.import_module(module), "instrument", None)
+    if not callable(fn):
+        return False
+    param = inspect.signature(fn).parameters.get("on_trace")
+    return param is not None and param.kind in (
+        inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+
+
+def test_observer_declarations_match_the_adapter_signatures() -> None:
+    """``has_invocation_observer`` is read off the SDK, not declared by the suite.
+
+    It gates C15 and C16, and an N/A is a hole that reads like coverage. So the
+    flag must say exactly what each adapter's own ``instrument()`` says: an
+    adapter that takes ``on_trace`` is graded on the observer AND on the parent
+    link that makes a handed-over trace safe to count, and the commit that gives
+    one an observer fails here until its driver grades both.
+    """
+    missing = sorted({d.name for d in all_drivers()} - set(OBSERVER_SURFACES))
+    assert not missing, (
+        f"driver(s) {missing} have no OBSERVER_SURFACES entry, so nothing checks "
+        f"their has_invocation_observer against the adapter. Map each to the "
+        f"module whose instrument() it drives."
+    )
+    disagreements: List[str] = []
+    for driver in all_drivers():
+        module = OBSERVER_SURFACES[driver.name]
+        has = _takes_on_trace(module)
+        declared = driver.capabilities.has_invocation_observer
+        if has and not declared:
+            disagreements.append(
+                f"  {driver.name}: {module}.instrument() takes on_trace, but the "
+                f"driver declares has_invocation_observer=False — C15/C16 would be "
+                f"N/A on an adapter that hands its caller every run. Give the driver "
+                f"a run_nested hook and delete its two DECLARED_NA lines."
+            )
+        if declared and not has:
+            disagreements.append(
+                f"  {driver.name}: the driver declares has_invocation_observer=True, "
+                f"but {module}.instrument() takes no on_trace — the observer it "
+                f"grades is not the adapter's public surface."
+            )
+    assert not disagreements, (
+        "the drivers and the adapters' instrument() signatures disagree about which "
+        "adapters hand their caller a run:\n" + "\n".join(disagreements)
+    )
+
+
 def test_every_framework_limit_is_still_in_the_adapter() -> None:
     """A FrameworkLimit cites a refusal in adapter source. It must still be there.
 

@@ -81,6 +81,7 @@ from . import (
     FrameworkLimit,
     fanout_threads,
     tool_result,
+    trace_observer,
     user_message,
 )
 from ._openai_wire import STUB_API_KEY, OpenAIWire
@@ -223,6 +224,27 @@ def run_error(ctx: Ctx) -> Any:
         _flush()
 
 
+def run_nested(ctx: Ctx) -> Any:
+    """The documented snippet with the observer: ``instrument(on_trace=...)``.
+
+    The README's ``decimalai.crewai.instrument`` call, given the suite's
+    observer in place of the caller's own, then ``kickoff()``. The harness runs
+    this inside a ``decimalai.start_trace()`` of its own, so the crew's trace is
+    graded on being filed under it (C16) and handed to the observer (C15).
+
+    The provider is NOT force-flushed here, unlike every other phase. The crew's
+    spans sit in the batch processor until the harness calls
+    ``decimalai.flush()`` — which is how a short-lived process gets its CrewAI
+    trace before it reports, so it is graded here rather than assumed.
+    """
+    from decimalai.crewai import instrument
+
+    _wire().register(ctx)
+    _instrument(ctx)
+    instrument(agent_name=ctx.agent_name, on_trace=trace_observer(ctx))
+    return _crew(ctx).kickoff()
+
+
 def _kickoff(ctx: Ctx) -> Any:
     return _crew(ctx).kickoff()
 
@@ -285,12 +307,14 @@ DRIVER = Driver(
     entrypoint=(
         "decimalai.otel.instrument() + _activate_crewai_instrumentation() "
         "(what init(crewai=True) runs) + LiteLLMInstrumentor; the skills phase adds "
-        "decimalai.crewai.instrument(enable_skill_loader=True)"
+        "decimalai.crewai.instrument(enable_skill_loader=True), the nested phase "
+        "decimalai.crewai.instrument(on_trace=...)"
     ),
     run=run,
     run_concurrent=fanout_threads(run),
     run_error=run_error,
     run_skills=run_skills,
+    run_nested=run_nested,
     capabilities=Capabilities(
         has_skills_rail=True,
         model_can_load_skill_bodies=False,

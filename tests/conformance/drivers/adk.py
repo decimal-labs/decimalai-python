@@ -50,6 +50,7 @@ from . import (
     FrameworkLimit,
     stub_script,
     tool_result,
+    trace_observer,
     user_message,
 )
 
@@ -236,7 +237,7 @@ def _agent(ctx: Ctx) -> Any:
     )
 
 
-def _runner(ctx: Ctx, agent: Any, *, skills: bool = False) -> Any:
+def _runner(ctx: Ctx, agent: Any, *, skills: bool = False, on_trace: Any = None) -> Any:
     from google.adk.runners import InMemoryRunner
 
     from decimalai.adk import DecimalaiPlugin
@@ -252,6 +253,7 @@ def _runner(ctx: Ctx, agent: Any, *, skills: bool = False) -> Any:
             # this run. Asking is not an assertion — contract.grade_delivery
             # grades what comes back.
             enable_load_skill_tool=skills and ctx.delivery_mode == TOOL_LOADED,
+            on_trace=on_trace,
         )],
     )
 
@@ -298,6 +300,20 @@ def run_concurrent(ctxs: Sequence[Ctx]) -> Any:
     for ctx in ctxs:
         _HANDLER.register(ctx)
     return asyncio.run(_gather(ctxs))
+
+
+def run_nested(ctx: Ctx) -> Any:
+    """One invocation with the suite's observer as the plugin's ``on_trace``.
+
+    The explicit ``plugins=[DecimalaiPlugin(..., on_trace=...)]`` form, for the
+    reason the module docstring gives for every other phase. The harness runs
+    this inside a ``decimalai.start_trace()`` of its own; ``asyncio.run`` copies
+    the caller's context into the invocation, which is where the plugin reads
+    the enclosing trace at ``before_run_callback``.
+    """
+    _HANDLER.register(ctx)
+    runner = _runner(ctx, _agent(ctx), on_trace=trace_observer(ctx))
+    return asyncio.run(_drive(ctx, runner))
 
 
 def run_error(ctx: Ctx) -> Any:
@@ -371,6 +387,7 @@ DRIVER = Driver(
     run_error=run_error,
     run_degenerate=run_degenerate,
     run_skills=run_skills,
+    run_nested=run_nested,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

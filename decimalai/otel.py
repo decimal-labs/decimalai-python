@@ -33,7 +33,17 @@ import threading
 import warnings
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+)
 from uuid import uuid4
 
 from .schema.common import FinishReason, SpanType, Status
@@ -324,6 +334,97 @@ def _reset_skill_rails() -> None:
     """Drop every buffered rail. Test seam only."""
     with _skill_rails_lock:
         _skill_rails.clear()
+
+
+# ── Run links ─────────────────────────────────────────────────
+# Who asked for a run, captured when the run STARTED and held until its trace is
+# assembled — the same join, on the same key, for the same reasons as the skill
+# rail above. The trace is assembled on the BatchSpanProcessor's worker thread
+# (or whichever thread forces a flush), where the caller's context no longer
+# exists: neither the `decimalai.start_trace()` the run was made inside, nor the
+# observer that was configured when it began. The OTel trace_id is the one
+# identifier both moments share.
+#
+# Two things ride a link, and they are the two the LangChain and ADK adapters
+# capture at run start on their own rails:
+#
+#   * parent_trace_id — the enclosing generic trace, so the run's trace is filed
+#     as its CHILD. Unlinked, one logical run ships as two unrelated root traces,
+#     and the router's delivery stamp — written onto the enclosing trace as well
+#     as onto this one (`skill_router._stamp_active_trace`) — is credited twice.
+#   * on_trace — the caller's observer, handed a detached copy of the finished
+#     trace once, before export. Captured at run start, so an `instrument()` call
+#     made while the run is in flight cannot move it to a different observer.
+#
+# Recorded by an adapter (`decimalai.crewai` today) from a span processor's
+# `on_start`, which runs on the caller's thread inside the caller's context —
+# the only moment both answers are readable.
+
+
+class RunLink(NamedTuple):
+    """What a run's trace inherits from the context it was started in."""
+
+    parent_trace_id: Optional[str] = None
+    on_trace: Optional[Callable[[RunTrace], None]] = None
+
+
+#: In-flight runs. Larger than the rail cap because every run of a linking
+#: adapter records one, not only the runs that routed a skill. Same discipline:
+#: a run whose root span never reaches the exporter must not pin its entry
+#: forever, so the oldest is evicted first.
+_RUN_LINK_MAX = 1024
+_run_links: "OrderedDict[int, RunLink]" = OrderedDict()
+_run_links_lock = threading.Lock()
+
+
+def record_run_link(
+    trace_id: int,
+    *,
+    parent_trace_id: Optional[str] = None,
+    on_trace: Optional[Callable[[RunTrace], None]] = None,
+) -> bool:
+    """Record, once, what the run whose OTel trace is ``trace_id`` started with.
+
+    FIRST write wins: a run's link is decided by the first span that records
+    one — the run's start — and every later span of the same run is a no-op.
+    Returns True when this call recorded the link.
+    """
+    if not trace_id:
+        return False
+    with _run_links_lock:
+        if trace_id in _run_links:
+            return False
+        _run_links[trace_id] = RunLink(parent_trace_id or None, on_trace)
+        while len(_run_links) > _RUN_LINK_MAX:
+            _run_links.popitem(last=False)
+    return True
+
+
+def _pop_run_link(tid: int) -> Optional[RunLink]:
+    """Take this run's link, removing it. Pop, never peek — like the rail, a
+    link read twice would hand one run's observer a second trace."""
+    with _run_links_lock:
+        return _run_links.pop(tid, None)
+
+
+def _reset_run_links() -> None:
+    """Drop every buffered link. Test seam only."""
+    with _run_links_lock:
+        _run_links.clear()
+
+
+def _notify_trace_observer(observer: Callable[[RunTrace], None], trace: RunTrace) -> None:
+    """Hand ``observer`` a detached copy of ``trace``. Never raises.
+
+    The same contract as the LangChain and ADK observers: a deep copy, so the
+    observer cannot edit the trace that is about to be exported, and an observer
+    that raises costs neither the run nor its trace — the failure is logged and
+    export carries on.
+    """
+    try:
+        observer(trace.model_copy(deep=True))
+    except Exception:
+        logger.exception("Trace observer failed for %s", trace.id)
 
 
 class _AgentNameStamper:
@@ -930,6 +1031,16 @@ class DecimalSpanExporter:
                 # the rail's own names are excluded rather than re-inferred,
                 # and so the assignments above cannot clobber the result.
                 self._infer_skill_rungs(run_trace)
+                # Who asked for this run, captured when it started (see
+                # "Run links"). LAST, on the finished trace: the parent is part
+                # of what the observer is handed, and the observer must see
+                # exactly the trace that is exported.
+                link = _pop_run_link(tid)
+                if link is not None:
+                    if link.parent_trace_id and not run_trace.parent_trace_id:
+                        run_trace.parent_trace_id = link.parent_trace_id
+                    if link.on_trace is not None:
+                        _notify_trace_observer(link.on_trace, run_trace)
                 self._send(run_trace)
         except Exception:
             logger.exception(
@@ -948,6 +1059,9 @@ class DecimalSpanExporter:
             # loses that run's routing_id. Popping again here is free — the pop
             # above already removed it, so this is a no-op on the happy path.
             _pop_skill_rail(tid)
+            # The run link, for the same reason: a run whose assembly raised
+            # must not hold a slot, or hand its observer to a later trace.
+            _pop_run_link(tid)
 
     def _flush_pending(self) -> None:
         """Finalize every buffered trace, whether or not its root arrived.

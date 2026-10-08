@@ -22,6 +22,27 @@ and patch releases are fixes.
   CrewAI makes outside an agent executor (output conversion, guardrails,
   planning) are left alone. `decimalai init --framework crewai` now says there
   is no template yet instead of "no prompt seam".
+- `decimalai.crewai.instrument(on_trace=fn)` hands you each CrewAI run's trace,
+  on the contract the LangChain and ADK observers already keep: `fn` is called
+  once per run, failed runs included, with a detached copy of the finished
+  `RunTrace` (its `id`, `parent_trace_id`, routing id, delivered skills and
+  model calls), before export. An observer that raises is logged; the run and
+  its trace carry on. Each `instrument()` call sets the observer for runs that
+  start afterwards. Before this, nothing a caller held could name the CrewAI
+  trace, which is assembled from OpenTelemetry spans under an id minted at
+  export.
+- A CrewAI run made inside `decimalai.start_trace()` is now filed as that
+  trace's child (`parent_trace_id`), captured when the run starts, the way
+  LangChain and ADK runs are. This applies to `init(crewai=True)` as well. The
+  skill router also stamps a delivery onto the enclosing trace, and the
+  platform credits the use once only when the run's trace is that trace's
+  linked child (and the enclosing trace made no model call of its own), so a
+  CrewAI run wrapped in `start_trace()` was credited twice.
+- `decimalai.flush()` first exports CrewAI runs still queued in the
+  OpenTelemetry batch processor, waiting at most five seconds, and only then
+  drains the sender. A short-lived process can now report on a CrewAI trace
+  that exists. The SIGTERM handler does the same. Processes that never set up
+  CrewAI tracing are unaffected.
 - The `conformance-tests` extra's CrewAI floor moves from 1.6.1 to 1.15.3, the
   lowest version that passes the CrewAI conformance column. 1.6.1 could not be
   traced (the OpenInference instrumentor needs crewai>=1.10.1), and crewai

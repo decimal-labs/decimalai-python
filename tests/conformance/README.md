@@ -128,6 +128,7 @@ The whole driver surface:
 | `run_error(ctx)` | a run that fails partway through |
 | `run_degenerate(ctx)` | a run with no model and no tools |
 | `run_skills(ctxs)` | the skills rail, one run per lane |
+| `run_nested(ctx)` | the snippet once more, with `trace_observer(ctx)` as the adapter's `on_trace` — the harness wraps it in its own `decimalai.start_trace()` |
 
 Everything a driver needs arrives on `Ctx`, and the contract asserts against the
 **same** `Ctx`. The sentinels are load-bearing: `ctx.prompt_sentinel` must go
@@ -202,6 +203,7 @@ a property of one driver's run, not something another framework may inject.
 | `degenerate` | no model, no tools | C7b |
 | `error` | a run that fails | C10 |
 | `concurrent` | N lanes, distinct agents | C9 |
+| `nested` | the snippet inside a `decimalai.start_trace()` the harness opens, with the suite's observer as `on_trace` | C15 C16 |
 | `skills` | the rail, N lanes, one agent | C8 |
 
 `skills` runs last on purpose: on several adapters, enabling the rail is an
@@ -209,7 +211,9 @@ irreversible process-wide monkey-patch that would double-trace every other
 phase. `DRIVER_MODULES` is ordered for the same reason — the drivers that enable
 a process-wide OpenInference instrumentor run last.
 
-C2, C11 and C12 grade **every** phase.
+C2, C6, C11 and C12 grade **every** phase. `nested` runs before `skills`: on
+langchain the rail is a process-wide handler that would trace the nested run a
+second time, beside the per-call handler carrying the observer.
 
 ## The probe
 
@@ -278,6 +282,8 @@ run*.
 | C13 `skills_activation` | nothing is recorded as activated that the model did not itself ask for |
 | C13b `skills_activation_recorded` | a body the model *did* pull is not silently dropped |
 | C14 `skills_body_delivered` | a skill's **body** reached the model, by any channel |
+| C15 `invocation_observer` | the adapter's `on_trace` is handed each run's trace once — a detached `RunTrace` matching the wire — and an observer that raises costs neither the run nor its trace |
+| C16 `parent_link` | a run made inside the caller's `decimalai.start_trace()` ships as that trace's child (`parent_trace_id`) |
 | D1 `delivery_channel` | …and each channel delivers **on its own**, with the other switched off |
 | J1 `journey` | the whole path: an agent on the platform → `decimalai init` → a file that runs → its prompt and a skill body in front of the model |
 
@@ -295,12 +301,28 @@ ask for a body at all. Neither claims more than it measures: the strongest thing
 either proves is that the model **asked for the body**, not that the skill
 changed the output.
 
+C15 and C16 grade the CALLER's side of a run, and share one flag,
+`has_invocation_observer`, because they are one hand-over. An application wraps a
+framework run in work of its own and needs the run's trace back: the adapter
+mints that trace's id where the caller cannot see it, and it is the trace the
+platform writes the run's usage receipt against (C15). And that trace has to be
+filed under the caller's: the router stamps a delivery onto the caller's
+enclosing trace too, and the platform credits the use once only for a linked
+child (C16). The observer the `nested` phase hands over is the suite's own
+(`drivers.trace_observer`): it records what it is given, edits it, then raises —
+so one run grades the argument, the copy and the isolation. The phase also leaves
+the CrewAI spans to `decimalai.flush()`, which is how a short-lived process gets
+that trace before it reports. The flag is not declared by judgement:
+`test_coverage` reads it off each adapter's `instrument()` signature (a named
+`on_trace`), so the six adapters without an observer are N/A until the commit
+that gives them one — and that commit is graded on the link too.
+
 Exact token counts are **not** asserted here — a stub model's numbers are
 arbitrary. Presence and plausibility are Tier A's job; exact counts are Tier B's.
 
 ### The delivery axis (D1)
 
-C1–C14 grade one capture per driver, in whatever configuration that adapter
+C1–C16 grade one capture per driver, in whatever configuration that adapter
 resolves to on its own. D1 is a **second axis over the same capture style**: one
 child process per *(driver, body channel)*, with the **other channel switched
 off** in that process's environment.
@@ -341,7 +363,7 @@ that channel. An adapter that grows the capability stops being excused.
 
 ### The journey axis (J1)
 
-C1–C14 and D1 all grade **one adapter**, handed a `Ctx` by a driver that already
+C1–C16 and D1 all grade **one adapter**, handed a `Ctx` by a driver that already
 knows the agent's name, already holds the skills, and never once runs the
 product's own entry point. J1 grades what a user actually does:
 
@@ -607,6 +629,12 @@ Stated so nobody mistakes a green cell for a guarantee.
   `[conformance-tests]` *alone* would skip it — loudly under
   `DECIMAL_CONFORMANCE_REQUIRE_ALL=1`, silently without. If the extras are ever
   reorganised, `journey_requirements()` names exactly what is missing.
+- **The parent link on adapters with no observer.** C16 is graded only where
+  C15 is: on the three adapters that hand their caller a run (langchain, adk,
+  crewai). The other six are N/A, and three of those carry a skills rail — a run
+  on anthropic, openai-agents or pydantic-ai wrapped in `decimalai.start_trace()`
+  ships unlinked today, so a routed delivery is credited on both traces. Their
+  N/A reasons say so, and giving any of them an `on_trace` turns both items on.
 - **Exact token counts, cost, latency.** Tier B's job.
 - **Cross-driver isolation.** Fixed: each driver's phases now run in their own
   process (see [One driver, one process](#one-driver-one-process)), so a late

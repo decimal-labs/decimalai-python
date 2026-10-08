@@ -79,13 +79,43 @@ copied. crewai 1.15 builds an agent's executor on its first task and reuses it,
 so enable the loader before the first ``kickoff()``. ``Crew.kickoff()``,
 ``Crew.kickoff_async()`` and ``Agent.kickoff()`` all dispatch through an
 executor and all get skills.
+
+The run's trace, handed back (``on_trace``) and filed under its caller
+----------------------------------------------------------------------
+The CrewAI trace is assembled from spans by the OpenTelemetry exporter, on the
+exporter's thread, under an id minted there — so nothing the caller holds names
+it. Two things close that, with the contract the LangChain and ADK adapters
+already keep:
+
+* ``instrument(on_trace=callable)`` calls the observer once per CrewAI run —
+  a failed run included — with a detached copy of that run's finished trace (a
+  ``RunTrace``), before export, on the thread that exports it. An observer that
+  raises is logged and costs neither the run nor its trace.
+* A run started inside ``decimalai.start_trace()`` is filed as that trace's
+  child (``parent_trace_id``). The router stamps a delivery onto the enclosing
+  trace too, and the platform credits the use once only for a linked child.
+
+Both are captured when the run STARTS — by a span processor
+(:class:`_RunLinker`) whose ``on_start`` runs on the caller's thread, inside the
+caller's context, at the run's first CrewAI span — and handed to the exporter
+through ``decimalai.otel.record_run_link``. By export time that context is gone,
+and an ``instrument()`` call made in between must not move a run that is
+already in flight.
+
+``decimalai.flush()`` pushes this pipeline out too, bounded by a timeout, so a
+short-lived process can report on a trace that exists. Without it the spans sit
+in the batch processor for up to five seconds, or until the process exits.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+
+if TYPE_CHECKING:
+    from .schema.trace import RunTrace
 
 logger = logging.getLogger("decimalai.crewai")
 
@@ -107,6 +137,38 @@ _skill_loader_installed = False
 _install_agent_name: Optional[str] = None
 
 _skill_router_singleton: Any = None
+
+
+@dataclass(frozen=True)
+class _InstrumentationConfig:
+    """What ``instrument()`` last said about runs that have yet to start."""
+
+    on_trace: Optional[Callable[["RunTrace"], None]] = None
+
+
+#: Published whole by ``instrument()`` and read whole by :class:`_RunLinker` at
+#: a run's start. Its own lock, not ``_install_lock``: span starts read it, and
+#: they must never wait behind a SkillRouter being built.
+_config_lock = threading.Lock()
+_instrument_config = _InstrumentationConfig()
+
+#: The tracer providers this SDK wired CrewAI's spans to — what
+#: ``decimalai.flush()`` pushes out. Filled by ``_wire_tracer_provider``, which
+#: ``decimalai._activate_crewai_instrumentation`` calls on both setup paths.
+_tracer_providers: List[Any] = []
+
+#: How long ``decimalai.flush()`` waits for this pipeline. The SDK's own
+#: ``BatchSpanProcessor.force_flush`` ignores its timeout (opentelemetry-sdk
+#: 1.42 exports everything, inline, under a lock), so the bound is enforced
+#: here. Five seconds is the sender's own per-trace wait, and leaves room inside
+#: the ten seconds a container runtime allows between SIGTERM and SIGKILL.
+_FLUSH_TIMEOUT_S = 5.0
+
+#: The instrumentation scope the OpenInference CrewAI instrumentor's spans carry
+#: (its tracer is ``trace_api.get_tracer(__name__, …)``). A span from this scope
+#: is a CrewAI run's; the provider-SDK spans beneath it are not, and neither is
+#: anything else sharing the pipeline.
+_CREWAI_SCOPE = "openinference.instrumentation.crewai"
 
 #: Roles CrewAI's leading instructions arrive under. "developer" is OpenAI's
 #: current name for the system role; a caller using it has a system prefix like
@@ -441,6 +503,177 @@ def _install_skill_loader() -> bool:
     return True
 
 
+# ── the run's trace: its caller, its observer, its flush ────
+
+
+def _enclosing_trace_id() -> Optional[str]:
+    """The live ``decimalai.start_trace()`` context's id, or None.
+
+    The same source and the same fail-open rule as the LangChain adapter's
+    ``_enclosing_generic_trace_id`` and ADK's ``before_run_callback``: a tracer
+    that raises while deciding how to label a trace is worse than an unlinked
+    trace, and None means "no enclosing trace" — never a wrong parent.
+    """
+    try:
+        from .generic import _get_current_trace
+
+        ctx = _get_current_trace()
+        return ctx.get_trace_id() if ctx is not None else None
+    except Exception:
+        return None
+
+
+def _span_scope_name(span: Any) -> str:
+    """The instrumentation scope a span was started under, or ""."""
+    scope = getattr(span, "instrumentation_scope", None)
+    name = getattr(scope, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _span_trace_id(span: Any) -> int:
+    """The span's OTel trace id — the key the exporter assembles its trace by."""
+    ctx = getattr(span, "context", None)
+    if ctx is None:
+        get = getattr(span, "get_span_context", None)
+        ctx = get() if callable(get) else None
+    tid = getattr(ctx, "trace_id", 0)
+    return tid if isinstance(tid, int) else 0
+
+
+class _RunLinker:
+    """Span processor: at a CrewAI run's first span, record who asked for it.
+
+    ``on_start`` runs on the thread that starts the span, in that thread's
+    context — inside ``Crew.kickoff()`` (or ``Agent.kickoff()``, or the
+    ``asyncio.to_thread`` that ``kickoff_async`` copies the context into), so it
+    can still read the enclosing ``decimalai.start_trace()`` and the observer
+    ``instrument()`` configured. The exporter cannot: it assembles the trace
+    later, on its own thread. What is read here travels to it through
+    ``decimalai.otel.record_run_link``, keyed by the trace id, and the first span
+    of a run decides; every later CrewAI span of that run is a no-op there.
+
+    Implements the OTel ``SpanProcessor`` protocol by duck typing, in full —
+    the SDK calls ``_on_ending`` from inside ``span.end()`` — like
+    ``decimalai.otel._AgentNameStamper``. Never raises: a span start is the
+    caller's own code path.
+    """
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        try:
+            if not _span_scope_name(span).startswith(_CREWAI_SCOPE):
+                return
+            tid = _span_trace_id(span)
+            if not tid:
+                return
+            with _config_lock:
+                settings = _instrument_config
+            from .otel import record_run_link
+
+            record_run_link(
+                tid,
+                parent_trace_id=_enclosing_trace_id(),
+                on_trace=settings.on_trace,
+            )
+        except Exception:  # pragma: no cover - linking must never break a span
+            logger.debug("Could not record the CrewAI run's link", exc_info=True)
+
+    def _on_ending(self, span: Any) -> None:
+        return None
+
+    def on_end(self, span: Any) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+def _wire_tracer_provider(provider: Any) -> None:
+    """Remember a provider CrewAI's spans now go to, and link its runs.
+
+    Called by ``decimalai._activate_crewai_instrumentation`` once the CrewAI
+    instrumentor is on — the one path both ``init(crewai=True)`` and
+    :func:`instrument` take — so every pipeline this SDK builds for CrewAI gets
+    the :class:`_RunLinker` and is flushed by ``decimalai.flush()``. A pipeline
+    this SDK did not build is never touched. Idempotent per provider.
+    """
+    with _install_lock:
+        if any(p is provider for p in _tracer_providers):
+            return
+        _tracer_providers.append(provider)
+    add = getattr(provider, "add_span_processor", None)
+    if not callable(add):
+        return
+    try:
+        add(_RunLinker())
+    except Exception:
+        logger.warning(
+            "decimalai: could not attach the CrewAI run linker to the tracer "
+            "provider; CrewAI traces will carry no parent_trace_id and on_trace "
+            "will not be called.",
+            exc_info=True,
+        )
+
+
+def _flush_tracing(timeout_s: Optional[float] = None) -> bool:
+    """Export every CrewAI run whose spans are still queued. True if it finished.
+
+    What ``decimalai.flush()`` calls first, so the trace exists — assembled,
+    observed, handed to the sender — before the sender is drained. Bounded: the
+    export runs on a helper thread and is waited for at most ``timeout_s``
+    (default ``_FLUSH_TIMEOUT_S``). The SDK's ``force_flush`` cannot bound
+    itself, and an unbounded wait would also deadlock a flush called while the
+    export lock is held on this thread — from inside an observer, or from a
+    SIGTERM handler that interrupted an export. Past the bound the export
+    carries on in the background; the trace still ships when it finishes.
+
+    A no-op when this SDK never wired CrewAI tracing, so a process that does not
+    use CrewAI is unaffected.
+    """
+    if timeout_s is None:
+        timeout_s = _FLUSH_TIMEOUT_S
+    with _install_lock:
+        providers = list(_tracer_providers)
+    if not providers:
+        return True
+    done = threading.Event()
+    budget_ms = max(1, int(timeout_s * 1000))
+
+    def _export() -> None:
+        try:
+            for provider in providers:
+                flush = getattr(provider, "force_flush", None)
+                if callable(flush):
+                    try:
+                        flush(budget_ms)
+                    except Exception:
+                        logger.debug("CrewAI tracer provider flush failed", exc_info=True)
+        finally:
+            done.set()
+
+    try:
+        threading.Thread(
+            target=_export, name="decimalai-crewai-flush", daemon=True,
+        ).start()
+    except RuntimeError:
+        # The interpreter is shutting down and will not start a thread. The
+        # provider's own exit hook (``otel._register_flush_atexit``) flushes it.
+        logger.debug("CrewAI trace flush skipped: interpreter shutting down")
+        return False
+    if done.wait(timeout_s):
+        return True
+    logger.warning(
+        "decimalai.flush(): CrewAI's trace pipeline did not finish exporting "
+        "within %.0fs. The export continues in the background and the trace "
+        "is still sent when it completes, but export_status() does not cover "
+        "it yet.",
+        timeout_s,
+    )
+    return False
+
+
 # ── tracing ─────────────────────────────────────────────────
 
 
@@ -480,11 +713,16 @@ def instrument(
     *,
     enable_skill_loader: bool = False,
     enable_load_skill_tool: bool = False,
+    on_trace: Optional[Callable[["RunTrace"], None]] = None,
 ) -> None:
     """Install DecimalAI for CrewAI: tracing, and optionally skill delivery.
 
     Idempotent. Call it before the first ``kickoff()``: CrewAI copies the global
     hook list into each agent executor when it builds one.
+
+    A run started inside ``decimalai.start_trace()`` is filed as that trace's
+    child (``parent_trace_id``), whether or not an observer is set — the same
+    link the LangChain and ADK adapters make.
 
     Args:
         agent_name: The DecimalAI agent these runs belong to. Names the traces,
@@ -503,10 +741,23 @@ def instrument(
             than rejected so the refusal happens out loud — the conformance
             suite asks for the tool loop precisely so this warning has to be
             emitted on the run.
+        on_trace: Optional observer, called once per CrewAI run — a failed run
+            included — with a detached copy of that run's finished trace (a
+            ``RunTrace``: its ``id``, ``parent_trace_id``, delivery rails and
+            model calls), before export, on the thread that exports it (the
+            OpenTelemetry batch worker, or the caller of ``decimalai.flush()``).
+            Exceptions it raises are logged and reach neither the run nor the
+            export. Captured when a run starts: each ``instrument()`` call sets
+            the observer for runs that start afterwards (``None`` removes it),
+            and a run already in flight keeps the one it started with.
     """
-    global _install_agent_name
+    global _install_agent_name, _instrument_config
     if agent_name is not None:
         _install_agent_name = agent_name
+    # Published before tracing is installed, so the first run after this call
+    # already starts with it.
+    with _config_lock:
+        _instrument_config = _InstrumentationConfig(on_trace=on_trace)
     if enable_load_skill_tool:
         logger.warning(
             "enable_load_skill_tool is not supported on the crewai adapter "
@@ -522,6 +773,7 @@ def instrument(
         _warn_if_disk_runtime_detected("crewai")
         _install_skill_loader()
     logger.info(
-        "DecimalAI CrewAI integration installed (agent_name=%s, skill_loader=%s)",
-        agent_name, enable_skill_loader,
+        "DecimalAI CrewAI integration installed (agent_name=%s, skill_loader=%s, "
+        "trace_observer=%s)",
+        agent_name, enable_skill_loader, on_trace is not None,
     )

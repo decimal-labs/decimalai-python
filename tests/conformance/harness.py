@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from .delivery import DEFAULT as DELIVERY_DEFAULT
-from .drivers import Ctx, Driver
+from .drivers import Ctx, Driver, observed_mark, observed_since
 from .probe import Probe, Recorded
 
 #: Lanes used by the concurrency phase.
@@ -53,6 +53,11 @@ class Phase:
     export_sent_delta: int = 0
     export_failed_delta: int = 0
     export_last_error: Optional[str] = None
+    # The caller's side of the run, for C15 / C16: what the conformance
+    # observer was handed (``drivers.trace_observer``), and the id of the
+    # ``decimalai.start_trace()`` the harness ran the phase inside, if it did.
+    observed: List[Dict[str, Any]] = field(default_factory=list)
+    enclosing_trace_ids: List[str] = field(default_factory=list)
 
     # ── views ────────────────────────────────────────────────
 
@@ -181,7 +186,16 @@ def _run_phase(
     *,
     fanout: bool,
     na_reason: Optional[str] = None,
+    enclose: bool = False,
 ) -> Phase:
+    """Run one phase and slice out what it produced.
+
+    ``enclose`` runs the hook inside a ``decimalai.start_trace()`` opened HERE,
+    named for the phase's agent, the way an application wraps a framework run
+    in a trace of its own. The harness opens it, not the driver, so every
+    framework is graded against the same enclosing trace, and its id is recorded
+    on the phase for C16.
+    """
     if fn is None or na_reason is not None:
         return Phase(
             name=name, ctxs=ctxs, ran=False,
@@ -192,11 +206,18 @@ def _run_phase(
 
     workdir = tempfile.mkdtemp(prefix=f"conformance-{name}-")
     cursor = probe.mark()
+    observed_cursor = observed_mark()
+    enclosing_ids: List[str] = []
     before = decimalai.export_status()
     exc: Optional[BaseException] = None
     with _observe(workdir) as cap:
         try:
-            fn(ctxs if fanout else ctxs[0])
+            if enclose:
+                with decimalai.start_trace(agent_name=ctxs[0].agent_name) as outer:
+                    enclosing_ids.append(outer.get_trace_id())
+                    fn(ctxs[0])
+            else:
+                fn(ctxs if fanout else ctxs[0])
         except BaseException as e:  # noqa: BLE001 - a failing run is a phase result
             exc = e
         _flush_sdk()
@@ -212,6 +233,8 @@ def _run_phase(
         export_sent_delta=after.sent - before.sent,
         export_failed_delta=after.failed - before.failed,
         export_last_error=str(after.last_error) if after.last_error else None,
+        observed=observed_since(observed_cursor),
+        enclosing_trace_ids=enclosing_ids,
     )
 
 
@@ -305,6 +328,15 @@ def observe(
             probe,
             fanout=True,
             na_reason=_skipped("concurrent") or caps.na_reason("C9"),
+        )
+        # The run as an application wraps it: inside a `decimalai.start_trace()`
+        # of its own (opened by `_run_phase`), with the suite's observer handed
+        # to the adapter. Before `skills`, which on langchain installs a
+        # process-wide handler that would trace this run a second time, beside
+        # the per-call handler carrying the observer.
+        phases["nested"] = _run_phase(
+            "nested", driver.run_nested, [ctx], probe, fanout=False, enclose=True,
+            na_reason=_skipped("nested") or caps.na_reason("C15"),
         )
         # LAST on purpose: on several adapters turning the rail on is an
         # irreversible process-wide monkey-patch, so it must not colour the

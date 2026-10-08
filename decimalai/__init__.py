@@ -32,6 +32,7 @@ import logging
 import os
 import signal
 import socket
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -79,7 +80,13 @@ def _register_sigterm_flush() -> None:
         return
 
     def _handler(signum: int, frame: Any) -> Any:
-        # Drain the BACKGROUND SENDER first, then the client buffer. Adapters
+        # The OpenTelemetry pipelines first: a CrewAI run is still a queue of
+        # spans until they are exported, and the default SIGTERM disposition
+        # re-raised below skips the provider's own exit hook, so they would
+        # never become a trace at all. Bounded, so a wedged export cannot use up
+        # the grace period before SIGKILL.
+        _flush_otel_pipelines()
+        # Then the BACKGROUND SENDER, then the client buffer. Adapters
         # hand traces to `_sender.submit(...)`, so a trace can be sitting in the
         # executor's queue having never reached the client — flushing only the
         # client leaves those behind. Measured: client-flush alone delivered 2 of
@@ -106,6 +113,34 @@ def _register_sigterm_flush() -> None:
     except (ValueError, OSError):
         # Not the main thread of the main interpreter, or the platform refuses.
         return
+
+
+def _flush_otel_pipelines() -> None:
+    """Export what is still queued in the OTel pipelines this SDK assembles from.
+
+    Today that is CrewAI's: a CrewAI run reaches DecimalAI as spans, queued in a
+    ``BatchSpanProcessor`` for up to five seconds before the exporter turns them
+    into a trace and hands it to the sender — so a flush that only drains the
+    sender can finish before the run's trace exists. Bounded by
+    ``decimalai.crewai._FLUSH_TIMEOUT_S``.
+
+    A no-op unless CrewAI tracing was set up by this SDK (``init(crewai=True)``
+    or ``decimalai.crewai.instrument()``): the module is only looked up, never
+    imported, and it flushes only the pipelines it built. Never raises.
+
+    Not called from :func:`_atexit_flush`. At a normal exit those providers have
+    already been shut down — and so flushed, by the SDK's bounded
+    ``BatchSpanProcessor.shutdown`` — from ``otel._register_flush_atexit``,
+    which runs during ``threading._shutdown()``, before any plain ``atexit``
+    handler.
+    """
+    crewai = sys.modules.get(f"{__name__}.crewai")
+    if crewai is None:
+        return
+    try:
+        crewai._flush_tracing()
+    except Exception:  # noqa: BLE001 — flushing must never raise into the caller
+        logger.debug("CrewAI trace pipeline flush failed", exc_info=True)
 
 
 def _atexit_flush() -> None:
@@ -282,7 +317,17 @@ def flush() -> None:
     `_sender.submit()` and was NOT awaited. Closing the gap means
     `last_send_error()` returns a meaningful value right after a
     `flush()` call, instead of only after atexit-shutdown.
+
+    With CrewAI tracing on (``init(crewai=True)`` or
+    ``decimalai.crewai.instrument()``), it first exports the CrewAI runs whose
+    spans are still queued in the OpenTelemetry batch processor, waiting at
+    most five seconds — so the run's trace has been assembled, handed to any
+    ``on_trace`` observer, and queued before the sender is drained. Before
+    that, a short-lived process could report on a run whose trace did not exist
+    yet. Processes that never set up CrewAI tracing are unaffected.
     """
+    # Before the sender: exporting these spans is what PUTS their trace on it.
+    _flush_otel_pipelines()
     try:
         from . import _config as _cfg
         client = getattr(_cfg, "_client", None)
@@ -578,6 +623,10 @@ def _activate_crewai_instrumentation(
             exc_info=True,
         )
         return
+    # The pipeline CrewAI's spans now leave through: links each run to the
+    # `start_trace()` it ran inside and to the `on_trace` observer it started
+    # with, and makes `decimalai.flush()` push it out. See decimalai/crewai.py.
+    _crewai_adapter._wire_tracer_provider(tracer_provider)
     logger.info("DecimalAI tracing enabled for CrewAI (OpenInference instrumentor)")
 
     # LLM request detail rides on the provider SDK's spans, not CrewAI's.
@@ -715,8 +764,10 @@ def init(
             itself, so this activates the OpenInference CrewAI instrumentor
             (plus provider instrumentors for importable LLM SDKs); if
             ``openinference-instrumentation-crewai`` isn't installed, a
-            warning explains that no traces will be captured. Skill delivery
-            is a separate, explicit step:
+            warning explains that no traces will be captured. A crew run
+            inside ``start_trace()`` is filed as that trace's child. Skill
+            delivery and the per-run ``on_trace`` observer are a separate,
+            explicit step:
             ``decimalai.crewai.instrument(agent_name=..., enable_skill_loader=True)``.
         autogen: RETIRED. AutoGen / AG2 is no longer a supported integration —
             this flag now installs the generic OpenTelemetry exporter (exactly

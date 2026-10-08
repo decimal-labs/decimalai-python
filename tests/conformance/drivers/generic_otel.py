@@ -197,7 +197,19 @@ DRIVER = Driver(
     run_degenerate=run_degenerate,
     capabilities=Capabilities(
         has_skills_rail=False,
+        has_invocation_observer=False,
         reasons={
+            "has_invocation_observer": (
+                "decimalai.otel.instrument() takes no on_trace: this rail assembles "
+                "traces from spans other code emitted and hands none of them to a "
+                "caller, so C15 has no observer to grade. The exporter links a run to "
+                "an enclosing decimalai.start_trace() only where an adapter recorded "
+                "that link when the run started (decimalai/crewai.py does; nothing "
+                "does here), so C16 is N/A with C15. Not a framework limit and not "
+                "this suite's opinion: test_coverage reads this flag off "
+                "instrument()'s own signature, so the commit that gives it on_trace "
+                "turns both items on."
+            ),
             "has_skills_rail": (
                 "the generic OTel rail has no skills surface at all — the docs "
                 "capability table records '—' for it, decimalai.otel.instrument() "
