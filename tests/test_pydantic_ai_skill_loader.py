@@ -179,19 +179,21 @@ class TestSkillsSystemPrompt:
             query=None, agent_name="shopper", scope=None
         )
 
-    def test_returns_empty_when_router_unavailable(self, fake_pydantic_ai):
+    def test_returns_empty_when_router_unavailable(self, fake_pydantic_ai, monkeypatch):
         """If no SkillRouter can be built, the function degrades to '' —
         it must never break agent construction."""
         _, _, pa = fake_pydantic_ai
         pa._skill_router_singleton = None
 
         # Force _get_skill_router() to fail (no config / import error path).
+        # Through monkeypatch: assigned directly, the stub outlived this test
+        # and every later pydantic_ai test in the session routed nothing.
         import decimalai.pydantic_ai as pa_mod
 
         def _boom():
             return None
 
-        pa_mod._get_skill_router = _boom  # type: ignore[assignment]
+        monkeypatch.setattr(pa_mod, "_get_skill_router", _boom)
 
         class _Ctx:
             agent = None

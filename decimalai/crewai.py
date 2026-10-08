@@ -352,24 +352,6 @@ def _insertion_point(messages: Sequence[Any]) -> tuple:
     return (cut, "system") if cut else (0, "user")
 
 
-def _release_scoped_rail(router: Any, scope: Optional[str]) -> None:
-    """Drain what the router filed under this run's scope.
-
-    This adapter reads the per-call contextvar rails and records them on the OTel
-    rail itself, so nothing else will ever read the router's per-scope copy — and
-    left in place, every run would hold one of the router's 4096 scoped slots
-    until eviction, which then warns on every new run.
-    """
-    if scope is None:
-        return
-    try:
-        router.consume_routing_id(scope=scope)
-        router.consume_offered_names(scope=scope)
-        router.consume_delivered_names(scope=scope)
-    except Exception:
-        logger.debug("router keeps no scoped rail to release", exc_info=True)
-
-
 def _inject_skills(context: Any) -> None:
     """Route this agent turn's skills and insert them into its messages.
 
@@ -395,6 +377,12 @@ def _inject_skills(context: Any) -> None:
     )
     scope = _scope()
     agent_name = _routing_agent_name()
+    from .skill_router import (
+        _release_scoped_routing_rail,
+        consume_last_delivered_names,
+        consume_last_offered_names,
+    )
+
     try:
         parts_fn = getattr(router, "build_prompt_parts", None)
         if callable(parts_fn):
@@ -415,15 +403,17 @@ def _inject_skills(context: Any) -> None:
     except Exception:
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return
+    finally:
+        # This adapter reads the per-call rails below and records them on the
+        # OTel rail itself, so nothing will ever read the router's per-scope
+        # copy of the decision: it is released here or never.
+        _release_scoped_routing_rail(router, scope)
 
     # Drain the router's per-call rails FIRST, whatever happens next: they are
     # contextvars scoped to the call that just ran, and leaving them full would
     # attribute this call's skills to the next one.
-    from .skill_router import consume_last_delivered_names, consume_last_offered_names
-
     offered = consume_last_offered_names()
     delivered = consume_last_delivered_names()
-    _release_scoped_rail(router, scope)
 
     texts = [t for t in (prefix, tail) if isinstance(t, str) and t]
     if not texts:

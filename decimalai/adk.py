@@ -387,6 +387,12 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         return
 
     query = _query_from_request(llm_request, state.user_input_preview)
+    scope = str(state.trace_id)
+    from .skill_router import (
+        _release_scoped_routing_rail,
+        consume_last_delivered_names,
+        consume_last_offered_names,
+    )
     try:
         parts_fn = getattr(router, "build_prompt_parts", None)
         if callable(parts_fn):
@@ -394,7 +400,7 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
             # (and carries the skill BODIES), `tail` is the one sentence that
             # depends on this query.
             prefix, tail, routing_id = parts_fn(
-                query=query, agent_name=state.agent_name, scope=str(state.trace_id),
+                query=query, agent_name=state.agent_name, scope=scope,
             )
         else:
             # A router object that predates the split still has to deliver.
@@ -402,17 +408,21 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
             # adapter traces perfectly while injecting nothing — the silent
             # no-op that cost LangChain 21 tests before its fallback existed.
             prefix, routing_id = router.build_prompt_fragment(
-                query=query, agent_name=state.agent_name, scope=str(state.trace_id),
+                query=query, agent_name=state.agent_name, scope=scope,
             )
             tail = ""
     except Exception:
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return
+    finally:
+        # The router keeps its own copy of this decision under the run's scope,
+        # for adapters that read it back from there. This one reads the
+        # per-call rails below, so the copy is released here or never.
+        _release_scoped_routing_rail(router, scope)
 
     # Drain the router's per-call rails FIRST, whatever happens next: they are
     # contextvars scoped to the call that just ran, and leaving them full would
     # attribute this turn's skills to the next one.
-    from .skill_router import consume_last_delivered_names, consume_last_offered_names
     offered = consume_last_offered_names()
     delivered = consume_last_delivered_names()
 

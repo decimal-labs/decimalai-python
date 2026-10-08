@@ -255,18 +255,28 @@ async def _skills_system_prompt(ctx: Any) -> str:
         agent_obj = getattr(ctx, "agent", None)
         if agent_obj is not None:
             agent_name = getattr(agent_obj, "name", None)
-        fragment, routing_id = router.build_prompt_fragment(
-            query=_run_query(ctx), agent_name=agent_name, scope=_scope(),
+        from .skill_router import (
+            _release_scoped_routing_rail,
+            consume_last_delivered_names,
+            consume_last_offered_names,
         )
+        scope = _scope()
+        try:
+            fragment, routing_id = router.build_prompt_fragment(
+                query=_run_query(ctx), agent_name=agent_name, scope=scope,
+            )
+        finally:
+            # The router keeps its own copy of this decision under the run's
+            # scope, for adapters that read it back from there. This one reads
+            # the per-call rails below, so the copy is released here or never.
+            # Only the decision: the body budget filed under the same scope is
+            # still needed by this run's load_skill calls.
+            _release_scoped_routing_rail(router, scope)
         # Drain the per-call contextvar rails NOW, one statement after the
         # router wrote them and on the same thread, so these are this call's
         # names. The router's instance rails are not used here on purpose: they
         # are process-global and clear-on-read, so under concurrent runs the
         # first drainer takes every lane's names.
-        from .skill_router import (
-            consume_last_delivered_names,
-            consume_last_offered_names,
-        )
         offered = consume_last_offered_names()
         delivered = consume_last_delivered_names()
         if routing_id:

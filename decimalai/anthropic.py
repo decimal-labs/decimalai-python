@@ -167,13 +167,21 @@ def skill_system(
     if router is None:
         return base if base is not None else ""
 
+    from .skill_router import _release_scoped_routing_rail
+
+    scope = _scope()
     try:
         fragment, routing_id = router.build_prompt_fragment(
-            query=query, agent_name=agent_name, scope=_scope(),
+            query=query, agent_name=agent_name, scope=scope,
         )
     except Exception:
         logger.debug("skill_system build_prompt_fragment failed (non-fatal)", exc_info=True)
         return base if base is not None else ""
+    finally:
+        # The router keeps its own copy of this decision under the run's scope,
+        # for adapters that read it back from there. This one reads the
+        # per-call rails below, so the copy is released here or never.
+        _release_scoped_routing_rail(router, scope)
 
     # Claim nothing for a call we inject nothing into. This guard used to sit
     # BELOW the routing-id stamp, so a call that got an empty fragment still

@@ -612,6 +612,15 @@ def _handle_load_skill(name: str) -> str:
     except Exception:
         logger.debug("load_skill handler failed (non-fatal)", exc_info=True)
         return f"load_skill error: could not load {name!r} (transient error)."
+    if kwargs:
+        # The router files each load a second time under the run's scope, for
+        # adapters that read loads back from there. This one records the load
+        # on its own run rail below (and drains only the scoped HASH, at trace
+        # end), so the router's copy of the name is released here or never.
+        try:
+            router.consume_loaded_names(**kwargs)
+        except Exception:
+            logger.debug("router keeps no scoped loaded rail to release", exc_info=True)
     # Attribute the load to THIS run rather than to whichever trace next
     # drains the router's shared `_loaded_names`. A body actually served
     # is the only thing that counts as loaded; a budget refusal or a
@@ -711,6 +720,11 @@ def _make_skill_aware_instructions(base: str):
             # Only pass `scope` when there IS a run to scope to, so a router
             # that predates the parameter is untouched on the unscoped path.
             kwargs = {"scope": run_key} if run_key else {}
+            from .skill_router import (
+                _release_scoped_routing_rail,
+                consume_last_delivered_names,
+                consume_last_offered_names,
+            )
             try:
                 fragment, routing_id = router.build_prompt_fragment(
                     query=_extract_query(ctx),
@@ -723,14 +737,17 @@ def _make_skill_aware_instructions(base: str):
                     query=_extract_query(ctx),
                     agent_name=getattr(agent, "name", None),
                 )
+            finally:
+                # The router keeps its own copy of this decision under the
+                # run's scope, for adapters that read it back from there. This
+                # one records it on its own run rail below, so the copy is
+                # released here or never. The body budget filed under the same
+                # scope stays: this run's load_skill calls still need it.
+                _release_scoped_routing_rail(router, kwargs.get("scope"))
             if routing_id:
                 _set_routing_id(routing_id)
             # Pull the names the Router offered for this call and
             # accumulate against the active trace.
-            from .skill_router import (
-                consume_last_delivered_names,
-                consume_last_offered_names,
-            )
             offered = consume_last_offered_names()
             if offered:
                 _add_skills_offered(offered)

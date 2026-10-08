@@ -92,6 +92,34 @@ def consume_last_delivered_names() -> List[str]:
     return []
 
 
+def _release_scoped_routing_rail(router: Any, scope: Optional[str]) -> None:
+    """Give back the routing slot a scoped routing call filed under ``scope``.
+
+    For the adapters that pass ``scope=`` to the router but read the decision
+    back from the per-call rails above, never from the router: ADK, Anthropic,
+    CrewAI, OpenAI Agents and Pydantic AI. The router still files every scoped
+    decision a second time under the run's scope, for the adapter that does read
+    it back from there (LangChain), and holds it until a scoped ``consume_*``
+    drains it. Left in place, each run keeps one of the router's
+    ``_MAX_SCOPED_RAILS`` slots for the life of the process: from run 4,097 on,
+    every new run evicts an older one and warns, and a LangChain run still in
+    flight in the same process loses its decision to that churn. Until
+    2026-10-08 only CrewAI released it.
+
+    Call it once the routing call returns or raises — an empty route files a
+    slot too. A router stand-in without the scoped drains has nothing to
+    release.
+    """
+    if scope is None:
+        return
+    try:
+        router.consume_routing_id(scope=scope)
+        router.consume_offered_names(scope=scope)
+        router.consume_delivered_names(scope=scope)
+    except Exception:
+        logger.debug("router keeps no scoped routing rail to release", exc_info=True)
+
+
 def _stamp_active_trace(
     routing_id: Optional[str],
     offered_names: Optional[List[str]],

@@ -47,6 +47,13 @@ and patch releases are fixes.
   lowest version that passes the CrewAI conformance column. 1.6.1 could not be
   traced (the OpenInference instrumentor needs crewai>=1.10.1), and crewai
   1.7–1.14 cannot be installed beside decimalai (they pin `click<8.2`).
+- Long-running processes no longer start logging "skill rail overflow" after
+  about 4,096 runs. The ADK, Anthropic, OpenAI Agents and Pydantic AI skill
+  loaders each left a per-run entry on the skill router that nothing removed:
+  from run 4,097 on, every new run evicted an older entry and warned, and a
+  LangChain run in flight in the same process could lose its routing decision.
+  Every loader now releases its entry as soon as the routing call returns, and
+  the OpenAI Agents `load_skill` tool does the same for each skill it loads.
 
 ## [0.13.8] — 2026-10-06
 
