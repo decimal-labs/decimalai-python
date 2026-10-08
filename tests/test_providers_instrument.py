@@ -223,6 +223,42 @@ class TestInstrumentFailure:
         assert "anthropic" in providers._instrumented
         assert any("failed to instrument" in r.getMessage() for r in caplog.records)
 
+    def test_an_instrumentor_that_refuses_the_installed_sdk_is_not_enabled(
+        self, fake_pipeline, monkeypatch, caplog,
+    ):
+        """``BaseInstrumentor.instrument()`` declines an SDK outside the range
+        the instrumentor declares by logging and returning None — the same
+        return as success, so the `except` above never sees it. That call was
+        reported as "tracing enabled" and recorded as instrumented."""
+        from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
+
+        calls = []
+
+        class RefusingOpenAIInstrumentor(BaseInstrumentor):
+            def instrumentation_dependencies(self):
+                return ("openai >= 999.0",)
+
+            def _instrument(self, **kwargs):
+                calls.append(kwargs)
+
+            def _uninstrument(self, **kwargs):
+                pass
+
+        _all_sdks_present(monkeypatch)
+        monkeypatch.setattr(
+            providers, "_load_instrumentor", lambda spec: RefusingOpenAIInstrumentor,
+        )
+
+        with caplog.at_level(logging.INFO, logger="decimalai.providers"):
+            instrument(openai=True)
+
+        assert calls == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("tracing enabled" in m for m in messages), messages
+        assert "openai" not in providers._instrumented  # refused → retryable
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("openai >= 999.0" in m for m in warnings), warnings
+
 
 # ── OTEL SDK absent → graceful None ───────────────────────────────────
 

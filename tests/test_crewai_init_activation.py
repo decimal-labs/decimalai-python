@@ -132,3 +132,103 @@ def test_init_crewai_warns_when_activation_fails(monkeypatch, caplog):
     )
     assert "NO CrewAI traces" in warning
     assert "version conflict" in warning
+
+
+def _refusing_instrumentor(requirement: str):
+    """A REAL OpenTelemetry instrumentor whose supported range no install meets.
+
+    ``BaseInstrumentor.instrument()`` does not raise on a library outside the
+    range an instrumentor declares: it logs the conflict on its own logger and
+    returns None — exactly what it returns on success. The OpenInference CrewAI
+    instrumentor declares ``crewai >= 1.10.1``, so on crewai 1.6.1 (which still
+    co-installs with decimalai) it does precisely this. A MagicMock cannot stand
+    in here: the refusal is BaseInstrumentor's own behaviour.
+    """
+    from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
+
+    class Refusing(BaseInstrumentor):
+        calls: list = []
+
+        def instrumentation_dependencies(self):
+            return (requirement,)
+
+        def _instrument(self, **kwargs):
+            type(self).calls.append(kwargs)
+
+        def _uninstrument(self, **kwargs):
+            pass
+
+    return Refusing
+
+
+def _install_crewai_instrumentor_class(monkeypatch, cls):
+    mod = types.ModuleType("openinference.instrumentation.crewai")
+    mod.CrewAIInstrumentor = cls
+    for name in ("openinference", "openinference.instrumentation"):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "openinference.instrumentation.crewai", mod)
+
+
+def test_init_crewai_warns_when_the_instrumentor_refuses_this_crewai(monkeypatch, caplog):
+    """A refused activation said "tracing enabled for CrewAI" over a process that
+    would capture no CrewAI span at all."""
+    refusing = _refusing_instrumentor("crewai >= 999.0")
+    _install_crewai_instrumentor_class(monkeypatch, refusing)
+
+    with caplog.at_level("INFO", logger="decimalai"):
+        decimalai.init(
+            api_key="dai_sk_test", base_url="http://localhost:8000", crewai=True
+        )
+
+    assert refusing.calls == [], "the stand-in did not refuse; the test proves nothing"
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("tracing enabled for CrewAI" in m for m in messages), messages
+    warning = "\n".join(
+        r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+    )
+    assert "NO CrewAI traces" in warning
+    assert "crewai >= 999.0" in warning, "the warning must name what was refused"
+
+
+def test_a_refused_provider_instrumentor_is_not_reported_as_enabled(monkeypatch, caplog):
+    """Same refusal, one step later: the provider instrumentor that carries the
+    model detail for CrewAI's LLM calls. Reported as enabled — and recorded as
+    instrumented, so a later ``init(openai=True)`` would not even try again."""
+    import decimalai.providers as providers
+
+    _fake_crewai_instrumentor(monkeypatch)
+    refusing = _refusing_instrumentor("openai >= 999.0")
+    monkeypatch.setattr(providers, "_sdk_present", lambda mod: mod == "openai")
+    monkeypatch.setattr(
+        providers, "_load_instrumentor",
+        lambda spec: refusing if spec.sdk_module == "openai" else None,
+    )
+    monkeypatch.setattr(providers, "_instrumented", set())
+
+    with caplog.at_level("INFO", logger="decimalai"):
+        decimalai.init(
+            api_key="dai_sk_test", base_url="http://localhost:8000", crewai=True
+        )
+
+    assert refusing.calls == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("enabled for openai SDK calls" in m for m in messages), messages
+    assert "openai" not in providers._instrumented
+    assert any("openai >= 999.0" in m for m in messages)
+
+
+def test_auto_trace_crewai_activates_the_crewai_instrumentor(monkeypatch):
+    """``DECIMAL_AUTO_TRACE=crewai`` is a documented value. It mapped to
+    ``init(otel=True)`` — the exporter alone, which CrewAI never feeds — so it
+    turned on nothing that could produce a CrewAI trace."""
+    instrumentor = _fake_crewai_instrumentor(monkeypatch)
+    monkeypatch.setenv("DECIMAL_AUTO_TRACE", "crewai")
+    monkeypatch.setenv("DECIMAL_API_KEY", "dai_sk_test")
+    monkeypatch.setenv("DECIMAL_BASE_URL", "http://localhost:8000")
+
+    decimalai._auto_init_from_env()
+
+    instrumentor.instrument.assert_called_once()
+    provider = instrumentor.instrument.call_args.kwargs["tracer_provider"]
+    assert len(_decimal_exporters(provider)) == 1

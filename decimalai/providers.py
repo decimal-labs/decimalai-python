@@ -139,6 +139,29 @@ def _load_instrumentor(spec: _ProviderSpec) -> Optional[type]:
     return getattr(module, spec.instrumentor_class, None)
 
 
+def _refusal(instrumentor: Any) -> Optional[str]:
+    """Why an instrumentor declined its ``instrument()`` call, or None if it didn't.
+
+    ``BaseInstrumentor.instrument()`` does not raise when the installed library
+    is outside the range the instrumentor declares (the OpenInference CrewAI
+    instrumentor, for one, takes only ``crewai >= 1.10.1``). It logs the
+    conflict on OpenTelemetry's own logger and returns None — what it returns
+    on success too — so a caller that only catches exceptions reports tracing
+    as on over a process that captures nothing. The instrumentor's own flag is
+    the only record of the refusal.
+
+    Only an explicit ``False`` counts as a refusal: an object that is not a
+    ``BaseInstrumentor`` (a test double) is taken at its word, as before.
+    """
+    if getattr(instrumentor, "is_instrumented_by_opentelemetry", None) is not False:
+        return None
+    try:
+        conflict = instrumentor._check_dependency_conflicts()
+    except Exception:
+        conflict = None
+    return str(conflict) if conflict else "it declined without naming a conflict"
+
+
 def _ensure_pipeline(agent_name: Optional[str], tracer_provider: Any = None) -> Any:
     """Attach a DecimalAI OTel exporter to a TracerProvider and return it.
 
@@ -281,12 +304,23 @@ def instrument(
             )
             logger.warning(msg, name, spec.pip) if forced else logger.info(msg, name, spec.pip)
             continue
+        instrumentor = instrumentor_cls()
         try:
-            instrumentor_cls().instrument(tracer_provider=provider)
+            instrumentor.instrument(tracer_provider=provider)
         except Exception:
             logger.warning(
                 "decimalai: failed to instrument the %s SDK (continuing)",
                 name, exc_info=True,
+            )
+            continue
+        refusal = _refusal(instrumentor)
+        if refusal:
+            logger.warning(
+                "decimalai: %s refused to instrument the installed %s SDK — "
+                "direct %s SDK calls will NOT be traced. Install a %s version in "
+                "the range it names, or a release of %s that supports this one. "
+                "It said: %s",
+                spec.pip, name, name, name, spec.pip, refusal,
             )
             continue
         if not explicit_provider:

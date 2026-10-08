@@ -612,8 +612,11 @@ def _activate_crewai_instrumentation(
             "with: pip install openinference-instrumentation-crewai"
         )
         return
+    from . import providers as _providers
+
+    instrumentor = CrewAIInstrumentor()
     try:
-        CrewAIInstrumentor().instrument(tracer_provider=tracer_provider)
+        instrumentor.instrument(tracer_provider=tracer_provider)
     except Exception:
         logger.warning(
             "decimalai.init(crewai=True): failed to activate the OpenInference "
@@ -621,6 +624,19 @@ def _activate_crewai_instrumentation(
             "usually an opentelemetry version conflict between the "
             "instrumentor and CrewAI's own pins.",
             exc_info=True,
+        )
+        return
+    # A version it does not support is refused without an exception, so the
+    # `except` above never sees it. See `providers._refusal`.
+    refusal = _providers._refusal(instrumentor)
+    if refusal:
+        logger.warning(
+            "decimalai.init(crewai=True): the OpenInference CrewAI instrumentor "
+            "refused the installed CrewAI — NO CrewAI traces will be captured. "
+            "Install a CrewAI in the range it names, or a release of "
+            "openinference-instrumentation-crewai that supports this one. It "
+            "said: %s",
+            refusal,
         )
         return
     # The pipeline CrewAI's spans now leave through: links each run to the
@@ -634,8 +650,6 @@ def _activate_crewai_instrumentation(
     # provider SDK — but attach to the exporter's provider directly instead
     # of going through providers.instrument(), whose pipeline setup would
     # add a SECOND exporter and double-ingest every trace.
-    from . import providers as _providers
-
     for pname, spec in _providers._PROVIDERS.items():
         if not _providers._sdk_present(spec.sdk_module):
             continue
@@ -648,12 +662,22 @@ def _activate_crewai_instrumentation(
                 pname, pname, spec.pip,
             )
             continue
+        provider_instrumentor = instrumentor_cls()
         try:
-            instrumentor_cls().instrument(tracer_provider=tracer_provider)
+            provider_instrumentor.instrument(tracer_provider=tracer_provider)
         except Exception:
             logger.warning(
                 "decimalai: failed to instrument the %s SDK for CrewAI "
                 "(continuing)", pname, exc_info=True,
+            )
+            continue
+        refusal = _providers._refusal(provider_instrumentor)
+        if refusal:
+            logger.warning(
+                "decimalai.init(crewai=True): %s refused to instrument the "
+                "installed %s SDK — CrewAI traces will lack %s model/token "
+                "detail. It said: %s",
+                spec.pip, pname, pname, refusal,
             )
             continue
         # Mark it globally instrumented so a later init(openai=True) doesn't
@@ -2092,7 +2116,12 @@ def _auto_init_from_env() -> None:
                 openai_agents=(auto_trace == "openai-agents"),
                 adk=(auto_trace == "adk"),
                 llamaindex=(auto_trace == "llamaindex"),
-                otel=(auto_trace in ("otel", "autogen", "crewai")),
+                # `crewai` is its own flag, not `otel`: the exporter alone
+                # receives nothing, because CrewAI emits no spans until its
+                # instrumentor is activated. `autogen` stays on the generic
+                # exporter, as documented.
+                crewai=(auto_trace == "crewai"),
+                otel=(auto_trace in ("otel", "autogen")),
                 # Direct/no-framework provider SDKs. "openai" is the raw SDK;
                 # the OpenAI Agents framework is the distinct "openai-agents".
                 openai=(auto_trace == "openai"),

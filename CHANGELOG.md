@@ -54,6 +54,16 @@ and patch releases are fixes.
   LangChain run in flight in the same process could lose its routing decision.
   Every loader now releases its entry as soon as the routing call returns, and
   the OpenAI Agents `load_skill` tool does the same for each skill it loads.
+- `DECIMAL_AUTO_TRACE=crewai` now traces CrewAI. It used to install only the
+  generic OpenTelemetry exporter, which CrewAI never sends spans to, so it
+  captured nothing; it now does what `init(crewai=True)` does.
+- `init(crewai=True)` no longer reports "tracing enabled" when the OpenInference
+  CrewAI instrumentor refuses the installed CrewAI (it instruments only
+  crewai>=1.10.1). It warns that no CrewAI traces will be captured and names the
+  version conflict. The same applies to the provider instrumentors that
+  `init(crewai=True)` and `init(openai=True)` / `anthropic=` / `google=` turn
+  on: a refused instrumentor is no longer reported as enabled or recorded as
+  instrumented.
 
 ## [0.13.8] — 2026-10-06
 
