@@ -195,8 +195,8 @@ def _function_response_content(name: str) -> SimpleNamespace:
 def _reset_sdk(monkeypatch):
     """Fresh SDK globals + a stubbed google-adk BasePlugin, per test."""
     import decimalai._config as cfg
-    from decimalai._config import DecimalConfig
     from decimalai import skill_router as sr
+    from decimalai._config import DecimalConfig
 
     sr._last_delivered_versions_ctx.set(None)
 
@@ -597,6 +597,7 @@ class TestInvocationObserver:
 
     def test_explicit_parent_wins_and_standalone_invocations_stay_roots(self):
         from uuid import uuid4
+
         from decimalai.adk import DecimalaiPlugin
         from decimalai.generic import start_trace
 
@@ -794,11 +795,11 @@ class TestRealAdkRun:
     """
 
     @staticmethod
-    def _build(router, *, tools=(), turns=None, on_trace=None):
+    def _build(router, *, tools=(), turns=None, on_trace=None, instrumented=False):
         from google.adk.agents import LlmAgent
         from google.adk.models.base_llm import BaseLlm
         from google.adk.models.llm_response import LlmResponse
-        from google.adk.runners import Runner
+        from google.adk.runners import InMemoryRunner, Runner
         from google.adk.sessions import InMemorySessionService
         from google.genai import types
 
@@ -829,6 +830,26 @@ class TestRealAdkRun:
             instruction=CALLER_PROMPT,
             tools=list(tools),
         )
+        if instrumented:
+            # Fleet uses global instrumentation and this synchronous runner,
+            # rather than explicitly constructing the tracing plugin.
+            adk.instrument(agent_name="support", enable_skill_loader=True, on_trace=on_trace)
+            runner = InMemoryRunner(agent=agent, app_name="support")
+            runner.session_service.create_session_sync(
+                app_name="support", user_id="u1", session_id="s1",
+            )
+            out = []
+            for ev in runner.run(
+                user_id="u1", session_id="s1",
+                new_message=types.Content(
+                    role="user", parts=[types.Part(text=USER_QUESTION)],
+                ),
+            ):
+                for part in (getattr(ev.content, "parts", None) or []) if ev.content else []:
+                    if part.text:
+                        out.append(part.text)
+            return "".join(out), seen
+
         svc = InMemorySessionService()
         runner = Runner(
             agent=agent, app_name="support", session_service=svc,
@@ -875,14 +896,21 @@ class TestRealAdkRun:
         assert trace.skills_offered_in_prompt == ["refund-policy", "returns-window"]
         assert trace.skills_delivered == ["refund-policy"]
 
-    def test_actual_get_body_hash_reaches_the_real_model_request_and_trace(self, use_router, monkeypatch):
+    @pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-async", "fleet-sync"])
+    def test_actual_get_body_hash_reaches_the_real_model_request_and_trace(self, use_router, monkeypatch, instrumented):
+        from google.adk.runners import Runner
+
         from decimalai.skill_router import SkillRouter
 
+        # Register restoration before instrument() replaces the real constructor.
+        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
         router = use_router(SkillRouter(
             api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
         ))
         digest = "a" * 64
-        body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}"
+        body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}\n" + (
+            "Verify the original order and apply the documented restocking fee.\n" * 90
+        )
         monkeypatch.setattr(router, "smart_route", MagicMock(return_value={
             "prompt_fragment": "Available skill: refund-policy",
             "routing_id": ROUTING_ID,
@@ -894,22 +922,34 @@ class TestRealAdkRun:
         monkeypatch.setattr(router, "get_skill_body_record", MagicMock(return_value={
             "body": body, "version": 3, "content_hash": digest,
         }))
-        answer, requests = self._build(router)
+        observed = []
+        answer, requests = self._build(
+            router, on_trace=observed.append, instrumented=instrumented,
+        )
         assert "23.5%" in answer
         assert body in requests[0].config.system_instruction
         assert requests[0].config.system_instruction.index(body) < requests[0].config.system_instruction.index(TAIL)
         trace = _flushed_traces()[0]
+        self._assert_retained_system_inputs(trace, observed, requests, [body], [TAIL])
         assert trace.skills_delivered_versions == [{"name": "refund-policy", "hash": digest, "routing_id": ROUTING_ID}]
         assert trace.active_skills == trace.skills_loaded_by_agent == []
 
-    def test_two_real_model_calls_preserve_both_complete_body_versions(self, use_router, monkeypatch):
+    @pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-async", "fleet-sync"])
+    def test_two_real_model_calls_preserve_both_complete_body_versions(self, use_router, monkeypatch, instrumented):
+        from google.adk.runners import Runner
+
         from decimalai.skill_router import SkillRouter
 
+        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
         router = use_router(SkillRouter(
             api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
         ))
-        first_body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}"
-        second_body = f"Opened boxes carry a 25% restocking fee. {SENTINEL}"
+        first_body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}\n" + (
+            "Verify the original order and apply the documented restocking fee.\n" * 90
+        )
+        second_body = f"Opened boxes carry a 25% restocking fee. {SENTINEL}\n" + (
+            "Apply the revised fee after verifying the original order.\n" * 25
+        )
         first_route = {
             "prompt_fragment": "Available skill: refund-policy",
             "routing_id": ROUTING_ID,
@@ -942,7 +982,11 @@ class TestRealAdkRun:
         def second_turn(types):
             return types.Content(role="model", parts=[types.Part(text="25%")])
 
-        _, requests = self._build(router, tools=[lookup_order], turns=[first_turn, second_turn])
+        observed = []
+        _, requests = self._build(
+            router, tools=[lookup_order], turns=[first_turn, second_turn],
+            on_trace=observed.append, instrumented=instrumented,
+        )
         assert len(requests) == 2
         assert first_body in requests[0].config.system_instruction
         assert TAIL in requests[0].config.system_instruction
@@ -950,6 +994,9 @@ class TestRealAdkRun:
         assert second_body in requests[1].config.system_instruction
         assert second_tail in requests[1].config.system_instruction
         trace = _flushed_traces()[0]
+        self._assert_retained_system_inputs(
+            trace, observed, requests, [first_body, second_body], [TAIL, second_tail],
+        )
         assert trace.skills_delivered_versions == [
             {"name": "refund-policy", "hash": "a" * 64, "routing_id": ROUTING_ID},
             {"name": "refund-policy", "hash": "b" * 64, "routing_id": second_id},
@@ -957,6 +1004,29 @@ class TestRealAdkRun:
         assert trace.routing_id == second_id
         assert len(trace.llm_calls) == 2
         assert trace.active_skills == trace.skills_loaded_by_agent == []
+
+    @staticmethod
+    def _assert_retained_system_inputs(trace, observed, requests, bodies, tails):
+        """Delivery metadata must remain gradeable against each actual prompt.
+
+        An ADK trace can claim delivery while retaining only user turns. Check
+        the complete exported and observer records against the real model
+        requests, including bodies that exceed the trace preview limit.
+        """
+        exported = trace.model_dump(mode="json")
+        assert len(observed) == 1
+        assert observed[0].model_dump(mode="json")["llm_calls"] == exported["llm_calls"]
+        assert len(exported["llm_calls"]) == len(requests) == len(bodies) == len(tails)
+        for call, request, body, tail in zip(exported["llm_calls"], requests, bodies, tails):
+            model_system = request.config.system_instruction
+            assert isinstance(model_system, str), "the real LlmAgent instruction shape changed"
+            systems = [entry["content"] for entry in call["rendered_input"] if entry["role"] == "system"]
+            assert systems == [model_system]
+            assert len(body) > 500, "the full body must exceed the input_preview cap"
+            assert "## Skill: refund-policy" in systems[0]
+            assert body in systems[0]
+            assert systems[0].index(body) < systems[0].index(tail)
+            assert USER_QUESTION in str(call["rendered_input"])
 
     def test_a_tool_turn_keeps_the_body_and_the_query(self, use_router):
         """Two model turns in one invocation. The second one's contents end in
