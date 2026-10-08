@@ -92,6 +92,23 @@ def consume_last_delivered_names() -> List[str]:
     return []
 
 
+_last_delivered_versions_ctx: ContextVar[Optional[List[Dict[str, str]]]] = ContextVar(
+    "decimalai_skill_router_last_delivered_versions", default=None,
+)
+
+
+def consume_last_delivered_versions() -> List[Dict[str, str]]:
+    """Read + clear immutable identities of this call's injected skill bodies.
+
+    These are delivery witnesses, never model-initiated activations. Each hash
+    comes from the response that supplied that exact body, including on a
+    fragment-cache hit; a later fetch must not replace the witnessed version.
+    """
+    versions = _last_delivered_versions_ctx.get()
+    _last_delivered_versions_ctx.set(None)
+    return [dict(version) for version in versions or []]
+
+
 def _release_scoped_routing_rail(router: Any, scope: Optional[str]) -> None:
     """Give back the routing slot a scoped routing call filed under ``scope``.
 
@@ -2004,7 +2021,7 @@ class SkillRouter:
         if not bypass_cache:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
-                fragment, routing_id, offered_names, delivered_names, split_parts = cached
+                fragment, routing_id, offered_names, delivered_names, split_parts, delivered_versions = cached
                 # A cache hit must re-emit the split exactly as the miss did.
                 # Without this, the second LLM call of a turn loses the prefix
                 # and the adapter falls back to the fragment — the injected
@@ -2023,6 +2040,9 @@ class SkillRouter:
                 _last_delivered_names_ctx.set(
                     list(delivered_names) if delivered_names else None
                 )
+                _last_delivered_versions_ctx.set(
+                    [dict(version) for version in delivered_versions] or None
+                )
                 self._record_routing_rails(
                     routing_id, offered_names, delivered_names, scope=scope,
                 )
@@ -2035,6 +2055,7 @@ class SkillRouter:
         # adapter and the generic quickstart never drain the rails).
         _last_offered_names_ctx.set(None)
         _last_delivered_names_ctx.set(None)
+        _last_delivered_versions_ctx.set(None)
         _last_split_parts_ctx.set(None)
 
         if query and self.strategy in ("auto", "semantic"):
@@ -2106,6 +2127,7 @@ class SkillRouter:
         # defense, count-capped, and the total respects body_token_budget.
         smart_routed = bool(query) and self.strategy in ("auto", "semantic")
         delivered_names: List[str] = []
+        delivered_versions: List[Dict[str, str]] = []
         if effective_inject and routed_names and smart_routed:
             bodies = []
             body_tokens = 0
@@ -2116,7 +2138,11 @@ class SkillRouter:
                 body_options: Dict[str, Any] = {"max_chars": self.per_body_char_limit}
                 if effective_agent is not None:
                     body_options["agent_name"] = effective_agent
+                # A stand-in may override get_skill_body without clearing its
+                # thread-local handoff. Never inherit a previous fetch's hash.
+                _body_hash_tls.value = None
                 body = self.get_skill_body(name, **body_options)
+                content_hash = getattr(_body_hash_tls, "value", None)
                 if not (body and body.strip()):
                     continue
                 body = body.strip()
@@ -2132,6 +2158,11 @@ class SkillRouter:
                 bodies.append(f"## Skill: {name}\n\n{body}")
                 # The body actually reached the prompt → delivered.
                 delivered_names.append(name)
+                if isinstance(content_hash, str) and content_hash:
+                    witness = {"name": name, "hash": content_hash}
+                    if isinstance(routing_id, str) and routing_id:
+                        witness["routing_id"] = routing_id
+                    delivered_versions.append(witness)
             if bodies:
                 body_block = "\n\n".join(bodies)
                 fragment = f"{fragment}\n\n{body_block}" if fragment else body_block
@@ -2141,6 +2172,9 @@ class SkillRouter:
                 if split_prefix:
                     split_prefix = f"{split_prefix}\n\n{body_block}"
                 _last_delivered_names_ctx.set(list(delivered_names))
+                _last_delivered_versions_ctx.set(
+                    [dict(version) for version in delivered_versions] or None
+                )
 
         # Invariant 6: delivered ⊆ offered ⊆ the injected text.
         #
@@ -2193,7 +2227,7 @@ class SkillRouter:
         if fragment or routing_id:
             self._fragment_cache.set(
                 cache_key,
-                (fragment, routing_id, offered_names, delivered_names, split_parts),
+                (fragment, routing_id, offered_names, delivered_names, split_parts, delivered_versions),
             )
         return fragment, routing_id
 

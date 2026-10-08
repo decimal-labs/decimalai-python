@@ -162,6 +162,12 @@ class RunTrace(BaseModel):
     # load_skill serve) — between offered (menu row) and
     # activated. Delivered implies offered, never implies activation.
     skills_delivered: List[str] = Field(default_factory=list)
+    # Immutable version identities returned with the bodies this invocation
+    # actually received. Advisory until the backend matches the observed body
+    # to that version; delivery remains separate from model-initiated loading.
+    # Each entry has name/hash and an optional routing_id from the exact body
+    # delivery, allowing earlier calls' routing tails to be verified as well.
+    skills_delivered_versions: List[Dict[str, str]] = Field(default_factory=list)
     # Session aggregation — multi-turn context
     session_metadata: Dict[str, Any] = Field(default_factory=dict)
     turn_index: Optional[int] = None

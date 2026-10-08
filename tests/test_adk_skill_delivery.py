@@ -125,6 +125,20 @@ class _EmptyRouter(_SplitRouter):
         return "", "", None
 
 
+class _VersionedRouter(_SplitRouter):
+    def __init__(self, hashes=None):
+        super().__init__()
+        self.hashes = iter(hashes or ["a" * 64])
+
+    def _rails(self):
+        super()._rails()
+        import decimalai.skill_router as sr
+
+        sr._last_delivered_versions_ctx.set([
+            {"name": "refund-policy", "hash": next(self.hashes)},
+        ])
+
+
 # ── a stand-in for ADK's LlmRequest ─────────────────────────
 
 
@@ -182,6 +196,9 @@ def _reset_sdk(monkeypatch):
     """Fresh SDK globals + a stubbed google-adk BasePlugin, per test."""
     import decimalai._config as cfg
     from decimalai._config import DecimalConfig
+    from decimalai import skill_router as sr
+
+    sr._last_delivered_versions_ctx.set(None)
 
     cfg._config = DecimalConfig(
         api_key="dai_sk_test", base_url="http://localhost:8000", enabled=True,
@@ -236,6 +253,8 @@ def _reset_sdk(monkeypatch):
             monkeypatch.setitem(sys.modules, name, mod)
 
     yield
+
+    sr._last_delivered_versions_ctx.set(None)
 
     (
         adk._PluginClass,
@@ -644,6 +663,119 @@ class TestInvocationObserver:
         assert {trace.agent_name for trace in _flushed_traces()} == {"first", "second"}
 
 
+class TestDeliveredVersions:
+    def test_a_delivery_hash_survives_worker_finalization_and_observer_mutation(self, use_router):
+        from decimalai.adk import DecimalaiPlugin
+
+        use_router(_VersionedRouter())
+        seen = []
+
+        def observe(trace):
+            seen.append(trace.model_copy(deep=True))
+            trace.skills_delivered_versions[0]["hash"] = "observer mutation"
+
+        _drive_one_turn(
+            DecimalaiPlugin(agent_name="support", enable_skill_loader=True, on_trace=observe),
+            _FakeLlmRequest(CALLER_PROMPT),
+        )
+        sent = _flushed_traces()[0]
+        expected = [{"name": "refund-policy", "hash": "a" * 64}]
+        assert seen[0].skills_delivered_versions == sent.skills_delivered_versions == expected
+        assert sent.model_dump(mode="json")["skills_delivered_versions"] == expected
+        assert sent.active_skills == sent.skills_loaded_by_agent == []
+
+    @pytest.mark.parametrize("failure", ["append", "router"])
+    def test_failed_insertion_does_not_export_a_version_or_leak_into_next_run(self, use_router, failure):
+        from decimalai.adk import DecimalaiPlugin
+
+        class RefusingRequest(_FakeLlmRequest):
+            def append_instructions(self, instructions):
+                return []
+
+        class FailingRouter(_VersionedRouter):
+            def build_prompt_parts(self, **kwargs):
+                self._rails()
+                raise RuntimeError("body assembly failed")
+
+        plugin = DecimalaiPlugin(agent_name="support", enable_skill_loader=True)
+        agent = _agent()
+
+        async def run(invocation_id, request):
+            ic = SimpleNamespace(agent=agent, invocation_id=invocation_id, user_content=USER_QUESTION)
+            cc = SimpleNamespace(invocation_id=invocation_id, agent_name=None)
+            await plugin.before_run_callback(invocation_context=ic)
+            await plugin.before_agent_callback(agent=agent, callback_context=cc)
+            await plugin.before_model_callback(callback_context=cc, llm_request=request)
+            await plugin.after_agent_callback(agent=agent, callback_context=cc)
+
+        async def drive():
+            use_router(FailingRouter() if failure == "router" else _VersionedRouter())
+            request = _FakeLlmRequest(CALLER_PROMPT) if failure == "router" else RefusingRequest(CALLER_PROMPT)
+            await run("refused", request)
+            # Keep the same async context: a new asyncio.run would isolate
+            # the stale ContextVar by itself and hide a missing drain.
+            use_router(_SplitRouter())  # an older router without a body hash
+            await run("next", _FakeLlmRequest(CALLER_PROMPT))
+
+        asyncio.run(drive())
+        refused, next_trace = _flushed_traces()
+        assert refused.skills_delivered == refused.skills_delivered_versions == []
+        assert next_trace.skills_delivered == ["refund-policy"]
+        assert next_trace.skills_delivered_versions == []
+
+    def test_distinct_versions_in_one_invocation_are_retained_and_identical_deliveries_deduped(self, use_router):
+        from decimalai.adk import DecimalaiPlugin
+
+        # A third call repeats the newest version: it must not erase the old
+        # version or duplicate the same witnessed name/hash pair.
+        use_router(_VersionedRouter(["a" * 64, "b" * 64, "b" * 64]))
+        plugin = DecimalaiPlugin(agent_name="support", enable_skill_loader=True)
+        agent = _agent()
+        ic = SimpleNamespace(agent=agent, invocation_id="multi", user_content=USER_QUESTION)
+        cc = SimpleNamespace(invocation_id="multi", agent_name=None)
+
+        async def drive():
+            await plugin.before_run_callback(invocation_context=ic)
+            await plugin.before_agent_callback(agent=agent, callback_context=cc)
+            for _ in range(3):
+                await plugin.before_model_callback(callback_context=cc, llm_request=_FakeLlmRequest(CALLER_PROMPT))
+            await plugin.after_agent_callback(agent=agent, callback_context=cc)
+
+        asyncio.run(drive())
+        trace = _flushed_traces()[0]
+        assert trace.skills_delivered == ["refund-policy"]
+        assert trace.skills_delivered_versions == [
+            {"name": "refund-policy", "hash": "a" * 64},
+            {"name": "refund-policy", "hash": "b" * 64},
+        ]
+        assert trace.active_skills == trace.skills_loaded_by_agent == []
+
+    def test_concurrent_invocations_keep_separate_delivery_witnesses(self, use_router):
+        from decimalai.adk import DecimalaiPlugin
+
+        use_router(_VersionedRouter(["a" * 64, "b" * 64]))
+        plugin = DecimalaiPlugin(enable_skill_loader=True)
+
+        async def run(invocation_id):
+            agent = _agent(invocation_id)
+            ic = SimpleNamespace(agent=agent, invocation_id=invocation_id, user_content=USER_QUESTION)
+            cc = SimpleNamespace(invocation_id=invocation_id, agent_name=None)
+            await plugin.before_run_callback(invocation_context=ic)
+            await plugin.before_agent_callback(agent=agent, callback_context=cc)
+            await plugin.before_model_callback(callback_context=cc, llm_request=_FakeLlmRequest(CALLER_PROMPT))
+            await asyncio.sleep(0)
+            await plugin.after_agent_callback(agent=agent, callback_context=cc)
+
+        async def drive():
+            await asyncio.gather(run("first"), run("second"))
+
+        asyncio.run(drive())
+        assert {trace.agent_name: trace.skills_delivered_versions for trace in _flushed_traces()} == {
+            "first": [{"name": "refund-policy", "hash": "a" * 64}],
+            "second": [{"name": "refund-policy", "hash": "b" * 64}],
+        }
+
+
 # ── layer 2: the real thing ─────────────────────────────────
 
 
@@ -742,6 +874,89 @@ class TestRealAdkRun:
         assert trace.routing_id == ROUTING_ID
         assert trace.skills_offered_in_prompt == ["refund-policy", "returns-window"]
         assert trace.skills_delivered == ["refund-policy"]
+
+    def test_actual_get_body_hash_reaches_the_real_model_request_and_trace(self, use_router, monkeypatch):
+        from decimalai.skill_router import SkillRouter
+
+        router = use_router(SkillRouter(
+            api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
+        ))
+        digest = "a" * 64
+        body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}"
+        monkeypatch.setattr(router, "smart_route", MagicMock(return_value={
+            "prompt_fragment": "Available skill: refund-policy",
+            "routing_id": ROUTING_ID,
+            "skills": [{"name": "refund-policy"}],
+            "stable_menu": "Available skill: refund-policy",
+            "stable_menu_skills": ["refund-policy"],
+            "routing_hint": TAIL,
+        }))
+        monkeypatch.setattr(router, "get_skill_body_record", MagicMock(return_value={
+            "body": body, "version": 3, "content_hash": digest,
+        }))
+        answer, requests = self._build(router)
+        assert "23.5%" in answer
+        assert body in requests[0].config.system_instruction
+        assert requests[0].config.system_instruction.index(body) < requests[0].config.system_instruction.index(TAIL)
+        trace = _flushed_traces()[0]
+        assert trace.skills_delivered_versions == [{"name": "refund-policy", "hash": digest, "routing_id": ROUTING_ID}]
+        assert trace.active_skills == trace.skills_loaded_by_agent == []
+
+    def test_two_real_model_calls_preserve_both_complete_body_versions(self, use_router, monkeypatch):
+        from decimalai.skill_router import SkillRouter
+
+        router = use_router(SkillRouter(
+            api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
+        ))
+        first_body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}"
+        second_body = f"Opened boxes carry a 25% restocking fee. {SENTINEL}"
+        first_route = {
+            "prompt_fragment": "Available skill: refund-policy",
+            "routing_id": ROUTING_ID,
+            "skills": [{"name": "refund-policy"}],
+            "stable_menu": "Available skill: refund-policy",
+            "stable_menu_skills": ["refund-policy"],
+            "routing_hint": TAIL,
+        }
+        second_id = "rt_" + "b" * 24
+        second_tail = "Use refund-policy for the follow-up request."
+        second_route = {**first_route, "routing_id": second_id, "routing_hint": second_tail}
+        monkeypatch.setattr(router, "smart_route", MagicMock(side_effect=[first_route, second_route]))
+        monkeypatch.setattr(router, "get_skill_body_record", MagicMock(side_effect=[
+            {"body": first_body, "version": 3, "content_hash": "a" * 64},
+            {"body": second_body, "version": 4, "content_hash": "b" * 64},
+        ]))
+        # A long-running tool can outlive the fragment cache; force that
+        # expiry instead of waiting 30s or switching to a synthetic router.
+        monkeypatch.setattr(router._fragment_cache, "get", lambda key: None)
+
+        def lookup_order(order_id: str) -> dict:
+            """Look up an order."""
+            return {"order_id": order_id, "state": "opened"}
+
+        def first_turn(types):
+            return types.Content(role="model", parts=[types.Part(
+                function_call=types.FunctionCall(name="lookup_order", args={"order_id": "A1"}),
+            )])
+
+        def second_turn(types):
+            return types.Content(role="model", parts=[types.Part(text="25%")])
+
+        _, requests = self._build(router, tools=[lookup_order], turns=[first_turn, second_turn])
+        assert len(requests) == 2
+        assert first_body in requests[0].config.system_instruction
+        assert TAIL in requests[0].config.system_instruction
+        assert second_tail not in requests[0].config.system_instruction
+        assert second_body in requests[1].config.system_instruction
+        assert second_tail in requests[1].config.system_instruction
+        trace = _flushed_traces()[0]
+        assert trace.skills_delivered_versions == [
+            {"name": "refund-policy", "hash": "a" * 64, "routing_id": ROUTING_ID},
+            {"name": "refund-policy", "hash": "b" * 64, "routing_id": second_id},
+        ]
+        assert trace.routing_id == second_id
+        assert len(trace.llm_calls) == 2
+        assert trace.active_skills == trace.skills_loaded_by_agent == []
 
     def test_a_tool_turn_keeps_the_body_and_the_query(self, use_router):
         """Two model turns in one invocation. The second one's contents end in

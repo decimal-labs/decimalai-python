@@ -391,6 +391,7 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
     from .skill_router import (
         _release_scoped_routing_rail,
         consume_last_delivered_names,
+        consume_last_delivered_versions,
         consume_last_offered_names,
     )
     try:
@@ -412,6 +413,9 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
             )
             tail = ""
     except Exception:
+        # A partially built prompt must not hand off its body witness to a
+        # later invocation, even when a custom router fails after setting it.
+        consume_last_delivered_versions()
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return
     finally:
@@ -425,6 +429,7 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
     # attribute this turn's skills to the next one.
     offered = consume_last_offered_names()
     delivered = consume_last_delivered_names()
+    delivered_versions = consume_last_delivered_versions()
 
     texts = [t for t in (prefix, tail) if t]
     if not texts:
@@ -448,6 +453,13 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         state.routing_id = routing_id
     state.skills_offered.update(n for n in offered if n)
     state.skills_delivered.update(n for n in delivered if n)
+    for version in delivered_versions:
+        name, digest = version.get("name"), version.get("hash")
+        if name not in delivered or not digest:
+            continue
+        # A long invocation may receive more than one immutable version.
+        # Preserve each actual delivery rather than replacing it with latest.
+        state.skills_delivered_versions.add((name, digest, version.get("routing_id") or ""))
 
 
 class _RunState:
@@ -459,6 +471,7 @@ class _RunState:
         "llm_calls", "spans", "pending_llm", "pending_tools", "agent_stack",
         "status", "error_code", "error_message", "manifest",
         "routing_id", "skills_offered", "skills_delivered",
+        "skills_delivered_versions",
         "parent_trace_id", "on_trace", "enable_skill_loader",
     )
 
@@ -502,6 +515,7 @@ class _RunState:
         self.routing_id: Optional[str] = None
         self.skills_offered: set = set()
         self.skills_delivered: set = set()
+        self.skills_delivered_versions: set[Tuple[str, str, str]] = set()
 
 
 def _plugin_class() -> Any:
@@ -1005,6 +1019,10 @@ def _plugin_class() -> Any:
                     routing_id=state.routing_id,
                     skills_offered_in_prompt=sorted(state.skills_offered),
                     skills_delivered=sorted(state.skills_delivered),
+                    skills_delivered_versions=[
+                        {"name": name, "hash": digest, **({"routing_id": route_id} if route_id else {})}
+                        for name, digest, route_id in sorted(state.skills_delivered_versions)
+                    ],
                 )
                 if state.on_trace is not None:
                     try:
