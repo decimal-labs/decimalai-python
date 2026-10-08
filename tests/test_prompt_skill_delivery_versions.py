@@ -113,7 +113,7 @@ def test_an_override_without_a_hash_cannot_reuse_the_thread_local_from_a_prior_f
 
 
 def test_only_the_bodies_that_survive_the_prompt_budget_have_witnesses():
-    router = _router(inject_body_top_k=2, max_loaded_bodies=2, body_token_budget=1)
+    router = _router(inject_body_top_k=2, max_loaded_bodies=2, body_token_budget=sr.estimate_tokens(BODY))
     with patch.object(router, "smart_route", return_value=_route((NAME, "second"))), \
          patch.object(router, "get_skill_body_record", side_effect=[_record(), _record("second body", OTHER_HASH)]):
         prefix, _, _ = router.build_prompt_parts("document this function", scope="run-1")

@@ -36,6 +36,7 @@ Two layers, because google-adk is not in the SDK's own dev environment:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import sys
 import types
@@ -900,17 +901,24 @@ class TestRealAdkRun:
     def test_actual_get_body_hash_reaches_the_real_model_request_and_trace(self, use_router, monkeypatch, instrumented):
         from google.adk.runners import Runner
 
+        import decimalai.adk as adk
         from decimalai.skill_router import SkillRouter
 
         # Register restoration before instrument() replaces the real constructor.
         monkeypatch.setattr(Runner, "__init__", Runner.__init__)
-        router = use_router(SkillRouter(
-            api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
-        ))
-        digest = "a" * 64
+        if instrumented:
+            # Exercise the factory Fleet's global instrumentation actually
+            # uses, so an adapter-specific legacy cap cannot bypass this test.
+            router = use_router(adk._get_skill_router())
+            assert isinstance(router, SkillRouter)
+        else:
+            router = use_router(SkillRouter(
+                api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
+            ))
         body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}\n" + (
-            "Verify the original order and apply the documented restocking fee.\n" * 90
+            "Verify the original order and apply the documented restocking fee.\n" * 220
         )
+        digest = hashlib.sha256(body.encode()).hexdigest()
         monkeypatch.setattr(router, "smart_route", MagicMock(return_value={
             "prompt_fragment": "Available skill: refund-policy",
             "routing_id": ROUTING_ID,
@@ -945,11 +953,13 @@ class TestRealAdkRun:
             api_key="dai_sk_test", base_url="http://localhost:8000", inject_body=True,
         ))
         first_body = f"Opened boxes carry a 23.5% restocking fee. {SENTINEL}\n" + (
-            "Verify the original order and apply the documented restocking fee.\n" * 90
+            "Verify the original order and apply the documented restocking fee.\n" * 220
         )
         second_body = f"Opened boxes carry a 25% restocking fee. {SENTINEL}\n" + (
             "Apply the revised fee after verifying the original order.\n" * 25
         )
+        first_hash = hashlib.sha256(first_body.encode()).hexdigest()
+        second_hash = hashlib.sha256(second_body.encode()).hexdigest()
         first_route = {
             "prompt_fragment": "Available skill: refund-policy",
             "routing_id": ROUTING_ID,
@@ -963,8 +973,8 @@ class TestRealAdkRun:
         second_route = {**first_route, "routing_id": second_id, "routing_hint": second_tail}
         monkeypatch.setattr(router, "smart_route", MagicMock(side_effect=[first_route, second_route]))
         monkeypatch.setattr(router, "get_skill_body_record", MagicMock(side_effect=[
-            {"body": first_body, "version": 3, "content_hash": "a" * 64},
-            {"body": second_body, "version": 4, "content_hash": "b" * 64},
+            {"body": first_body, "version": 3, "content_hash": first_hash},
+            {"body": second_body, "version": 4, "content_hash": second_hash},
         ]))
         # A long-running tool can outlive the fragment cache; force that
         # expiry instead of waiting 30s or switching to a synthetic router.
@@ -997,10 +1007,10 @@ class TestRealAdkRun:
         self._assert_retained_system_inputs(
             trace, observed, requests, [first_body, second_body], [TAIL, second_tail],
         )
-        assert trace.skills_delivered_versions == [
-            {"name": "refund-policy", "hash": "a" * 64, "routing_id": ROUTING_ID},
-            {"name": "refund-policy", "hash": "b" * 64, "routing_id": second_id},
-        ]
+        assert trace.skills_delivered_versions == sorted([
+            {"name": "refund-policy", "hash": first_hash, "routing_id": ROUTING_ID},
+            {"name": "refund-policy", "hash": second_hash, "routing_id": second_id},
+        ], key=lambda entry: (entry["name"], entry["hash"], entry["routing_id"]))
         assert trace.routing_id == second_id
         assert len(trace.llm_calls) == 2
         assert trace.active_skills == trace.skills_loaded_by_agent == []
@@ -1014,9 +1024,36 @@ class TestRealAdkRun:
         requests, including bodies that exceed the trace preview limit.
         """
         exported = trace.model_dump(mode="json")
+        # Exercise the real ingest serializer and httpx JSON encoding too:
+        # observer equality alone misses a later exporter truncation.
+        import json
+
+        import httpx
+
+        from decimalai._client import DecimalAIClient
+
+        captured = []
+
+        def capture(request):
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "accepted"}, request=request)
+
+        client = DecimalAIClient(api_key="dai_sk_test", base_url="http://sdk-proof.test")
+        client._http.close()
+        client._http = httpx.Client(
+            base_url="http://sdk-proof.test", transport=httpx.MockTransport(capture),
+        )
+        try:
+            client.ingest_trace(trace)
+        finally:
+            client._http.close()
+        assert len(captured) == 1
+        assert captured[0]["llm_calls"] == exported["llm_calls"]
+        assert captured[0]["skills_delivered_versions"] == exported["skills_delivered_versions"]
         assert len(observed) == 1
         assert observed[0].model_dump(mode="json")["llm_calls"] == exported["llm_calls"]
         assert len(exported["llm_calls"]) == len(requests) == len(bodies) == len(tails)
+        assert len(bodies[0]) > 13_000, "the real body must exceed the former 8192-char cap"
         for call, request, body, tail in zip(exported["llm_calls"], requests, bodies, tails):
             model_system = request.config.system_instruction
             assert isinstance(model_system, str), "the real LlmAgent instruction shape changed"

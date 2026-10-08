@@ -6,6 +6,14 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+- Skill delivery keeps complete immutable bodies or omits them when they do
+  not fit. The default per-body character cap now follows the existing
+  6,000-token body budget (24,000 characters with the same estimate); explicit
+  caller caps still apply. Prompt injection and `load_skill` reject partial
+  server responses and enforce the total budget on the first body too. A
+  refused body emits no delivery or load witness. Previously bodies above
+  8,192 characters were clipped while retaining their full version's hash,
+  preventing the recorded prompt from proving which complete version ran.
 - CrewAI gets automatic skill delivery (crewai>=1.15.3).
   `from decimalai.crewai import instrument;
   instrument(agent_name="support", enable_skill_loader=True)` routes every agent

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json as json_module
 import logging
 import os
+import re
 import time
 import warnings
 from collections import OrderedDict
@@ -174,6 +175,27 @@ def estimate_tokens(text: str) -> int:
     ±20% on English markdown is fine: the body budgets are soft
     context-hygiene caps, not hard limits."""
     return (len(text) + 3) // 4
+
+
+def _body_is_known_partial(body: Any, record: Optional[Dict[str, Any]] = None) -> bool:
+    """A partial body cannot witness delivery of its full immutable version.
+
+    New servers declare truncation. Recognize the old terminal markers too,
+    without mistaking a complete record's literal example for truncation.
+    """
+    record = record or {}
+    if record.get("truncated") is True or record.get("content_hash_matches_body") is False:
+        return True
+    total = record.get("total_chars")
+    if isinstance(body, str) and isinstance(total, int) and total > len(body):
+        return True
+    if record.get("content_hash_matches_body") is True:
+        return False
+    return isinstance(body, str) and bool(re.search(
+        r"\n\n\[\.\.\. truncated (?:by the per-body limit|\d+ of \d+ chars"
+        r" — request without max_chars for the full body)\]\s*$",
+        body,
+    ))
 
 
 # ── Progressive disclosure: the load_skill tool ────────────────────────
@@ -540,7 +562,7 @@ class _BodyLoadBudget:
         return None
 
     def would_exceed(self, tokens: int) -> bool:
-        return bool(self.loaded) and self.tokens_used + tokens > self.token_budget
+        return self.tokens_used + tokens > self.token_budget
 
     def record(self, name: str, tokens: int) -> None:
         if self._first_load_at is None:
@@ -915,7 +937,7 @@ class SkillRouter:
         inject_body_top_k: int = 1,
         max_loaded_bodies: int = 3,
         body_token_budget: int = 6000,
-        per_body_char_limit: int = 8192,
+        per_body_char_limit: Optional[int] = None,
         body_load_deadline_s: float = 20.0,
         priority_skills: Optional[List[str]] = None,
     ):
@@ -943,11 +965,14 @@ class SkillRouter:
         self.priority_skills = list(dict.fromkeys(priority_skills or []))
         # Body guardrail (the progressive-disclosure path): caps for on-demand load_skill AND
         # the body-inject path (bodies injected un-trimmed before top-k). Defaults
-        # mirror the backend's config (max_loaded_bodies=3, body_token_budget
-        # ≈6k tok, per-body trim 8KB).
+        # Full bodies fit or are omitted, never trimmed into a partial version.
+        # Derive the default character cap from the same chars/4 estimate as
+        # the total token budget; an explicit caller cap remains authoritative.
         self.max_loaded_bodies = max(1, int(max_loaded_bodies))
         self.body_token_budget = max(1, int(body_token_budget))
-        self.per_body_char_limit = max(256, int(per_body_char_limit))
+        self.per_body_char_limit = max(256, int(
+            per_body_char_limit if per_body_char_limit is not None else 4 * self.body_token_budget
+        ))
         self.body_load_deadline_s = float(body_load_deadline_s)
 
         # Fallback body-load budget for tool-execution contexts that did not
@@ -1294,7 +1319,9 @@ class SkillRouter:
 
         ``max_chars`` asks the server to trim (body guardrail); ``agent_name``
         resolves the exact version that agent was offered (Use pins).
-        Returns the body text or None if not found.
+        Returns the body text or None if not found. Direct callers may request
+        partial text, but a partial record never hands off a full-version hash
+        and is refused by prompt injection and ``load_skill``.
 
         Prefer :meth:`get_skill_body_record` when you also want the version the
         body came from — this wrapper drops it.
@@ -1302,13 +1329,19 @@ class SkillRouter:
         # Cleared FIRST, so a miss or a raise below can never leave the previous
         # body's hash on this thread for `load_skill` to pick up.
         _body_hash_tls.value = None
+        _body_hash_tls.partial = None
         result = self.get_skill_body_record(
             skill_name, version, max_chars=max_chars, agent_name=agent_name,
         )
         if not result:
             return None
+        body = result.get("body")
+        _body_hash_tls.partial = _body_is_known_partial(body, result)
         content_hash = result.get("content_hash")
-        if isinstance(content_hash, str) and content_hash:
+        if _body_hash_tls.partial:
+            with self._rail_lock:
+                self._loaded_hashes.pop(skill_name, None)
+        elif isinstance(content_hash, str) and content_hash:
             # Two readers, on purpose. `_loaded_hashes` is the persistent
             # last-seen map behind `loaded_skill_hash()`; the thread-local is
             # the race-free handoff to `load_skill`, which needs the hash of the
@@ -1317,7 +1350,7 @@ class SkillRouter:
             _body_hash_tls.value = content_hash
             with self._rail_lock:
                 self._loaded_hashes[skill_name] = content_hash
-        return result.get("body")
+        return body
 
     def get_skill_body_record(
         self,
@@ -1378,7 +1411,7 @@ class SkillRouter:
         the adapter feeds back as the tool result, or an explanatory message
         (budget exhausted / not found) the model can act on. Enforces the
         per-turn body guardrail: ``max_loaded_bodies``, ``body_token_budget``,
-        ``per_body_char_limit`` trim, ``body_load_deadline_s``. Records the
+        ``per_body_char_limit`` cap, ``body_load_deadline_s``. Records the
         load on the active trace (``skills_loaded_by_agent``) so the
         offered-vs-loaded join closes server-side.
 
@@ -1435,23 +1468,32 @@ class SkillRouter:
         # `get_skill_body` reports the load with no hash — exactly what every
         # load reported before this rail existed.
         _body_hash_tls.value = None
+        _body_hash_tls.partial = None
         body = self.get_skill_body(
             name,
             max_chars=self.per_body_char_limit,
             agent_name=agent_name or self.agent_name,
         )
         content_hash = getattr(_body_hash_tls, "value", None)
+        partial = getattr(_body_hash_tls, "partial", None)
+        if partial is True or (partial is None and _body_is_known_partial(body)):
+            return (
+                f"load_skill budget exhausted: {name!r} was returned as a partial body. "
+                "Its complete instructions were not loaded. Proceed with what is already loaded."
+            )
         if body is None or not body.strip():
             return (
                 f"load_skill: no skill named {name!r} is available. Use the exact "
                 "name from the skills menu."
             )
         body = body.strip()
-        # Client-side trim as defense in depth — older backends ignore max_chars.
+        # Older backends may ignore max_chars. Refuse instead of delivering a
+        # clipped body with the immutable full-version hash.
         if len(body) > self.per_body_char_limit:
-            body = (
-                body[: self.per_body_char_limit]
-                + "\n\n[... truncated by the per-body limit]"
+            return (
+                f"load_skill budget exhausted: the complete body of {name!r} exceeds "
+                f"the {self.per_body_char_limit}-character per-body limit. "
+                "Its instructions were not loaded. Proceed with what is already loaded."
             )
 
         tokens = estimate_tokens(body)
@@ -2122,9 +2164,9 @@ class SkillRouter:
         # Only inject when the result is RELEVANCE-RANKED (smart routing). In full-menu mode the
         # "top" skill isn't ranked by the query, so injecting its body would be arbitrary — there
         # we keep the menu only.
-        # Body guardrail (the progressive-disclosure path): bodies injected un-trimmed pre-topk.
-        # Now each body is server-trimmed (max_chars) + client-trimmed as
-        # defense, count-capped, and the total respects body_token_budget.
+        # Fetch with a bounded character cap, but inject only complete bodies.
+        # Partial server responses and oversized old-server bodies are omitted;
+        # the same total token budget applies to the first and later bodies.
         smart_routed = bool(query) and self.strategy in ("auto", "semantic")
         delivered_names: List[str] = []
         delivered_versions: List[Dict[str, str]] = []
@@ -2141,18 +2183,19 @@ class SkillRouter:
                 # A stand-in may override get_skill_body without clearing its
                 # thread-local handoff. Never inherit a previous fetch's hash.
                 _body_hash_tls.value = None
+                _body_hash_tls.partial = None
                 body = self.get_skill_body(name, **body_options)
                 content_hash = getattr(_body_hash_tls, "value", None)
+                partial = getattr(_body_hash_tls, "partial", None)
+                if partial is True or (partial is None and _body_is_known_partial(body)):
+                    continue
                 if not (body and body.strip()):
                     continue
                 body = body.strip()
                 if len(body) > self.per_body_char_limit:
-                    body = (
-                        body[: self.per_body_char_limit]
-                        + "\n\n[... truncated by the per-body limit]"
-                    )
+                    continue
                 tokens = estimate_tokens(body)
-                if bodies and body_tokens + tokens > self.body_token_budget:
+                if body_tokens + tokens > self.body_token_budget:
                     break
                 body_tokens += tokens
                 bodies.append(f"## Skill: {name}\n\n{body}")

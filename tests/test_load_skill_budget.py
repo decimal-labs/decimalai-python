@@ -5,12 +5,12 @@ same idiom as tests/test_skill_router.py). Covers:
 
   - load_skill happy path (server-trim param, prefixed body block, telemetry)
   - max_loaded_bodies count budget + dedup (already-loaded name is free)
-  - body_token_budget (first body always allowed, second large body refused)
+  - body_token_budget (first and later bodies obey the same total budget)
   - not-found and empty-name messages
-  - client-side per_body_char_limit trim (defense against old backends)
+  - client-side per_body_char_limit refusal (defense against old backends)
   - fresh-fragment budget reset vs cached-fragment NO reset
   - _BodyLoadBudget deadline refusal
-  - inject path guardrail (per-body trim, count cap, token budget,
+  - inject path guardrail (complete bodies only, count cap, token budget,
     server-trim requested via max_chars)
 """
 
@@ -29,8 +29,6 @@ from decimalai.skill_router import (
     estimate_tokens,
     load_skill_tool_spec,
 )
-
-TRUNCATION_MARKER = "[... truncated by the per-body limit]"
 
 
 @pytest.fixture(autouse=True)
@@ -144,10 +142,8 @@ class TestLoadSkill:
 
     def test_token_budget_refuses_second_large_body(self):
         router = _router(body_token_budget=50)
-        big = "x" * 400  # ~100 tokens — alone over the 50-token budget
+        big = "x" * 120  # ~30 tokens; either fits, but both exceed 50.
         with patch.object(router, "get_skill_body", return_value=big):
-            # First body is ALWAYS allowed, even if it alone exceeds the budget
-            # (would_exceed only kicks in once something is loaded).
             first = router.load_skill("a")
             assert first.startswith("## Skill: a\n\n")
 
@@ -155,6 +151,17 @@ class TestLoadSkill:
             assert "load_skill budget exhausted" in refusal
             assert "50-token body budget" in refusal
             assert "'b'" in refusal
+
+    def test_first_body_also_obeys_the_total_token_budget(self):
+        router = _router(body_token_budget=50, per_body_char_limit=1000)
+        with patch.object(router, "get_skill_body", return_value="x" * 400), \
+                patch("decimalai.generic.log_skill_loaded") as logged:
+            out = router.load_skill("big-skill", scope="bounded")
+        assert "50-token body budget" in out
+        assert "## Skill:" not in out
+        assert router.consume_loaded_names(scope="bounded") == []
+        assert router.consume_loaded_hashes(scope="bounded") == {}
+        logged.assert_not_called()
 
     def test_not_found_returns_no_skill_named_message(self):
         router = _router()
@@ -172,13 +179,13 @@ class TestLoadSkill:
         assert "load_skill error" in out
         assert "name is required" in out
 
-    def test_client_side_trim_appends_marker(self):
+    def test_oversized_old_server_body_is_refused_without_a_partial_delivery(self):
         router = _router(per_body_char_limit=300)
         with patch.object(router, "get_skill_body", return_value="z" * 1000):
             out = router.load_skill("big-skill")
-        prefix = "## Skill: big-skill\n\n"
-        assert out.startswith(prefix)
-        assert out[len(prefix):] == "z" * 300 + "\n\n" + TRUNCATION_MARKER
+        assert "300-character per-body limit" in out
+        assert "## Skill:" not in out
+        assert "z" * 300 not in out
 
 
 # ── Budget lifecycle: fresh fragment resets, cache hit does not ──
@@ -252,9 +259,8 @@ class TestBodyLoadBudgetDeadline:
 
 
 class TestInjectBodyGuardrail:
-    def test_bodies_trimmed_counted_and_token_budgeted(self):
-        # per-body trim 400 chars → each trimmed body ≈110 tokens (incl.
-        # marker); budget 150 fits only the first body.
+    def test_complete_bodies_counted_and_token_budgeted(self):
+        # Each complete 400-char body is ~100 tokens; budget 150 fits one.
         router = _router(
             inject_body=True, inject_body_top_k=3,
             per_body_char_limit=400, body_token_budget=150,
@@ -263,7 +269,7 @@ class TestInjectBodyGuardrail:
             "prompt_fragment": "MENU", "routing_id": "rt_9",
             "skills": [{"name": "s1"}, {"name": "s2"}, {"name": "s3"}],
         }
-        big = "b" * 2000
+        big = "b" * 400
         with patch.object(router, "smart_route", return_value=route), \
                 patch.object(router, "get_skill_body", return_value=big) as gsb:
             fragment, routing_id = router.build_prompt_fragment(
@@ -272,11 +278,9 @@ class TestInjectBodyGuardrail:
 
         assert routing_id == "rt_9"
         assert fragment.startswith("MENU")
-        # Injected body is trimmed to the per-body limit with the marker.
-        assert TRUNCATION_MARKER in fragment
-        assert "b" * 401 not in fragment
+        assert "truncated" not in fragment
         assert "b" * 400 in fragment
-        # Token budget: s1 (~110 tok) fits; s2 would blow 150 → dropped,
+        # Token budget: s1 (~100 tok) fits; s2 would blow 150 → dropped,
         # loop stops (s3 never fetched).
         assert "## Skill: s1" in fragment
         assert "## Skill: s2" not in fragment
