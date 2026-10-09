@@ -50,7 +50,8 @@ import threading
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from functools import wraps
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from .schema.common import CallRole, FinishReason, SpanType, Status
@@ -142,6 +143,45 @@ class _InstrumentationConfig:
 
 _instrument_lock = threading.Lock()
 _instrument_config = _InstrumentationConfig()
+_sync_run_lock = threading.Lock()
+_SYNC_PARENT_ATTR = "_decimalai_invocation_parent_trace_id"
+_MISSING_PARENT = object()
+
+
+def _preserve_sync_run_parent() -> None:
+    """Hand the caller's parent to the invocation before ADK starts its thread.
+
+    Runner.run creates a plain worker thread, so its before_run callback cannot
+    read the caller's ContextVars. Carry only the parent on an invocation-owned
+    RunConfig copy. The private attribute stays out of ADK's serialized metadata;
+    neither the caller's config nor a shared plugin is mutated.
+    """
+    try:
+        from google.adk.runners import Runner
+    except ImportError:
+        return
+    with _sync_run_lock:
+        original_run = getattr(Runner, "run", None)
+        if not callable(original_run) or getattr(original_run, "_decimalai_parent_wrapped", False):
+            return
+
+        @wraps(original_run)
+        def run_with_parent(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+            # This is a generator: capture when iteration starts, as the native
+            # Runner does, rather than when a deferred iterator is constructed.
+            from google.adk.agents.run_config import RunConfig
+
+            from .generic import _get_current_trace
+
+            enclosing = _get_current_trace()
+            config = kwargs.get("run_config")
+            config = (config if config is not None else RunConfig()).model_copy()
+            object.__setattr__(config, _SYNC_PARENT_ATTR, enclosing.get_trace_id() if enclosing else None)
+            kwargs["run_config"] = config
+            yield from original_run(self, *args, **kwargs)
+
+        run_with_parent._decimalai_parent_wrapped = True  # type: ignore[attr-defined]
+        Runner.run = run_with_parent  # type: ignore[method-assign]
 
 
 def _now() -> datetime:
@@ -657,10 +697,14 @@ def _plugin_class() -> Any:
             state.enable_skill_loader = settings.enable_skill_loader
             state.parent_trace_id = self.parent_trace_id
             if not state.parent_trace_id:
-                from .generic import _get_current_trace
-                enclosing = _get_current_trace()
-                if enclosing is not None:
-                    state.parent_trace_id = enclosing.get_trace_id()
+                captured = getattr(getattr(invocation_context, "run_config", None), _SYNC_PARENT_ATTR, _MISSING_PARENT)
+                if captured is not _MISSING_PARENT:
+                    state.parent_trace_id = captured
+                else:
+                    from .generic import _get_current_trace
+                    enclosing = _get_current_trace()
+                    if enclosing is not None:
+                        state.parent_trace_id = enclosing.get_trace_id()
             state.root_agent_name = getattr(agent, "name", None)
             state.user_input_preview = _content_to_text(
                 getattr(invocation_context, "user_content", None)
@@ -1149,6 +1193,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     ``enable_load_skill_tool`` to the class alone took every ADK conformance
     item from green to "the documented snippet ran and NOTHING was POSTed".
     """
+    _preserve_sync_run_parent()
     return _plugin_class()(
         agent_name=agent_name, name=name, project=project,
         parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,

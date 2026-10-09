@@ -6,6 +6,10 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+- ADK synchronous `Runner.run()` preserves the enclosing DecimalAI trace as
+  its parent across ADK's worker thread. The handoff belongs to each invocation,
+  including reused and concurrent runners; explicit plugin parents still win
+  and standalone invocations remain roots.
 - Skill delivery keeps complete immutable bodies or omits them when they do
   not fit. The default per-body character cap now follows the existing
   6,000-token body budget (24,000 characters with the same estimate); explicit

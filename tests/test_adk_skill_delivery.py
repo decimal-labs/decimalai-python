@@ -211,6 +211,14 @@ def _reset_sdk(monkeypatch):
 
     import decimalai.adk as adk
 
+    if HAS_REAL_ADK:
+        from google.adk.runners import Runner
+
+        # The plugin factory now preserves parents at Runner.run's caller
+        # boundary as well as patching the constructor during instrument().
+        monkeypatch.setattr(Runner, "run", Runner.run)
+        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
+
     saved = (
         adk._PluginClass,
         dict(adk._manifest_ids),
@@ -931,13 +939,18 @@ class TestRealAdkRun:
             "body": body, "version": 3, "content_hash": digest,
         }))
         observed = []
-        answer, requests = self._build(
-            router, on_trace=observed.append, instrumented=instrumented,
-        )
+        from decimalai.generic import start_trace
+
+        with start_trace(agent_name="outer", auto_send=False) as parent:
+            parent_id = parent.get_trace_id()
+            answer, requests = self._build(
+                router, on_trace=observed.append, instrumented=instrumented,
+            )
         assert "23.5%" in answer
         assert body in requests[0].config.system_instruction
         assert requests[0].config.system_instruction.index(body) < requests[0].config.system_instruction.index(TAIL)
         trace = _flushed_traces()[0]
+        assert trace.parent_trace_id == observed[0].parent_trace_id == parent_id
         self._assert_retained_system_inputs(trace, observed, requests, [body], [TAIL])
         assert trace.skills_delivered_versions == [{"name": "refund-policy", "hash": digest, "routing_id": ROUTING_ID}]
         assert trace.active_skills == trace.skills_loaded_by_agent == []
@@ -1050,6 +1063,7 @@ class TestRealAdkRun:
         assert len(captured) == 1
         assert captured[0]["llm_calls"] == exported["llm_calls"]
         assert captured[0]["skills_delivered_versions"] == exported["skills_delivered_versions"]
+        assert captured[0].get("parent_trace_id") == exported.get("parent_trace_id")
         assert len(observed) == 1
         assert observed[0].model_dump(mode="json")["llm_calls"] == exported["llm_calls"]
         assert len(exported["llm_calls"]) == len(requests) == len(bodies) == len(tails)
@@ -1146,3 +1160,217 @@ class TestRealAdkRun:
         assert _append_system_text(req, [PREFIX, TAIL]) is True
         flat = _system_instruction_text(req)
         assert flat.index(CALLER_PROMPT) < flat.index(SENTINEL) < flat.index(TAIL)
+
+
+@pytest.mark.skipif(not HAS_REAL_ADK, reason="google-adk not installed")
+class TestRealAdkParentLink:
+    """The sync caller boundary must work before ADK starts its worker thread."""
+
+    def test_explicit_plugin_and_global_instrument_share_one_idempotent_parent_patch(self, monkeypatch):
+        from google.adk.runners import Runner
+
+        import decimalai.adk as adk
+
+        original = getattr(Runner.run, "__wrapped__", Runner.run)
+        monkeypatch.setattr(Runner, "run", original)
+        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
+        adk.DecimalaiPlugin()
+        wrapped = Runner.run
+        assert wrapped is not original
+        assert wrapped.__wrapped__ is original
+        adk.DecimalaiPlugin()
+        adk.instrument()
+        adk.instrument()
+        assert Runner.run is wrapped
+
+    @staticmethod
+    def _runner(monkeypatch, observed, *, instrumented, explicit_parent=None, barrier=None):
+        from google.adk.agents import LlmAgent
+        from google.adk.models.base_llm import BaseLlm
+        from google.adk.models.llm_response import LlmResponse
+        from google.adk.plugins.base_plugin import BasePlugin
+        from google.adk.runners import InMemoryRunner, Runner
+        from google.genai import types
+
+        import decimalai.adk as adk
+
+        configs = []
+
+        class CaptureConfig(BasePlugin):
+            def __init__(self):
+                super().__init__(name="capture_config")
+
+            async def before_run_callback(self, *, invocation_context):
+                configs.append(invocation_context.run_config)
+
+        class StubLlm(BaseLlm):
+            async def generate_content_async(self, llm_request, stream=False):
+                if barrier is not None:
+                    # Each caller has its own event loop. Force both actual
+                    # model invocations to overlap before either can finalize.
+                    barrier.wait(timeout=10)
+                yield LlmResponse(content=types.Content(
+                    role="model", parts=[types.Part(text="Provider-free answer")],
+                ))
+
+        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
+        plugins = [CaptureConfig()]
+        if instrumented:
+            adk.instrument(agent_name="parent_probe", on_trace=observed.append)
+        else:
+            plugins.insert(0, adk.DecimalaiPlugin(
+                agent_name="parent_probe", parent_trace_id=explicit_parent, on_trace=observed.append,
+            ))
+        runner = InMemoryRunner(
+            agent=LlmAgent(name="parent_probe", model=StubLlm(model="capturing-stub"), instruction=CALLER_PROMPT),
+            app_name="parent_probe", plugins=plugins,
+        )
+        return runner, configs
+
+    @staticmethod
+    def _run(runner, session_id, *, synchronous, run_config=None):
+        from google.genai import types
+
+        arguments = {
+            "user_id": "u", "session_id": session_id,
+            "new_message": types.Content(role="user", parts=[types.Part(text=session_id)]),
+            "run_config": run_config,
+        }
+        if synchronous:
+            return list(runner.run(**arguments))
+
+        async def run():
+            return [event async for event in runner.run_async(**arguments)]
+
+        return asyncio.run(run())
+
+    @staticmethod
+    def _session(runner, session_id):
+        runner.session_service.create_session_sync(app_name="parent_probe", user_id="u", session_id=session_id)
+
+    @staticmethod
+    def _assert_parents(observed, expected):
+        import json
+
+        import httpx
+
+        from decimalai._client import DecimalAIClient
+
+        sent = _flushed_traces()
+        assert len(observed) == len(sent) == len(expected)
+        assert {trace.user_input_preview: trace.parent_trace_id for trace in observed} == expected
+        assert {trace.user_input_preview: trace.parent_trace_id for trace in sent} == expected
+        assert {trace.id for trace in observed} == {trace.id for trace in sent}
+        assert len({trace.id for trace in sent}) == len(expected)
+        payloads = []
+
+        def capture(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "accepted"}, request=request)
+
+        client = DecimalAIClient(api_key="dai_sk_test", base_url="http://sdk-proof.test")
+        client._http.close()
+        client._http = httpx.Client(base_url="http://sdk-proof.test", transport=httpx.MockTransport(capture))
+        try:
+            for trace in sent:
+                client.ingest_trace(trace)
+        finally:
+            client._http.close()
+        assert {trace["user_input_preview"]: trace.get("parent_trace_id") for trace in payloads} == expected
+        assert "_decimalai_invocation_parent_trace_id" not in json.dumps(payloads)
+
+    @pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-plugin", "global-instrument"])
+    @pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
+    def test_reused_runner_and_config_capture_each_parent_and_standalone_root(self, monkeypatch, instrumented, synchronous):
+        from google.adk.agents.run_config import RunConfig
+
+        from decimalai.generic import start_trace
+
+        observed = []
+        runner, configs = self._runner(monkeypatch, observed, instrumented=instrumented)
+        config = RunConfig(max_llm_calls=5, custom_metadata={"caller": "preserved"})
+        original = config.model_dump(mode="json")
+        expected = {}
+        for session_id in ("first_parent", "second_parent", "standalone"):
+            self._session(runner, session_id)
+            if session_id == "standalone":
+                expected[session_id] = None
+                self._run(runner, session_id, synchronous=synchronous, run_config=config)
+            else:
+                with start_trace(agent_name=session_id, auto_send=False) as outer:
+                    expected[session_id] = outer.get_trace_id()
+                    self._run(runner, session_id, synchronous=synchronous, run_config=config)
+        self._assert_parents(observed, expected)
+        assert config.model_dump(mode="json") == original
+        assert not hasattr(config, "_decimalai_invocation_parent_trace_id")
+        assert len(configs) == 3
+        assert all(value.model_dump(mode="json") == original for value in configs)
+        if synchronous:
+            assert all(value is not config for value in configs)
+            assert len({id(value) for value in configs}) == 3
+
+    @pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-plugin", "global-instrument"])
+    @pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
+    def test_concurrent_invocations_on_one_runner_keep_separate_parents(self, monkeypatch, instrumented, synchronous):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        from google.adk.agents.run_config import RunConfig
+
+        from decimalai.generic import start_trace
+
+        observed = []
+        runner, configs = self._runner(monkeypatch, observed, instrumented=instrumented, barrier=Barrier(2))
+        config = RunConfig(custom_metadata={"caller": "shared input config"})
+        original = config.model_dump(mode="json")
+        for session_id in ("concurrent_first", "concurrent_second"):
+            self._session(runner, session_id)
+
+        def invoke(session_id):
+            with start_trace(agent_name=session_id, auto_send=False) as parent:
+                parent_id = parent.get_trace_id()
+                self._run(runner, session_id, synchronous=synchronous, run_config=config)
+                return session_id, parent_id
+
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            expected = dict(callers.map(invoke, ("concurrent_first", "concurrent_second")))
+        self._assert_parents(observed, expected)
+        assert len(set(expected.values())) == 2
+        assert config.model_dump(mode="json") == original
+        assert not hasattr(config, "_decimalai_invocation_parent_trace_id")
+        if synchronous:
+            assert len(configs) == 2 and configs[0] is not configs[1]
+            assert all(value is not config for value in configs)
+
+    @pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
+    def test_explicit_plugin_parent_wins_over_caller_and_standalone(self, monkeypatch, synchronous):
+        from uuid import uuid4
+
+        from decimalai.generic import start_trace
+
+        observed = []
+        explicit = str(uuid4())
+        runner, _ = self._runner(monkeypatch, observed, instrumented=False, explicit_parent=explicit)
+        for session_id in ("explicit_nested", "explicit_standalone"):
+            self._session(runner, session_id)
+        with start_trace(agent_name="ignored_parent", auto_send=False) as outer:
+            assert outer.get_trace_id() != explicit
+            self._run(runner, "explicit_nested", synchronous=synchronous)
+        self._run(runner, "explicit_standalone", synchronous=synchronous)
+        self._assert_parents(observed, {"explicit_nested": explicit, "explicit_standalone": explicit})
+
+    def test_deferred_sync_iterator_captures_parent_when_iteration_starts(self, monkeypatch):
+        from google.genai import types
+
+        from decimalai.generic import start_trace
+
+        observed = []
+        runner, _ = self._runner(monkeypatch, observed, instrumented=True)
+        self._session(runner, "deferred")
+        events = runner.run(user_id="u", session_id="deferred", new_message=types.Content(
+            role="user", parts=[types.Part(text="deferred")],
+        ))
+        with start_trace(agent_name="iteration_parent", auto_send=False) as outer:
+            expected = outer.get_trace_id()
+            assert list(events)
+        self._assert_parents(observed, {"deferred": expected})

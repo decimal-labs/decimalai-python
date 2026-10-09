@@ -24,8 +24,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from decimalai.schema.common import FinishReason, Status
-from decimalai.schema.manifest import ManifestTracker
-
 
 # ── Setup/Teardown ──────────────────────────────────────────
 
@@ -43,6 +41,13 @@ def _reset_sdk(monkeypatch):
     )
     cfg._client = MagicMock()
     cfg._client.register_manifest.return_value = {"manifest_id": "test-manifest-id", "status": "active"}
+
+    # A previously imported real Runner can remain in sys.modules while the
+    # plugin import below is stubbed. Restore its caller-boundary patch too.
+    runners = sys.modules.get("google.adk.runners")
+    runner = getattr(runners, "Runner", None)
+    if runner is not None and callable(getattr(runner, "run", None)):
+        monkeypatch.setattr(runner, "run", runner.run)
 
     # Stub the one google-adk import _plugin_class() performs, so the tests
     # run without google-adk installed (and deterministically with it).
