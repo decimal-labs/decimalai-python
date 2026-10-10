@@ -633,7 +633,7 @@ def _load_skill_tool_enabled() -> bool:
         return True
 
 
-def _handle_load_skill(name: str) -> str:
+def _handle_load_skill(name: str, *, agent_name: Optional[str] = None) -> str:
     """Tool callback — always returns a string the model can act on."""
     router = _get_skill_router()
     if router is None:
@@ -641,22 +641,29 @@ def _handle_load_skill(name: str) -> str:
     run_key = _current_run_key()
     # Only pass `scope` when there IS a run to scope to, so a router that
     # predates the parameter is untouched on the unscoped path.
-    kwargs = {"scope": run_key} if run_key else {}
+    scope_options = {"scope": run_key} if run_key else {}
+    kwargs = {**scope_options, **({"agent_name": agent_name} if agent_name else {})}
     try:
-        result = router.load_skill(name, **kwargs)
+        try:
+            result = router.load_skill(name, **kwargs)
+        except TypeError:
+            # Older routers may lack per-run scope. Retain agent context: an
+            # unscoped fallback could silently serve a different saved version.
+            fallback = {"agent_name": agent_name} if agent_name else {}
+            if fallback == kwargs:
+                raise
+            result = router.load_skill(name, **fallback)
     except TypeError:
-        # Router from an older SDK — no per-run scope parameter.
-        result = router.load_skill(name)
+        return "load_skill error: this router cannot honor the agent's saved skill configuration."
     except Exception:
         logger.debug("load_skill handler failed (non-fatal)", exc_info=True)
         return f"load_skill error: could not load {name!r} (transient error)."
-    if kwargs:
-        # The router files each load a second time under the run's scope, for
-        # adapters that read loads back from there. This one records the load
-        # on its own run rail below (and drains only the scoped HASH, at trace
-        # end), so the router's copy of the name is released here or never.
+    if scope_options:
+        # The router mirrors each load under the run's scope. This adapter
+        # records successful callbacks on its own rail below, so release the
+        # router's copy of the names here.
         try:
-            router.consume_loaded_names(**kwargs)
+            router.consume_loaded_names(**scope_options)
         except Exception:
             logger.debug("router keeps no scoped loaded rail to release", exc_info=True)
     # Attribute the load to THIS run rather than to whichever trace next
@@ -668,14 +675,24 @@ def _handle_load_skill(name: str) -> str:
         consume_versions = getattr(router, "consume_delivered_versions", None)
         if run_key and callable(consume_versions):
             try:
-                versions = copy_delivered_versions(consume_versions(scope=run_key), names=[name])
+                # A run-scoped drain can include another parallel callback's
+                # body. Keep every witnessed delivery with its own name;
+                # filtering to this callback would discard the other's pin.
+                versions = copy_delivered_versions(consume_versions(scope=run_key))
             except Exception:
                 logger.debug("load_skill body-version drain failed (non-fatal)", exc_info=True)
-        _record_run_rail(loaded=[name], delivered_versions=versions)
+        _record_run_rail(
+            delivered=[version["name"] for version in versions],
+            loaded=[name],
+            delivered_versions=versions,
+        )
     return result
 
 
-def _make_load_skill_tool() -> Any:
+_SKILL_TOOL_AGENT_ATTR = "__decimalai_skill_agent_name__"
+
+
+def _make_load_skill_tool(agent_name: Optional[str] = None) -> Any:
     """Build the native load_skill FunctionTool (the progressive-disclosure path).
 
     The OpenAI Agents SDK owns its tool loop, so a load_skill tool result is
@@ -699,11 +716,14 @@ def _make_load_skill_tool() -> Any:
     from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
 
     def load_skill(name: str) -> str:
-        return _handle_load_skill(name)
+        # An immutable tool binding survives copied async tool contexts and
+        # parallel runs. Never mutate the shared router's default agent name.
+        return _handle_load_skill(name, agent_name=agent_name)
 
     load_skill.__doc__ = LOAD_SKILL_TOOL_DESCRIPTION
     try:
         tool = function_tool(load_skill)
+        setattr(tool, _SKILL_TOOL_AGENT_ATTR, agent_name)
     except Exception:
         _load_skill_tool_registration_failed = True
         logger.warning(
@@ -941,9 +961,19 @@ def _install_agent_hooks() -> bool:
             if not _skill_loader_installed or not _load_skill_tool_enabled():
                 return tools
             try:
-                if any(getattr(t, "name", None) == "load_skill" for t in tools):
-                    return tools  # already declared (constructor path, or the user's own)
-                tool = _make_load_skill_tool()
+                agent_name = getattr(self, "name", None)
+                for index, existing in enumerate(tools):
+                    if getattr(existing, "name", None) != "load_skill":
+                        continue
+                    if not hasattr(existing, _SKILL_TOOL_AGENT_ATTR):
+                        return tools  # the user's own tool is left alone
+                    if getattr(existing, _SKILL_TOOL_AGENT_ATTR) == agent_name:
+                        return tools
+                    # Agent.clone() can reuse the source agent's tool list. A
+                    # clone or renamed agent must resolve its own saved pin.
+                    rebound = _make_load_skill_tool(agent_name)
+                    return [*tools[:index], *([rebound] if rebound is not None else []), *tools[index + 1:]]
+                tool = _make_load_skill_tool(agent_name)
                 if tool is None:
                     return tools
                 _note_retrofit(self)
@@ -1022,7 +1052,7 @@ def _install_skill_loader() -> None:
             try:
                 tools = getattr(self, "tools", None)
                 if isinstance(tools, list) and not _agent_has_load_skill_tool(self):
-                    tool = _make_load_skill_tool()
+                    tool = _make_load_skill_tool(getattr(self, "name", None))
                     if tool is not None:
                         tools.append(tool)
             except Exception:

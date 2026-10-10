@@ -2209,7 +2209,7 @@ class SkillRouter:
                 return "", None
         else:
             try:
-                result = self.get_menu(category=category, scope=scope)
+                result = self.get_menu(category=category, agent_name=effective_agent, scope=scope)
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment get_menu failed: %s", e)
                 return "", None

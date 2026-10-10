@@ -4,6 +4,12 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.13.9] — 2026-10-10
+
+- OpenAI Agents native skill loaders now honor the executing agent's saved installation scope and version pin, including prebuilt agents, clones and handoffs. Custom user loaders remain unchanged.
+- Parallel skill loads retain every delivered immutable version witness on the shared run, so the trace records the bodies that actually ran.
+- Full skill menus preserve the executing agent's scope.
+
 ## [Unreleased]
 
 - ADK synchronous `Runner.run()` preserves the enclosing DecimalAI trace as
