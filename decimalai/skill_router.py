@@ -134,6 +134,9 @@ def _release_scoped_routing_rail(router: Any, scope: Optional[str]) -> None:
         router.consume_routing_id(scope=scope)
         router.consume_offered_names(scope=scope)
         router.consume_delivered_names(scope=scope)
+        versions = getattr(router, "consume_delivered_versions", None)
+        if callable(versions):
+            versions(scope=scope)
     except Exception:
         logger.debug("router keeps no scoped routing rail to release", exc_info=True)
 
@@ -142,6 +145,7 @@ def _stamp_active_trace(
     routing_id: Optional[str],
     offered_names: Optional[List[str]],
     delivered_names: Optional[List[str]],
+    delivered_versions: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     """Auto-stamp the active generic trace (`decimalai.start_trace`)
     with the routing decision — routing_id + offered/delivered names — so
@@ -166,6 +170,8 @@ def _stamp_active_trace(
             ctx.log_skill_offered(names=list(offered_names))
         if delivered_names:
             ctx.log_skill_delivered(names=list(delivered_names))
+        if delivered_versions:
+            ctx.log_skill_delivery_versions(versions=delivered_versions)
     except Exception:
         logger.debug("auto-stamp of active trace failed (non-fatal)", exc_info=True)
 
@@ -591,6 +597,24 @@ class _BodyLoadBudget:
 #: only ever read on the line after it is written, and is cleared before the
 #: write it describes.
 _body_hash_tls = _thread_local()
+
+
+def _served_version_identity(record: Dict[str, Any]) -> Dict[str, str]:
+    """Copy an exact server-served UUID pair, never reconstruct one from a name."""
+    from uuid import UUID
+
+    pair = {}
+    for key in ("skill_id", "version_id"):
+        value = record.get(key)
+        if not isinstance(value, str):
+            return {}
+        try:
+            if str(UUID(value)) != value:
+                return {}
+        except ValueError:
+            return {}
+        pair[key] = value
+    return pair
 
 _body_budget_ctx: ContextVar[Optional[_BodyLoadBudget]] = ContextVar(
     "decimalai_skill_router_body_budget", default=None,
@@ -1034,6 +1058,7 @@ class SkillRouter:
         self._routing_id_rail: Optional[str] = None
         self._offered_names_rail: List[str] = []
         self._delivered_names_rail: List[str] = []
+        self._delivered_versions_rail: List[Dict[str, str]] = []
         # Per-run twin of the three rails above, the same shape and the same
         # discipline as `_scoped_loaded_names`. Without it a scoped adapter
         # could keep its LOADS apart from a concurrent run's but not its
@@ -1330,6 +1355,7 @@ class SkillRouter:
         # body's hash on this thread for `load_skill` to pick up.
         _body_hash_tls.value = None
         _body_hash_tls.partial = None
+        _body_hash_tls.identity = None
         result = self.get_skill_body_record(
             skill_name, version, max_chars=max_chars, agent_name=agent_name,
         )
@@ -1348,6 +1374,7 @@ class SkillRouter:
             # body IT just fetched and not whichever version another thread
             # stored last. See the comment at that call site.
             _body_hash_tls.value = content_hash
+            _body_hash_tls.identity = _served_version_identity(result)
             with self._rail_lock:
                 self._loaded_hashes[skill_name] = content_hash
         return body
@@ -1469,12 +1496,14 @@ class SkillRouter:
         # load reported before this rail existed.
         _body_hash_tls.value = None
         _body_hash_tls.partial = None
+        _body_hash_tls.identity = None
         body = self.get_skill_body(
             name,
             max_chars=self.per_body_char_limit,
             agent_name=agent_name or self.agent_name,
         )
         content_hash = getattr(_body_hash_tls, "value", None)
+        identity = getattr(_body_hash_tls, "identity", None) or {}
         partial = getattr(_body_hash_tls, "partial", None)
         if partial is True or (partial is None and _body_is_known_partial(body)):
             return (
@@ -1534,6 +1563,16 @@ class SkillRouter:
         self._record_window_hash(name, content_hash)
         if rail_scope is not None:
             self._record_scoped_load(rail_scope, name, content_hash)
+        if isinstance(content_hash, str) and content_hash:
+            witness = {"name": name, "hash": content_hash, **identity}
+            self._record_delivery_versions([witness], scope=rail_scope)
+            try:
+                from .generic import _get_current_trace
+                enclosing = _get_current_trace()
+                if enclosing is not None:
+                    enclosing.log_skill_delivery_versions(versions=[witness])
+            except Exception:
+                logger.debug("load_skill: no active trace for immutable delivery", exc_info=True)
         try:
             from .generic import log_skill_loaded
             try:
@@ -1569,6 +1608,7 @@ class SkillRouter:
     # warns. A skills rail that quietly empties under load is exactly the failure
     # this rung was rebuilt to remove.
     _MAX_SCOPED_RAILS = 4096
+    _MAX_DELIVERED_VERSIONS = 512
 
     def _evict_rail_overflow(self, store: Any, what: str) -> None:
         """Drop the oldest entry and say so. Callers hold ``_rail_lock``."""
@@ -1749,13 +1789,14 @@ class SkillRouter:
                 self._loaded_names
                 or self._offered_names_rail
                 or self._delivered_names_rail
+                or self._delivered_versions_rail
                 or self._routing_id_rail
             ):
                 self._unscoped_rail_owners.clear()
 
     def drain_unscoped_rails_for(
-        self, scopes: Any
-    ) -> Tuple[Optional[str], List[str], List[str], List[str]]:
+        self, scopes: Any, *, include_versions: bool = False,
+    ) -> Any:
         """Take the unscoped rails ONLY if every writer is one of ``scopes``.
 
         Replaces a peek-then-drain pair that had two defects, both of which put
@@ -1794,19 +1835,25 @@ class SkillRouter:
             # Breaking a documented path to close a narrow race is the worse
             # trade.
             if owners - wanted:
-                return None, [], [], []
+                return (None, [], [], [], []) if include_versions else (None, [], [], [])
             routing_id = self._routing_id_rail
             offered = list(self._offered_names_rail or [])
             delivered = list(self._delivered_names_rail or [])
             loaded = list(self._loaded_names or [])
+            # Legacy unowned name rails support assemble-then-invoke callers.
+            # Immutable identities require an actual writer owned by this run;
+            # a later invocation must not borrow another thread's body metadata.
+            versions = [dict(v) for v in self._delivered_versions_rail] if owners else []
             self._routing_id_rail = None
             if self._offered_names_rail:
                 self._offered_names_rail.clear()
             if self._delivered_names_rail:
                 self._delivered_names_rail.clear()
             self._loaded_names.clear()
+            self._delivered_versions_rail.clear()
             self._unscoped_rail_owners.clear()
-        return routing_id, offered, delivered, loaded
+        result = (routing_id, offered, delivered, loaded)
+        return (*result, versions) if include_versions else result
 
     def unscoped_rail_owners(self) -> List[str]:
         """The scopes that wrote whatever is currently on the unscoped rails.
@@ -1823,7 +1870,7 @@ class SkillRouter:
         Caller holds `_rail_lock`."""
         bucket = self._scoped_routing_rails.get(scope)
         if bucket is None:
-            bucket = {"routing_id": None, "offered": [], "delivered": []}
+            bucket = {"routing_id": None, "offered": [], "delivered": [], "versions": []}
             self._scoped_routing_rails[scope] = bucket
         self._scoped_routing_rails.move_to_end(scope)
         while len(self._scoped_routing_rails) > self._MAX_SCOPED_RAILS:
@@ -1845,6 +1892,7 @@ class SkillRouter:
         offered_names: Optional[List[str]],
         delivered_names: Optional[List[str]],
         scope: Optional[str] = None,
+        delivered_versions: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Mirror one routing decision onto the instance rails.
 
@@ -1875,6 +1923,7 @@ class SkillRouter:
             # nothing put nothing on the unscoped rails to be claimed.
             self._note_unscoped_writer(rail_scope)
         if rail_scope is None:
+            self._record_delivery_versions(delivered_versions or [], scope=None)
             return
         with self._rail_lock:
             bucket = self._scoped_rail(rail_scope)
@@ -1886,6 +1935,52 @@ class SkillRouter:
             for name in delivered_names or ():
                 if name not in bucket["delivered"]:
                     bucket["delivered"].append(name)
+        self._record_delivery_versions(delivered_versions or [], scope=rail_scope)
+
+    def _record_delivery_versions(self, versions: List[Dict[str, str]], *, scope: Optional[str]) -> None:
+        if not versions:
+            return
+        self._note_unscoped_writer(scope)
+        with self._rail_lock:
+            for version in versions:
+                if version not in self._delivered_versions_rail:
+                    self._delivered_versions_rail.append(dict(version))
+                    if len(self._delivered_versions_rail) > self._MAX_DELIVERED_VERSIONS:
+                        self._delivered_versions_rail.pop(0)
+                        logger.warning("skill version rail overflow: oldest unscoped witness evicted")
+                if scope is not None:
+                    bucket = self._scoped_rail(scope)
+                    if version not in bucket["versions"]:
+                        bucket["versions"].append(dict(version))
+                        if len(bucket["versions"]) > self._MAX_DELIVERED_VERSIONS:
+                            bucket["versions"].pop(0)
+                            logger.warning("skill version rail overflow: oldest scoped witness evicted")
+
+    def consume_delivered_versions(self, scope: Optional[str] = None) -> List[Dict[str, str]]:
+        """Drain immutable bodies for this run, including actual load_skill serves.
+
+        Keep the same scope as the names drain. The per-call contextvar remains
+        preferable when it propagates; this mirror survives copied callbacks.
+        """
+        with self._rail_lock:
+            if scope is not None:
+                bucket = self._scoped_routing_rails.get(scope)
+                if bucket is None:
+                    return []
+                result = [dict(v) for v in bucket["versions"]]
+                bucket["versions"] = []
+                # Scoped copies remain authoritative for every other live run.
+                # Release this mirror too: adapters that consume per-call rails
+                # otherwise retain every completed body in a singleton forever.
+                self._delivered_versions_rail[:] = [
+                    v for v in self._delivered_versions_rail if v not in result
+                ]
+                self._drop_scoped_rail_if_spent(scope)
+            else:
+                result = [dict(v) for v in self._delivered_versions_rail]
+                self._delivered_versions_rail.clear()
+        self._forget_unscoped_owners_if_drained()
+        return result
 
     def consume_routing_id(self, scope: Optional[str] = None) -> Optional[str]:
         """Read + clear the most recent routing id minted since the last
@@ -2087,8 +2182,9 @@ class SkillRouter:
                 )
                 self._record_routing_rails(
                     routing_id, offered_names, delivered_names, scope=scope,
+                    delivered_versions=delivered_versions,
                 )
-                _stamp_active_trace(routing_id, offered_names, delivered_names)
+                _stamp_active_trace(routing_id, offered_names, delivered_names, delivered_versions)
                 return fragment, routing_id
 
         # Reset both rails up front so a call that offers or
@@ -2184,6 +2280,7 @@ class SkillRouter:
                 # thread-local handoff. Never inherit a previous fetch's hash.
                 _body_hash_tls.value = None
                 _body_hash_tls.partial = None
+                _body_hash_tls.identity = None
                 body = self.get_skill_body(name, **body_options)
                 content_hash = getattr(_body_hash_tls, "value", None)
                 partial = getattr(_body_hash_tls, "partial", None)
@@ -2203,6 +2300,7 @@ class SkillRouter:
                 delivered_names.append(name)
                 if isinstance(content_hash, str) and content_hash:
                     witness = {"name": name, "hash": content_hash}
+                    witness.update(getattr(_body_hash_tls, "identity", None) or {})
                     if isinstance(routing_id, str) and routing_id:
                         witness["routing_id"] = routing_id
                     delivered_versions.append(witness)
@@ -2253,12 +2351,13 @@ class SkillRouter:
         # telemetry off the router itself.
         self._record_routing_rails(
             routing_id, offered_names, delivered_names, scope=scope,
+            delivered_versions=delivered_versions,
         )
 
         # Stamp the active generic trace (raw-loop quickstart) —
         # adapter paths stamp their own trace objects, so this is a no-op
         # or an idempotent double-set there.
-        _stamp_active_trace(routing_id, offered_names, delivered_names)
+        _stamp_active_trace(routing_id, offered_names, delivered_names, delivered_versions)
 
         # Cache the success path. We don't cache errors — next call
         # retries on the assumption the failure was transient. The cached

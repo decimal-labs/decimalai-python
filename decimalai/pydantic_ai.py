@@ -175,7 +175,11 @@ def _handle_load_skill(name: str) -> str:
                         digests = router.consume_loaded_hashes(scope=scope) or {}
                     except (AttributeError, TypeError):
                         digests = {}
-                    record_skill_rail(loaded=served, loaded_hashes=digests)
+                    try:
+                        versions = router.consume_delivered_versions(scope=scope)
+                    except (AttributeError, TypeError):
+                        versions = []
+                    record_skill_rail(loaded=served, loaded_hashes=digests, delivered_versions=versions)
                 except Exception:
                     logger.debug(
                         "skill rail recording failed (non-fatal)", exc_info=True
@@ -258,13 +262,18 @@ async def _skills_system_prompt(ctx: Any) -> str:
         from .skill_router import (
             _release_scoped_routing_rail,
             consume_last_delivered_names,
+            consume_last_delivered_versions,
             consume_last_offered_names,
         )
         scope = _scope()
+        consume_last_delivered_versions()
         try:
             fragment, routing_id = router.build_prompt_fragment(
                 query=_run_query(ctx), agent_name=agent_name, scope=scope,
             )
+        except Exception:
+            consume_last_delivered_versions()
+            raise
         finally:
             # The router keeps its own copy of this decision under the run's
             # scope, for adapters that read it back from there. This one reads
@@ -279,6 +288,7 @@ async def _skills_system_prompt(ctx: Any) -> str:
         # first drainer takes every lane's names.
         offered = consume_last_offered_names()
         delivered = consume_last_delivered_names()
+        delivered_versions = consume_last_delivered_versions()
         if routing_id:
             _set_routing_id(routing_id)
         # Tell the model how bodies arrive when the tool exists.
@@ -296,6 +306,7 @@ async def _skills_system_prompt(ctx: Any) -> str:
                     routing_id=routing_id,
                     offered=offered,
                     delivered=delivered,
+                    delivered_versions=delivered_versions,
                     prompt_text=fragment,
                 )
             except Exception:

@@ -1166,6 +1166,134 @@ class TestRealAdkRun:
 class TestRealAdkParentLink:
     """The sync caller boundary must work before ADK starts its worker thread."""
 
+    @pytest.mark.parametrize("failure", ["extraction", "registration-refusal"])
+    def test_first_manifest_failure_keeps_both_children_in_reused_sync_session(
+        self, monkeypatch, use_router, caplog, failure,
+    ):
+        import json
+
+        import httpx
+        from google.adk.agents import LlmAgent
+        from google.adk.models.base_llm import BaseLlm
+        from google.adk.models.llm_response import LlmResponse
+        from google.adk.runners import InMemoryRunner
+        from google.genai import types
+
+        import decimalai._config as cfg
+        import decimalai.adk as adk
+        from decimalai import skill_router as sr
+        from decimalai._client import DecimalAIClient
+        from decimalai.generic import start_trace
+
+        monkeypatch.setattr(adk, "_pending_manifests", {})
+        pending_submit = MagicMock(wraps=cfg.submit_trace_pending_manifest)
+        monkeypatch.setattr(cfg, "submit_trace_pending_manifest", pending_submit)
+        if failure == "extraction":
+            # A failed CURRENT shape must not inherit or replay an OLD one.
+            adk._manifest_ids["manifest_probe"] = "previous-manifest-id"
+            adk._pending_manifests["manifest_probe"] = (
+                MagicMock(), ConnectionError("previous refusal"),
+            )
+            original_extract = adk.extract_from_config
+            calls = []
+
+            def extract(**kwargs):
+                calls.append(None)
+                if len(calls) == 1:
+                    raise ValueError("private metadata must not appear in logs")
+                return original_extract(**kwargs)
+
+            monkeypatch.setattr(adk, "extract_from_config", extract)
+        else:
+            cfg._client.register_manifest.side_effect = [
+                ConnectionError("offline refusal"),
+                {"manifest_id": "registered-manifest-id", "status": "active"},
+                {"manifest_id": "registered-manifest-id", "status": "active"},
+            ]
+
+        bodies = ["synthetic first body", "synthetic second body"]
+        names = ["first-skill", "second-skill"]
+        requests = []
+
+        class Router:
+            def build_prompt_parts(self, query=None, **kwargs):
+                index = len(requests)
+                sr._last_offered_names_ctx.set([names[index]])
+                sr._last_delivered_names_ctx.set([names[index]])
+                sr._last_delivered_versions_ctx.set([{
+                    "name": names[index], "hash": hashlib.sha256(bodies[index].encode()).hexdigest(),
+                }])
+                return "### " + names[index] + "\n" + bodies[index], "", None
+
+        class StubLlm(BaseLlm):
+            async def generate_content_async(self, llm_request, stream=False):
+                requests.append(llm_request.config.system_instruction)
+                yield LlmResponse(content=types.Content(
+                    role="model", parts=[types.Part(text="synthetic answer")],
+                ))
+
+        use_router(Router())
+        observed = []
+        adk.instrument(agent_name="manifest_probe", enable_skill_loader=True, on_trace=observed.append)
+        runner = InMemoryRunner(
+            agent=LlmAgent(name="manifest_probe", model=StubLlm(model="offline-stub"), instruction=CALLER_PROMPT),
+            app_name="manifest_probe",
+        )
+        runner.session_service.create_session_sync(app_name="manifest_probe", user_id="u", session_id="shared")
+        with start_trace(agent_name="generic_parent", auto_send=False) as parent:
+            parent_id = parent.get_trace_id()
+            for step in range(2):
+                assert list(runner.run(
+                    user_id="u", session_id="shared", new_message=types.Content(
+                        role="user", parts=[types.Part(text=f"synthetic request {step}")],
+                    ),
+                ))
+                cfg._sender.flush()
+
+        sent = _flushed_traces()
+        assert len(requests) == len(observed) == len(sent) == 2
+        assert len({trace.id for trace in sent}) == 2
+        for index, (callback, exported) in enumerate(zip(observed, sent)):
+            assert callback.id == exported.id
+            assert callback.parent_trace_id == exported.parent_trace_id == parent_id
+            assert bodies[index] in requests[index]
+            assert bodies[1 - index] not in requests[index]
+            assert exported.skills_delivered == callback.skills_delivered == [names[index]]
+            assert exported.skills_delivered_versions == [{
+                "name": names[index], "hash": hashlib.sha256(bodies[index].encode()).hexdigest(),
+            }]
+        if failure == "extraction":
+            assert observed[0].manifest_id is sent[0].manifest_id is None
+            assert sent[1].manifest_id == "test-manifest-id"
+            pending_submit.assert_not_called()
+            records = [record for record in caplog.records if "manifest preparation failed" in record.message]
+            assert len(records) == 1 and "ValueError" in records[0].message
+            assert records[0].exc_info is None
+            assert "private metadata" not in caplog.text
+        else:
+            pending_submit.assert_called_once()
+            assert [trace.manifest_id for trace in sent] == ["registered-manifest-id"] * 2
+
+        payloads = []
+
+        def capture(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "accepted"}, request=request)
+
+        client = DecimalAIClient(api_key="dai_sk_test", base_url="http://offline.invalid")
+        client._http.close()
+        client._http = httpx.Client(base_url="http://offline.invalid", transport=httpx.MockTransport(capture))
+        try:
+            for trace in sent:
+                client.ingest_trace(trace)
+        finally:
+            client._http.close()
+        assert len(payloads) == 2
+        assert all(payload["parent_trace_id"] == parent_id for payload in payloads)
+        assert [payload["skills_delivered"] for payload in payloads] == [[name] for name in names]
+        if failure == "extraction":
+            assert payloads[0].get("manifest_id") is None
+
     def test_explicit_plugin_and_global_instrument_share_one_idempotent_parent_patch(self, monkeypatch):
         from google.adk.runners import Runner
 

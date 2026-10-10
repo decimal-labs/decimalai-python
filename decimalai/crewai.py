@@ -380,9 +380,11 @@ def _inject_skills(context: Any) -> None:
     from .skill_router import (
         _release_scoped_routing_rail,
         consume_last_delivered_names,
+        consume_last_delivered_versions,
         consume_last_offered_names,
     )
 
+    consume_last_delivered_versions()
     try:
         parts_fn = getattr(router, "build_prompt_parts", None)
         if callable(parts_fn):
@@ -401,6 +403,7 @@ def _inject_skills(context: Any) -> None:
             )
             tail = ""
     except Exception:
+        consume_last_delivered_versions()
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return
     finally:
@@ -414,6 +417,7 @@ def _inject_skills(context: Any) -> None:
     # attribute this call's skills to the next one.
     offered = consume_last_offered_names()
     delivered = consume_last_delivered_names()
+    delivered_versions = consume_last_delivered_versions()
 
     texts = [t for t in (prefix, tail) if isinstance(t, str) and t]
     if not texts:
@@ -444,6 +448,7 @@ def _inject_skills(context: Any) -> None:
             routing_id=routing_id,
             offered=offered,
             delivered=delivered,
+            delivered_versions=delivered_versions,
             prompt_text="\n\n".join(texts),
         )
     except Exception:

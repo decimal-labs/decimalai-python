@@ -167,14 +167,21 @@ def skill_system(
     if router is None:
         return base if base is not None else ""
 
-    from .skill_router import _release_scoped_routing_rail
+    from .skill_router import (
+        _release_scoped_routing_rail,
+        consume_last_delivered_names,
+        consume_last_delivered_versions,
+        consume_last_offered_names,
+    )
 
     scope = _scope()
+    consume_last_delivered_versions()
     try:
         fragment, routing_id = router.build_prompt_fragment(
             query=query, agent_name=agent_name, scope=scope,
         )
     except Exception:
+        consume_last_delivered_versions()
         logger.debug("skill_system build_prompt_fragment failed (non-fatal)", exc_info=True)
         return base if base is not None else ""
     finally:
@@ -182,6 +189,10 @@ def skill_system(
         # for adapters that read it back from there. This one reads the
         # per-call rails below, so the copy is released here or never.
         _release_scoped_routing_rail(router, scope)
+
+    offered = consume_last_offered_names()
+    delivered = consume_last_delivered_names()
+    delivered_versions = consume_last_delivered_versions()
 
     # Claim nothing for a call we inject nothing into. This guard used to sit
     # BELOW the routing-id stamp, so a call that got an empty fragment still
@@ -200,14 +211,11 @@ def skill_system(
     # state that under a concurrent fanout hands lane 1 everybody's names.
     try:
         from .otel import record_skill_rail
-        from .skill_router import (
-            consume_last_delivered_names,
-            consume_last_offered_names,
-        )
         record_skill_rail(
             routing_id=routing_id,
-            offered=consume_last_offered_names(),
-            delivered=consume_last_delivered_names(),
+            offered=offered,
+            delivered=delivered,
+            delivered_versions=delivered_versions,
             prompt_text=fragment,
         )
     except Exception:

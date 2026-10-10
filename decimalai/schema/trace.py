@@ -165,8 +165,9 @@ class RunTrace(BaseModel):
     # Immutable version identities returned with the bodies this invocation
     # actually received. Advisory until the backend matches the observed body
     # to that version; delivery remains separate from model-initiated loading.
-    # Each entry has name/hash and an optional routing_id from the exact body
-    # delivery, allowing earlier calls' routing tails to be verified as well.
+    # Each entry has name/hash, optional routing_id, and an optional atomic
+    # skill_id/version_id UUID pair from the exact served version. Copies survive
+    # cache hits and later renames/retirement; never infer IDs from current names.
     skills_delivered_versions: List[Dict[str, str]] = Field(default_factory=list)
     # Session aggregation — multi-turn context
     session_metadata: Dict[str, Any] = Field(default_factory=dict)

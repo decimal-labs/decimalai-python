@@ -54,6 +54,7 @@ from functools import wraps
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from uuid import UUID, uuid4
 
+from ._skill_witness import copy_delivered_versions
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
@@ -434,6 +435,9 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         consume_last_delivered_versions,
         consume_last_offered_names,
     )
+    # Custom and older routers need not initialize the newly added rail.
+    # Only this prompt build may supply this turn's immutable body witness.
+    consume_last_delivered_versions()
     try:
         parts_fn = getattr(router, "build_prompt_parts", None)
         if callable(parts_fn):
@@ -493,13 +497,16 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         state.routing_id = routing_id
     state.skills_offered.update(n for n in offered if n)
     state.skills_delivered.update(n for n in delivered if n)
-    for version in delivered_versions:
+    for version in copy_delivered_versions(delivered_versions, names=delivered):
         name, digest = version.get("name"), version.get("hash")
         if name not in delivered or not digest:
             continue
         # A long invocation may receive more than one immutable version.
         # Preserve each actual delivery rather than replacing it with latest.
-        state.skills_delivered_versions.add((name, digest, version.get("routing_id") or ""))
+        state.skills_delivered_versions.add((
+            name, digest, version.get("routing_id") or "",
+            version.get("skill_id") or "", version.get("version_id") or "",
+        ))
 
 
 class _RunState:
@@ -555,7 +562,7 @@ class _RunState:
         self.routing_id: Optional[str] = None
         self.skills_offered: set = set()
         self.skills_delivered: set = set()
-        self.skills_delivered_versions: set[Tuple[str, str, str]] = set()
+        self.skills_delivered_versions: set[Tuple[str, str, str, str, str]] = set()
 
 
 def _plugin_class() -> Any:
@@ -1035,7 +1042,18 @@ def _plugin_class() -> Any:
             from . import _config
             if not _config._is_enabled():
                 return
-            manifest_id = self._maybe_register_manifest(state)
+            manifest_prepared = True
+            try:
+                manifest_id = self._maybe_register_manifest(state)
+            except Exception as exc:
+                # Manifest metadata is optional. A failed current extraction
+                # must neither lose a completed run nor attach an older shape.
+                manifest_prepared = False
+                manifest_id = None
+                logger.warning(
+                    "ADK manifest preparation failed for trace %s (%s); exporting without manifest",
+                    state.trace_id, type(exc).__name__,
+                )
             try:
                 client = _config._get_client()
                 config = _config._get_config()
@@ -1064,8 +1082,10 @@ def _plugin_class() -> Any:
                     skills_offered_in_prompt=sorted(state.skills_offered),
                     skills_delivered=sorted(state.skills_delivered),
                     skills_delivered_versions=[
-                        {"name": name, "hash": digest, **({"routing_id": route_id} if route_id else {})}
-                        for name, digest, route_id in sorted(state.skills_delivered_versions)
+                        {"name": name, "hash": digest,
+                         **({"routing_id": route_id} if route_id else {}),
+                         **({"skill_id": skill_id, "version_id": version_id} if skill_id and version_id else {})}
+                        for name, digest, route_id, skill_id, version_id in sorted(state.skills_delivered_versions)
                     ],
                 )
                 if state.on_trace is not None:
@@ -1074,7 +1094,7 @@ def _plugin_class() -> Any:
                         state.on_trace(trace.model_copy(deep=True))
                     except Exception:
                         logger.exception("ADK trace observer failed for %s", trace.id)
-                if state.agent_name in _pending_manifests:
+                if manifest_prepared and state.agent_name in _pending_manifests:
                     # Registration was refused: hold the trace, re-register on the
                     # sender's thread, and stamp the real id before it ships.
                     _config.submit_trace_pending_manifest(

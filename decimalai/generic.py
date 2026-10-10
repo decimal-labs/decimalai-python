@@ -122,6 +122,7 @@ class TraceContext:
         # offered (menu row only) and activated. Deliberately NOT written
         # into _active_skills: delivery is not activation.
         self._skills_delivered: set[str] = set()
+        self._skills_delivered_versions: List[Dict[str, str]] = []
 
     def log_llm_call(
         self,
@@ -351,6 +352,12 @@ class TraceContext:
             if isinstance(hash, str) and hash:
                 self._active_skills.setdefault(n, hash)
 
+    def log_skill_delivery_versions(self, *, versions: List[Dict[str, str]]) -> None:
+        """Retain the exact immutable identities supplied with delivered bodies."""
+        from ._skill_witness import merge_delivered_versions
+
+        self._skills_delivered_versions = merge_delivered_versions(self._skills_delivered_versions, versions)
+
     def build_trace(self) -> RunTrace:
         """Assemble the collected data into a RunTrace."""
         from . import _config
@@ -387,6 +394,7 @@ class TraceContext:
             skills_offered_in_prompt=sorted(self._skills_offered_in_prompt),
             skills_loaded_by_agent=sorted(self._skills_loaded_by_agent),
             skills_delivered=sorted(self._skills_delivered),
+            skills_delivered_versions=[dict(v) for v in self._skills_delivered_versions],
             session_metadata=self.session_metadata,
             turn_index=self.turn_index,
             manifest_id=_manifest_id,

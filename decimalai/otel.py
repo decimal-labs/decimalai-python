@@ -46,6 +46,7 @@ from typing import (
 )
 from uuid import uuid4
 
+from ._skill_witness import copy_delivered_versions, merge_delivered_versions
 from .schema.common import FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
@@ -225,6 +226,7 @@ def record_skill_rail(
     routing_id: Optional[str] = None,
     offered: Optional[Sequence[str]] = None,
     delivered: Optional[Sequence[str]] = None,
+    delivered_versions: Optional[Sequence[Dict[str, str]]] = None,
     loaded: Optional[Sequence[str]] = None,
     loaded_hashes: Optional[Mapping[str, Optional[str]]] = None,
     prompt_text: Optional[str] = None,
@@ -237,6 +239,8 @@ def record_skill_rail(
             is attributed to, and a later turn must not overwrite it.
         offered: names whose menu row was put in the prompt.
         delivered: names whose BODY was put in the prompt.
+        delivered_versions: exact body-response witnesses for delivered or
+            loaded names, including an optional served skill/version UUID pair.
         loaded: names whose body reached the model as a tool result.
         loaded_hashes: ``name -> content_hash`` for those bodies, so the
             activation resolves to the skill VERSION the model actually read
@@ -293,6 +297,7 @@ def record_skill_rail(
                 "delivered": [],
                 "loaded": [],
                 "loaded_hashes": {},
+                "delivered_versions": [],
             }
             _skill_rails[key] = rail
         if routing_id and not rail["routing_id"]:
@@ -306,6 +311,10 @@ def record_skill_rail(
             for name in incoming:
                 if name not in bucket:
                     bucket.append(name)
+        rail["delivered_versions"] = merge_delivered_versions(
+            rail.get("delivered_versions"),
+            copy_delivered_versions(delivered_versions, names=set(kept_delivered) | set(kept_loaded)),
+        )
         # `setdefault`, because a rail created before this key existed is
         # still live in a long-running process mid-upgrade.
         digests = rail.setdefault("loaded_hashes", {})
@@ -1003,6 +1012,9 @@ class DecimalSpanExporter:
                     run_trace.skills_offered_in_prompt = sorted(offered)
                     run_trace.skills_delivered = sorted(delivered)
                     run_trace.skills_loaded_by_agent = sorted(loaded)
+                    run_trace.skills_delivered_versions = copy_delivered_versions(
+                        rail.get("delivered_versions"), names=delivered,
+                    )
                     # The VERSION of each loaded body, where the rail carries
                     # one. This cannot change which skills the trace reports as
                     # activated: every name added here is already in

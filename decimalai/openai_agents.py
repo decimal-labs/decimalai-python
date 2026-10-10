@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
+from ._skill_witness import copy_delivered_versions, merge_delivered_versions
+
 
 def _coerce_span_id(raw: Any) -> Optional[UUID]:
     """OpenAI Agents emits span_ids like 'span_<hex>' / 'trace_<hex>', but
@@ -211,6 +213,17 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+_skills_delivered_versions_ctx: ContextVar[Optional[tuple[str, List[Dict[str, str]]]]] = ContextVar(
+    "decimalai_skills_delivered_versions_openai_agents", default=None,
+)
+
+
+def _consume_skills_delivered_versions(run_key: str) -> List[Dict[str, str]]:
+    owned = _skills_delivered_versions_ctx.get()
+    _skills_delivered_versions_ctx.set(None)
+    return copy_delivered_versions(owned[1]) if owned and owned[0] == run_key else []
+
+
 def _clean_names(names: Any) -> List[str]:
     """Keep only non-blank strings — same filter as `_add_skills_offered`."""
     if not isinstance(names, (list, tuple, set)):
@@ -264,6 +277,7 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 "offered": [],
                 "delivered": [],
                 "loaded": [],
+                "delivered_versions": [],
                 "agent": None,
                 "user_input": None,
                 # Every distinct string `Agent.get_system_prompt` resolved on
@@ -286,6 +300,7 @@ def _record_run_rail(
     offered: Optional[List[str]] = None,
     delivered: Optional[List[str]] = None,
     loaded: Optional[List[str]] = None,
+    delivered_versions: Optional[List[Dict[str, str]]] = None,
     agent: Any = None,
     user_input: Optional[str] = None,
     system_prompt: Optional[str] = None,
@@ -308,6 +323,10 @@ def _record_run_rail(
             for name in _clean_names(names):
                 if name not in rail[key]:
                     rail[key].append(name)
+        rail["delivered_versions"] = merge_delivered_versions(
+            rail.get("delivered_versions"),
+            copy_delivered_versions(delivered_versions, names=_clean_names(delivered) + _clean_names(loaded)),
+        )
         if agent is not None:
             rail["agent"] = agent
         # First turn wins: it carries the run's original ask.
@@ -399,6 +418,25 @@ def _drain_router_loaded_hashes(
         logger.debug("router hash-rail drain failed (non-fatal)", exc_info=True)
         return {}
     return merged
+
+
+def _drain_router_delivered_versions(scope: Optional[str]) -> List[Dict[str, str]]:
+    """Take only this invocation's versions; discard the shared reset copy."""
+    router = _skill_router_singleton
+    consume = getattr(router, "consume_delivered_versions", None)
+    if not callable(consume):
+        return []
+    versions = []
+    if scope:
+        try:
+            versions = copy_delivered_versions(consume(scope=scope))
+        except Exception:
+            logger.debug("scoped body-version drain failed (non-fatal)", exc_info=True)
+    try:
+        consume()
+    except Exception:
+        logger.debug("shared body-version reset failed (non-fatal)", exc_info=True)
+    return versions
 
 
 # ── SkillRouter dynamic loader ──────────────────────────────
@@ -626,7 +664,14 @@ def _handle_load_skill(name: str) -> str:
     # is the only thing that counts as loaded; a budget refusal or a
     # not-found message is not.
     if isinstance(result, str) and result.startswith(f"## Skill: {name}"):
-        _record_run_rail(loaded=[name])
+        versions = []
+        consume_versions = getattr(router, "consume_delivered_versions", None)
+        if run_key and callable(consume_versions):
+            try:
+                versions = copy_delivered_versions(consume_versions(scope=run_key), names=[name])
+            except Exception:
+                logger.debug("load_skill body-version drain failed (non-fatal)", exc_info=True)
+        _record_run_rail(loaded=[name], delivered_versions=versions)
     return result
 
 
@@ -723,8 +768,10 @@ def _make_skill_aware_instructions(base: str):
             from .skill_router import (
                 _release_scoped_routing_rail,
                 consume_last_delivered_names,
+                consume_last_delivered_versions,
                 consume_last_offered_names,
             )
+            consume_last_delivered_versions()
             try:
                 fragment, routing_id = router.build_prompt_fragment(
                     query=_extract_query(ctx),
@@ -733,10 +780,18 @@ def _make_skill_aware_instructions(base: str):
                 )
             except TypeError:
                 # Router from an older SDK — no per-run scope parameter.
-                fragment, routing_id = router.build_prompt_fragment(
-                    query=_extract_query(ctx),
-                    agent_name=getattr(agent, "name", None),
-                )
+                consume_last_delivered_versions()
+                try:
+                    fragment, routing_id = router.build_prompt_fragment(
+                        query=_extract_query(ctx),
+                        agent_name=getattr(agent, "name", None),
+                    )
+                except Exception:
+                    consume_last_delivered_versions()
+                    raise
+            except Exception:
+                consume_last_delivered_versions()
+                raise
             finally:
                 # The router keeps its own copy of this decision under the
                 # run's scope, for adapters that read it back from there. This
@@ -753,8 +808,13 @@ def _make_skill_aware_instructions(base: str):
                 _add_skills_offered(offered)
             # Names whose BODY the Router injected count as delivered.
             delivered = consume_last_delivered_names()
+            delivered_versions = copy_delivered_versions(consume_last_delivered_versions(), names=delivered)
             if delivered:
                 _add_skills_delivered(delivered)
+            previous = _skills_delivered_versions_ctx.get()
+            _skills_delivered_versions_ctx.set((run_key, merge_delivered_versions(
+                previous[1] if previous and previous[0] == run_key else [], delivered_versions,
+            )) if run_key else None)
             # The contextvar writes above are made inside the Task the
             # runner gathers this callable in, so they die with it. Mirror
             # everything onto THIS run's rail, which `_send_trace` can read.
@@ -762,6 +822,7 @@ def _make_skill_aware_instructions(base: str):
                 routing_id=routing_id,
                 offered=offered,
                 delivered=delivered,
+                delivered_versions=delivered_versions,
                 agent=agent,
             )
             if not fragment:
@@ -1538,6 +1599,7 @@ class _TraceAccumulator:
         # Bodies that reached the model (Router body injection) —
         # between offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
+        self.skills_delivered_versions: List[Dict[str, str]] = []
         # llm_call id -> the system prompt the SERVER echoed back for that
         # call (`Response.instructions`). `ResponseSpanData` has no
         # instructions slot, so this side table is where the system half of
@@ -2216,6 +2278,16 @@ class DecimalTracingProcessor:
             acc.skills_delivered.update(rail_loaded)
             acc.skills_offered_in_prompt.update(rail_loaded)
 
+        acc.skills_delivered_versions = merge_delivered_versions(
+            acc.skills_delivered_versions, _consume_skills_delivered_versions(acc.trace_id),
+        )
+        acc.skills_delivered_versions = merge_delivered_versions(
+            acc.skills_delivered_versions, run_rail.get("delivered_versions"),
+        )
+        acc.skills_delivered_versions = merge_delivered_versions(
+            acc.skills_delivered_versions, _drain_router_delivered_versions(acc.trace_id),
+        )
+
         # The VERSION of each body the model read. Drained unconditionally, for
         # the same leak reason the names are, and stamped only onto names this
         # run already claims as loaded.
@@ -2313,6 +2385,9 @@ class DecimalTracingProcessor:
             skills_offered_in_prompt=sorted(acc.skills_offered_in_prompt),
             skills_loaded_by_agent=sorted(acc.skills_loaded_by_agent),
             skills_delivered=sorted(acc.skills_delivered),
+            skills_delivered_versions=copy_delivered_versions(
+                acc.skills_delivered_versions, names=acc.skills_delivered,
+            ),
         )
 
         try:

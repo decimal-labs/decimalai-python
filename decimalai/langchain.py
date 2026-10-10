@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID, uuid4
 
+from ._skill_witness import copy_delivered_versions, merge_delivered_versions
+
 # The one module-level framework import in this file, and it is deliberate: a base
 # class cannot be chosen lazily the way every other langchain import here is. The
 # try/except preserves the guarantee that a core-only install stays importable —
@@ -201,6 +203,17 @@ def _consume_skills_delivered() -> List[str]:
     return sorted(s)
 
 
+_skills_delivered_versions_ctx: ContextVar[Optional[List[Dict[str, str]]]] = ContextVar(
+    "decimalai_skills_delivered_versions_langchain", default=None,
+)
+
+
+def _consume_skills_delivered_versions() -> List[Dict[str, str]]:
+    versions = _skills_delivered_versions_ctx.get()
+    _skills_delivered_versions_ctx.set(None)
+    return copy_delivered_versions(versions)
+
+
 # One model call's identity, as a Router rail scope key. Minted by
 # `_open_call_rails` and read back by `_capture_call_rails` in the same
 # Context, so it names the call rather than merely being recent.
@@ -237,6 +250,7 @@ def _open_call_rails() -> tuple:
         _routing_id_ctx.set(None),
         _skills_offered_ctx.set(None),
         _skills_delivered_ctx.set(None),
+        _skills_delivered_versions_ctx.set(None),
         _call_scope_ctx.set(uuid4().hex),
     )
 
@@ -244,7 +258,7 @@ def _open_call_rails() -> tuple:
 def _close_call_rails(tokens: tuple) -> None:
     """End the model call started by `_open_call_rails`."""
     for var, token in zip(
-        (_routing_id_ctx, _skills_offered_ctx, _skills_delivered_ctx,
+        (_routing_id_ctx, _skills_offered_ctx, _skills_delivered_ctx, _skills_delivered_versions_ctx,
          _call_scope_ctx),
         tokens,
     ):
@@ -537,8 +551,8 @@ except Exception:  # noqa: BLE001 - a Router-less install still traces fine
 
 
 def _drain_unscoped_rails_for(
-    scopes: "set[str]",
-) -> tuple[Optional[str], List[str], List[str], List[str]]:
+    scopes: "set[str]", *, include_versions: bool = False,
+) -> tuple:
     """Atomic, ownership-required version of :func:`_drain_router_rails`.
 
     Falls back to the old unconditional drain only for a router object from an
@@ -546,15 +560,24 @@ def _drain_unscoped_rails_for(
     there, so the pre-existing behaviour is all that is available.
     """
     if _skill_router_singleton is None:
-        return None, [], [], []
+        return (None, [], [], [], []) if include_versions else (None, [], [], [])
     owned = getattr(_skill_router_singleton, "drain_unscoped_rails_for", None)
     if owned is None:
-        return _drain_router_rails()
+        legacy = _drain_router_rails()
+        return (*legacy, []) if include_versions else legacy
     try:
+        if include_versions:
+            try:
+                result = owned(scopes, include_versions=True)
+            except TypeError:
+                result = owned(scopes)
+            if isinstance(result, tuple) and len(result) == 4:
+                return (*result, [])
+            return result
         return owned(scopes)
     except Exception:
         logger.debug("Ownership-checked rail drain failed", exc_info=True)
-        return None, [], [], []
+        return (None, [], [], [], []) if include_versions else (None, [], [], [])
 
 
 def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str]]:
@@ -609,8 +632,8 @@ def _run_scopes(state: "_RunState") -> "set[str]":
 
 
 def _drain_scoped_router_rails(
-    scopes: "set[str]",
-) -> tuple[Optional[str], List[str], List[str], List[str]]:
+    scopes: "set[str]", *, include_versions: bool = False,
+) -> tuple:
     """Drain the Router rails filed under THIS run's scopes.
 
     ``_ambient_run_scope`` files each write under whichever LangChain run was
@@ -628,11 +651,12 @@ def _drain_scoped_router_rails(
     """
     router = _skill_router_singleton
     if router is None or not scopes:
-        return None, [], [], []
+        return (None, [], [], [], []) if include_versions else (None, [], [], [])
     routing_id: Optional[str] = None
     offered: List[str] = []
     delivered: List[str] = []
     loaded: List[str] = []
+    versions: List[Dict[str, str]] = []
     for scope in scopes:
         try:
             rid = router.consume_routing_id(scope=scope)
@@ -642,13 +666,21 @@ def _drain_scoped_router_rails(
         except TypeError:
             # A router from an older SDK takes no `scope` at all. Nothing is
             # scoped on it, so there is nothing here to drain.
-            return None, [], [], []
+            return (None, [], [], [], []) if include_versions else (None, [], [], [])
         except Exception:
             logger.debug("scoped router-rail drain failed (non-fatal)", exc_info=True)
             continue
+        if include_versions:
+            consume_versions = getattr(router, "consume_delivered_versions", None)
+            if callable(consume_versions):
+                try:
+                    versions = merge_delivered_versions(versions, consume_versions(scope=scope))
+                except Exception:
+                    logger.debug("scoped body-version drain failed (non-fatal)", exc_info=True)
         if routing_id is None and isinstance(rid, str) and rid:
             routing_id = rid
-    return routing_id, offered, delivered, loaded
+    result = (routing_id, offered, delivered, loaded)
+    return (*result, versions) if include_versions else result
 
 
 def _drain_router_loaded_hashes(
@@ -730,6 +762,12 @@ def _discard_scoped_router_rails(state: "_RunState") -> None:
             logger.debug(
                 'router keeps no scoped hash rail to release', exc_info=True,
             )
+        try:
+            consume_versions = getattr(router, "consume_delivered_versions", None)
+            if callable(consume_versions):
+                consume_versions(scope=scope)
+        except Exception:
+            logger.debug("router keeps no scoped body-version rail to release", exc_info=True)
         # The hash bucket is a separate store, so releasing the names does not
         # release it. Without this an abandoned run leaves one small dict
         # behind until the LRU pushes it out — the same slow leak this
@@ -1003,6 +1041,9 @@ def _inject_skills_into_input(input_value: Any) -> Any:
         return input_value
 
     query = _extract_query_from_messages(messages)
+    from .skill_router import consume_last_delivered_versions
+
+    consume_last_delivered_versions()
     # `agent_name` is what scopes the routed menu to THIS agent. Without it the
     # resolver only sees org-owned workspace-scope skills: an agent-scope Use —
     # the row every registry skill pulled onto one agent lands in — matches on
@@ -1032,6 +1073,7 @@ def _inject_skills_into_input(input_value: Any) -> Any:
             )
             tail = ""
     except Exception:
+        consume_last_delivered_versions()
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
         return input_value
 
@@ -1039,14 +1081,22 @@ def _inject_skills_into_input(input_value: Any) -> Any:
         _set_routing_id(routing_id)
     # Pull the names the Router offered for this call and
     # accumulate against the active trace.
-    from .skill_router import consume_last_delivered_names, consume_last_offered_names
+    from .skill_router import (
+        consume_last_delivered_names,
+        consume_last_delivered_versions,
+        consume_last_offered_names,
+    )
     offered = consume_last_offered_names()
     if offered:
         _add_skills_offered(offered)
     # Names whose BODY the Router injected count as delivered.
     delivered = consume_last_delivered_names()
+    versions = consume_last_delivered_versions()
     if delivered:
         _add_skills_delivered(delivered)
+    _skills_delivered_versions_ctx.set(merge_delivered_versions(
+        _skills_delivered_versions_ctx.get(), copy_delivered_versions(versions, names=delivered),
+    ))
     if not prefix:
         return input_value
 
@@ -1650,6 +1700,7 @@ class _RunState:
         "final_output_preview", "seen_tools", "seen_model", "seen_prompts",
         "seen_output_contract", "streaming_buffers", "active_skills",
         "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
+        "skills_delivered_versions",
         "routing_id",
     )
 
@@ -1756,6 +1807,7 @@ class _RunState:
         # Bodies that reached the model (Router body injection) — between
         # offered and activated; never implies activation.
         self.skills_delivered: set[str] = set()
+        self.skills_delivered_versions: List[Dict[str, str]] = []
         # The routing decision THIS run was given, captured off the
         # BaseChatModel patch's contextvar inside the model call it belongs
         # to (see `_capture_call_rails`). Per-run because the Router
@@ -1983,6 +2035,7 @@ class CallbackHandler(_CallbackBase):
         "root_run_id", "seen_tools", "seen_model", "seen_prompts",
         "seen_output_contract", "streaming_buffers", "active_skills",
         "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
+        "skills_delivered_versions",
     )
 
     def _capture_call_rails(self, state: _RunState) -> None:
@@ -2022,6 +2075,9 @@ class CallbackHandler(_CallbackBase):
             if isinstance(name, str) and name.strip():
                 state.skills_delivered.add(name.strip())
                 state.skills_offered_in_prompt.add(name.strip())
+        state.skills_delivered_versions = merge_delivered_versions(
+            state.skills_delivered_versions, _skills_delivered_versions_ctx.get(),
+        )
 
     def log_skill_offered(self, *, names: List[str]) -> None:
         """Manually record skills that were offered in the system prompt."""
@@ -2790,8 +2846,8 @@ class CallbackHandler(_CallbackBase):
         #    claim rests on.
         scopes = _run_scopes(state)
         (
-            scoped_routing_id, scoped_offered, scoped_delivered, scoped_loaded,
-        ) = _drain_scoped_router_rails(scopes)
+            scoped_routing_id, scoped_offered, scoped_delivered, scoped_loaded, scoped_versions,
+        ) = _drain_scoped_router_rails(scopes, include_versions=True)
 
         # One atomic ask-and-take. The previous peek-then-drain pair had two
         # ways of putting another run's data on this trace: a write landing
@@ -2807,7 +2863,8 @@ class CallbackHandler(_CallbackBase):
             rail_offered,
             rail_delivered,
             rail_loaded,
-        ) = _drain_unscoped_rails_for(scopes)
+            rail_versions,
+        ) = _drain_unscoped_rails_for(scopes, include_versions=True)
 
         # Drain the contextvars too — a `log_skill_*` call or an injection
         # that happened outside the patched invoke lands there, and an
@@ -2817,6 +2874,12 @@ class CallbackHandler(_CallbackBase):
         for n in _consume_skills_delivered():
             state.skills_delivered.add(n)
             state.skills_offered_in_prompt.add(n)  # delivered implies offered
+        state.skills_delivered_versions = merge_delivered_versions(
+            state.skills_delivered_versions, _consume_skills_delivered_versions(),
+        )
+        state.skills_delivered_versions = merge_delivered_versions(
+            state.skills_delivered_versions, [*scoped_versions, *rail_versions],
+        )
         ctx_routing_id = _consume_routing_id()
 
         if not state.skills_offered_in_prompt:
@@ -2918,6 +2981,9 @@ class CallbackHandler(_CallbackBase):
             skills_offered_in_prompt=sorted(state.skills_offered_in_prompt),
             skills_loaded_by_agent=sorted(state.skills_loaded_by_agent),
             skills_delivered=sorted(state.skills_delivered),
+            skills_delivered_versions=copy_delivered_versions(
+                state.skills_delivered_versions, names=state.skills_delivered,
+            ),
         )
 
     def _attach_tool_calls(self, state: _RunState) -> None:
