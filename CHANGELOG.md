@@ -12,6 +12,15 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+- `decimalai agents create NAME` creates an agent from a terminal, the same
+  call as the dashboard's create form. `--pack ROLE` starts it on the pack's
+  starter prompt and starter skills (`--no-starters` keeps only the prompt);
+  `--skill` attaches your own or public registry skills by name, slug or id,
+  repeatable; `--prompt-file` sets the system prompt. Skill names resolve
+  exactly. An unknown one stops the command before anything is created, and a
+  skill the server refuses (such as a plan limit) is named in the output. The
+  same call is available as `DecimalAIClient.create_agent()`. `decimalai init`
+  now points at it when the agent doesn't exist yet.
 - ADK synchronous `Runner.run()` preserves the enclosing DecimalAI trace as
   its parent across ADK's worker thread. The handoff belongs to each invocation,
   including reused and concurrent runners; explicit plugin parents still win

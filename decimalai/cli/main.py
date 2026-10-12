@@ -269,6 +269,7 @@ def _scaffold_agent_file(
             click.echo("")
         click.echo("  Create it first, then run this again:")
         click.echo(f"    → {_dashboard_url(base_url)}/agents/new")
+        click.echo(f"    → decimalai agents create {agent_name} --pack <role>")
         click.echo("")
         raise SystemExit(1)
 
@@ -603,7 +604,8 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     # 4. Show next steps
     dashboard_url = _dashboard_url(base_url)
     click.echo("")
-    click.echo("  Already created an agent? Turn it into a runnable file:")
+    click.echo("  Create an agent, then turn it into a runnable file:")
+    click.echo("    decimalai agents create <agent-name> --pack <role>")
     click.echo("    decimalai init <agent-name>   # writes ./agent.py, skills wired")
     click.echo("")
     click.echo("  See it work in 2 minutes — seeds a demo into your workspace:")
@@ -619,6 +621,158 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     click.echo("  → Build an agent from a skill: https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/support-agent/support_agent.ipynb")
     click.echo("")
     client.close()
+
+# ── Agents ─────────────────────────────────────────────────
+
+@cli.group()
+def agents():
+    """Agent commands."""
+    pass
+
+
+_UUID_RE = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+def _resolve_skill_id(http, ref):
+    """A ``--skill`` value → a skill id, or ``None`` when nothing has that name.
+
+    Your own skills first, by exact name, then the public registry's detail
+    route, which takes a slug. A namespaced name (``borghei/data-quality-auditor``)
+    can't travel in that path, so it goes through search, which accepts only an
+    exact name match. Taking the top search hit would attach whatever ranked
+    first on a typo, the bug ``_registry_resolve`` documents for ``skills pull``.
+    """
+    import re
+
+    from .._registry_resolve import RESOLVE_LIMIT, find_exact
+
+    if re.match(_UUID_RE, ref):
+        return ref
+    resp = _get_past_admission_aborts(http, f"/api/v1/skills?name={urllib.parse.quote(ref, safe='')}&limit=1")
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("skills", data) if isinstance(data, dict) else data
+    if isinstance(rows, list) and rows and rows[0].get("id"):
+        return rows[0]["id"]
+    resp = _get_past_admission_aborts(http, f"/api/v1/registry/skills/{urllib.parse.quote(ref, safe='')}")
+    if resp.status_code != 404:
+        resp.raise_for_status()
+        return resp.json().get("id")
+    resp = _get_past_admission_aborts(
+        http, f"/api/v1/registry/skills?q={urllib.parse.quote(ref, safe='')}&limit={RESOLVE_LIMIT}",
+    )
+    resp.raise_for_status()
+    match = find_exact(resp.json().get("items") or [], ref)
+    return match.get("id") if match else None
+
+
+@agents.command("create")
+@click.argument("agent_name")
+@click.option("--pack", default=None, metavar="ROLE",
+              help="Start from a role pack (its starter prompt and starter skills), "
+                   "e.g. support, data-engineer, doc-ops. An unknown name lists them all.")
+@click.option("--prompt-file", type=click.File("r"), default=None,
+              help="System prompt from a file ('-' reads stdin). Replaces the pack's starter prompt.")
+@click.option("--skill", "skill_refs", multiple=True, metavar="SLUG",
+              help="Attach a skill: one of yours or a public registry skill, by name, slug or id. Repeatable.")
+@click.option("--no-starters", is_flag=True, default=False,
+              help="With --pack, take the starter prompt but none of its starter skills.")
+@click.option("--description", default=None, help="A note on what this agent does.")
+@common_options
+def agents_create(agent_name, pack, prompt_file, skill_refs, no_starters, description,
+                  api_key, base_url, project):
+    """Create an agent, from a role pack or from skills you pick.
+
+    \b
+    Examples:
+        $ decimalai agents create support-bot --pack support
+        $ decimalai agents create invoice-reader --skill first-fluke-oma-pdf
+        $ decimalai agents create triage --prompt-file prompt.md --skill my-runbook
+
+    The agent exists as soon as this returns, with no code deployed yet. Run
+    `decimalai init AGENT_NAME` next to write a runnable file that loads it.
+    """
+    import httpx
+
+    from .._client import DecimalAPIError
+
+    if no_starters and not pack:
+        raise click.UsageError("--no-starters only applies with --pack.")
+    system_prompt = prompt_file.read() if prompt_file else None
+    if prompt_file and not system_prompt.strip():
+        raise click.UsageError("--prompt-file is empty.")
+
+    client = _make_client(api_key, base_url, project)
+    try:
+        skill_ids = []
+        if pack and not no_starters:
+            # Authenticated, so the starter set is the one the create form
+            # offers this workspace (same trust filter, same revision).
+            resp = _get_past_admission_aborts(
+                client._http, f"/api/v1/registry/packs/{urllib.parse.quote(pack, safe='')}?skill_limit=8",
+            )
+            if resp.status_code == 404:
+                try:
+                    detail = resp.json().get("detail")
+                except Exception:  # noqa: BLE001 — a non-JSON 404 still means "no such pack"
+                    detail = None
+                click.echo(f"  ✗ {detail or f'Unknown pack {pack!r}.'}", err=True)
+                raise SystemExit(1)
+            resp.raise_for_status()
+            data = resp.json()
+            skill_ids = [s["id"] for s in data.get("starter_skills") or [] if s.get("id")]
+            missing = data.get("starter_skills_missing") or []
+            if missing:
+                click.echo(f"  ⚠ {len(missing)} of this pack's starter skills are unavailable right now "
+                           f"and won't be attached: {', '.join(missing)}")
+
+        unresolved = []
+        for ref in skill_refs:
+            sid = _resolve_skill_id(client._http, ref)
+            if sid is None:
+                unresolved.append(ref)
+            elif sid not in skill_ids:
+                skill_ids.append(sid)
+        if unresolved:
+            # Before the create, so a typo never leaves behind an agent that is
+            # quietly missing the skill it was asked for.
+            for ref in unresolved:
+                click.echo(f"  ✗ No skill named {ref!r} in your workspace or the public registry.", err=True)
+            click.echo(f"    Browse skills at {_dashboard_url(base_url)}/skills. Nothing was created.")
+            raise SystemExit(1)
+
+        try:
+            result = client.create_agent(
+                agent_name, description=description, system_prompt=system_prompt,
+                pack=pack, skill_ids=skill_ids,
+            )
+        except DecimalAPIError as e:
+            if e.status_code in (400, 409):
+                click.echo(f"  ✗ {e.server_detail or e}", err=True)
+                raise SystemExit(1)
+            raise
+    except httpx.HTTPError as e:
+        _http_die(e, base_url)
+    finally:
+        client.close()
+
+    name = result.get("agent_name") or agent_name
+    click.echo("")
+    click.echo(f"  ✓ Created agent {name}")
+    if pack:
+        click.echo(f"    Prompt: {'from --prompt-file' if system_prompt else f'the {pack} starter prompt'}")
+    click.echo(f"    Skills attached: {result.get('skills_assigned', 0)}")
+    failed = result.get("skills_failed_detail") or [
+        {"skill_id": sid, "error": "not attached"} for sid in result.get("skills_failed") or []
+    ]
+    for f in failed:
+        click.echo(f"    ✗ {f.get('skill_id')}: {f.get('error')}", err=True)
+    click.echo("")
+    click.echo("  Next, write a runnable file that loads it:")
+    click.echo(f"    decimalai init {name}")
+    click.echo(f"  → {_dashboard_url(base_url)}/agents/{urllib.parse.quote(name, safe='')}")
+    click.echo("")
+
 
 @cli.group()
 def traces():

@@ -16,6 +16,7 @@ import httpx
 from ._config import sdk_headers
 from ._responses import (
     AgentListResponse,
+    CreateAgentResponse,
     IngestionResult,
     IngestionSkipped,
     ManifestDiffResponse,
@@ -842,6 +843,39 @@ class DecimalAIClient:
         )
         _raise_for_status(resp)
         return cast(AgentListResponse, resp.json())
+
+    def create_agent(
+        self,
+        agent_name: str,
+        *,
+        description: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        pack: Optional[str] = None,
+        skill_ids: Optional[List[str]] = None,
+    ) -> CreateAgentResponse:
+        """Create an agent — the same call the dashboard's create form makes.
+
+        ``pack`` with no ``system_prompt`` starts the agent on that pack's
+        starter prompt as-is. ``skill_ids`` takes your own skills or public
+        registry skills. One the server can't attach comes back in
+        ``skills_failed`` (with the reason in ``skills_failed_detail``) instead
+        of failing the create, so check it.
+
+        Raises:
+            DecimalAPIError: 400 for an invalid name or an unknown pack, 409
+                when an agent with this name already exists.
+        """
+        body: Dict[str, Any] = {"agent_name": agent_name, "skill_ids": list(skill_ids or [])}
+        if description is not None:
+            body["description"] = description
+        if system_prompt is not None:
+            body["system_prompt"] = system_prompt
+        if pack is not None:
+            body["pack"] = pack
+        # Not `idempotent=True`: a 500 means the create ran part-way. A replay
+        # after a 502/504 that did land answers 409, which says the name is taken.
+        resp = self._request_with_retry("POST", "/api/v1/agents", json=body)
+        return cast(CreateAgentResponse, resp.json())
 
     def get_agent_prompt(
         self,

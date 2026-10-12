@@ -141,6 +141,16 @@ class AgentListResponse(TypedDict, total=False):
     parent_child_map: Dict[str, List[str]]
 
 
+class CreateAgentResponse(TypedDict, total=False):
+    agent_name: str
+    agent_id: str
+    manifest_id: str
+    version_label: Optional[str]
+    skills_assigned: int
+    skills_failed: List[str]
+    skills_failed_detail: List[Dict[str, Any]]
+
+
 # ── Manifests ───────────────────────────────────────────────
 
 
