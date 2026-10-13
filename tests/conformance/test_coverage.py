@@ -374,7 +374,10 @@ def test_every_init_framework_flag_has_a_driver() -> None:
     or not the docs repo is anywhere nearby.
     """
     flags = init_framework_flags()
-    known = set(FLAG_SLUGS) | set(PROVIDER_FLAG_DRIVERS)
+    # Evidence exports bounded metadata; it does not instrument a framework or
+    # provider. Its opt-in, privacy and durable transport contract has its own suite.
+    non_adapter_flags = {'evidence'}
+    known = set(FLAG_SLUGS) | set(PROVIDER_FLAG_DRIVERS) | non_adapter_flags
 
     unclassified = sorted(flags - known)
     assert not unclassified, (

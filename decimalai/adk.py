@@ -1073,6 +1073,7 @@ def _plugin_class() -> Any:
                     spans=list(state.spans),
                     llm_calls=list(state.llm_calls),
                     manifest_id=manifest_id,
+                    session_metadata={'framework': 'adk'},
                     # Skill-delivery rails. `routing_id` closes the
                     # routing_decision × trace_skill_activation join;
                     # `skills_delivered` is the subset whose BODY reached the

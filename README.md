@@ -467,3 +467,15 @@ MIT — see [LICENSE](https://github.com/decimal-labs/decimalai-python/blob/main
 ---
 
 [Docs](https://docs.decimal.ai) · [Registry](https://app.decimal.ai/skills) · [SDK](https://github.com/decimal-labs/decimalai-python) · Specs: [agentversion](https://github.com/decimal-labs/agentversion) · [skillevaluation](https://github.com/decimal-labs/skillevaluation) · [regression-check](https://github.com/decimal-labs/regression-check)
+
+### Optional runtime evidence
+
+Authenticated applications can enable bounded metadata evidence with
+`decimalai.init(api_key=..., evidence=True, evidence_directory="/private/evidence")`.
+It keeps a separate durable local spool and uploads only when the server advertises
+`/api/v1/evidence/capabilities` with the supported after-commit receipt contract.
+Collection is off by default; offline, manifest-only and keyless starter work gains
+no uploads. Credentials, prompts, answers and skill bodies are never evidence
+payloads. Missing capability or a transport failure retains pending events without
+retrying your model work. Uploaded client reports do not themselves verify source
+activation, business publication, retirement or account deletion.

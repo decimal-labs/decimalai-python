@@ -536,6 +536,11 @@ class DecimalAIClient:
             skipped: IngestionSkipped = {"status": "skipped", "reason": "manifest_only_mode"}
             return skipped
         payload = _scrub_surrogates(trace.model_dump(mode="json"))
+        try:
+            from .evidence import observe_trace
+            observe_trace(self, trace)
+        except Exception:
+            pass  # Metadata collection never retries or changes the customer operation.
         _warn_if_strict_manifest_missing(bool(payload.get("manifest_id")))
         resp = self._request_with_retry(
             "POST", "/api/v1/traces", json=payload, idempotent=True
@@ -556,6 +561,12 @@ class DecimalAIClient:
             }
             return skipped
         payload = [_scrub_surrogates(t.model_dump(mode="json")) for t in traces]
+        try:
+            from .evidence import observe_trace
+            for trace in traces:
+                observe_trace(self, trace)
+        except Exception:
+            pass
         _warn_if_strict_manifest_missing(
             all(p.get("manifest_id") for p in payload) if payload else True
         )

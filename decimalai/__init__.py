@@ -733,6 +733,8 @@ def init(
     skill_authority: Optional[str] = None,
     inject_skill_body: Optional[bool] = None,
     load_skill_tool: Optional[bool] = None,
+    evidence: bool = False,
+    evidence_directory: Optional[str] = None,
 ) -> None:
     """Initialize the DecimalAI SDK.
 
@@ -921,6 +923,12 @@ def init(
             base_url=config.base_url,
             project=config.project,
         )
+        if evidence and not manifest_only:
+            try:
+                from .evidence import enable
+                enable(config.api_key, config.base_url, evidence_directory)
+            except Exception:
+                logger.warning("Evidence collection is pending: local exporter unavailable")
         # Register the atexit flush handler exactly once. This prevents
         # silent trace loss when a script ingests <50 traces and exits.
         # A re-init means a different key, workspace or base_url. A prompt cached
