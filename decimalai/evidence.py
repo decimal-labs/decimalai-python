@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
     from ._client import DecimalAIClient
@@ -169,6 +169,8 @@ class EvidenceSpool:
         changes = []
         seen = set()
         for item in response["items"]:
+            if not isinstance(item, dict) or type(item.get("seq")) is not int:
+                return False
             eid = item.get("event_id")
             original = expected.get(eid)
             if not original or eid in seen or item.get("seq") != original["seq"]:
@@ -178,6 +180,10 @@ class EvidenceSpool:
                 if item.get("event_hash") != digest(original) or not item.get(
                     "receipt_id"
                 ):
+                    return False
+                try:
+                    UUID(item["receipt_id"])
+                except (ValueError, TypeError, AttributeError):
                     return False
                 changes.append(("acked", None, eid))
             elif item.get("status") == "rejected":
@@ -453,6 +459,12 @@ class EvidenceClient:
                         )
                     except ValueError:
                         delay = 30
+                    if response.status_code in (401, 403):
+                        self.last_status = "authorization_pending"
+                        delay = max(delay, 3600)
+                    elif response.status_code == 410:
+                        self.last_status = "stream_expired"
+                        delay = max(delay, 86400)
                     self.next_try = (
                         time.monotonic() + delay + random.uniform(0, delay / 10)
                     )

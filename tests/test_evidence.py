@@ -255,3 +255,35 @@ def test_closed_shard_only_pruned_after_all_hash_checked_acks(tmp_path):
     rejected.acknowledge({"durable": True, "items": [reject]}, [event])
     assert not rejected.prune_closed()
     assert rejected.path.exists() and rejected.health()["quarantined"] == 1
+
+
+def test_revoked_auth_preserves_events_and_backs_off(tmp_path):
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "enabled": True,
+                    "schema_version": 1,
+                    "acknowledgement": "per_event_after_commit",
+                },
+            )
+        return httpx.Response(403)
+
+    client = EvidenceClient(
+        "fake-key",
+        "https://example.test",
+        tmp_path,
+        background=False,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        before = client.spool.pending()
+        import time
+
+        assert not client.upload_once()
+        assert client.last_status == "authorization_pending"
+        assert client.next_try - time.monotonic() >= 3599
+        assert client.spool.pending() == before
+    finally:
+        client.close()
