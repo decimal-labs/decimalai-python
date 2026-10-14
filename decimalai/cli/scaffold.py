@@ -163,7 +163,8 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
+import sys
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # keeps this module pure — it imports nothing at run time
     from .._agent import AgentConfig
@@ -879,6 +880,38 @@ INSTALL: Dict[str, str] = {
     "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
     "adk": 'pip install "decimalai[adk]"',
 }
+
+#: Extras whose framework floor needs a newer Python than decimalai itself
+#: (pyproject's `[adk]` and `[pydantic-ai]`: google-adk and pydantic-ai-slim at
+#: their floors require 3.11). pip does not report the mismatch. On an older
+#: Python it installs the newest decimalai release whose requirements still
+#: resolve, older than the one that wrote the file, and prints nothing.
+EXTRA_MIN_PYTHON: Dict[str, Tuple[int, int]] = {
+    "adk": (3, 11),
+    "pydantic-ai": (3, 11),
+}
+
+
+def install_python_note(
+    framework: str, version_info: Optional[Sequence[int]] = None
+) -> Optional[str]:
+    """A warning to print under the install line, or None.
+
+    Only when this Python is older than the framework's extra needs, because
+    that is the one case where the printed line "works" and installs the wrong
+    SDK. ``version_info`` defaults to the running interpreter's.
+    """
+    need = EXTRA_MIN_PYTHON.get(framework)
+    have = tuple((version_info if version_info is not None else sys.version_info)[:2])
+    if need is None or have >= need:
+        return None
+    return (
+        f"decimalai[{framework}] needs Python {need[0]}.{need[1]} or newer, and this is "
+        f"Python {have[0]}.{have[1]}. Here pip installs an older decimalai release "
+        f"instead, without saying so. Run the install line under Python "
+        f"{need[0]}.{need[1]}+."
+    )
+
 
 ENV_VARS: Dict[str, tuple] = {
     "langchain": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),

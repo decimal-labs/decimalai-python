@@ -26,6 +26,11 @@ appended after it, so the caller's own instructions stay in the cacheable
 prefix (the fragment is rebuilt per query and so differs on every call —
 in front, it would break the prompt cache for everything behind it).
 
+On the async client the routing call (a blocking HTTP request) runs on a
+worker thread, so it never stalls the event loop. ``AsyncMessages.stream()``
+therefore routes when its ``async with`` block is entered, not when
+``stream()`` is called.
+
 Manual / explicit path::
 
     from decimalai.anthropic import skill_system
@@ -45,12 +50,13 @@ untouched.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
 import warnings
-from contextvars import ContextVar
-from typing import Any, List, Optional, Union
+from contextvars import Context, ContextVar, copy_context
+from typing import Any, Callable, List, Optional, Union
 
 logger = logging.getLogger("decimalai.anthropic")
 
@@ -294,36 +300,191 @@ _injecting: ContextVar[bool] = ContextVar(
 )
 
 
+def _inject_best_effort(kwargs: dict) -> None:
+    """Inject into ``kwargs``, never raising: a router failure sends the
+    caller's own prompt, untouched."""
+    try:
+        _inject_skills_into_create_kwargs(kwargs)
+    except Exception:
+        logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+
+
 def _inject_once(kwargs: dict) -> Any:
     """Inject unless an outer patched call already did. Returns a reset token,
     or None when this call is the inner one and must leave kwargs alone."""
     if _injecting.get():
         return None
     token = _injecting.set(True)
-    try:
-        _inject_skills_into_create_kwargs(kwargs)
-    except Exception:
-        logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+    _inject_best_effort(kwargs)
     return token
 
 
-def _patch(original: Any) -> Any:
-    """Wrap one SDK method so skills are injected into its ``system`` kwarg."""
-    if inspect.iscoroutinefunction(original):
-        @functools.wraps(original)
-        async def patched_async(self, *args, **kwargs):
-            token = _inject_once(kwargs)
-            try:
-                return await original(self, *args, **kwargs)
-            finally:
-                if token is not None:
-                    _injecting.reset(token)
-        return patched_async
+# ── the async client: route on a worker thread ──────────────────────────────
+#
+# The router is a synchronous HTTP client: one routing call is a route request
+# plus a body fetch, each with its own read budget, plus admission retries.
+# Made inline from a coroutine, it stalled every other coroutine on the event
+# loop (in an async server, every other conversation in the process) until the
+# platform answered.
 
-    # Plain functions: every sync method, AsyncMessages.stream() (returns an
-    # async context manager) and AsyncMessages.create (anthropic's
-    # @required_args wrapper is a plain function that returns the coroutine).
-    # Each binds kwargs when called, so injecting before the call is enough.
+_UNSET = object()
+
+
+def _running_asyncio_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """The asyncio loop running on this thread, or None.
+
+    None under another async library: anthropic's async client is built on
+    anyio and also runs under trio.
+    """
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _adopt_sdk_context_writes(ctx: Context) -> None:
+    """Copy into the current Context what routing wrote into ``ctx``.
+
+    Only this SDK's own variables (named ``decimalai_*``): this adapter's
+    routing id (read back with :func:`get_current_routing_id`), the router's
+    per-call rails that :func:`skill_system` drains, and the router's per-turn
+    body budget, which a later ``router.load_skill()`` in the same coroutine
+    reads. The caller is left with the Context an inline call would have left.
+    Anything else a worker thread set stays in that thread's copy.
+    """
+    for var, value in ctx.items():
+        if var.name.startswith("decimalai_") and var.get(_UNSET) is not value:
+            var.set(value)
+
+
+async def _inject_once_off_loop(kwargs: dict) -> Any:
+    """`_inject_once` for the async client, with the routing call on a worker
+    thread. Returns a reset token for the caller to reset, or None.
+
+    The thread runs in a COPY of the caller's Context, so everything routing
+    reads from it is the caller's: the run's agent name set by
+    ``providers.agent_run()``, and the live OTel span that the run's routing
+    decision is filed under. Its writes are then copied back
+    (`_adopt_sdk_context_writes`).
+
+    On asyncio, cancelling the caller while the router is in flight cancels
+    the call at once (anyio, under trio, waits for the thread). The abandoned
+    routing call finishes on its thread and the message is never sent, though
+    the decision it made is still recorded against the run.
+    """
+    if _injecting.get():
+        return None
+    ctx = copy_context()
+    started: List[bool] = []
+
+    def route() -> None:
+        started.append(True)
+        _inject_best_effort(kwargs)
+
+    try:
+        loop = _running_asyncio_loop()
+        if loop is not None:
+            await loop.run_in_executor(None, ctx.run, route)
+        else:
+            import anyio.to_thread
+
+            await anyio.to_thread.run_sync(ctx.run, route)
+    except Exception:
+        # Only the hand-off can fail here (`route` never raises), for example
+        # an executor that is shutting down. If routing never started, route
+        # inline: a blocked loop for one call is better than a call that
+        # silently goes out without its skills.
+        logger.debug("off-loop skill routing hand-off failed", exc_info=True)
+        if not started:
+            _inject_best_effort(kwargs)
+    else:
+        _adopt_sdk_context_writes(ctx)
+    return _injecting.set(True)
+
+
+def _patch_async_call(original: Any) -> Any:
+    """Wrap ``AsyncMessages.create`` or ``.parse``.
+
+    ``parse`` is a coroutine function. ``create`` is anthropic's
+    ``@required_args`` wrapper, a plain function that returns the coroutine.
+    Both bind ``kwargs`` when called, so this awaits the routing first and calls
+    the original after. The guard stays up while the request is awaited, so a
+    helper built on another patched method does not route again.
+    """
+    @functools.wraps(original)
+    async def patched(self, *args, **kwargs):
+        token = await _inject_once_off_loop(kwargs)
+        try:
+            result = original(self, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            if token is not None:
+                _injecting.reset(token)
+    return patched
+
+
+class _OffLoopMessageStreamManager:
+    """What the patched ``AsyncMessages.stream()`` returns in place of the
+    SDK's ``AsyncMessageStreamManager``.
+
+    The SDK's ``stream()`` is a plain function that puts ``system`` into the
+    request body when it is called, so nothing can be awaited before the body
+    is built. This manager calls the real ``stream()`` in ``__aenter__``, after
+    the routing has been awaited on a worker thread, and hands back the SDK's
+    own ``AsyncMessageStream``. It has the manager's interface
+    (``async with``), not its class.
+    """
+
+    def __init__(self, open_stream: Callable[[], Any], kwargs: dict) -> None:
+        self._open_stream = open_stream
+        self._kwargs = kwargs
+        self._manager: Any = None
+
+    async def __aenter__(self) -> Any:
+        if self._manager is not None:
+            # Entered twice: let the SDK's manager answer as it would.
+            return await self._manager.__aenter__()
+        token = await _inject_once_off_loop(self._kwargs)
+        try:
+            self._manager = self._open_stream()
+            # The guard stays up until the request is sent. A stream() built
+            # on create(stream=True) runs that create inside this __aenter__,
+            # and it must see that this call has already routed.
+            return await self._manager.__aenter__()
+        finally:
+            if token is not None:
+                _injecting.reset(token)
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        if self._manager is None:
+            return None
+        return await self._manager.__aexit__(exc_type, exc, tb)
+
+
+def _patch_async_stream(original: Any) -> Any:
+    """Wrap ``AsyncMessages.stream``: routing moves to ``__aenter__``."""
+    @functools.wraps(original)
+    def patched(self, *args, **kwargs):
+        # A closure over this call's `kwargs` dict, not functools.partial: a
+        # partial copies the dict now, and the routing writes `system` into it
+        # later.
+        return _OffLoopMessageStreamManager(
+            lambda: original(self, *args, **kwargs), kwargs,
+        )
+    return patched
+
+
+def _patch(original: Any, *, name: str = "create", async_client: bool = False) -> Any:
+    """Wrap one SDK method so skills are injected into its ``system`` kwarg."""
+    if async_client and name == "stream":
+        return _patch_async_stream(original)
+    if async_client or inspect.iscoroutinefunction(original):
+        return _patch_async_call(original)
+
+    # The sync client: every method binds kwargs when called, so injecting
+    # before the call is enough.
     @functools.wraps(original)
     def patched(self, *args, **kwargs):
         token = _inject_once(kwargs)
@@ -361,7 +522,9 @@ def _install_skill_loader() -> None:
                     cls.__name__, name,
                 )
                 continue
-            setattr(cls, name, _patch(original))
+            setattr(cls, name, _patch(
+                original, name=name, async_client=cls is AsyncMessages,
+            ))
     _skill_loader_installed = True
     logger.info("DecimalAI SkillRouter loader installed (Anthropic)")
 

@@ -47,7 +47,10 @@ global_instruction_plugin.py:86-121``). ``flows/llm_flows/core/_model_call.py``
 runs that hook (line 194) and hands the same request object to
 ``llm.generate_content_async`` (line 261), so what is appended here is what the
 model is sent. The router call is a blocking HTTP round-trip, so it runs on a
-worker thread and never on ADK's event loop.
+worker thread and never on ADK's event loop. Model turns of one invocation
+that ask the same question while that call is in flight — the branches of a
+``ParallelAgent`` — wait for it and share its answer, so one user turn is one
+routing decision and the trace names it.
 
 ADK itself ships a native skill mechanism — ``google.adk.tools.skill_toolset.
 SkillToolset``, with ``list_skills`` / ``load_skill`` / ``load_skill_resource``
@@ -553,7 +556,7 @@ def _system_instruction_text(llm_request: Any) -> str:
     """Flatten whatever is in ``config.system_instruction`` to text.
 
     Used to VERIFY that an append actually landed before anything is claimed
-    as delivered — see ``_inject_skills_into_request``.
+    as delivered — see ``_deliver_routed_turn``.
     """
     config = getattr(llm_request, "config", None)
     si = getattr(config, "system_instruction", None)
@@ -607,29 +610,109 @@ def _append_system_text(llm_request: Any, texts: List[str]) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _RoutedTurn:
+    """One routing decision: what the router returned, and its drained rails.
+
+    Built on the worker thread that made the router call, because the rails
+    are ContextVars of that call (see ``_route_turn``). Applied on the loop by
+    ``_deliver_routed_turn`` to every model request that shares the decision,
+    so it is read-only once built.
+    """
+
+    prefix: Any
+    tail: Any
+    routing_id: Optional[str]
+    offered: Tuple[str, ...]
+    delivered: Tuple[str, ...]
+    delivered_versions: Tuple[Dict[str, str], ...]
+
+
 def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
     """Route this turn's skills and append them to the system instruction.
 
+    Blocking, for a caller that is not on ADK's event loop. The plugin itself
+    goes through ``_route_turn_shared`` instead, which runs ``_route_turn`` on
+    a worker thread and shares one call between the model turns of an
+    invocation that ask the same question at the same moment.
+    """
+    routed = _route_turn(state, _query_from_request(llm_request, state.user_input_preview))
+    if routed is not None:
+        _deliver_routed_turn(state, llm_request, routed)
+
+
+async def _route_turn_shared(state: "_RunState", query: Optional[str]) -> Optional[_RoutedTurn]:
+    """This invocation's routing decision for ``query``, made once while in flight.
+
+    The branches of an ADK ``ParallelAgent`` are model turns of ONE invocation:
+    one ``_RunState``, so one scope (the trace id), one agent label, and the
+    same user text. They ask the router the same question at the same moment,
+    and would get the same answer: those are the inputs the router's cache is
+    keyed by. While the router call ran on the loop, the first branch blocked the
+    loop and filled that cache, and the others hit it. Off the loop they all
+    missed it at once, and each made its own platform call: N routing
+    decisions for one user turn, of which the trace (it has ONE
+    ``routing_id``) could name only one. The rest were orphans, deflating
+    acceptance and inflating the decision count.
+
+    So a call in flight is shared: a model turn that asks the question an
+    in-flight call is already asking waits for that call and gets its answer,
+    failure included. N branches retrying a failing platform at the same
+    instant would only multiply its load, and three of them are the three
+    consecutive failures that open the router's circuit breaker, which then
+    skips routing for every turn of its cooldown. Sharing ends when the call
+    lands. A later model turn (a tool step) goes to the router as it always
+    did, and the router's cache answers it with the same decision for the rest
+    of the turn.
+
+    Keyed by the question alone, since the scope and the label are this
+    invocation's (the router's other cache inputs are fixed for this adapter):
+    two different questions are two calls, never one answer.
+
+    The call runs as its own task, and every model turn — the one that started
+    it too — awaits it through ``asyncio.shield``: ADK cancels the other
+    branches when one escalates, and a cancelled branch must not take the
+    answer from a branch still waiting on it. The task is created here, so
+    ``asyncio.to_thread`` still runs the router in a copy of the context of the
+    turn that started it (OpenTelemetry's span, the enclosing generic trace).
+    Only ADK's event loop touches ``routing_flights``, so it needs no lock.
+    """
+    key = query or ""
+    flight = state.routing_flights.get(key)
+    if flight is None:
+        flight = asyncio.ensure_future(asyncio.to_thread(_route_turn, state, query))
+        state.routing_flights[key] = flight
+
+        def _landed(done: "asyncio.Future[Optional[_RoutedTurn]]") -> None:
+            if state.routing_flights.get(key) is done:
+                del state.routing_flights[key]
+            if not done.cancelled():
+                # Retrieved, so a failure no surviving turn awaited is not
+                # reported by asyncio as an exception nobody handled.
+                done.exception()
+
+        flight.add_done_callback(_landed)
+    return await asyncio.shield(flight)
+
+
+def _route_turn(state: "_RunState", query: Optional[str]) -> Optional[_RoutedTurn]:
+    """Ask the router for ``query``'s skills, and drain the call's rails.
+
     Blocking: the router call is a synchronous HTTP round-trip. The plugin
-    therefore never calls this on ADK's event loop — ``before_model_callback``
-    awaits it through ``asyncio.to_thread``, which runs it on a worker thread
-    in a COPY of the caller's context (OpenTelemetry's current span and the
+    therefore never calls this on ADK's event loop — ``_route_turn_shared``
+    runs it through ``asyncio.to_thread``, which runs it on a worker thread in
+    a COPY of the caller's context (OpenTelemetry's current span and the
     generic tracer's enclosing trace come with it). The router call and the
     drain of its per-call rails below MUST stay in this one function for that
     reason: the rails are ContextVars, and a value the router sets in the
     worker's copy is gone once the worker returns.
 
-    Nothing is claimed that was not verified: the offered / delivered / routing
-    rails are stamped onto the run only after the appended prefix has been read
-    back out of ``llm_request``. A router call that produced no text, or an
-    append the request refused, leaves the trace saying nothing happened —
-    because nothing did.
+    None when there is no router, or the router raised: an unskilled turn.
     """
     router = _get_skill_router()
     if router is None:
-        return
+        return None
 
-    query = _query_from_request(llm_request, state.user_input_preview)
     scope = str(state.trace_id)
     from .skill_router import (
         _release_scoped_routing_rail,
@@ -663,7 +746,7 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         # later invocation, even when a custom router fails after setting it.
         consume_last_delivered_versions()
         logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
-        return
+        return None
     finally:
         # The router keeps its own copy of this decision under the run's scope,
         # for adapters that read it back from there. This one reads the
@@ -676,6 +759,28 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
     offered = consume_last_offered_names()
     delivered = consume_last_delivered_names()
     delivered_versions = consume_last_delivered_versions()
+    return _RoutedTurn(
+        prefix=prefix, tail=tail, routing_id=routing_id,
+        offered=tuple(offered), delivered=tuple(delivered),
+        delivered_versions=tuple(delivered_versions),
+    )
+
+
+def _deliver_routed_turn(state: "_RunState", llm_request: Any, routed: _RoutedTurn) -> None:
+    """Append a routing decision to one model request, and stamp what landed.
+
+    Called once for each model turn that shares the decision, each with its
+    own request. Stamping the run again for a second branch changes nothing:
+    the rails are sets, and the decision is the same one.
+
+    Nothing is claimed that was not verified: the offered / delivered / routing
+    rails are stamped onto the run only after the appended prefix has been read
+    back out of ``llm_request``. A router call that produced no text, or an
+    append the request refused, leaves the trace saying nothing happened —
+    because nothing did.
+    """
+    prefix, tail, routing_id = routed.prefix, routed.tail, routed.routing_id
+    offered, delivered = routed.offered, routed.delivered
 
     texts = [t for t in (prefix, tail) if t]
     if not texts:
@@ -699,7 +804,7 @@ def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
         state.routing_id = routing_id
     state.skills_offered.update(n for n in offered if n)
     state.skills_delivered.update(n for n in delivered if n)
-    for version in copy_delivered_versions(delivered_versions, names=delivered):
+    for version in copy_delivered_versions(routed.delivered_versions, names=delivered):
         name, digest = version.get("name"), version.get("hash")
         if name not in delivered or not digest:
             continue
@@ -721,7 +826,7 @@ class _RunState:
         "open_tool_calls", "failed_tool_calls",
         "status", "error_code", "error_message", "manifest",
         "routing_id", "skills_offered", "skills_delivered",
-        "skills_delivered_versions",
+        "skills_delivered_versions", "routing_flights",
         "parent_trace_id", "on_trace", "enable_skill_loader",
     )
 
@@ -775,6 +880,10 @@ class _RunState:
         self.skills_offered: set = set()
         self.skills_delivered: set = set()
         self.skills_delivered_versions: set[Tuple[str, str, str, str, str]] = set()
+        # Routing calls in flight, by question: the model turns of this
+        # invocation that ask one at the same moment (a ParallelAgent's
+        # branches) share it. See `_route_turn_shared`.
+        self.routing_flights: Dict[str, "asyncio.Future[Optional[_RoutedTurn]]"] = {}
 
 
 def _plugin_class() -> Any:
@@ -1064,11 +1173,17 @@ def _plugin_class() -> Any:
             # an unskilled turn, it does not break the caller's model call.
             # Off the loop: the router call blocks on HTTP, and a slow
             # platform must stall this turn only — not every other coroutine
-            # on ADK's event loop. This invocation awaits it, so nothing else
-            # touches this request or this turn's rails meanwhile.
+            # on ADK's event loop. Shared: a sibling branch asking the same
+            # question meanwhile waits for this call instead of making its own,
+            # so the turn is one routing decision. The decision is appended to
+            # THIS request here, on the loop, by the turn that owns it.
             if state.enable_skill_loader:
                 try:
-                    await asyncio.to_thread(_inject_skills_into_request, state, llm_request)
+                    routed = await _route_turn_shared(
+                        state, _query_from_request(llm_request, state.user_input_preview),
+                    )
+                    if routed is not None:
+                        _deliver_routed_turn(state, llm_request, routed)
                 except Exception:
                     logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             model = getattr(llm_request, "model", None)
@@ -1094,7 +1209,7 @@ def _plugin_class() -> Any:
             # offered [...] but those names are not in the prompt the model was
             # shown" the first time the rail was graded (2026-09-03).
             #
-            # Must stay AFTER `_inject_skills_into_request` above, or it records
+            # Must stay AFTER `_deliver_routed_turn` above, or it records
             # the instruction as it was before the skills were appended.
             sys_text = _system_instruction_text(llm_request)
             if sys_text:

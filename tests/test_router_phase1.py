@@ -25,7 +25,7 @@ from decimalai import skill_router as sr
 from decimalai.skill_router import (
     _COLD_PATH_TIMEOUT,
     SkillRouter,
-    _CircuitBreaker,
+    _HotPathBreakers,
     _hot_path_read_budget,
     consume_last_delivered_names,
     routing_status,
@@ -39,12 +39,12 @@ BODY = "Opened boxes carry a 23.5% restocking fee."
 def _fresh_breaker_and_budget(monkeypatch):
     """Every test gets its own breaker and an empty per-context body budget.
 
-    Both are process-global: the breaker is module state and the budget is a
-    module-level ContextVar. Without this a test that opens the breaker (or
+    Both are process-global: the breakers are module state and the budget is
+    a module-level ContextVar. Without this a test that opens the breaker (or
     leaves a budget in the context) changes the outcome of whichever test runs
     next — the R15 pollution this file also fixes in test_availability_contract.
     """
-    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+    monkeypatch.setattr(sr, "_hot_path_breakers", _HotPathBreakers())
     token = sr._body_budget_ctx.set(None)
     yield
     sr._body_budget_ctx.reset(token)
@@ -200,8 +200,8 @@ class TestInTurnBodyFetchIsAHotPath:
         monkeypatch.setattr(httpx, "request", platform)
         router = _router()
         router.build_prompt_fragment("refund an opened box", scope="run")
-        sr._hot_path_breaker = _CircuitBreaker(threshold=1, cooldown_s=60.0)
-        sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
+        sr._hot_path_breakers = _HotPathBreakers(threshold=1, cooldown_s=60.0)
+        sr._hot_path_breakers.for_host(BASE).record_failure(httpx.ConnectError("down"))
 
         out = router.load_skill("refund-policy", scope="run")
 
@@ -383,12 +383,12 @@ class TestAFailedRouteIsCachedForTheTurn:
         platform = FakePlatform()
         monkeypatch.setattr(httpx, "request", platform)
         router = _router()
-        sr._hot_path_breaker = _CircuitBreaker(threshold=1, cooldown_s=60.0)
-        sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
+        sr._hot_path_breakers = _HotPathBreakers(threshold=1, cooldown_s=60.0)
+        sr._hot_path_breakers.for_host(BASE).record_failure(httpx.ConnectError("down"))
         assert router.build_prompt_fragment("q", scope="run-1") == ("", None)
         assert platform.calls == []
 
-        sr._hot_path_breaker = _CircuitBreaker()  # the platform is back
+        sr._hot_path_breakers = _HotPathBreakers()  # the platform is back
         _, routing_id = router.build_prompt_fragment("q", scope="run-1")
         assert routing_id == ranked_route()["routing_id"]
 

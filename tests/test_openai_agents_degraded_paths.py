@@ -637,17 +637,28 @@ class TestRetrofitsAgentsBuiltBeforeInstrument:
         tools = asyncio.run(later.get_all_tools(types.SimpleNamespace()))
         assert [t.name for t in tools] == ["load_skill"]
 
-    def test_a_user_written_instructions_callable_is_left_alone(self, fake_agents):
+    def test_a_user_written_instructions_callable_runs_and_the_menu_trails_it(self, fake_agents):
+        """CONTRACT CHANGED (was "is left alone": the prompt equalled the
+        callable's output). An agent whose instructions are the user's own
+        function got `load_skill` but no routing decision, so its loads named
+        none. The function still runs, and its output still leads; the routed
+        menu is appended after it."""
         _, Agent, oa = fake_agents
 
         def mine(ctx, agent):
             return "MY PROMPT"
 
         prebuilt = Agent(name="early", instructions=mine)
-        oa._skill_router_singleton = MagicMock()
+        router = MagicMock()
+        router.build_prompt_fragment.return_value = ("## Recommended Skills\n| a |", "rt_1")
+        oa._skill_router_singleton = router
         oa._install_skill_loader()
 
-        assert asyncio.run(prebuilt.get_system_prompt(types.SimpleNamespace())) == "MY PROMPT"
+        prompt = asyncio.run(prebuilt.get_system_prompt(types.SimpleNamespace()))
+        assert prompt.startswith("MY PROMPT")
+        assert prompt.count("## Recommended Skills") == 1
+        assert prompt.index("MY PROMPT") < prompt.index("## Recommended Skills")
+        assert prebuilt.instructions is mine
 
     def test_plain_instrument_hooks_the_class_without_loading_skills(self, fake_agents):
         """The observer hook is always on — it is what hands the trace

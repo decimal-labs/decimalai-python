@@ -54,24 +54,36 @@ def pytest_configure(config):
     decimalai at module-level get the right behavior.
     """
     os.environ.setdefault("DECIMALAI_SKIP_VERIFY", "1")
+    _check_test_environment()
     _check_openai2_environment()
 
 
-# ── 5. The openai 2 environment runs its own slice of the unit suite ───────────
+# ── 5. Two test environments, and the openai 2 one runs its own slice ─────────
 #
 # No environment can install every framework the SDK supports: openai-agents and
 # pydantic-ai need openai>=3, while crewai, litellm and llama-index-llms-openai pin
-# openai<3. The default environment (`.venv`, `.[dev]`) is the openai 3 one, and in
-# it the cases below that need the real crewai/litellm SKIP. So those files are run a
-# second time, in the environment built from `.[conformance-tests-openai2]`:
+# openai<3. tests/conformance/environments.py defines the two by the extras that
+# build them (TEST_ENV_EXTRAS):
+#
+#   openai3  `.[dev,conformance-tests]`   the whole unit suite
+#   openai2  `.[conformance-tests-openai2]`  the files below, which need crewai/litellm
+#
+# A plain `.[dev]` install is neither: it lacks google-adk, pydantic-ai-slim and the
+# OpenInference instrumentors, so the unit cases that need those skip in it (it does
+# hold anthropic, which langchain-anthropic in `[dev]` requires, so the Anthropic
+# cases run there), and the CrewAI and LiteLLM cases skip in any openai 3 environment. Setting DECIMAL_TEST_ENV is the claim that
+# this IS one of the two, and the session refuses to start when the claim is false
+# (_check_test_environment) — so CI, the publish gate and `bin/wt land`, which all
+# set it, cannot pass by skipping, and a venv left below the SDK's floors says so
+# instead of failing on tests unrelated to the change being gated. Unset, a run is
+# leniently "openai3": a contributor's `.[dev]` venv keeps its skips.
 #
 #     DECIMAL_TEST_ENV=openai2 .venv-openai2/bin/python -m pytest tests/ -q
 #
-# collects ONLY these files (the rest of the unit suite imports openai 3 frameworks
-# that environment cannot hold), and refuses to start if the packages that make the
-# skips go away are missing — so the slice cannot pass by skipping. bin/wt land runs
-# it whenever `.venv-openai2` exists (the landing gate's suite definition). tests/conformance
-# is never filtered here: it reads DECIMAL_TEST_ENV itself (tests/conformance/environments.py).
+# collects ONLY the files below (the rest of the unit suite imports openai 3
+# frameworks that environment cannot hold). bin/wt land runs it whenever
+# `.venv-openai2` exists (the landing gate's suite definition). tests/conformance
+# is never filtered here: it reads DECIMAL_TEST_ENV itself.
 OPENAI2_UNIT_TESTS = (
     "test_crewai_*.py",          # crewai + its OpenInference instrumentor
     "unit/test_llm_evals.py",    # litellm, through decimalai.evals
@@ -104,6 +116,88 @@ def _test_env() -> str:
         return current_env()
     except ValueError as exc:
         raise pytest.UsageError(str(exc)) from None
+
+
+def _check_test_environment() -> None:
+    """Refuse a run that names an environment this interpreter is not.
+
+    Every distribution the environment's extras require must be installed, at or
+    above its floor. Only a NAMED run is held to it (see section 5 above).
+    """
+    if not (os.environ.get("DECIMAL_TEST_ENV") or "").strip():
+        return
+    env = _test_env()
+    from tests.conformance import environments
+
+    problems = environments.environment_problems(env)
+    if not problems:
+        return
+    repo = os.path.dirname(_TESTS_DIR)
+    also = ("Add `,live-llm-tests` to the extras if this venv also runs the live "
+            "release gate." if env == "openai3" else "")
+    if environments.is_venv(sys.prefix, sys.base_prefix):
+        venv = os.path.realpath(sys.prefix)
+        checkout = os.path.dirname(venv)
+        if not os.path.isfile(os.path.join(checkout, "pyproject.toml")):
+            checkout = repo
+        fix = (f"Rebuild this venv ({venv}) from its extras, exactly:\n  "
+               + environments.rebuild_commands(env, venv, checkout) + "\n" + also)
+    else:
+        # Not a venv: Homebrew's or the system's python, a conda env, a CI runner's
+        # own interpreter. Its prefix is a Python installation, so the fix must
+        # never name it. Build a new venv in the checkout and leave this one alone.
+        target = os.path.join(repo, environments.VENV_DIRS[env])
+        fix = (f"This interpreter is not a virtualenv ({sys.prefix}), so do not "
+               "rebuild it in place. Build the environment as a new venv in the "
+               "checkout, then run the tests with that venv's python:\n  "
+               + environments.rebuild_commands(env, None, repo) + "\n"
+               f"  DECIMAL_TEST_ENV={env} {target}/bin/python -m pytest tests/ -q\n"
+               + also)
+    raise pytest.UsageError(
+        f"DECIMAL_TEST_ENV={env} names the environment built by "
+        f"`{environments.TEST_ENVS[env]}`, and this interpreter ({sys.executable}) is "
+        f"not it:\n  - " + "\n  - ".join(problems) + "\n\nA run that names its "
+        "environment must not pass by skipping what that environment exists to run, "
+        "or grade a framework below the floor the SDK supports (it carries no code "
+        "for older releases, so those fail on tests unrelated to any change). "
+        + fix
+    )
+
+
+_ENV_NOTE: list = []   # computed once per session: (note, holds another world's dists)
+
+
+def _environment_note() -> tuple:
+    """One line naming the environment, and another world's distributions if it holds any."""
+    if not _ENV_NOTE:
+        env = _test_env()
+        from tests.conformance import environments
+
+        extra = environments.strays(env)
+        note = f"test environment: {env} ({environments.TEST_ENVS[env]})"
+        if extra:
+            note += (
+                f" ALSO holds {', '.join(extra)}, which only the other environment's "
+                "extras install. This run grades more than CI's and the gate's will; "
+                "rebuild the venv from its extras for counts that match."
+            )
+        _ENV_NOTE.append((note, bool(extra)))
+    return _ENV_NOTE[0]
+
+
+def pytest_report_header(config):
+    if not (os.environ.get("DECIMAL_TEST_ENV") or "").strip():
+        return None
+    return _environment_note()[0]
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Repeat a stray-distribution note at the end, where `-q` (the gates' mode) shows it."""
+    if not (os.environ.get("DECIMAL_TEST_ENV") or "").strip():
+        return
+    note, strays = _environment_note()
+    if strays:
+        terminalreporter.write_line(note, yellow=True)
 
 
 def _check_openai2_environment() -> None:

@@ -27,6 +27,7 @@ reproduce.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -442,6 +443,17 @@ class TestAsyncRoutingRunsOffTheLoop:
         assert trace.routing_id == ROUTING_IDS["agent-b"]
         assert trace.skills_offered_in_prompt == ["beta"]
 
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11),
+        reason=(
+            "Python 3.10: asyncio.create_task takes no context=, so LangGraph cannot carry the "
+            "run's RunnableConfig into an async node, and create_agent's model node calls "
+            "model.ainvoke(messages) without one. The model call then carries no callbacks "
+            "and no parent run id, so routing cannot tell which run or agent it is for. "
+            "An upstream limit, not this adapter's: it holds on 0.13.9 too. The adapter "
+            "logs a warning the first time it happens (TestPython310AsyncNodeWithoutItsRunWarns)."
+        ),
+    )
     def test_two_async_runs_route_concurrently_and_keep_their_own_rails(
         self, monkeypatch, loader,
     ):
@@ -512,3 +524,143 @@ class TestAsyncRoutingRunsOffTheLoop:
 
         [request] = _menu_requests(router)
         assert request["thread"] == threading.get_ident()
+
+
+# ── 3. Python 3.10: an async graph node that lost its run says so ────────────
+#
+# Below 3.11 asyncio.create_task takes no `context=`, so LangGraph cannot carry a
+# run's config into an async node, and create_agent's model node calls
+# `model.ainvoke(messages)` without one. The model call reaches the adapter with
+# no callbacks and no parent run id: it routes without the agent its trace is
+# filed under, so that agent's skills and pins are not offered, and the trace
+# records neither the call nor its routing decision. That is upstream's limit
+# (TestAsyncRoutingRunsOffTheLoop skips the concurrent case on 3.10 for it); the
+# adapter's part is that it must not be silent.
+
+
+def _lost_run_warnings(caplog) -> List[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "WARNING" and "Python 3.10" in r.getMessage()
+    ]
+
+
+class TestPython310AsyncNodeWithoutItsRunWarns:
+    @pytest.fixture
+    def py310(self, monkeypatch):
+        """This interpreter, as the adapter sees a 3.10 one; nothing warned yet."""
+        import decimalai.langchain as lc
+
+        monkeypatch.setattr(lc, "_ASYNC_NODE_LOSES_ITS_RUN", True)
+        monkeypatch.setattr(lc, "_lost_run_warned", False)
+        return lc
+
+    @staticmethod
+    def _open_run(lc, monkeypatch, name: str = "agent-a"):
+        """A handler with one root run in flight, and no other handler alive."""
+        import weakref
+        from uuid import uuid4
+
+        handler = lc.CallbackHandler(auto_send=False)
+        live = weakref.WeakSet([handler])
+        monkeypatch.setattr(lc, "_live_handlers", live)
+        run_id = uuid4()
+        handler.on_chain_start({}, {"messages": []}, run_id=run_id,
+                               parent_run_id=None, name=name)
+        return handler, run_id
+
+    @staticmethod
+    def _bare_ainvoke(**kwargs):
+        """`await model.ainvoke(...)` from a Context holding no LangChain run."""
+        from contextvars import Context
+
+        llm = FakeListChatModel(responses=["ok"] * 4)
+        return Context().run(asyncio.run, llm.ainvoke("refund my order", **kwargs))
+
+    def test_a_model_call_that_arrives_without_the_open_run_warns_once(
+        self, py310, monkeypatch, router, loader, caplog,
+    ):
+        handler, run_id = self._open_run(py310, monkeypatch)
+        caplog.set_level("WARNING", logger="decimalai")
+
+        self._bare_ainvoke()
+        self._bare_ainvoke()
+
+        [message] = _lost_run_warnings(caplog)
+        assert "'agent-a'" in message, "it must name the agent whose skills go missing"
+        assert "routes as no agent" in message
+        assert "Python 3.11" in message and ".invoke()" in message, "and say what fixes it"
+        handler.on_chain_end({}, run_id=run_id, parent_run_id=None)
+
+    def test_it_names_the_install_agent_when_instrument_gave_one(
+        self, py310, monkeypatch, router, loader, caplog,
+    ):
+        handler, run_id = self._open_run(py310, monkeypatch)
+        monkeypatch.setattr(py310, "_install_agent_name", "support-bot")
+        caplog.set_level("WARNING", logger="decimalai")
+
+        self._bare_ainvoke()
+
+        [message] = _lost_run_warnings(caplog)
+        assert "routes as 'support-bot'" in message
+        handler.on_chain_end({}, run_id=run_id, parent_run_id=None)
+
+    def test_a_bare_call_with_no_run_in_flight_is_not_the_case(
+        self, py310, monkeypatch, router, loader, caplog,
+    ):
+        import weakref
+
+        monkeypatch.setattr(py310, "_live_handlers", weakref.WeakSet())
+        caplog.set_level("WARNING", logger="decimalai")
+
+        self._bare_ainvoke()
+
+        assert _lost_run_warnings(caplog) == []
+
+    def test_a_call_handed_its_callbacks_is_not_the_case(
+        self, py310, monkeypatch, router, loader, caplog,
+    ):
+        handler, run_id = self._open_run(py310, monkeypatch)
+        caplog.set_level("WARNING", logger="decimalai")
+
+        self._bare_ainvoke(config={"callbacks": [handler]})
+
+        assert _lost_run_warnings(caplog) == []
+        handler.on_chain_end({}, run_id=run_id, parent_run_id=None)
+
+    def test_python_3_11_and_later_never_warn(self, monkeypatch, router, loader, caplog):
+        import decimalai.langchain as lc
+
+        monkeypatch.setattr(lc, "_ASYNC_NODE_LOSES_ITS_RUN", False)
+        monkeypatch.setattr(lc, "_lost_run_warned", False)
+        handler, run_id = self._open_run(lc, monkeypatch)
+        caplog.set_level("WARNING", logger="decimalai")
+
+        self._bare_ainvoke()
+
+        assert _lost_run_warnings(caplog) == []
+        handler.on_chain_end({}, run_id=run_id, parent_run_id=None)
+
+    def test_the_flag_is_this_interpreter(self):
+        import decimalai.langchain as lc
+
+        assert lc._ASYNC_NODE_LOSES_ITS_RUN is (sys.version_info < (3, 11))
+
+    @pytest.mark.skipif(sys.version_info >= (3, 11),
+                        reason="the real upstream shape exists only below Python 3.11")
+    def test_a_real_async_create_agent_run_on_3_10_warns(
+        self, monkeypatch, router, loader, caplog,
+    ):
+        """The shape itself, on the 3.10 CI leg: no simulated flag or run."""
+        import decimalai.langchain as lc
+        from decimalai.langchain import CallbackHandler
+
+        monkeypatch.setattr(lc, "_lost_run_warned", False)
+        caplog.set_level("WARNING", logger="decimalai")
+
+        asyncio.run(_graph("agent-a").ainvoke(
+            _user("refund my order"), config={"callbacks": [CallbackHandler()]},
+        ))
+
+        [message] = _lost_run_warnings(caplog)
+        assert "'agent-a'" in message

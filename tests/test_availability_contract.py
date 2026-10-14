@@ -27,6 +27,7 @@ from decimalai.skill_router import (
     _HOT_PATH_READ_FLOOR_S,
     SkillRouter,
     _CircuitBreaker,
+    _HotPathBreakers,
     _hot_path_read_budget,
     _hot_path_timeout,
     _is_hot_path,
@@ -40,7 +41,7 @@ UNREACHABLE = "http://127.0.0.1:9"  # discard port: refuses immediately
 def _restore_the_process_breaker(monkeypatch):
     """Give each test its own breaker and put the process one back afterwards.
 
-    Several tests below swap `skill_router._hot_path_breaker` for one they can
+    Several tests below swap `skill_router._hot_path_breakers` for one they can
     drive (an open breaker with a 30-60 s cooldown, among others). Assigned
     directly and never restored, the last of them stayed installed for the rest
     of the pytest process: run in one process before it,
@@ -50,7 +51,7 @@ def _restore_the_process_breaker(monkeypatch):
     """
     from decimalai import skill_router as sr
 
-    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+    monkeypatch.setattr(sr, "_hot_path_breakers", _HotPathBreakers())
 
 
 def _serve(handler_cls):
@@ -280,15 +281,15 @@ class TestRoutingDegradationIsVisible:
     def test_a_healthy_process_reports_healthy(self):
         from decimalai import skill_router as sr
 
-        sr._hot_path_breaker = _CircuitBreaker()
+        sr._hot_path_breakers = _HotPathBreakers()
         assert routing_status().healthy is True
         assert routing_status().breaker_open is False
 
     def test_a_timeout_is_counted_and_flips_healthy(self):
         from decimalai import skill_router as sr
 
-        sr._hot_path_breaker = _CircuitBreaker(threshold=3)
-        sr._hot_path_breaker.record_failure(httpx.ReadTimeout("too slow"))
+        sr._hot_path_breakers = _HotPathBreakers(threshold=3)
+        sr._hot_path_breakers.for_host(UNREACHABLE).record_failure(httpx.ReadTimeout("too slow"))
         st = routing_status()
         assert st.healthy is False, "a timeout must not read as healthy"
         assert st.timeouts == 1
@@ -297,9 +298,9 @@ class TestRoutingDegradationIsVisible:
     def test_the_open_breaker_is_reported_with_a_count(self):
         from decimalai import skill_router as sr
 
-        sr._hot_path_breaker = _CircuitBreaker(threshold=2, cooldown_s=60.0)
+        sr._hot_path_breakers = _HotPathBreakers(threshold=2, cooldown_s=60.0)
         for _ in range(2):
-            sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
+            sr._hot_path_breakers.for_host(UNREACHABLE).record_failure(httpx.ConnectError("down"))
         st = routing_status()
         assert st.breaker_open is True
         assert st.opens == 1
@@ -308,9 +309,10 @@ class TestRoutingDegradationIsVisible:
     def test_a_success_restores_healthy(self):
         from decimalai import skill_router as sr
 
-        sr._hot_path_breaker = _CircuitBreaker(threshold=2)
-        sr._hot_path_breaker.record_failure(httpx.ConnectError("down"))
-        sr._hot_path_breaker.record_success()
+        sr._hot_path_breakers = _HotPathBreakers(threshold=2)
+        breaker = sr._hot_path_breakers.for_host(UNREACHABLE)
+        breaker.record_failure(httpx.ConnectError("down"))
+        breaker.record_success()
         st = routing_status()
         assert st.healthy is True
         # The cumulative counter is NOT reset — a health check wants "has this
@@ -461,7 +463,7 @@ class TestAnEmptyMenuNamesItsFailure:
         from decimalai import skill_router as sr
         from decimalai.skill_router import SkillRouter
 
-        sr._hot_path_breaker = _CircuitBreaker()
+        sr._hot_path_breakers = _HotPathBreakers()
         return SkillRouter(api_key="dai_sk_t", base_url="http://127.0.0.1:9")
 
     def test_a_timeout_is_named(self, monkeypatch):
@@ -484,6 +486,6 @@ class TestAnEmptyMenuNamesItsFailure:
         from decimalai import skill_router as sr
 
         r = self._router()
-        sr._hot_path_breaker = _CircuitBreaker(threshold=1, cooldown_s=30.0)
-        sr._hot_path_breaker.record_failure()
+        sr._hot_path_breakers = _HotPathBreakers(threshold=1, cooldown_s=30.0)
+        sr._hot_path_breakers.for_host(r.base_url).record_failure()
         assert r.smart_route("q")["degraded_reason"] == "circuit_open"

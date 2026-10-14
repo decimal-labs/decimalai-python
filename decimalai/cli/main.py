@@ -175,6 +175,7 @@ def _scaffold_agent_file(
         UnusableModel,
         env_vars,
         install_command,
+        install_python_note,
         normalize_framework,
         normalize_model,
         render_agent_file,
@@ -436,6 +437,9 @@ def _scaffold_agent_file(
     click.echo("")
     click.echo("  Install:")
     click.echo(f"    {install_command(framework, model)}")
+    python_note = install_python_note(framework)
+    if python_note:
+        click.echo(f"  ! {python_note}")
     click.echo("")
     click.echo("  Set:")
     for var in env_vars(framework, model):

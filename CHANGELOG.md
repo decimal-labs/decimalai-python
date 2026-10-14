@@ -20,20 +20,44 @@ existed only for them are gone.
   instead of the `pydantic-ai` meta package, whose logfire extra cannot be
   installed beside google-adk.
 - `[evals]` is no longer part of `[all]`: litellm pins `openai<3`, and
-  `[openai-agents]` / `[pydantic-ai]` need `openai>=3`.
+  `[openai]`, `[openai-agents]` and `[pydantic-ai]` need `openai>=3`.
 - `[adk]`, `[pydantic-ai]` and `[all]` need Python 3.11+, because the google-adk
   and pydantic-ai-slim releases they floor require it. The core package and
   the other extras still install on Python 3.10.
+- pip reports neither conflict. Asked for `[evals]` beside `[openai]`,
+  `[openai-agents]`, `[pydantic-ai]` or `[all]`, or for `[adk]`,
+  `[pydantic-ai]` or `[all]` on Python 3.10, it installs decimalai 0.13.9, the
+  newest release whose requirements still resolve, and prints nothing (uv does
+  the same). `pip show decimalai` says which release you got. A floor on
+  decimalai itself, such as `pip install "decimalai[adk]>=0.14"`, makes pip
+  fail with `ResolutionImpossible` instead. `decimalai init --framework adk`
+  or `--framework pydantic-ai`, run on Python 3.10, says so under the install
+  line it prints.
 
-### Breaking: the `init()` framework flags deliver skills
+### Breaking: the `init()` framework flags and `DECIMAL_AUTO_TRACE` deliver skills
 
 - `init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
   `init(crewai=True)` now turn the skill loader on, the same install as that
   adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Through
   0.13.9 they installed tracing only, so the setup the docs teach traced well
-  and delivered no skills. `init(..., skills=False)` keeps a flag to tracing
-  only. The provider flags (`openai=`, `anthropic=`, `google=`) stay
-  tracing-only.
+  and delivered no skills. The provider flags (`openai=`, `anthropic=`,
+  `google=`) stay tracing-only.
+- `DECIMAL_AUTO_TRACE=langchain`, `openai-agents`, `adk` and `crewai` call those
+  same flags at import, so a deployment set up with environment variables and
+  no code starts delivering skills when it upgrades.
+- With the loader on, those adapters send the turn's message (on CrewAI, the
+  task description) to the platform's router before the model sees it, and add
+  a skills menu to the prompt, plus a skill body on the adapters that inject
+  one. The routing call has a 5 s read budget by default, and a repeat within
+  30 s reuses the answer.
+- Two opt-outs keep a flag to tracing only: `init(..., skills=False)` in code,
+  and the new `DECIMALAI_SKILLS=0` environment variable, which is the default
+  of `init(skills=...)` and the opt-out on the `DECIMAL_AUTO_TRACE` path, where
+  there is no `init()` call to pass an argument to. `0`, `false`, `no` and
+  `off` turn the loader off. A value the SDK does not recognise turns it off
+  too, and logs a warning. An explicit `skills=` argument wins over the
+  variable, and the variable does not change an explicit
+  `instrument(enable_skill_loader=True)`.
 - Re-running `init()` with a different API key, base URL, `inject_skill_body`
   or `load_skill_tool` drops every adapter's cached skill router. Before, a
   second `init(api_key=B)` sent traces as org B while routing org A's skills.
@@ -54,6 +78,20 @@ existed only for them are gone.
   with `tool_use_behavior="stop_on_first_tool"` used to end its run with a
   skill body, and a custom `ToolsToFinalOutputFunction` was handed DecimalAI's
   tool. Both now see only the agent's own tools.
+- OpenAI Agents: an agent whose `instructions` is your own function (sync or
+  async, on `Agent` or `SandboxAgent`) is routed. Your function runs as
+  before, and the skills menu is appended to what it returns. Through 0.13.9
+  such an agent got the `load_skill` tool but no menu and no routing
+  decision, so its loads named none and the platform served any public skill
+  by name. If your function already appends a fragment from your own
+  `SkillRouter` (the 0.13.9 docs' workaround), remove that, or the menu
+  appears twice.
+- OpenAI Agents: runs with tracing disabled (`RunConfig(tracing_disabled=True)`,
+  `set_tracing_disabled(True)` or `OPENAI_AGENTS_DISABLE_TRACING`) each get
+  their own run scope. Before, every untraced run shared one (the Agents SDK
+  gives them all the trace id `no-op`): one body budget between them, and each
+  run's loads named whichever run had routed last. The adapter also kept a
+  record of those runs that nothing read or released.
 - Pydantic AI: the skills menu is an instructions function routed once per run,
   so every turn of a conversation (`message_history=`) is routed and traced,
   not only the first. A second tool named `load_skill` no longer makes every
@@ -72,6 +110,16 @@ existed only for them are gone.
   after `init(adk=True)` when you passed no plugins. The DecimalAI plugin goes
   in through the `App` ADK wraps the agent in, so a suite run with
   `-W error::DeprecationWarning` can build a runner again.
+- Google ADK: tool results reach the trace. Every ADK tool call used to be
+  recorded as `success` with no result: the record built from the model turn
+  never got one, and the tool callback's record, which had it, was dropped
+  because a record of that name already existed. The result now lands on the
+  matching record, found by the function-call id ADK assigns, so parallel
+  calls to one tool each get their own. It is stored as bounded JSON (as text
+  when it has no JSON form), and a tool that raises marks its own record.
+  Results of ADK's own `SkillToolset` (`load_skill`, skill resources and
+  scripts) keep the skill's name and frontmatter metadata whole. Those native
+  loads are not yet counted as skill activations.
 - `init(enabled=False)` also stops a skill loader an earlier `init()`
   installed: no message is routed and no skill is injected or loaded while the
   SDK is disabled. Before, traces stopped but every user message still went to
@@ -80,38 +128,79 @@ existed only for them are gone.
   per-call `CallbackHandler(agent_name=...)` or a named graph), not only for
   `instrument(agent_name=...)`. Unnamed runs used to route as no agent, so
   agent assignments and version pins were ignored.
+- LangChain on Python 3.10: an async `create_agent` run (`ainvoke` /
+  `astream`) now logs a warning the first time its model call arrives without
+  the run. asyncio on 3.10 cannot hand a run's config to an async LangGraph
+  node, and `create_agent`'s model node calls the model without passing it on,
+  so those calls route without the agent the trace is filed under (that
+  agent's skills and pins are not offered) and are missing from the trace.
+  This was silent, and is unchanged otherwise: it is LangChain's limit, and
+  0.13.9 behaves the same. It corrects the 0.11.0 note below, which says
+  per-run attribution holds on 3.10 with `langchain-core>=1.4.8`; that holds
+  for runnables that pass their config on, not for this node. Sync `.invoke()`
+  runs, nodes that pass `config` to the model, and Python 3.11+ are
+  unaffected.
 - The blocking routing call no longer runs on the event loop in the async
-  paths of the LangChain, OpenAI Agents, Pydantic AI and ADK adapters. CrewAI
-  hooks are synchronous by CrewAI's design; the adapter warns once when CrewAI
-  runs one on a running loop (only the deprecated `CrewAgentExecutor` under
-  `Crew.akickoff()` does).
+  paths of the LangChain, OpenAI Agents, Pydantic AI and ADK adapters, nor in
+  `AsyncAnthropic`'s `messages.create()`, `messages.stream()` and
+  `messages.parse()`. CrewAI hooks are synchronous by CrewAI's design; the
+  adapter warns once when CrewAI runs one on a running loop (only the
+  deprecated `CrewAgentExecutor` under `Crew.akickoff()` does).
+- `AsyncAnthropic().messages.stream()` routes when its `async with` block is
+  entered, not when it is called. It returns a manager with the same
+  `async with` interface, which yields the SDK's own `AsyncMessageStream`, but
+  is not an `AsyncMessageStreamManager` instance.
+- Google ADK: model turns of one invocation that ask the same question at the
+  same moment (a `ParallelAgent`'s branches) share one routing call, so a user
+  turn is still one routing decision, and it is the one the trace names.
 - CrewAI warns once when `Agent(skills=...)` / `Crew(skills=...)` puts CrewAI's
   own skill catalog in the same model call as DecimalAI's menu.
 
 ### Changed: skill routing
 
-- A skill body is injected when the platform ranked the result by this turn's
-  message (degraded retrieval included, when its rows still matched). The top
-  row of an unranked or fallback menu no longer lands in turns like "thanks!".
-  Two bodies are injected ranked or not, because there is no wrong one to
-  pick: the `priority_skills` the platform offered, and the agent's only skill
-  (a show-all menu whose `rows_total` is 1), so a reworded question in a
-  one-skill workspace still gets the body on the adapters with no `load_skill`
-  tool. That skill's body also reaches small talk.
-- `load_skill` sends the run's `routing_id`, and the platform serves a skill
-  reachable only through the public registry just when that decision offered
-  it, so a prompt injection cannot load an arbitrary registry skill by name.
-  Skills the org owns, installed or assigned load either way.
+- A skill body is injected only when the platform says it ranked the result
+  by this turn's message (`query_ranked`). A degraded result still injects
+  when it is ranked: lexical-only retrieval during an embedding outage, or a
+  fallback menu whose top row matched the message. The top row of a menu that
+  nothing in the message matched no longer lands in turns like "thanks!".
+  From a platform that does not send `query_ranked`, a `full_menu` result
+  counts as unranked and retrieval as ranked. Two bodies are injected ranked
+  or not, because there is no wrong one to pick: the `priority_skills` the
+  platform offered, and the agent's only skill (a show-all menu whose
+  `rows_total` is 1), so a reworded question in a one-skill workspace still
+  gets the body on the adapters with no `load_skill` tool. That skill's body
+  also reaches small talk.
+- `load_skill` names the run's routing decision (`routing_id`) on each body
+  request, and the platform decides what to serve. Skills the org owns, has
+  installed or has assigned to the agent load whatever the menu showed,
+  including one the menu cap left off this turn's menu. A skill reachable only
+  through the public registry loads just when the run was offered it, so a
+  prompt injection cannot load an arbitrary registry skill by name. The SDK
+  refuses no name itself: a load from a router that has never routed (a
+  hand-built menu, a direct `SkillRouter.load_skill()` call) names no decision
+  and is not confined, and neither is a load against a platform that does not
+  yet read `routing_id` on `GET /skills/{name}/body`.
 - The in-turn `/body` fetch uses the 5 s hot-path budget and the circuit
   breaker, like `/route` and `/menu`. Disk export keeps the cold budget.
 - `routing_status()` turns unhealthy on 401, 402, 403, 429 and 5xx responses
   (new `http_errors` and `last_status_code` fields), not only on timeouts. A
-  404 for an unknown skill name is not a failure.
-- A slow failed routing call (a timeout, or a 429 whose `Retry-After` waits
-  ran out) is cached for the turn, so the other model calls of that turn do
-  not each wait it out again. A fast failure (an edge 429, a 5xx, a 401) is
-  not cached: the next call retries, and three in a row open the breaker. An
-  open breaker is not cached.
+  404 for an unknown skill name is not a failure. It reports the failures of
+  every API key and base URL the process routes with; one the process stopped
+  using stops counting 60 s after its last call, once another is in use.
+- The routing circuit breaker is per base URL and API key for failed
+  responses (401, 402, 403, 429, 5xx), and per host for transport failures
+  (timeouts, refused connections). One key's revoked credential, plan limit or
+  rate limit no longer pauses routing for the other keys in the process, and
+  the ERROR line names the likely cause instead of always suggesting a longer
+  timeout.
+- A slow failed routing call (a timeout, or any failure that took a second or
+  more, such as a 429 whose `Retry-After` waits ran out) is cached for the
+  turn, so the other model calls of that turn do not each wait it out again.
+  For a caller that passes no `scope=` (LangChain, a hand-written loop) it is
+  held 5 s, not the 30 s a success is kept, so one timeout no longer strips
+  skills from other conversations sending the same message. A fast failure
+  (an edge 429, a 5xx, a 401) is not cached: the next call retries, and three
+  in a row open the breaker. An open breaker is not cached.
 - `load_skill` tells the model when the platform was unavailable instead of
   saying the skill does not exist.
 - Routing no longer asks the platform for skill attachments it discarded.
@@ -128,6 +217,26 @@ existed only for them are gone.
   skill the server refuses (such as a plan limit) is named in the output. The
   same call is available as `DecimalAIClient.create_agent()`. `decimalai init`
   now points at it when the agent doesn't exist yet.
+
+### Conformance suite
+
+- Three contract items, each red for at least one framework before this
+  release's fixes: C17 (a tool call recorded as done carries what the tool
+  returned), C18 (the agent a run is routed for is the agent its trace is
+  filed under, including an agent the framework does not name) and C19 (every
+  turn of a conversation is routed, on that turn's own message).
+- An entry-shape axis (S1) grades the second documented ways into a
+  framework: ADK `Runner(app=App(...))`, OpenAI `SandboxAgent`,
+  `init(openai_agents=True)` followed by `instrument()`, and Anthropic
+  `messages.stream()`. Each was red before this release's fixes.
+- The matrix runs in two environments, `DECIMAL_TEST_ENV=openai3` and
+  `openai2`, because no single environment can hold openai-agents beside
+  crewai and litellm. A driver whose framework is installed below the SDK's
+  floor reports NOT RUN instead of grading a release the SDK no longer
+  supports.
+- The probe answers routing in the platform's own shapes (`strategy`,
+  `query_ranked`, the split between the stable menu and the per-turn tail),
+  and the CrewAI driver sets the telemetry variables CrewAI reads.
 
 ## [0.13.9] — 2026-10-10
 

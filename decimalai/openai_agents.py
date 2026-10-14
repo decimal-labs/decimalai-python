@@ -26,6 +26,7 @@ import inspect
 import logging
 import threading
 import warnings
+import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -260,15 +261,63 @@ _run_rails_lock = threading.Lock()
 _RUN_RAILS_MAX = 256
 
 
+#: The id an untraced run's trace reports: `NoOpTrace.trace_id` is this literal
+#: for every run, so it names no run at all.
+_UNTRACED_TRACE_ID = "no-op"
+
+
+class _UntracedRunKey(str):
+    """The run key of a run with tracing disabled. A plain string to every
+    store it keys; the type says no trace will ever end for it."""
+
+    __slots__ = ()
+
+
+#: The key each live untraced run is scoped by, held by its trace OBJECT and
+#: gone with it. See `_current_run_key`.
+_untraced_run_keys: "weakref.WeakKeyDictionary[Any, _UntracedRunKey]" = weakref.WeakKeyDictionary()
+_untraced_run_keys_lock = threading.Lock()
+
+
 def _current_run_key() -> Optional[str]:
-    """The active Agents-SDK trace id, or None outside a run."""
+    """The key naming the active Agents-SDK run, or None outside one.
+
+    A traced run's key is its trace id. A run with tracing disabled
+    (``RunConfig(tracing_disabled=True)``, ``set_tracing_disabled(True)``,
+    ``OPENAI_AGENTS_DISABLE_TRACING``) runs under a ``NoOpTrace``, whose id is
+    ``"no-op"`` for EVERY run. Keyed on that, all concurrent untraced runs
+    shared one scope: one body budget, and one routing decision for their
+    loads, so a run's ``load_skill`` named whichever run had routed last, and
+    that decides what the platform serves from the public registry.
+
+    The SDK still builds a fresh ``NoOpTrace`` for each run and makes it the
+    current trace for exactly that run, so the object is per run even though
+    its id is not: an untraced run gets an `_UntracedRunKey` minted once per
+    trace object. No processor ever sees a ``NoOpTrace`` end, so nothing
+    would ever pop a rail recorded under that key; `_record_run_rail`
+    records none.
+    """
     try:
         from agents.tracing import get_current_trace
         trace = get_current_trace()
     except Exception:
         return None
     trace_id = getattr(trace, "trace_id", None)
-    return trace_id if isinstance(trace_id, str) else None
+    if not isinstance(trace_id, str):
+        return None
+    if trace_id != _UNTRACED_TRACE_ID:
+        return trace_id
+    try:
+        with _untraced_run_keys_lock:
+            key = _untraced_run_keys.get(trace)
+            if key is None:
+                key = _UntracedRunKey(f"untraced_{uuid4().hex}")
+                _untraced_run_keys[trace] = key
+    except TypeError:
+        # A trace object that cannot be weakly referenced or hashed names no
+        # run, so it gets the unscoped path rather than one shared scope.
+        return None
+    return key
 
 
 def _rails_for(run_key: str) -> Dict[str, Any]:
@@ -312,10 +361,12 @@ def _record_run_rail(
     """Stamp routing/loading telemetry onto the CURRENT run's rail.
 
     Returns False when there is no active run to attribute to (the caller
-    then leaves the value on the legacy contextvar/router rails).
+    then leaves the value on the legacy contextvar/router rails), and for an
+    untraced run: its trace never reaches `_send_trace`, the only reader, so
+    a rail recorded for it would be held until evicted and read by nobody.
     """
     run_key = _current_run_key()
-    if run_key is None:
+    if run_key is None or isinstance(run_key, _UntracedRunKey):
         return False
     rail = _rails_for(run_key)
     with _run_rails_lock:
@@ -447,8 +498,9 @@ def _drain_router_delivered_versions(scope: Optional[str]) -> List[Dict[str, str
 # `agents.Agent.__init__` so every Agent created afterwards has its
 # string `instructions` wrapped into a callable that appends skill
 # content fetched from the platform per-run — after the agent's own
-# instructions, so those stay a stable cacheable prefix. User-supplied
-# callables pass through untouched (their judgment wins).
+# instructions, so those stay a stable cacheable prefix. A user-supplied
+# callable is left in place and routed at run time instead: the class-level
+# `get_system_prompt` hook appends the same fragment to what it returns.
 
 _skill_loader_installed = False
 _skill_router_singleton: Any = None
@@ -695,6 +747,13 @@ def _handle_load_skill(name: str, *, agent_name: Optional[str] = None) -> str:
             loaded=[name],
             delivered_versions=versions,
         )
+        if isinstance(run_key, _UntracedRunKey):
+            # The router files each load's version under the run's scope for
+            # `_send_trace` to drain, and an untraced run never sends one.
+            try:
+                router.consume_loaded_hashes(scope=run_key)
+            except Exception:
+                logger.debug("router keeps no scoped hash rail to release", exc_info=True)
     return result
 
 
@@ -1102,7 +1161,17 @@ def _install_agent_hooks() -> bool:
                     # the fragment again here would inject the skills menu twice.
                     pass
                 elif callable(current):
-                    pass  # a callable the user wrote — their judgment wins
+                    # A callable the user wrote. `original_gsp` called it once
+                    # and awaited what it returned; route and append the menu
+                    # to that, as for a string. Left unrouted, the agent still
+                    # had `load_skill`, and its loads named no routing decision:
+                    # the platform then treats a load as a direct fetch and
+                    # serves any public skill by name, which is what a prompt
+                    # injection naming a planted skill asks for.
+                    if base is None or isinstance(base, str):
+                        routed = await _skill_aware_prompt_async(base or "", run_context, self)
+                        # With nothing routed, a callable's None stays None.
+                        resolved = routed if routed or base is not None else base
                 else:
                     _note_retrofit(self)
                     # After the WHOLE resolved prompt: on a sandbox run that is
@@ -1265,8 +1334,8 @@ def _install_skill_loader() -> None:
     1. `Agent.__init__` — agents built from here on get their string
        `instructions` wrapped into the skill-aware callable and the
        load_skill tool appended to their declared tool list. A
-       user-supplied instructions callable is left alone (their
-       judgment > ours).
+       user-supplied instructions callable is left in place; layer 2
+       routes it, appending the fragment to what it returns.
     2. `Agent.get_system_prompt` / `Agent.get_all_tools` (see
        `_install_agent_hooks`) — the same two affordances, attached at
        RUN time, for agents that already existed when this was called.
@@ -1293,7 +1362,8 @@ def _install_skill_loader() -> None:
         if current is None or isinstance(current, str):
             base = current or ""
             self.instructions = _make_skill_aware_instructions(base)
-        # callables left untouched
+        # A callable the user wrote stays as written: the class-level
+        # `get_system_prompt` hook routes it per turn (see there).
         # Register load_skill so surfaced descriptions are
         # executable — an agent that can see a skill can pull its body.
         if _load_skill_tool_enabled():

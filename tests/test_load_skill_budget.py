@@ -194,8 +194,10 @@ class TestLoadSkill:
 class TestBudgetReset:
     def test_fresh_fragment_resets_budget(self):
         router = _router(max_loaded_bodies=1)
-        # Both names are on the menu: load_skill serves only offered skills
-        # (2026-10-14), and this test is about the turn budget, not the offer.
+        # Both names are on the menu, so the test does not depend on what the
+        # platform serves: it confines public-only names to the run's offer
+        # through the routing_id load_skill sends. This test is about the turn
+        # budget, not the offer.
         route = {
             "prompt_fragment": "MENU", "routing_id": "rt_1",
             "skills": [{"name": "a"}, {"name": "b"}],

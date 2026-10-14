@@ -335,8 +335,11 @@ class TestSandboxAgentGetsSkills:
                                           capabilities=caps))
         assert len([r for r in caplog.records if NAMESPACED in r.getMessage()]) == 1
 
-    def test_a_user_written_sandbox_instructions_callable_is_left_alone(self, sdk):
-        """Same policy as a plain Agent: the user's own callable decides."""
+    def test_a_user_written_sandbox_instructions_callable_is_routed(self, sdk):
+        """CONTRACT CHANGED (was "is left alone": no routing, no menu). Same
+        policy as a plain Agent, which phase 1d reversed: the user's callable
+        still runs and leads, and the routed menu trails it. The sync, async
+        and callable-object shapes are in test_openai_agents_phase1d.py."""
         router = _Router()
         oa._skill_router_singleton = router
         model = _ScriptedModel([_text("ok")])
@@ -344,9 +347,10 @@ class TestSandboxAgentGetsSkills:
         _sandbox_run(SandboxAgent(name="sbx", instructions=lambda ctx, agent: "MINE",
                                   model=model))
 
-        assert router.routes == []
-        assert MENU not in model.calls[0]["instructions"]
-        assert "MINE" in model.calls[0]["instructions"]
+        assert [r["agent_name"] for r in router.routes] == ["sbx"]
+        shown = model.calls[0]["instructions"]
+        assert shown.count(MENU) == 1
+        assert shown.index("MINE") < shown.index(MENU)
 
     def test_a_plain_agent_keeps_the_plain_tool_name(self, sdk):
         router = _Router()

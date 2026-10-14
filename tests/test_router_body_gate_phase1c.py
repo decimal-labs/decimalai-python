@@ -38,7 +38,7 @@ import httpx
 import pytest
 
 from decimalai import skill_router as sr
-from decimalai.skill_router import SkillRouter, _CircuitBreaker, consume_last_delivered_names
+from decimalai.skill_router import SkillRouter, _HotPathBreakers, consume_last_delivered_names
 
 BASE = "http://platform.test"
 RID = "rt_" + "c" * 24
@@ -52,7 +52,7 @@ REWORDED = "I want my money back for order 42"
 
 @pytest.fixture(autouse=True)
 def _fresh_breaker_and_budget(monkeypatch):
-    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+    monkeypatch.setattr(sr, "_hot_path_breakers", _HotPathBreakers())
     token = sr._body_budget_ctx.set(None)
     yield
     sr._body_budget_ctx.reset(token)

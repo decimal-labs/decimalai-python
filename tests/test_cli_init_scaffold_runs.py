@@ -653,7 +653,19 @@ def test_langchain_template_emits_no_deprecation_warnings(tmp_path):
     ))
 
     proc = subprocess.run(
-        [sys.executable, "-W", "error::DeprecationWarning", str(driver)],
+        [
+            sys.executable, "-W", "error::DeprecationWarning",
+            # One third-party exemption, and only for warnings attributed to that
+            # module. On Python 3.11 opentelemetry-api 1.42.1 (the newest google-adk
+            # allows) reads entry points through importlib.metadata's deprecated
+            # SelectableGroups dict interface, at import, from
+            # `opentelemetry.util._importlib_metadata`. Under -W error that import
+            # raised, and the run died before the generated file did anything. It is
+            # not something a template can avoid; the file's own warnings still raise.
+            # Later -W options take precedence, so this one has to come second.
+            "-W", "ignore::DeprecationWarning:opentelemetry.util._importlib_metadata",
+            str(driver),
+        ],
         capture_output=True, text=True, cwd=tmp_path, timeout=SLOW_TIMEOUT,
         env=_ENV,
     )

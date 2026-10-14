@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import re
+import types
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -715,6 +716,59 @@ class TestCliWritesTheFile:
         result = _run_cli([AGENT, "--api-key", "dai_sk_x",
                            "--framework", "openai-agents"])
         assert 'pip install "decimalai[openai-agents]"' in result.output
+
+    @pytest.mark.parametrize("framework", ["adk", "pydantic-ai"])
+    def test_an_extra_this_python_cannot_install_is_said_out_loud(
+        self, framework, tmp_path, monkeypatch
+    ):
+        """On Python 3.10 the printed `pip install "decimalai[adk]"` does not
+        fail: pip quietly installs an older decimalai, under a file written for
+        this one. The next steps say so instead of leaving it to be found."""
+        from decimalai.cli import scaffold
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(scaffold, "sys", types.SimpleNamespace(version_info=(3, 10, 14)))
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--framework", framework])
+        assert result.exit_code == 0, result.output
+        assert f'pip install "decimalai[{framework}]"' in result.output
+        assert (f"decimalai[{framework}] needs Python 3.11 or newer, and this is "
+                "Python 3.10") in result.output
+        assert "older decimalai release" in result.output
+
+    @pytest.mark.parametrize("framework,version", [
+        ("adk", (3, 11, 0)), ("pydantic-ai", (3, 12, 1)),
+        ("langchain", (3, 10, 14)), ("openai-agents", (3, 10, 14)),
+    ])
+    def test_no_python_note_where_the_extra_installs(
+        self, framework, version, tmp_path, monkeypatch
+    ):
+        from decimalai.cli import scaffold
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(scaffold, "sys", types.SimpleNamespace(version_info=version))
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--framework", framework])
+        assert result.exit_code == 0, result.output
+        assert "needs Python" not in result.output
+
+    @pytest.mark.parametrize("framework,dist", [("adk", "google-adk"),
+                                                ("pydantic-ai", "pydantic-ai-slim")])
+    def test_the_python_floor_is_the_frameworks_own(self, framework, dist):
+        """EXTRA_MIN_PYTHON restates what the framework's own metadata says;
+        hold it to that, where the framework is installed."""
+        from importlib import metadata
+
+        from packaging.specifiers import SpecifierSet
+
+        from decimalai.cli.scaffold import EXTRA_MIN_PYTHON
+
+        try:
+            requires = metadata.metadata(dist)["Requires-Python"]
+        except metadata.PackageNotFoundError:
+            pytest.skip(f"{dist} is not installed in this environment")
+        need = EXTRA_MIN_PYTHON[framework]
+        spec = SpecifierSet(requires)
+        assert f"{need[0]}.{need[1]}.0" in spec
+        assert f"{need[0]}.{need[1] - 1}.99" not in spec
 
     def test_the_prompt_is_summarized_in_the_header(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

@@ -45,7 +45,7 @@ import pytest
 from decimalai import skill_router as sr
 from decimalai.skill_router import (
     SkillRouter,
-    _CircuitBreaker,
+    _HotPathBreakers,
     consume_last_delivered_names,
 )
 
@@ -57,7 +57,7 @@ RID_B = "rt_" + "b" * 24
 
 @pytest.fixture(autouse=True)
 def _fresh_breaker_and_budget(monkeypatch):
-    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+    monkeypatch.setattr(sr, "_hot_path_breakers", _HotPathBreakers())
     token = sr._body_budget_ctx.set(None)
     yield
     sr._body_budget_ctx.reset(token)
@@ -296,11 +296,12 @@ class TestLoadSkillLetsThePlatformDecide:
     def test_an_open_breaker_route_also_sends_an_empty_routing_id(self, monkeypatch):
         platform = _install(monkeypatch, FakePlatform())
         router = _router()
-        for _ in range(sr._hot_path_breaker.threshold):
-            sr._hot_path_breaker.record_failure(RuntimeError("down"), status_code=503)
-        assert sr._hot_path_breaker.is_open()
+        breaker = sr._hot_path_breakers.for_credential(router.base_url, router.api_key)
+        for _ in range(breaker.threshold):
+            breaker.record_failure(RuntimeError("down"), status_code=503)
+        assert breaker.is_open()
         router.build_prompt_fragment("refund an opened box", scope="run")
-        sr._hot_path_breaker.record_success()  # the platform is back for the load
+        breaker.record_success()  # the platform is back for the load
         assert router.load_skill("warranty-terms", scope="run").startswith("## Skill: warranty-terms")
         (call,) = platform.body_calls("warranty-terms")
         assert _params(call)["routing_id"] == ""

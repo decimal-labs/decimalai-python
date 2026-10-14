@@ -17,6 +17,7 @@ the `routing_decision × trace_skill_activation` join can close.
 
 from __future__ import annotations
 
+import hashlib
 import json as json_module
 import logging
 import os
@@ -30,7 +31,7 @@ from pathlib import Path
 from threading import Lock
 from threading import local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -470,6 +471,27 @@ def _ranked_by_this_query(result: Dict[str, Any]) -> bool:
 #: a timeout or an admission wait costs seconds.
 _SLOW_FAILURE_S = 1.0
 
+#: How long a slow failure is reused for a caller that names no run (no
+#: ``scope=``): LangChain, whose ambient run id names each model call rather
+#: than the turn, and a hand-written loop. For them the cache slot is one per
+#: (query, agent) for the whole process, so "the next model call of this turn"
+#: and "another conversation asking the same thing" are the same lookup, and
+#: the router cannot tell them apart. When the failure was kept for the 30 s a
+#: success is, one timeout during a brownout left every conversation sending
+#: that message (a chat UI's suggested-prompt button) without skills for half
+#: a minute.
+#:
+#: 5 s covers the gap the cache exists for: the model call that follows the
+#: failed route (it is the call that route was for, plus any tool it runs). It
+#: is also the breaker's first pause, and does not grow with a raised read
+#: budget: the gap between a turn's model calls does not either. A turn that
+#: outlasts it retries once per window, which also lets a recovered platform
+#: back in; three failures in a row open the breaker. The price: a
+#: conversation that asks the same thing within those 5 s is served the
+#: failure too. Only a run id closes that, and a caller that names its run
+#: keeps the failure for the turn (the cache TTL) where no other run sees it.
+_UNSCOPED_FAILURE_TTL_S = 5.0
+
 
 def _failure_worth_caching(result: Dict[str, Any], elapsed_s: float) -> bool:
     """Should this failed routing call be cached for the rest of the turn?
@@ -523,6 +545,74 @@ def _bodies_without_ranking(
     return names
 
 
+class _RoutingTotals:
+    """The process-wide counters behind ``routing_status()``.
+
+    Monotonic for the life of the process: a health check wants "has this ever
+    degraded", not a gauge that a recovery quietly resets to zero. They live
+    apart from the breakers because there is one breaker per host and per API
+    key, in a bounded store (see ``_HotPathBreakers``): dropping the least
+    recently used breaker must not make a total go down.
+
+    ``timeouts`` counts transport failures (a read timeout, a refused
+    connection); ``http_errors`` counts responses that arrived but mean no
+    skills (see ``_is_health_failure``).
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.timeouts = 0
+        self.http_errors = 0
+        self.opens = 0
+        self.suppressed = 0
+        self.last_error: Optional[str] = None
+        self.last_error_at: Optional[float] = None
+        self.last_status_code: Optional[int] = None
+        self.last_success_at: Optional[float] = None
+
+    def failure(self, error_text: Optional[str], status_code: Optional[int]) -> None:
+        with self._lock:
+            if status_code is None:
+                self.timeouts += 1
+            else:
+                self.http_errors += 1
+                self.last_status_code = status_code
+            if error_text is not None:
+                self.last_error = error_text
+                self.last_error_at = time.time()
+
+    def opened(self) -> None:
+        with self._lock:
+            self.opens += 1
+
+    def skipped(self) -> None:
+        with self._lock:
+            self.suppressed += 1
+
+    def success(self) -> None:
+        with self._lock:
+            self.last_success_at = time.time()
+
+
+def _status_hint(status_code: Optional[int]) -> str:
+    """What an operator can do about a key whose responses opened its breaker."""
+    if status_code == 401:
+        return "Check that this API key is valid and has not been revoked."
+    if status_code == 403:
+        return "This API key may not route skills here; check its organization and scopes."
+    if status_code == 402:
+        return "This key's plan does not cover the request; check its billing."
+    if status_code == 429:
+        return "This key is rate limited or over its quota; routing resumes when the limit resets."
+    if status_code == 404:
+        return "The routing endpoint was not found at this base URL; check it."
+    if status_code is not None and status_code >= 500:
+        return "The platform answered this key's requests with a server error."
+    if status_code is not None and status_code < 400:
+        return "The response was not JSON (a proxy or login page?); check the base URL."
+    return ""
+
+
 class _CircuitBreaker:
     """Stop paying the timeout once the platform is clearly unreachable.
 
@@ -538,6 +628,11 @@ class _CircuitBreaker:
     suppressed routing through the next one. It now starts at 5 s and doubles
     per consecutive open to a 30 s ceiling: a blip costs 5 s, a real outage
     still backs all the way off, and one success resets the ladder.
+
+    ONE BREAKER PER CAUSE (2026-10-14). A breaker pauses only the routing its
+    failures are about: ``kind="transport"`` for a host that did not answer,
+    ``kind="credential"`` for one API key the platform answered with a status
+    that leaves its turns without skills. ``_HotPathBreakers`` holds them.
     """
 
     def __init__(
@@ -545,28 +640,29 @@ class _CircuitBreaker:
         threshold: int = 3,
         cooldown_s: float = 5.0,
         max_cooldown_s: float = 30.0,
+        *,
+        kind: str = "transport",
+        target: str = "",
+        totals: Optional[_RoutingTotals] = None,
     ):
         self.threshold = threshold
         self.base_cooldown_s = cooldown_s
         self.max_cooldown_s = max_cooldown_s
+        # What a failure here is about, for the ERROR line: the host at
+        # `target` did not answer ("transport"), or `target` answered one API
+        # key with a failure ("credential").
+        self.kind = kind
+        self.target = target
+        self.totals = totals if totals is not None else _RoutingTotals()
         self._consecutive_failures = 0
         self._consecutive_opens = 0
         self._opened_at: Optional[float] = None
         self._lock = Lock()
-        # Counters for `routing_status()`. Monotonic for the life of the
-        # process — a health check wants "has this ever degraded", not a
-        # gauge that a recovery quietly resets to zero.
-        # `timeouts` counts transport failures (a read timeout, a refused
-        # connection); `http_errors` counts responses that arrived but mean
-        # no skills (see `_is_health_failure`). Both feed the same breaker.
-        self.timeouts = 0
-        self.http_errors = 0
-        self.opens = 0
-        self.suppressed = 0
         self.last_error: Optional[str] = None
-        self.last_error_at: Optional[float] = None
         self.last_status_code: Optional[int] = None
-        self.last_success_at: Optional[float] = None
+        # When a call last consulted or fed this breaker (monotonic). Lets
+        # `routing_status()` stop counting one the process no longer routes with.
+        self.last_used_at = time.monotonic()
 
     def _current_cooldown(self) -> float:
         """Caller holds the lock."""
@@ -575,6 +671,7 @@ class _CircuitBreaker:
 
     def is_open(self) -> bool:
         with self._lock:
+            self.last_used_at = time.monotonic()
             if self._opened_at is None:
                 return False
             if time.monotonic() - self._opened_at >= self._current_cooldown():
@@ -585,7 +682,7 @@ class _CircuitBreaker:
                 self._opened_at = None
                 self._consecutive_failures = 0
                 return False
-            self.suppressed += 1
+            self.totals.skipped()
             return True
 
     def record_failure(
@@ -601,39 +698,194 @@ class _CircuitBreaker:
         never got an answer (timeout, refused connection).
         """
         with self._lock:
+            self.last_used_at = time.monotonic()
             self._consecutive_failures += 1
-            if status_code is None:
-                self.timeouts += 1
-            else:
-                self.http_errors += 1
+            if status_code is not None:
                 self.last_status_code = status_code
-            if error is not None:
-                self.last_error = f"{type(error).__name__}: {error}"
-                self.last_error_at = time.time()
+            error_text = f"{type(error).__name__}: {error}" if error is not None else None
+            if error_text is not None:
+                self.last_error = error_text
+            self.totals.failure(error_text, status_code)
             if self._consecutive_failures >= self.threshold and self._opened_at is None:
                 self._opened_at = time.monotonic()
                 self._consecutive_opens += 1
-                self.opens += 1
-                # ERROR, not warning. While this is open every agent in the
-                # process answers without skills and nothing else says so.
-                logger.error(
-                    "SkillRouter: %d consecutive failures — pausing skill "
-                    "routing for %.0fs. Agents will run WITHOUT SKILLS until "
-                    "the platform answers. Last error: %s. If this is slowness "
-                    "rather than an outage, raise %s (currently %.1fs).",
-                    self._consecutive_failures, self._current_cooldown(),
-                    self.last_error, _HOT_PATH_READ_ENV, _hot_path_read_budget(),
-                )
+                self.totals.opened()
+                # ERROR, not warning. While this is open every agent routing
+                # through it answers without skills and nothing else says so.
+                logger.error("%s", self._open_message())
 
-    def record_success(self) -> None:
+    def _open_message(self) -> str:
+        """The ERROR line for an open, naming what can be done. Caller holds the lock.
+
+        Never the key: a credential breaker is named by its base URL alone.
+        """
+        n, cooldown = self._consecutive_failures, self._current_cooldown()
+        if self.kind == "credential":
+            return (
+                f"SkillRouter: {n} consecutive failed responses from {self.target} "
+                f"for one API key — pausing skill routing with that key for "
+                f"{cooldown:.0f}s; other keys are not paused. Its agents will run "
+                f"WITHOUT SKILLS meanwhile. Last error: {self.last_error}. "
+                f"{_status_hint(self.last_status_code)}"
+            ).rstrip()
+        where = f" to {self.target}" if self.target else ""
+        return (
+            f"SkillRouter: {n} consecutive failures reaching the platform{where} — "
+            f"pausing skill routing{where} for {cooldown:.0f}s, for every API key. "
+            f"Agents will run WITHOUT SKILLS until it answers. Last error: "
+            f"{self.last_error}. If this is slowness rather than an outage, raise "
+            f"{_HOT_PATH_READ_ENV} (currently {_hot_path_read_budget():.1f}s)."
+        )
+
+    def record_reachable(self) -> None:
+        """The host answered, whatever it said: its transport failures are over.
+
+        Not a routing success — the answer may be a 401 — so the totals' last
+        success is left alone.
+        """
         with self._lock:
+            self.last_used_at = time.monotonic()
             self._consecutive_failures = 0
             self._consecutive_opens = 0
             self._opened_at = None
-            self.last_success_at = time.time()
+
+    def record_success(self) -> None:
+        self.record_reachable()
+        self.totals.success()
 
 
-_hot_path_breaker = _CircuitBreaker()
+#: A breaker no call has consulted for this long, while the process kept routing
+#: through others, stops counting toward `routing_status()`: the old key after
+#: `init(api_key=...)` replaced it, a base URL that was corrected. Long enough
+#: that a tenant with traffic every few seconds is never dropped between turns.
+_BREAKER_SUPERSEDED_AFTER_S = 60.0
+
+
+def _without_userinfo(url: str) -> str:
+    """``url`` minus any ``user:password@``, so it can be logged."""
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    return parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]).geturl()
+
+
+def _host_of(base_url: str) -> str:
+    """``scheme://host[:port]`` of a base URL: what a transport failure is about."""
+    parts = urlsplit(_without_userinfo(base_url))
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}".lower()
+    return _without_userinfo(base_url)
+
+
+def _key_digest(api_key: Optional[str]) -> str:
+    """Names a key in the breaker store without holding the key there."""
+    return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+
+
+class _HotPathBreakers:
+    """Every hot-path circuit breaker in the process, one per cause.
+
+    It was ONE breaker for the whole process. That was right while only
+    transport failures fed it, and wrong from the moment 401/402/403/429/5xx
+    did (Phase 1, 2026-10-14, so that a revoked key stops reading as healthy):
+    three 401s from one router's revoked key, or a 429 from one tenant's quota,
+    paused skill routing for every other router in the process, healthy keys
+    included, and the fix-the-key path waited out the cooldown.
+
+    Two kinds now:
+
+    * per HOST (``for_host``), fed by transport failures — no answer at all.
+      Shared by every key on that host, because the host not answering is not
+      something any key changes, and sharing it is what keeps N routers from
+      each paying the read timeout during an outage. Any answer, even a 401,
+      proves the host reachable and resets it. Another host is not paused.
+    * per (base URL, API key) (``for_credential``), fed by responses that
+      leave a turn without skills. Two routers holding one key share it (a key
+      that is revoked is revoked everywhere); no other key is paused by it.
+
+    Bounded LRU: a process that serves many tenants' keys does not grow without
+    limit. Dropping a breaker costs at most ``threshold`` more fast failures for
+    that key, and the totals live in ``totals``, not in the breakers.
+    """
+
+    def __init__(
+        self,
+        threshold: int = 3,
+        cooldown_s: float = 5.0,
+        max_cooldown_s: float = 30.0,
+        *,
+        max_breakers: int = 512,
+    ):
+        self.threshold = threshold
+        self.cooldown_s = cooldown_s
+        self.max_cooldown_s = max_cooldown_s
+        self.max_breakers = max(2, int(max_breakers))
+        self.totals = _RoutingTotals()
+        self._breakers: "OrderedDict[Tuple[str, ...], _CircuitBreaker]" = OrderedDict()
+        self._lock = Lock()
+
+    def for_host(self, base_url: str) -> _CircuitBreaker:
+        host = _host_of(base_url)
+        return self._get(("transport", host), "transport", host)
+
+    def for_credential(self, base_url: str, api_key: Optional[str]) -> _CircuitBreaker:
+        return self._get(
+            ("credential", base_url, _key_digest(api_key)), "credential",
+            _without_userinfo(base_url),
+        )
+
+    def _get(self, key: Tuple[str, ...], kind: str, target: str) -> _CircuitBreaker:
+        with self._lock:
+            breaker = self._breakers.get(key)
+            if breaker is not None:
+                self._breakers.move_to_end(key)
+                return breaker
+            breaker = _CircuitBreaker(
+                self.threshold, self.cooldown_s, self.max_cooldown_s,
+                kind=kind, target=target, totals=self.totals,
+            )
+            self._breakers[key] = breaker
+            while len(self._breakers) > self.max_breakers:
+                self._breakers.popitem(last=False)
+            return breaker
+
+    def status(self) -> "RoutingStatus":
+        with self._lock:
+            breakers = list(self._breakers.values())
+        states = []
+        for b in breakers:
+            with b._lock:
+                states.append((b._opened_at is not None, b._consecutive_failures, b.last_used_at))
+        # A breaker counts unless the process has gone on routing through
+        # others for `_BREAKER_SUPERSEDED_AFTER_S` without consulting it.
+        # Measured against the latest use, not the clock, so an idle process
+        # keeps reporting what its last calls found.
+        latest = max((used for _, _, used in states), default=0.0)
+        current = [
+            (is_open, failures) for is_open, failures, used in states
+            if latest - used <= _BREAKER_SUPERSEDED_AFTER_S
+        ]
+        open_now = any(is_open for is_open, _ in current)
+        consecutive = max((failures for _, failures in current), default=0)
+        t = self.totals
+        with t._lock:
+            return RoutingStatus(
+                healthy=not open_now and consecutive == 0,
+                breaker_open=open_now,
+                consecutive_failures=consecutive,
+                timeouts=t.timeouts,
+                http_errors=t.http_errors,
+                opens=t.opens,
+                suppressed=t.suppressed,
+                read_budget_s=_hot_path_read_budget(),
+                last_error=t.last_error,
+                last_error_at=t.last_error_at,
+                last_status_code=t.last_status_code,
+                last_success_at=t.last_success_at,
+            )
+
+
+_hot_path_breakers = _HotPathBreakers()
 
 
 class RoutingStatus:
@@ -672,29 +924,22 @@ class RoutingStatus:
 def routing_status() -> RoutingStatus:
     """Is skill routing actually working in this process?
 
-    `healthy` is False while the breaker is open OR after any hot-path failure
-    that has not been followed by a success — a timeout, or a response such as
-    401, 403, 429 or 5xx that leaves the turn without skills. It answers "are
-    my agents getting their skills right now", which is the question a 200 from
-    the agent cannot. A 404 for an unknown skill name is not a failure.
+    `healthy` is False while any breaker is open OR after any hot-path failure
+    that has not been followed by a success for the same cause — a timeout
+    reaching a host, or a response such as 401, 403, 429 or 5xx for one API
+    key — because each leaves turns without skills. It answers "are my agents
+    getting their skills right now", which is the question a 200 from the
+    agent cannot. A 404 for an unknown skill name is not a failure.
+
+    Every host and key the process routes with counts, so a process with one
+    failing key reads unhealthy while another key succeeds: that key's agents
+    are the ones running without skills. One the process stopped using (no call
+    for `_BREAKER_SUPERSEDED_AFTER_S` while others were used) stops counting;
+    the totals (`timeouts`, `http_errors`, `opens`, `suppressed`) keep its
+    failures. `consecutive_failures` is the longest current run of any one
+    breaker, i.e. how close the nearest one is to opening.
     """
-    b = _hot_path_breaker
-    with b._lock:
-        open_now = b._opened_at is not None
-        return RoutingStatus(
-            healthy=not open_now and b._consecutive_failures == 0,
-            breaker_open=open_now,
-            consecutive_failures=b._consecutive_failures,
-            timeouts=b.timeouts,
-            http_errors=b.http_errors,
-            opens=b.opens,
-            suppressed=b.suppressed,
-            read_budget_s=_hot_path_read_budget(),
-            last_error=b.last_error,
-            last_error_at=b.last_error_at,
-            last_status_code=b.last_status_code,
-            last_success_at=b.last_success_at,
-        )
+    return _hot_path_breakers.status()
 
 
 class _BodyLoadBudget:
@@ -893,9 +1138,11 @@ class _FragmentCache:
             self._data.move_to_end(key)
             return value
 
-    def set(self, key: Any, value: Any) -> None:
+    def set(self, key: Any, value: Any, *, ttl_seconds: Optional[float] = None) -> None:
+        """Store ``value``; ``ttl_seconds`` shortens (never lengthens) this entry's life."""
+        ttl = self._ttl if ttl_seconds is None else min(self._ttl, ttl_seconds)
         with self._lock:
-            expire_ts = time.time() + self._ttl
+            expire_ts = time.time() + ttl
             if key in self._data:
                 self._data.move_to_end(key)
             self._data[key] = (value, expire_ts)
@@ -1351,12 +1598,27 @@ class SkillRouter:
         )
 
         hot = _is_hot_path(path) if hot is None else hot
-        if hot and _hot_path_breaker.is_open():
+        # Two breakers, one per cause (see `_HotPathBreakers`): the host's,
+        # which every key on it shares, and this key's own. Looked up per call,
+        # so a router whose `base_url` or `api_key` is reassigned follows it.
+        host_breaker = key_breaker = None
+        if hot:
+            breakers = _hot_path_breakers
+            host_breaker = breakers.for_host(self.base_url)
+            key_breaker = breakers.for_credential(self.base_url, self.api_key)
             # Short-circuit rather than pay the timeout again. See _CircuitBreaker.
-            raise SkillRouterError(
-                f"SkillRouter circuit open for {method} {path} — skipping the call "
-                "while the platform is unreachable. Skills are unavailable this turn."
-            )
+            if host_breaker.is_open():
+                raise SkillRouterError(
+                    f"SkillRouter circuit open for {method} {path} — skipping the call "
+                    f"while the platform at {host_breaker.target} is unreachable. "
+                    "Skills are unavailable this turn."
+                )
+            if key_breaker.is_open():
+                raise SkillRouterError(
+                    f"SkillRouter circuit open for {method} {path} — skipping the call "
+                    "while this API key's requests keep failing (last: HTTP "
+                    f"{key_breaker.last_status_code}). Skills are unavailable this turn."
+                )
 
         # Freeze the caller's auth/scope and request inputs across admission
         # retries. Only reads and the routing request qualify; publishing and
@@ -1394,8 +1656,8 @@ class SkillRouter:
                 time.sleep(delay)
                 waited += delay
         except httpx.HTTPError as e:
-            if hot:
-                _hot_path_breaker.record_failure(e)
+            if host_breaker is not None:
+                host_breaker.record_failure(e)
             raise SkillRouterError(
                 f"SkillRouter transport error on {method} {path}: {e}"
             ) from e
@@ -1433,14 +1695,17 @@ class SkillRouter:
                 detail=detail,
                 headers=resp_headers,
             )
-            if hot:
+            if host_breaker is not None and key_breaker is not None:
+                # Any answer proves the host reachable. Whether it delivers
+                # skills is this key's matter, not every key's.
+                host_breaker.record_reachable()
                 if _is_health_failure(path, resp.status_code):
-                    _hot_path_breaker.record_failure(error, status_code=resp.status_code)
+                    key_breaker.record_failure(error, status_code=resp.status_code)
                 else:
                     # The platform answered (an unknown skill name, a request
                     # it rejected) — it is up, and that is what the breaker
                     # tracks.
-                    _hot_path_breaker.record_success()
+                    key_breaker.record_success()
             raise error
 
         try:
@@ -1449,13 +1714,15 @@ class SkillRouter:
             error = SkillRouterError(
                 f"SkillRouter got non-JSON response from {method} {path}: {e}"
             )
-            if hot:
+            if host_breaker is not None and key_breaker is not None:
                 # A 200 that is not JSON (an HTML login or challenge page from
                 # a proxy) delivers no skills either.
-                _hot_path_breaker.record_failure(error, status_code=resp.status_code)
+                host_breaker.record_reachable()
+                key_breaker.record_failure(error, status_code=resp.status_code)
             raise error from e
-        if hot:
-            _hot_path_breaker.record_success()
+        if host_breaker is not None and key_breaker is not None:
+            host_breaker.record_reachable()
+            key_breaker.record_success()
         return data
 
     def get_menu(
@@ -2411,10 +2678,14 @@ class SkillRouter:
         Errors are swallowed: a failed platform call returns
         ``("", None)`` so prompt assembly never blocks on a transient
         network blip. The warning is logged and ``routing_status()`` turns
-        unhealthy. A SLOW failure (a timeout, an admission wait) is cached,
-        for the same window as a success, so the other LLM calls of the turn
-        do not each pay that time again (until 2026-10-14 every call
-        retried). A new run (another ``scope``) or another query retries; so
+        unhealthy. A SLOW failure (a timeout, an admission wait) is cached so
+        the other LLM calls of the turn do not each pay that time again
+        (until 2026-10-14 every call retried). Under ``scope=`` it is kept
+        for the turn (the cache TTL) and a new run retries at once. Without
+        a scope the slot is shared by every caller asking the same query as
+        the same agent, so it is kept only ``_UNSCOPED_FAILURE_TTL_S`` (5 s),
+        long enough for the turn's next model call and not long enough to
+        strip skills from other conversations. Another query retries; so
         does ``bypass_cache=True``. A fast failure (an edge 429, a 5xx, a
         401) is not cached: retrying it costs nothing, and the circuit
         breaker stops a run of them. Nor is an open breaker: it costs nothing
@@ -2722,20 +2993,24 @@ class SkillRouter:
         # the full 5 s timeout (or an admission wait) until three of them
         # opened the breaker. Cached, the turn pays it once; the next run
         # (another scope) or query asks again. A FAST failure is not cached
-        # (see `_failure_worth_caching`): retrying it costs nothing, and on an
-        # unscoped caller (LangChain) a cached one also took skills from every
-        # other run asking the same question for 30 s. The cached value
-        # carries offered/delivered so cache hits can re-emit them; the public
-        # return stays a 2-tuple.
+        # (see `_failure_worth_caching`): retrying it costs nothing. Without a
+        # scope the slot belongs to nobody in particular — every conversation
+        # asking this query as this agent reads it, LangChain's included — so
+        # a slow failure there is held only for `_UNSCOPED_FAILURE_TTL_S`, not
+        # the 30 s that took skills from every other conversation. The cached
+        # value carries offered/delivered so cache hits can re-emit them; the
+        # public return stays a 2-tuple.
         split_parts = (split_prefix, split_tail) if split_prefix else None
         _last_split_parts_ctx.set(split_parts)
 
         cache_failure = routing_failed and _failure_worth_caching(result, route_elapsed)
         if fragment or routing_id or cache_failure:
+            failure_only = cache_failure and not (fragment or routing_id)
             self._fragment_cache.set(
                 cache_key,
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
                  delivered_versions),
+                ttl_seconds=_UNSCOPED_FAILURE_TTL_S if failure_only and not scope else None,
             )
         return fragment, routing_id
 

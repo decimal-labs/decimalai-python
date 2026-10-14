@@ -175,6 +175,11 @@ dev = [
     # this repo's.
     "langchain>=1.4.5",
     "langchain-openai>=1.7.1",
+    # The ChatAnthropic case in tests/test_skill_route_split_langchain.py. It was
+    # only in `live-llm-tests`, so the case ran on a developer's fuller venv and
+    # in no environment CI or the gate builds (tests/test_test_environments_phase1.py
+    # holds every unit test's importorskip to an environment's extras).
+    "langchain-anthropic>=1.7.6",
     "openai-agents>=0.23.1",
     # For the create_react_agent introspection test.
     "langgraph>=1.2.15",

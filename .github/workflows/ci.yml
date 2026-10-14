@@ -31,10 +31,41 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # THE OPENAI 3 WORLD, built exactly as tests/conformance/environments.py defines
+    # it: `.[dev,conformance-tests]` (TEST_ENV_EXTRAS["openai3"]). `.[dev]` alone is
+    # not that environment — it carries no google-adk, pydantic-ai-slim or
+    # OpenInference instrumentors, so the ADK and Pydantic AI unit cases skip in it,
+    # and no other job runs them. It does carry anthropic (langchain-anthropic, in
+    # `[dev]`, requires it), so the Anthropic unit cases also run on the 3.10 leg
+    # below and on the floors job. DECIMAL_TEST_ENV=openai3 makes tests/conftest.py refuse to start
+    # unless every distribution those extras require is installed at or above its
+    # floor, so this job cannot pass by skipping.
+    #
+    # 3.11 and 3.12 both build it. 3.10 stays on `.[dev]` with DECIMAL_TEST_ENV
+    # unset (the lenient default), so the core suite still runs across the
+    # supported range: google-adk 2.12 and pydantic-ai-slim 2.56, which
+    # `conformance-tests` pulls through `all`, need 3.11+.
+    #
+    # 3.11 joined on 2026-10-14, once tests/test_cli_init_scaffold_runs.py's
+    # no-deprecation check stopped reading a third-party warning as the scaffold's
+    # own (opentelemetry-api 1.42.1, capped by google-adk, uses importlib.metadata's
+    # deprecated SelectableGroups interface on 3.11, and `-W error` made that import
+    # raise). The full openai 3 environment passes on 3.11 with that fixed.
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          - python-version: "3.10"
+            extras: dev
+            test-env: ""
+          - python-version: "3.11"
+            extras: dev,conformance-tests
+            test-env: openai3
+          - python-version: "3.12"
+            extras: dev,conformance-tests
+            test-env: openai3
+    env:
+      DECIMAL_TEST_ENV: ${{ matrix.test-env }}
 
     steps:
       - uses: actions/checkout@v6
@@ -49,19 +80,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[${{ matrix.extras }}]"
 
       - name: Run tests
         # tests/conformance is excluded here and owned by the `conformance` jobs
-        # below. Not because it is slow — because `.[dev]` installs only a few of
-        # the frameworks its drivers drive, so running it in this job would report
-        # most adapters "NOT RUN" and still exit 0. A partial conformance matrix is
-        # worse than none: it reads as coverage and is not.
+        # below: the conformance marker mutates adapter globals, so it cannot share
+        # a process with the unit suite (pyproject addopts deselects it), and a
+        # partial conformance matrix reads as coverage and is not.
         #
-        # The CrewAI and LiteLLM cases that need the real package skip here: this
-        # is the openai 3 world, and those pin openai<3. `test-openai2` runs them.
+        # The CrewAI, LiteLLM and llama-index-llms-openai cases that need the real
+        # package skip here: this is the openai 3 world, and those pin openai<3.
+        # `test-openai2` runs them. Nothing else skips for want of a framework on
+        # the 3.11 and 3.12 legs (tests/test_test_environments_phase1.py holds every
+        # unit test's importorskip to one environment's extras).
         run: |
-          python -m pytest tests/ -q \
+          python -m pytest tests/ -q -rs \
             --ignore=tests/test_langchain_compat.py \
             --ignore=tests/conformance
 
@@ -110,8 +143,9 @@ jobs:
     # adk. tests/conformance/environments.py says which driver belongs where, and
     # both jobs set DECIMAL_TEST_ENV so REQUIRE_ALL requires exactly that set.
     timeout-minutes: 30
-    env:
-      DECIMAL_TEST_ENV: openai3
+    # DECIMAL_TEST_ENV=openai3 is set on the matrix step only, not the job: the
+    # coverage guard runs before the framework install, and a run that names its
+    # environment refuses to start until that environment is installed.
     steps:
       - uses: actions/checkout@v6
 
@@ -131,7 +165,8 @@ jobs:
         # framework (every driver imports its own lazily, inside run()), so
         # "somebody added a framework and skipped the driver" fails in seconds
         # rather than after the multi-minute install below. It is environment-
-        # independent, so this job runs it for both.
+        # independent, so this job runs it for both — with DECIMAL_TEST_ENV unset,
+        # since nothing is installed yet that a named environment would require.
         run: python -m pytest tests/conformance/test_coverage.py -q -m conformance
 
       - name: Install every framework the openai 3 drivers drive
@@ -145,6 +180,7 @@ jobs:
         # failure. Without it, a broken install set produces a green job that
         # graded nothing.
         env:
+          DECIMAL_TEST_ENV: openai3
           DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
         # -m conformance is REQUIRED: the marker is deselected in addopts (it
         # mutates adapter globals, so it cannot share a process with the unit

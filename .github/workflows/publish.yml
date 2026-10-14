@@ -15,14 +15,33 @@ jobs:
     runs-on: ubuntu-latest
     # Permissions are declared per job, never workflow-wide: a workflow-level
     # `id-token: write` is inherited by EVERY job, and this one runs
-    # `pip install -e ".[dev]"` — arbitrary install-time and import-time code from
-    # every transitive dev dependency. That code must not be able to mint a PyPI
+    # `pip install -e ".[dev,conformance-tests]"` — arbitrary install-time and
+    # import-time code from every transitive test dependency. That code must not be able to mint a PyPI
     # Trusted-Publisher token. Only the publish job below gets id-token.
     permissions:
       contents: read
+    # The openai 3 environment exactly as tests/conformance/environments.py
+    # defines it (`.[dev,conformance-tests]`, DECIMAL_TEST_ENV=openai3), the same
+    # install ci.yml's `test` job gates on: with `.[dev]` alone the ADK and Pydantic
+    # AI unit cases skip, and a release would ship those adapters graded only by
+    # conformance. The named environment refuses to start if anything its
+    # extras require is missing or below its floor. 3.10 keeps `.[dev]`, for the
+    # reason ci.yml's `test` job gives. The openai 2 unit slice is ci.yml's
+    # `test-openai2`, which `conformance-graded` below requires on the released commit.
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          - python-version: "3.10"
+            extras: dev
+            test-env: ""
+          - python-version: "3.11"
+            extras: dev,conformance-tests
+            test-env: openai3
+          - python-version: "3.12"
+            extras: dev,conformance-tests
+            test-env: openai3
+    env:
+      DECIMAL_TEST_ENV: ${{ matrix.test-env }}
     steps:
       - uses: actions/checkout@v6
 
@@ -33,19 +52,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e ".[dev]"
+          pip install -e ".[${{ matrix.extras }}]"
 
       - name: Run tests
         # This selects ZERO conformance tests, by design and by construction:
         # pyproject.toml addopts is
         #   -m 'not integration and not live_llm and not conformance_live and not conformance'
         # so every one of the framework-adapter contract tests is deselected here.
-        # That is correct for THIS job — `.[dev]` installs three of the eleven
-        # frameworks, so running the matrix here would report eight adapters NOT
-        # RUN and still exit 0. The adapters are gated by `conformance-graded`
-        # below, which reads the result of the job that has the full install set.
-        # Do not "fix" this by dropping `-m` here; that produces a partial matrix
-        # that reads as coverage and is not.
+        # That is correct for THIS job — the conformance marker mutates adapter
+        # globals and cannot share a process with the unit suite. The adapters are
+        # gated by `conformance-graded` below, which reads the result of the two
+        # ci.yml jobs that run the matrix in each environment. Do not "fix" this by
+        # dropping `-m` here.
         run: pytest tests/ -v
 
   conformance-graded:

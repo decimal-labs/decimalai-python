@@ -749,6 +749,54 @@ def _install_crewai_skill_loader() -> None:
     _crewai_adapter._install_skill_loader()
 
 
+#: The environment default of ``init(skills=...)``, like
+#: ``DECIMALAI_LOAD_SKILL_TOOL`` for ``load_skill_tool``. It exists for
+#: ``DECIMAL_AUTO_TRACE``: that path calls the framework flags at import, and a
+#: deployment that set it up to need no code change has no ``init()`` call to
+#: pass ``skills=False`` to.
+_SKILLS_ENV_VAR = "DECIMALAI_SKILLS"
+_SKILLS_ENV_OFF = ("0", "false", "no", "off")
+_SKILLS_ENV_ON = ("1", "true", "yes", "on")
+
+
+class _SkillsFromEnv:
+    """The default of ``init(skills=...)``: ``DECIMALAI_SKILLS``, else on.
+
+    A sentinel, not ``None``: ``skills=None`` stays a ``TypeError``, so a
+    caller can never mean "on" by passing a value that is not a bool.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<True unless DECIMALAI_SKILLS=0>"
+
+
+_SKILLS_FROM_ENV: Any = _SkillsFromEnv()
+
+
+def _skills_from_env() -> bool:
+    """``init(skills=...)`` left unset: what ``DECIMALAI_SKILLS`` says.
+
+    Unset or empty is on. ``0``/``false``/``no``/``off`` is off, and so is a
+    value this does not recognise, with a warning: the variable exists to opt
+    out (on is the default), so a mistyped opt-out must not quietly route every
+    message and rewrite every prompt.
+    """
+    raw = os.environ.get(_SKILLS_ENV_VAR)
+    value = (raw or "").strip().lower()
+    if not value or value in _SKILLS_ENV_ON:
+        return True
+    if value not in _SKILLS_ENV_OFF:
+        logger.warning(
+            "%s=%r is not a value DecimalAI recognises, so the init() framework "
+            "flags install tracing only, as for %s=0. Use 0/false/no/off to keep "
+            "them to tracing, or 1/true/yes/on (or unset it) to deliver skills.",
+            _SKILLS_ENV_VAR, raw, _SKILLS_ENV_VAR,
+        )
+    return False
+
+
 def _api_key_from_env() -> str:
     """First non-empty key among the accepted env-var spellings.
 
@@ -788,7 +836,7 @@ def init(
     load_skill_tool: Optional[bool] = None,
     evidence: bool = False,
     evidence_directory: Optional[str] = None,
-    skills: bool = True,
+    skills: bool = _SKILLS_FROM_ENV,
 ) -> None:
     """Initialize the DecimalAI SDK.
 
@@ -810,8 +858,8 @@ def init(
     delivers the agent's skills, so ``init(langchain=True, agent_name="support")``
     is the whole setup. It is the same install as calling that adapter's
     ``instrument(agent_name=..., enable_skill_loader=True)`` after a bare
-    ``init()``; do one or the other, not both. ``skills=False`` keeps the flag
-    to tracing only.
+    ``init()``; do one or the other, not both. ``skills=False``, or
+    ``DECIMALAI_SKILLS=0`` in the environment, keeps the flag to tracing only.
 
     ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
     a supported integration: the flag is now an alias for ``otel=True`` that
@@ -903,11 +951,18 @@ def init(
             On timeout, init() logs a warning and continues (does not
             raise) so a transiently slow backend doesn't break startup.
         skills: Whether a framework flag above also turns on that adapter's
-            skill loader. ``True`` (default) makes the flag form deliver the
-            agent's skills; ``False`` installs tracing only, exactly as
-            ``instrument()`` does without ``enable_skill_loader``. Ignored when
-            no skill-capable framework flag is set, and when ``enabled`` is
-            ``False``. With the loader on, the default ``skill_authority``
+            skill loader. ``True`` makes the flag form deliver the agent's
+            skills; ``False`` installs tracing only, exactly as
+            ``instrument()`` does without ``enable_skill_loader``. Left unset,
+            it falls back to the ``DECIMALAI_SKILLS`` env var (``0``/``false``/
+            ``no``/``off`` is ``False``; a value it does not recognise is
+            ``False`` too, with a warning), then to ``True``. That variable is
+            how ``DECIMAL_AUTO_TRACE`` is kept to tracing only, since that path
+            has no ``init()`` call to pass this to. It is this argument's
+            default and nothing more: an explicit
+            ``instrument(enable_skill_loader=True)`` is not affected. Ignored
+            when no skill-capable framework flag is set, and when ``enabled``
+            is ``False``. With the loader on, the default ``skill_authority``
             ("auto") treats the router as the skills channel, so the LangChain
             and OpenAI Agents adapters stop syncing local SKILL.md files to and
             from the platform; pass ``skill_authority="harness"`` to keep both.
@@ -929,8 +984,10 @@ def init(
 
     # `skills` is an on/off switch. The adapters' `instrument(skills=[...])` is
     # a list of skill dicts for the manifest, and a list here would otherwise
-    # read as truthy — "on" — while meaning something else entirely.
-    if not isinstance(skills, bool):
+    # read as truthy — "on" — while meaning something else entirely. Unset, it
+    # is the `_SKILLS_FROM_ENV` sentinel, read only where a flag needs it.
+    skills_from_env = skills is _SKILLS_FROM_ENV
+    if not skills_from_env and not isinstance(skills, bool):
         raise TypeError(
             "decimalai.init(skills=...) takes True or False: whether a framework "
             f"flag also delivers the agent's skills. Got {type(skills).__name__}. "
@@ -1123,7 +1180,21 @@ def init(
         # agent needs: tracing AND the skill loader. Through 0.13.9 it called
         # instrument() with the loader off, and a user who followed the docs got
         # good traces and zero skills, with nothing saying so. `skills=False` is
-        # the tracing-only install.
+        # the tracing-only install, and so is `DECIMALAI_SKILLS=0` when the
+        # argument is left unset — the opt-out for `DECIMAL_AUTO_TRACE`, which
+        # calls these flags with no `init()` line anyone could add it to.
+        if skills_from_env:
+            skills = (
+                _skills_from_env()
+                if (langchain or openai_agents or adk or crewai)
+                else True
+            )
+            if not skills:
+                logger.info(
+                    "DecimalAI: %s turns the skill loader off; the init() "
+                    "framework flags install tracing only.",
+                    _SKILLS_ENV_VAR,
+                )
         if langchain:
             from .langchain import instrument as _lc_install
             _lc_install(agent_name=agent_name, enable_skill_loader=skills)
@@ -2214,7 +2285,8 @@ __all__ = [
 
 
 # ── Auto-init from environment variable ────────────────────────
-# Setting DECIMAL_AUTO_TRACE=langchain will auto-init and install tracing.
+# Setting DECIMAL_AUTO_TRACE=langchain will auto-init and install tracing, plus
+# the skill loader unless DECIMALAI_SKILLS=0.
 
 def _auto_init_from_env() -> None:
     """Auto-initialize from environment variables if configured.
@@ -2223,6 +2295,8 @@ def _auto_init_from_env() -> None:
     1. `DECIMAL_AUTO_TRACE=<framework>` — full framework auto-install, the same
        as passing that framework's flag to `init()`: on langchain,
        openai-agents, adk and crewai that includes the skill loader.
+       `DECIMALAI_SKILLS=0` keeps it to tracing only (`init()` reads it as its
+       `skills=` default, and this path passes none).
     2. `DECIMAL_API_KEY` present AND `DECIMAL_AUTOINIT != "false"` — bare
        init() so users get ingest + atexit flush without a line of
        boilerplate. Opt out with `DECIMAL_AUTOINIT=false`.

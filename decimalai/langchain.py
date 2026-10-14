@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
 import time
 import warnings
+import weakref
 from contextvars import Context, ContextVar, copy_context
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -1217,6 +1219,71 @@ def _adopt_sdk_context_writes(ctx: Context) -> None:
             var.set(value)
 
 
+# ── Python 3.10: an async graph node loses its run ───────────────────────────
+#
+# Below 3.11, asyncio.create_task takes no `context=`, so LangGraph cannot carry a
+# run's RunnableConfig into an async node, and create_agent's model node calls
+# `model.ainvoke(messages)` with no config of its own. That model call reaches the
+# patch with no callbacks and no parent run id. It routes as the install agent (or
+# as no agent), not the agent the run's trace is filed under, so that agent's
+# skills and pins are not offered, and the trace records neither the call nor its
+# routing decision. A sync `.invoke()` of the same graph, and every run on 3.11+,
+# keeps its run. The limit is upstream's; what the adapter owes is a warning,
+# because otherwise the skills go missing with nothing said.
+_ASYNC_NODE_LOSES_ITS_RUN = sys.version_info < (3, 11)
+
+#: Every CallbackHandler alive, so the check below can ask whether a run is in
+#: flight. Weak: a handler going out of scope leaves it.
+_live_handlers: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+_lost_run_warned = False
+
+
+def _warn_if_async_call_lost_its_run(config: Any) -> None:
+    """Warn once when an async model call arrives without the run it belongs to.
+
+    Only on Python 3.10, and only when the call carries no callbacks, LangChain's
+    ambient config holds none either, and some handler has a run open. A bare
+    ``await model.ainvoke(...)`` with nothing in flight is a call outside any run,
+    and is left alone.
+    """
+    global _lost_run_warned
+    if _lost_run_warned or not _ASYNC_NODE_LOSES_ITS_RUN:
+        return
+    try:
+        if isinstance(config, dict) and config.get("callbacks") is not None:
+            return
+        config_var = _lc_config_var()
+        ambient = config_var.get() if config_var is not None else None
+        if isinstance(ambient, dict) and ambient.get("callbacks") is not None:
+            return
+        open_agents: set = set()
+        any_open = False
+        for handler in list(_live_handlers):
+            names = handler._open_run_agent_names()
+            if names is None:
+                continue
+            any_open = True
+            open_agents.update(names)
+        if not any_open:
+            return
+        _lost_run_warned = True
+        routed = _install_agent_name
+        logger.warning(
+            "On Python 3.10 an async model call arrived without "
+            "the LangChain run in flight (%s). asyncio there cannot hand a run's "
+            "config to an async create_agent or LangGraph node, so this call %s: "
+            "the run's agent-scope skills and pins are not offered, and its trace "
+            "records neither the call nor its routing decision. Use Python 3.11+, "
+            "or run the graph with .invoke(); instrument(agent_name=...) at least "
+            "routes as the right agent. Logged once.",
+            ", ".join(repr(n) for n in sorted(open_agents)[:3]) or "unnamed",
+            f"routes as {routed!r}" if routed else "routes as no agent",
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic must never cost the call
+        logger.debug("lost-run check failed (non-fatal)", exc_info=True)
+
+
 async def _inject_skills_off_loop(input_value: Any, config: Any = None) -> Any:
     """`_inject_skills_into_input` for ``ainvoke`` / ``astream``, run off the loop.
 
@@ -1234,6 +1301,7 @@ async def _inject_skills_off_loop(input_value: Any, config: Any = None) -> Any:
     so the handler's ``on_chat_model_start`` reads the same call rails it
     would have read had nothing moved.
     """
+    _warn_if_async_call_lost_its_run(config)
     ctx = copy_context()
     loop = asyncio.get_running_loop()
     injected = await loop.run_in_executor(
@@ -2064,6 +2132,27 @@ class CallbackHandler(_CallbackBase):
         self._root_of: Dict[UUID, UUID] = {}
         self._state_lock = threading.RLock()
         self._reset_state()
+        try:
+            _live_handlers.add(self)
+        except TypeError:  # pragma: no cover - a subclass that is not weak-referenceable
+            pass
+
+    def _open_run_agent_names(self) -> Optional[set]:
+        """The agent names of this handler's open (non-leaf) root runs, or None.
+
+        None means no such run is in flight. An unnamed run contributes nothing
+        to the set, so an empty set still means "a run is open".
+        """
+        with self._state_lock:
+            states = [s for s in self._runs.values() if not s.is_leaf_root]
+        if not states:
+            return None
+        names = set()
+        for state in states:
+            name = self._explicit_agent_name or state.detected_agent_name
+            if name:
+                names.add(str(name))
+        return names
 
     # ── Agent name ─────────────────────────────────────────
 

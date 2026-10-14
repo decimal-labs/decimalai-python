@@ -21,7 +21,9 @@ pip install decimalai
 uv pip install decimalai
 ```
 
-Requires **Python 3.10+** (`pip` won't install current releases on older Pythons). The `[adk]`, `[pydantic-ai]` and `[all]` extras need **Python 3.11+**: the google-adk and pydantic-ai-slim releases they install require it.
+Requires **Python 3.10+** (`pip` won't install current releases on older Pythons). The `[adk]`, `[pydantic-ai]` and `[all]` extras need **Python 3.11+**: the google-adk and pydantic-ai-slim releases they install require it. On Python 3.10 pip does not refuse them; it installs an older decimalai instead (see [below](#when-pip-installs-an-older-decimalai)).
+
+`[langchain]` installs on Python 3.10 with one limit there. asyncio on 3.10 cannot hand a run's config to an async LangGraph node, so a model that the node calls without passing `config` on, as `create_agent`'s model node does, runs outside the run. Under `ainvoke` / `astream` those model calls route without the agent the trace is filed under, so that agent's skills and pins are not offered, and the trace records neither the calls nor their routing decisions. The SDK logs a warning the first time it happens. Sync `.invoke()` runs, nodes that pass `config` to the model, and every run on Python 3.11+ are unaffected; `instrument(agent_name=...)` at least routes the calls as the right agent.
 
 Each framework extra supports the framework's latest release only, and floors it there.
 
@@ -35,7 +37,21 @@ pip install "decimalai[all]"             # every framework adapter (not [evals];
 
 Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
 
-`[evals]` installs litellm, which pins `openai<3`, while `[openai-agents]` and `[pydantic-ai]` need `openai>=3`. So `[evals]` is not part of `[all]`, and it cannot be installed in the same environment as those two. CrewAI has no extra for the same reason: install `crewai` yourself, beside the adapters that run on `openai<3`.
+`[evals]` installs litellm, which pins `openai<3`, while `[openai]`, `[openai-agents]` and `[pydantic-ai]` need `openai>=3`. So `[evals]` is not part of `[all]`, and it cannot be installed in the same environment as those three. CrewAI has no extra for the same reason: install `crewai` yourself, beside the adapters that run on `openai<3`.
+
+### When pip installs an older decimalai
+
+Extras that cannot be installed together are not an error to pip. It goes back through older decimalai releases until one resolves, installs that, and prints nothing (`uv pip install` does the same). Two requests do this today, and both end on **decimalai 0.13.9**, the last release before the framework floors above, without this release's fixes:
+
+- `[evals]` together with `[openai]`, `[openai-agents]`, `[pydantic-ai]` or `[all]`, on any Python.
+- `[adk]`, `[pydantic-ai]` or `[all]` on Python 3.10.
+
+Check the version you got, and put a floor on decimalai itself so pip names the conflict instead of falling back:
+
+```bash
+pip show decimalai                       # Version: 0.13.9 means pip fell back
+pip install "decimalai[adk]>=0.14"       # fails with ResolutionImpossible rather than install 0.13.9
+```
 
 ## See it in 2 minutes
 
@@ -136,10 +152,13 @@ def run_agent(query):
 
 ```bash
 export DECIMAL_API_KEY=dai_sk_...
-export DECIMAL_AUTO_TRACE=langchain   # or "openai-agents"
-# Just run your app — tracing activates on import
+export DECIMAL_AUTO_TRACE=langchain   # or "openai-agents", "adk", "crewai", "llamaindex", ...
+# export DECIMALAI_SKILLS=0           # tracing only: no skill routing, nothing added to prompts
+# Just run your app — tracing and skills activate on import
 python app.py
 ```
+
+`DECIMAL_AUTO_TRACE=<framework>` runs the matching `decimalai.init()` framework flag at import. On `langchain`, `openai-agents`, `adk` and `crewai` that includes the skill loader: each turn's message (on CrewAI, the task description) goes to the platform's router, and a skills menu (plus, on the injecting adapters, a skill body) is added to the prompt. Through 0.13.9 this path was tracing only. `DECIMALAI_SKILLS=0` (or `false`/`no`/`off`) keeps it to tracing; it is the default of `init(skills=...)`, so it applies to the flags in code too, and an explicit `skills=` argument wins over it.
 
 ## What It Does
 
@@ -270,8 +289,8 @@ You can read each run's trace as the LangChain and ADK adapters let you: `instru
 
 With the loader on, the router adds a ranked **menu** of relevant skills to the prompt (one short row per skill: name + when to use it). A menu row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
 
-- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform ranked the skills by this turn's message and did not fall back to its default menu, so a "thanks!" gets the menu alone. The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk`, `crewai` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins.
-- **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch an offered skill's body mid-turn. It serves only skills the router has offered, never an arbitrary registry name. If another tool in the run is already called `load_skill` (an OpenAI `SandboxAgent`'s native skills, or your own tool on Pydantic AI), DecimalAI's is exposed as `decimalai_load_skill` instead and the menu names it. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
+- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the menu alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole menu is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk`, `crewai` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins.
+- **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch an offered skill's body mid-turn. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the menu cap left off this turn's menu), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself; a load from a router that has never routed (a hand-built menu, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. If another tool in the run is already called `load_skill` (an OpenAI `SandboxAgent`'s native skills, or your own tool on Pydantic AI), DecimalAI's is exposed as `decimalai_load_skill` instead and the menu names it. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
 - **Export to disk** — for runtimes that natively load skills from files (Claude Code, Cursor, ...), write them out with `router.export(...)` or `decimalai skills export` and let the runtime deliver them. Export takes no copy and needs no fork; you can export a skill you only linked.
 
 Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop the adapter controls):
@@ -280,7 +299,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 |---|---|---|---|
 | `decimalai.openai_agents` | ✅ | ✅ | tool auto-registers with the loader |
 | `decimalai.pydantic_ai` | ✅ | ✅ | routed once per run on the run's message, every turn of a conversation included; bodies arrive via `load_skill` unless the tool is off |
-| `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns) |
+| `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns); on Python 3.10, async `create_agent` runs route their model calls without the run (warns once; see [Installation](#installation)) |
 | `decimalai.adk` | ✅ | ❌ injection-only | bodies appended to `system_instruction`; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ❌ injection-only | patches `messages.create()`, `.stream()` and `.parse()` (sync and async; not `client.beta`) — no loop to route a tool result back |

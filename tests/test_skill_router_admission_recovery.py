@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from decimalai import skill_router as sr
-from decimalai.skill_router import SkillRouter, SkillRouterError, _ADMISSION_MAX_WAIT_S, _CircuitBreaker
+from decimalai.skill_router import SkillRouter, SkillRouterError, _ADMISSION_MAX_WAIT_S, _HotPathBreakers
 
 
 @pytest.fixture(autouse=True)
@@ -14,12 +14,12 @@ def _fresh_breaker(monkeypatch):
     """Each test drives one request against its own breaker.
 
     Since 2026-10-14 a 429 or 5xx on a hot path (`/route`, `/menu`, `/body`)
-    counts toward the process-wide breaker, as it should. These tests send
-    several in a row on purpose, so sharing one breaker opened it by the third
-    test and every later one was short-circuited instead of exercising
-    admission recovery.
+    counts toward the breaker of the key that got it, as it should. These tests
+    send several in a row with one key on purpose, so sharing its breaker opened
+    it by the third test and every later one was short-circuited instead of
+    exercising admission recovery.
     """
-    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+    monkeypatch.setattr(sr, "_hot_path_breakers", _HotPathBreakers())
 
 
 def response(status, headers=None, body=None):
@@ -85,8 +85,17 @@ def test_persistent_admission_obeys_attempt_and_wait_caps(retry_after, expected_
 
 def test_elapsed_network_time_prevents_another_admission_wait():
     router = SkillRouter(api_key="fixture")
-    with patch("decimalai.skill_router.httpx.request", return_value=response(429, {"Retry-After": "2"})) as request, \
-            patch("decimalai.skill_router.time.monotonic", side_effect=[0.0, 4.0]), \
+    # The request itself takes 4 s, so 4 s + a 2 s Retry-After is past the 5 s
+    # cap. A clock the request advances, not a fixed list of readings: the
+    # breakers read the monotonic clock too.
+    clock = {"now": 0.0}
+
+    def slow_429(*args, **kwargs):
+        clock["now"] += 4.0
+        return response(429, {"Retry-After": "2"})
+
+    with patch("decimalai.skill_router.httpx.request", side_effect=slow_429) as request, \
+            patch("decimalai.skill_router.time.monotonic", side_effect=lambda: clock["now"]), \
             patch("decimalai.skill_router.time.sleep") as sleep, pytest.raises(SkillRouterError):
         router._request("GET", "/api/v1/skills/policy/body")
     assert request.call_count == 1
