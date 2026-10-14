@@ -148,28 +148,40 @@ def test_env_var_decimalai_api_key_alias_works():
 
 
 def test_module_entrypoint_matches_console_script_behavior():
-    """Running via `python -m decimalai.cli --version` should produce
-    the same output as running via the console script. We exercise
-    the module form; if the console script is installed in this venv,
-    we ALSO compare its output (skip otherwise).
+    """`python -m decimalai.cli --version` and the console script print the
+    same thing.
+
+    The console script is compared by running its declared entry point
+    ([project.scripts] in pyproject.toml) in THIS interpreter, from the same
+    directory as the module form, which is exactly what the generated script
+    does. Looking the script up on PATH instead compared against whatever
+    `decimalai` happened to be installed globally: in the land gate that was a
+    PyPI 0.13.9 from pyenv/Homebrew, so the test failed on every version bump
+    and passed only while the global copy and the checkout agreed.
     """
+    import tomllib
+
     module_result = _run(["--version"])
     assert module_result.returncode == 0
     module_out = module_result.stdout.strip()
 
-    # If the `decimalai` console script is on PATH, compare directly.
-    # `decimalai` is the ONLY console script pyproject declares
-    # ([project.scripts]: decimalai = "decimalai.cli.main:cli").
-    import shutil
-    decimal_bin = shutil.which("decimalai")
-    if not decimal_bin:
-        pytest.skip("`decimalai` console script not installed; can't compare")
-
+    scripts = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())["project"]["scripts"]
+    assert set(scripts) == {"decimalai"}, f"unexpected console scripts: {scripts}"
+    target_module, _, target_attr = scripts["decimalai"].partition(":")
     script_result = subprocess.run(
-        [decimal_bin, "--version"],
-        capture_output=True, text=True, timeout=10.0,
+        [
+            _PYTHON,
+            "-c",
+            "import importlib, sys; sys.argv[0] = 'decimalai'; "
+            f"getattr(importlib.import_module({target_module!r}), {target_attr!r})()",
+            "--version",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        timeout=10.0,
     )
-    assert script_result.returncode == 0
+    assert script_result.returncode == 0, script_result.stderr
     script_out = script_result.stdout.strip()
 
     assert module_out == script_out, (
