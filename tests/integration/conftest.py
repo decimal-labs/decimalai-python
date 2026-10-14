@@ -27,6 +27,27 @@ def _reset_sdk():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _fresh_agents_http_pool():
+    """Give each test a fresh OpenAI Agents HTTP connection pool.
+
+    openai-agents 0.23 keeps one module-global httpx2 client
+    (agents.models.openai_provider._http_client) for every run in the process,
+    whatever event loop the run is on. A test that ran on one loop (the
+    streaming test's asyncio run) leaves pooled connections bound to that loop;
+    the next Runner.run_sync opens a new loop, reuses the pool, and fails with
+    "RuntimeError: Event loop is closed" while closing a stale connection.
+    That is upstream behaviour, reproduced identically with SDK 0.13.9, so the
+    fix here is isolation: each live test is its own process-like scenario.
+    """
+    yield
+    try:
+        from agents.models import openai_provider
+    except ImportError:
+        return
+    openai_provider._http_client = None
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     """Convert provider quota/rate-limit failures into skips.
