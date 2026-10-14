@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-14
+
 ### Breaking: every framework extra floors the framework's latest release
 
 Older framework releases are no longer supported, and the code paths that
