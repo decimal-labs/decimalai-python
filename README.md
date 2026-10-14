@@ -50,7 +50,7 @@ Check the version you got, and put a floor on decimalai itself so pip names the 
 
 ```bash
 pip show decimalai                       # Version: 0.13.9 means pip fell back
-pip install "decimalai[adk]>=0.14"       # fails with ResolutionImpossible rather than install 0.13.9
+pip install "decimalai[adk]>=0.14"       # fails with an error rather than install 0.13.9
 ```
 
 ## See it in 2 minutes

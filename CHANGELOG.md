@@ -32,7 +32,8 @@ existed only for them are gone.
   newest release whose requirements still resolve, and prints nothing (uv does
   the same). `pip show decimalai` says which release you got. A floor on
   decimalai itself, such as `pip install "decimalai[adk]>=0.14"`, makes pip
-  fail with `ResolutionImpossible` instead. `decimalai init --framework adk`
+  fail with an error instead (on Python 3.10, "No matching distribution found
+  for google-adk>=2.12.0"). `decimalai init --framework adk`
   or `--framework pydantic-ai`, run on Python 3.10, says so under the install
   line it prints.
 
