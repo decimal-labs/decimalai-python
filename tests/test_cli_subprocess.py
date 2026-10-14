@@ -159,13 +159,20 @@ def test_module_entrypoint_matches_console_script_behavior():
     PyPI 0.13.9 from pyenv/Homebrew, so the test failed on every version bump
     and passed only while the global copy and the checkout agreed.
     """
-    import tomllib
+    import re
 
     module_result = _run(["--version"])
     assert module_result.returncode == 0
     module_out = module_result.stdout.strip()
 
-    scripts = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())["project"]["scripts"]
+    # Read [project.scripts] without tomllib, which Python 3.10 does not have.
+    section = re.search(
+        r"^\[project\.scripts\]\s*\n(.*?)(?=^\[|\Z)",
+        (_REPO_ROOT / "pyproject.toml").read_text(),
+        re.M | re.S,
+    )
+    assert section, "pyproject.toml declares no [project.scripts]"
+    scripts = dict(re.findall(r'^\s*([\w.-]+)\s*=\s*"([^"]+)"', section.group(1), re.M))
     assert set(scripts) == {"decimalai"}, f"unexpected console scripts: {scripts}"
     target_module, _, target_attr = scripts["decimalai"].partition(":")
     script_result = subprocess.run(
