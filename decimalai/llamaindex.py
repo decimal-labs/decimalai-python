@@ -1,7 +1,7 @@
 """LlamaIndex integration for DecimalAI.
 
 Provides a ``DecimalSpanHandler`` that plugs into LlamaIndex's
-instrumentation dispatcher (v0.12.0+) to capture query engine,
+instrumentation dispatcher (llama-index-core>=0.14.25) to capture query engine,
 retriever, LLM, and embedding spans as DecimalAI traces.
 
 Usage::
@@ -1568,9 +1568,8 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
     (queries, retrieval, LLM calls, synthesis) will be automatically
     captured and sent to the DecimalAI backend.
 
-    Requires ``llama-index-core>=0.12.0`` to be installed. (Earlier
-    releases either lack the instrumentation dispatcher entirely or call
-    span handlers with an incompatible pre-0.10.30 signature.)
+    Requires ``llama-index-core>=0.14.25``, the release this adapter is
+    written and tested against; older releases are not supported.
 
     Call it once. LlamaIndex's dispatcher takes span handlers additively and
     never gives them back, so a second install double-traces every query from
@@ -1619,11 +1618,10 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
         from llama_index.core.instrumentation import get_dispatcher
     except ImportError:
         raise ImportError(
-            "This integration requires llama-index-core>=0.12.0 — either "
-            "LlamaIndex is not installed, or the installed llama-index-core "
-            "predates its instrumentation dispatcher. Install or upgrade "
-            "with: pip install -U \"decimalai[llamaindex]\" "
-            "\"llama-index-core>=0.12.0\""
+            "This integration requires llama-index-core>=0.14.25, and "
+            "llama_index.core.instrumentation could not be imported. Install "
+            "or upgrade with: pip install -U \"decimalai[llamaindex]\" "
+            "\"llama-index-core>=0.14.25\""
         )
 
     handler = DecimalSpanHandler(agent_name=agent_name)

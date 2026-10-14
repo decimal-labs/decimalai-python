@@ -31,13 +31,17 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    prompt set (a real state — it is optional at creation) the file still runs
    and sends nothing rather than inventing one.
 
-1. `enable_skill_loader=True`. Both skill-capable adapters default it to
-   False (decimalai/langchain.py, decimalai/openai_agents.py), so a file that
-   merely calls `init()` traces beautifully and delivers NONE of the agent's
-   skills. The failure is silent and it is the whole reason the scaffold is
-   worth shipping: without the flag the model is handed a list of skill titles
-   it cannot read. Every generated file carries it, and
+1. `enable_skill_loader=True`. Every adapter's `instrument()` defaults it to
+   False (decimalai/langchain.py, decimalai/openai_agents.py, …), so a file
+   that calls `instrument()` without it traces beautifully and delivers NONE of
+   the agent's skills. The failure is silent and it is the whole reason the
+   scaffold is worth shipping: without the flag the model is handed a list of
+   skill titles it cannot read. Every generated file carries it, and
    `tests/test_cli_init_scaffold.py` fails the build if one stops.
+   (`init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
+   `init(crewai=True)` turn the loader on themselves since 2026-10-14; the
+   templates keep the explicit `instrument()` line because it is where the
+   agent name is bound and where the adapter's other options go.)
 
 2. The agent name is BOUND. An unbound name means the adapter auto-detects
    one off the runnable ("langchain-agent" when it cannot tell), so traces are
@@ -62,9 +66,9 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    `LangGraphDeprecatedSinceV10` on every single run (it moved, and goes away in
    langgraph 2.0), and it lives in a package the template does not otherwise
    import. `langchain.agents` is the same distribution `init_chat_model` already
-   comes from, so the install line does not grow. `langchain` 0.3.x has no
-   `create_agent`, and cannot be what resolves here: `decimalai[langchain]`
-   floors `langchain-core>=1.3.3`, which 0.3.x caps below 1.0.
+   comes from, so the install line does not grow. `decimalai[langchain]`
+   floors `langchain-core>=1.6.10`, so the `langchain` that resolves beside it
+   is a 1.x release, which is where `create_agent` lives.
 
 4. TRACING IS NOT AUTOMATIC ON EVERY ADAPTER, and the pydantic-ai template is
    where that bites. `decimalai init` ends by printing "The trace appears at →
@@ -116,15 +120,13 @@ they additionally construct a model and an entry point. Every claim the two
 share is identical, deliberately:
 
   * langchain: `init()` with no framework flag, then a single
-    `instrument(agent_name=..., enable_skill_loader=True)`. Passing
-    `langchain=True` to `init()` would install tracing a first time with the
-    loader off, which resolves `disk_sync` the other way and can leave skills
-    arriving from two sources at once.
-  * openai-agents: same shape, and for a sharper reason — that adapter's
-    `instrument()` has no already-installed guard and calls
-    `add_trace_processor()` unconditionally, which appends rather than
-    dedupes. `init(openai_agents=True)` followed by `instrument()` registers
-    two processors and double-sends every trace.
+    `instrument(agent_name=..., enable_skill_loader=True)`. `init(langchain=True)`
+    is the same install, so passing it as well installs twice: the first one
+    wins, and the explicit call's arguments — its `agent_name` included — are
+    dropped with a warning, which leaves skills routed for no agent.
+  * openai-agents: same shape. `init(openai_agents=True)` is the same install
+    as the explicit `instrument()` line, so it is one or the other — never
+    both.
   * pydantic-ai: the same `instrument(agent_name=..., enable_skill_loader=True)`
     — but `init(otel=True)`, not a bare `init()`. That is not a contradiction of
     the rule above, it is the same rule: exactly one span source per file. On
@@ -175,7 +177,7 @@ DEFAULT_MODEL = "gpt-4o-mini"
 #:
 #: Pydantic AI resolves `provider:model` and REFUSES a bare one —
 #: `infer_model("gpt-4o-mini")` raises `UserError: Unknown model`, checked
-#: against pydantic-ai 2.36. So the shared default would have produced a file
+#: against pydantic-ai-slim 2.56. So the shared default would have produced a file
 #: that dies on the line that builds the Agent, every run, for the default
 #: invocation of the command.
 _FRAMEWORK_DEFAULT_MODELS: Dict[str, str] = {
@@ -458,9 +460,9 @@ def _render_langchain(
         "# The SDK turns injection on by default for adapters with no load_skill",
         "# tool — pass init(inject_skill_body=False) if you want menu-only.",
         "#",
-        "# Do not also pass langchain=True to init() above. That installs tracing a",
-        "# first time with the loader off, and the repeat call cannot undo the",
-        "# disk-mirror decision it already made.",
+        "# Do not also pass langchain=True to init() above. That is this same",
+        "# install, and the first one wins: this line's agent_name would be",
+        "# ignored, so skills would be routed for no agent.",
         f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
@@ -552,16 +554,16 @@ def _render_openai_agents(
         _init_call(base_url),
         "",
         "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# It defaults to False, and tracing alone does not deliver them. This",
-        "# adapter owns a tool loop, so the model fetches each skill's body on",
-        "# demand via the load_skill tool rather than having it injected.",
+        "# instrument() defaults it to False, and tracing alone does not deliver",
+        "# them. This adapter owns a tool loop, so the model fetches each skill's",
+        "# body on demand via the load_skill tool rather than having it injected.",
         "#",
         "# This call must stay ABOVE the Agent(...) below: the loader works by",
         "# wrapping Agent.__init__, and on builds without the run-time hooks an",
         "# agent constructed earlier silently receives nothing.",
         "#",
-        "# Do not also pass openai_agents=True to init() above — that registers a",
-        "# second trace processor and every trace is sent twice.",
+        "# Do not also pass openai_agents=True to init() above. That is this same",
+        "# install, so it is one or the other — never both.",
         f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
@@ -670,10 +672,10 @@ def _render_pydantic_ai(
         "Agent.instrument_all()",
         "",
         "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# It defaults to False, and tracing alone does not deliver them. This",
-        "# adapter registers a real load_skill tool on every Agent, and Pydantic AI",
-        "# owns its tool loop — so the model reads the menu, asks for the one it",
-        "# needs, and the body comes back mid-turn.",
+        "# instrument() defaults it to False, and tracing alone does not deliver",
+        "# them. This adapter registers a real load_skill tool on every Agent,",
+        "# and Pydantic AI owns its tool loop — so the model reads the menu, asks",
+        "# for the one it needs, and the body comes back mid-turn.",
         "#",
         "# agent_name is the fallback for an Agent built without a name=. Pydantic",
         "# AI infers one from the VARIABLE it was assigned to in that case, so",
@@ -802,7 +804,7 @@ def _render_adk(
         "#",
         "# This call patches Runner.__init__ to attach the DecimalAI plugin, so it",
         "# must stay ABOVE the InMemoryRunner(...) below. Do not also pass adk=True",
-        "# to init() above — that installs the same plugin a second time.",
+        "# to init() above: that is this same install, so one of the two is noise.",
         f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
@@ -867,10 +869,12 @@ _RENDERERS = {
 INSTALL: Dict[str, str] = {
     "langchain": 'pip install "decimalai[langchain]" langchain langchain-openai',
     "openai-agents": 'pip install "decimalai[openai-agents]"',
-    # One line, whatever the model. The `pydantic-ai` distribution (which is what
-    # `decimalai[pydantic-ai]` resolves to — not `pydantic-ai-slim`) bundles the
-    # openai, google and anthropic provider bindings, and the OpenTelemetry SDK
-    # the template's tracing needs is already a core dependency of decimalai.
+    # One line, whatever the model. `decimalai[pydantic-ai]` resolves to
+    # `pydantic-ai-slim[openai,google,anthropic]`, so those three provider
+    # bindings come with it, and the OpenTelemetry SDK the template's tracing
+    # needs is already a core dependency of decimalai. Not the `pydantic-ai`
+    # meta package: its logfire extra needs an opentelemetry-api that
+    # google-adk rules out of `decimalai[all]`.
     # A provider outside those three adds a token; see _PYDANTIC_AI_PROVIDERS.
     "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
     "adk": 'pip install "decimalai[adk]"',
@@ -905,13 +909,16 @@ _PROVIDER_REQUIREMENTS: Dict[str, tuple] = {
 
 #: Pydantic AI's own provider prefixes — a DIFFERENT vocabulary from LangChain's
 #: above, which is why this is a second table rather than a shared one:
-#: LangChain spells Gemini `google_genai` and reads `GOOGLE_API_KEY`, Pydantic AI
-#: spells it `google` and reads `GEMINI_API_KEY` first
-#: (`pydantic_ai.providers.google`, checked on 2.36). Sharing one table would
-#: have printed a key the run does not read for exactly the model the fleet uses.
+#: LangChain spells Gemini `google_genai`, Pydantic AI spells it `google`.
+#: Pydantic AI's GoogleProvider reads `GOOGLE_API_KEY`, else the legacy
+#: `GEMINI_API_KEY` (`pydantic_ai.providers.google`, pydantic-ai-slim 2.56), so
+#: the `GEMINI_API_KEY` the table names still runs; when both are set,
+#: `GOOGLE_API_KEY` is the one used.
 #:
-#: The extra is empty for the three providers the `pydantic-ai` distribution
-#: already carries; the rest are `pydantic-ai-slim` extras it does not.
+#: The extra is empty for the providers `decimalai[pydantic-ai]` already
+#: installs (`pydantic-ai-slim[openai,google,anthropic]`; azure, deepseek and
+#: ollama ride the openai binding). The rest are `pydantic-ai-slim` extras —
+#: never the `pydantic-ai` meta package, which pulls logfire.
 _PYDANTIC_AI_PROVIDERS: Dict[str, tuple] = {
     # provider prefix -> (extra pip requirement, model-provider env var)
     "openai": ("", "OPENAI_API_KEY"),
@@ -919,17 +926,13 @@ _PYDANTIC_AI_PROVIDERS: Dict[str, tuple] = {
     "openai-responses": ("", "OPENAI_API_KEY"),
     "azure": ("", "AZURE_OPENAI_API_KEY"),
     "google": ("", "GEMINI_API_KEY"),
-    # The spelling every pydantic-ai before 2.x used for the same provider.
-    # Accepted so a model string copied from an older project prints the right
-    # key rather than silently falling back to OpenAI's.
-    "google-gla": ("", "GEMINI_API_KEY"),
     "google-vertex": ("", "GOOGLE_API_KEY"),
     "anthropic": ("", "ANTHROPIC_API_KEY"),
-    "groq": ('"pydantic-ai[groq]"', "GROQ_API_KEY"),
-    "mistral": ('"pydantic-ai[mistral]"', "MISTRAL_API_KEY"),
-    "cohere": ('"pydantic-ai[cohere]"', "CO_API_KEY"),
-    "huggingface": ('"pydantic-ai[huggingface]"', "HF_TOKEN"),
-    "openrouter": ('"pydantic-ai[openrouter]"', "OPENROUTER_API_KEY"),
+    "groq": ('"pydantic-ai-slim[groq]"', "GROQ_API_KEY"),
+    "mistral": ('"pydantic-ai-slim[mistral]"', "MISTRAL_API_KEY"),
+    "cohere": ('"pydantic-ai-slim[cohere]"', "CO_API_KEY"),
+    "huggingface": ('"pydantic-ai-slim[huggingface]"', "HF_TOKEN"),
+    "openrouter": ('"pydantic-ai-slim[openrouter]"', "OPENROUTER_API_KEY"),
     "deepseek": ("", "DEEPSEEK_API_KEY"),
     "ollama": ("", ""),  # local, no key
 }
@@ -964,15 +967,8 @@ def normalize_model(framework: str, model: Optional[str]) -> str:
     built-in `TestModel`, and refusing it would be this function inventing a rule
     the framework does not have.
 
-    STRICTER THAN THE OLDEST SUPPORTED PYDANTIC AI, deliberately, and this is the
-    one place that is worth stating. `pydantic-ai` 0.1.0 (the floor
-    `decimalai[pydantic-ai]` declares) still inferred OpenAI from a bare name;
-    2.x removed that. So on an ancient pin this refuses something that would have
-    run — but the fix it names, `openai:<model>`, resolves on BOTH (checked by
-    running `infer_model` under 0.1.0 and 2.36), so nobody is ever pushed off a
-    working configuration and onto a broken one. The alternative, gating on the
-    installed version, would make `decimalai init` behave differently on two
-    machines with the same command.
+    This matches the pydantic-ai-slim `decimalai[pydantic-ai]` floors (2.56),
+    which refuses a bare name too, so it refuses nothing that would have run.
     """
     model = (model or "").strip() or default_model(framework)
     if framework == "adk":

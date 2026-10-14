@@ -194,9 +194,11 @@ class TestLoadSkill:
 class TestBudgetReset:
     def test_fresh_fragment_resets_budget(self):
         router = _router(max_loaded_bodies=1)
+        # Both names are on the menu: load_skill serves only offered skills
+        # (2026-10-14), and this test is about the turn budget, not the offer.
         route = {
             "prompt_fragment": "MENU", "routing_id": "rt_1",
-            "skills": [{"name": "a"}],
+            "skills": [{"name": "a"}, {"name": "b"}],
         }
         with patch.object(router, "smart_route", return_value=route), \
                 patch.object(router, "get_skill_body", side_effect=lambda n, **kw: f"BODY {n}"):
@@ -211,9 +213,10 @@ class TestBudgetReset:
 
     def test_cached_fragment_does_not_reset_budget(self):
         router = _router(max_loaded_bodies=1)
+        # Both names are on the menu — see test_fresh_fragment_resets_budget.
         route = {
             "prompt_fragment": "MENU", "routing_id": "rt_2",
-            "skills": [{"name": "a"}],
+            "skills": [{"name": "a"}, {"name": "b"}],
         }
         with patch.object(router, "smart_route", return_value=route) as mock_route, \
                 patch.object(router, "get_skill_body", side_effect=lambda n, **kw: f"BODY {n}"):

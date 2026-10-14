@@ -48,10 +48,36 @@ def _reset_sdk(monkeypatch):
     cfg._client = MagicMock()
     cfg._client.register_manifest.return_value = {"manifest_id": "m1"}
     monkeypatch.setattr(providers, "_sdk_present", lambda _mod: False)
+    # init(crewai=True) now also registers the skill hook in CrewAI's global
+    # hook registry (where crewai is installed). That registry outlives the
+    # test, so a hook this test added is taken out again.
+    monkeypatch.setattr(
+        crewai_adapter, "_skill_loader_installed",
+        crewai_adapter._skill_loader_installed,
+    )
+    hooks_before = _registered_crewai_hooks()
     yield
+    if crewai_adapter._skill_hook not in hooks_before:
+        _unregister_crewai_skill_hook(crewai_adapter._skill_hook)
     crewai_adapter._tracer_providers[:] = saved_providers
     cfg._config = saved_config
     cfg._client = saved_client
+
+
+def _registered_crewai_hooks() -> list:
+    try:
+        from crewai.hooks import get_before_llm_call_hooks
+    except ImportError:
+        return []
+    return list(get_before_llm_call_hooks())
+
+
+def _unregister_crewai_skill_hook(hook) -> None:
+    try:
+        from crewai.hooks import unregister_before_llm_call_hook
+    except ImportError:
+        return
+    unregister_before_llm_call_hook(hook)
 
 
 def _fake_crewai_instrumentor(monkeypatch, instrument_side_effect=None):

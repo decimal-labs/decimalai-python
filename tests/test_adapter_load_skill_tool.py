@@ -5,8 +5,10 @@ tests/test_pydantic_ai_skill_loader.py — so no pydantic-ai / openai-agents
 behavior is exercised, only our adapter surface:
 
   - pydantic_ai: patched Agent.__init__ registers load_skill via
-    ``self.tool_plain(fn)`` (config-gated), and _skills_system_prompt
-    appends LOAD_SKILL_PROMPT_HINT only once the tool is active.
+    ``self.tool_plain(fn, name=..., description=..., prepare=...)``
+    (config-gated) and the skills function via ``self.instructions(fn)``, and
+    _skills_system_prompt appends LOAD_SKILL_PROMPT_HINT only once the tool is
+    active.
   - openai_agents: patched Agent.__init__ appends the function_tool to
     ``agent.tools`` (once per agent, never duplicated), and the wrapped
     instructions callable appends LOAD_SKILL_PROMPT_HINT only when the
@@ -22,6 +24,7 @@ import logging
 import os
 import sys
 import types
+from contextlib import asynccontextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -50,24 +53,38 @@ def _fresh_config(monkeypatch, *, load_skill_tool_env: str | None = None):
 
 
 def _make_fake_pydantic_ai():
-    """Fake ``pydantic_ai`` module — Agent records system_prompt(fn) and
-    tool_plain(fn) registrations (the only surface the adapter touches)."""
+    """Fake ``pydantic_ai`` module — Agent records instructions(fn) and
+    tool_plain(fn, ...) registrations, and has the ``iter`` the run scope
+    patches (the only surface the adapter touches)."""
     mod = types.ModuleType("pydantic_ai")
 
     class Agent:
         def __init__(self, model=None, system_prompt=""):
             self.model = model
             self.base_system_prompt = system_prompt
-            self.registered_system_prompts = []
+            self.registered_instructions = []
             self.registered_tools = []
+            self.registered_tool_kwargs = []
 
-        def system_prompt(self, fn):
-            self.registered_system_prompts.append(fn)
+        def instructions(self, fn):
+            # The adapter registers an instructions function, not a system
+            # prompt, since 2026-10-14 (see tests/test_pydantic_ai_phase1.py).
+            self.registered_instructions.append(fn)
             return fn
 
-        def tool_plain(self, fn):
+        def tool_plain(self, fn, **kwargs):
+            # Real signature: name=, description=, prepare=, … — the adapter
+            # registers under `decimalai_load_skill` with a `prepare` that
+            # picks the exposed name per run.
             self.registered_tools.append(fn)
+            self.registered_tool_kwargs.append(kwargs)
             return fn
+
+        @asynccontextmanager
+        async def iter(self, prompt):
+            # Present because the real one is: `instrument()` brackets every run
+            # by patching `Agent.iter`, which every supported pydantic-ai has.
+            yield prompt
 
     mod.Agent = Agent
     return mod, Agent
@@ -81,15 +98,22 @@ def fake_pydantic_ai(monkeypatch):
 
     mod, Agent = _make_fake_pydantic_ai()
     original_init = Agent.__init__
+    original_iter = Agent.iter
 
     monkeypatch.setitem(sys.modules, "pydantic_ai", mod)
     monkeypatch.setattr(pa, "_skill_loader_installed", False)
+    # `install()` also installs the run scope and name capture on this class;
+    # reset them with the loader so each test patches its own fake.
+    monkeypatch.setattr(pa, "_run_scope_installed", False)
+    monkeypatch.setattr(pa, "_name_capture_installed", False)
+    monkeypatch.setattr(pa, "_default_agent_name", None)
     monkeypatch.setattr(pa, "_skill_router_singleton", None)
     monkeypatch.setattr(pa, "_load_skill_tool_active", False)
 
     yield mod, Agent, pa
 
     Agent.__init__ = original_init
+    Agent.iter = original_iter
 
 
 class TestPydanticAiLoadSkillTool:
@@ -101,10 +125,15 @@ class TestPydanticAiLoadSkillTool:
 
         assert len(agent.registered_tools) == 1
         assert agent.registered_tools[0].__name__ == "load_skill"
+        # Keyed under the namespaced name so a caller's own `load_skill` can
+        # still register; `prepare` shows it to the model as `load_skill`
+        # unless that name is taken (tests/test_pydantic_ai_phase1.py).
+        assert agent.registered_tool_kwargs[0]["name"] == pa._NAMESPACED_TOOL_NAME
+        assert agent.registered_tool_kwargs[0]["prepare"] is pa._prepare_load_skill
         # The module flag now gates the prompt hint.
         assert pa._load_skill_tool_active is True
-        # The skills system prompt is still registered alongside the tool.
-        assert pa._skills_system_prompt in agent.registered_system_prompts
+        # The skills instructions function is still registered alongside the tool.
+        assert pa._skills_system_prompt in agent.registered_instructions
         # ...and the base prompt survived the patched __init__.
         assert agent.base_system_prompt == "BASE"
 
@@ -153,7 +182,7 @@ class TestPydanticAiLoadSkillTool:
         assert agent.registered_tools == []
         assert pa._load_skill_tool_active is False
         # Only the tool is gated — the skill loader itself still installs.
-        assert pa._skills_system_prompt in agent.registered_system_prompts
+        assert pa._skills_system_prompt in agent.registered_instructions
 
     def test_prompt_hint_appended_only_when_tool_active(self, fake_pydantic_ai):
         _, _, pa = fake_pydantic_ai

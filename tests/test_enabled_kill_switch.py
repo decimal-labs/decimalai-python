@@ -102,6 +102,16 @@ def fresh_sdk(monkeypatch, tmp_path):
     # Keep the real adapter's skill sync/pull intact — only neutralize the
     # global callback registration, which has no bearing on this behaviour.
     monkeypatch.setattr(lc_ctx, "register_configure_hook", lambda *a, **k: None)
+    # `init(langchain=True)` also installs the skill loader, which rebinds
+    # BaseChatModel's four entry points for the whole process. Put them back,
+    # or every later test in the session runs on a patched chat model.
+    from langchain_core.language_models.chat_models import BaseChatModel
+
+    for entry_point in ("invoke", "ainvoke", "stream", "astream"):
+        monkeypatch.setattr(
+            BaseChatModel, entry_point, getattr(BaseChatModel, entry_point)
+        )
+    monkeypatch.setattr(dlc, "_skill_loader_installed", dlc._skill_loader_installed)
     return tmp_path
 
 

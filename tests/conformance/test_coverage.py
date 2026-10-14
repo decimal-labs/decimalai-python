@@ -53,6 +53,7 @@ import pytest
 from . import contract
 from .delivery import DELIVERY_MODES
 from .drivers import ADVERTISED_SNAPSHOT, CAPABILITY_ITEMS, DRIVER_MODULES, all_drivers
+from .environments import DRIVER_ENVS, ENV_VAR, TEST_ENVS, current_env, graded_elsewhere
 from .journey import (
     SCAFFOLD_KEYS,
     journey_framework,
@@ -201,16 +202,26 @@ EXTRA_SLUGS: Dict[str, Set[str]] = {
 }
 
 #: Extras that install no framework adapter, each with the reason. Anything
-#: ending in ``-tests`` is a test-only install set and is classified
-#: automatically (it pulls the same frameworks for a live lane, so requiring a
-#: separate driver for it would double-count).
+#: ending in ``-tests`` (or ``-tests-<env>``, for a test environment named in
+#: ``environments.TEST_ENVS``) is a test-only install set and is classified
+#: automatically (it pulls the same frameworks for a live lane or a test
+#: environment, so requiring a separate driver for it would double-count).
 NON_FRAMEWORK_EXTRAS: Dict[str, str] = {
     "openai": "the provider SDK for the init(openai=True) rail, not a framework "
               "— see PROVIDER_FLAG_DRIVERS",
     "evals": "litellm, for the eval runner; instruments nothing",
     "all": "an alias for every runtime extra above; adds no framework of its own",
-    "dev": "the unit-test toolchain",
+    "dev": "the unit-test toolchain plus the openai 3 frameworks its tests import",
+    "test-toolchain": "pytest and friends alone, shared by `dev` and the openai 2 "
+                      "environment; installs no framework",
 }
+
+
+def is_test_only_extra(name: str) -> bool:
+    """``<x>-tests``, or ``<x>-tests-<env>`` for a known test environment."""
+    return name.endswith("-tests") or any(
+        name.endswith(f"-tests-{env}") for env in TEST_ENVS
+    )
 
 
 def declared_extras(pyproject_text: str) -> List[str]:
@@ -432,7 +443,7 @@ def test_every_framework_extra_has_a_driver() -> None:
 
     classified = set(EXTRA_SLUGS) | set(NON_FRAMEWORK_EXTRAS)
     unclassified = sorted(
-        e for e in extras if e not in classified and not e.endswith("-tests")
+        e for e in extras if e not in classified and not is_test_only_extra(e)
     )
     assert not unclassified, (
         f"pyproject.toml gained extra(s) with no conformance classification: "
@@ -441,9 +452,10 @@ def test_every_framework_extra_has_a_driver() -> None:
         "In tests/conformance/test_coverage.py either add it to EXTRA_SLUGS "
         "(mapping it to the docs capability-table slug it makes work, and "
         "creating a driver for that slug), or to NON_FRAMEWORK_EXTRAS with the "
-        "reason it instruments nothing. `<name>-tests` extras classify "
-        "themselves — they install frameworks for a live lane, and the runtime "
-        "extra beside them already carries the driver."
+        "reason it instruments nothing. `<name>-tests` and `<name>-tests-<env>` "
+        "extras classify themselves — they install frameworks for a live lane or "
+        "a test environment, and the runtime extra beside them already carries "
+        "the driver."
     )
 
     stale = sorted(set(EXTRA_SLUGS) - set(extras))
@@ -483,7 +495,7 @@ def test_every_driver_module_on_disk_is_registered() -> None:
 
 
 def test_no_driver_is_silently_unavailable() -> None:
-    """In a full-install environment, every driver must actually run.
+    """In a full-install environment, every driver that belongs to it must run.
 
     This closes the one way the hermetic tier can be green and prove nothing. A
     driver whose imports are absent is recorded ``NOT RUN`` in the matrix and its
@@ -492,28 +504,113 @@ def test_no_driver_is_silently_unavailable() -> None:
 
     Opt-in, via ``DECIMAL_CONFORMANCE_REQUIRE_ALL=1``, because the honest answer
     differs by environment: a developer with only ``[dev]`` installed SHOULD get
-    skips rather than a red suite. CI sets it after installing
-    ``.[conformance-tests]``, which is the environment where a missing import is
-    a build problem rather than a fact of life.
+    skips rather than a red suite. CI sets it after installing the environment's
+    extra (``environments.TEST_ENVS``), which is where a missing import is a build
+    problem rather than a fact of life.
+
+    Per environment, because no environment can hold every framework (openai 3
+    vs crewai/litellm's openai<3). ``DECIMAL_TEST_ENV`` names this one; the
+    drivers ``environments.DRIVER_ENVS`` assigns to it must all be runnable, and
+    the ones it assigns elsewhere are graded by the other environment's job.
     """
     import os
 
     if os.environ.get("DECIMAL_CONFORMANCE_REQUIRE_ALL") != "1":
         pytest.skip(
-            "set DECIMAL_CONFORMANCE_REQUIRE_ALL=1 (after installing "
-            '`.[conformance-tests]`) to require every driver to be runnable'
+            "set DECIMAL_CONFORMANCE_REQUIRE_ALL=1 (after installing this "
+            f"environment's extra, {ENV_VAR}={current_env()}: "
+            f"{TEST_ENVS[current_env()]}) to require every driver that belongs "
+            "to it to be runnable"
         )
+    env = current_env()  # raises on an unknown DECIMAL_TEST_ENV — loud, not a default
     unavailable = {
-        d.name: d.missing_requirements for d in all_drivers() if not d.available
+        d.name: d.missing_requirements
+        for d in all_drivers()
+        if not d.available and env in DRIVER_ENVS.get(d.name, frozenset())
     }
     assert not unavailable, (
-        "DECIMAL_CONFORMANCE_REQUIRE_ALL=1 is set, and these drivers cannot run "
-        "because their framework is not installed:\n"
+        f"DECIMAL_CONFORMANCE_REQUIRE_ALL=1 is set in the {env!r} test environment "
+        f"({ENV_VAR}), and these drivers that belong to it cannot run because "
+        "their framework is not installed:\n"
         + "\n".join(f"  {name}: missing {mods}" for name, mods in sorted(unavailable.items()))
         + "\n\nThese would have been reported NOT RUN and skipped, leaving the job "
-        "green while proving nothing about those adapters. Add the missing "
-        "distribution(s) to the `conformance-tests` extra in pyproject.toml — that "
-        "extra is the single source for what this tier needs installed."
+        "green while proving nothing about those adapters. This environment is "
+        f"built by `{TEST_ENVS[env]}`; add the missing distribution(s) to that "
+        "extra in pyproject.toml — it is the single source for what this "
+        "environment needs installed."
+    )
+
+
+def test_every_driver_belongs_to_a_test_environment() -> None:
+    """No driver may be graded nowhere.
+
+    ``DECIMAL_CONFORMANCE_REQUIRE_ALL`` only requires a driver in the
+    environment(s) ``DRIVER_ENVS`` names for it. A driver missing from the map
+    would be required by neither job, so its column could go unrun in both and
+    both would stay green — the exact hole REQUIRE_ALL exists to close.
+    """
+    names = {d.name for d in all_drivers()}
+    unmapped = sorted(names - set(DRIVER_ENVS))
+    assert not unmapped, (
+        f"driver(s) {unmapped} are in no test environment, so no CI job requires "
+        "them to run. Add each to DRIVER_ENVS in tests/conformance/environments.py "
+        "with the environment whose install set carries its framework "
+        f"({', '.join(f'{e}: {how}' for e, how in sorted(TEST_ENVS.items()))}), "
+        "and add the framework to that extra."
+    )
+    ghosts = sorted(set(DRIVER_ENVS) - names)
+    assert not ghosts, f"DRIVER_ENVS names driver(s) that do not exist: {ghosts}"
+    bad = sorted(
+        f"{name}: {sorted(envs)}" for name, envs in DRIVER_ENVS.items()
+        if not envs or not envs <= set(TEST_ENVS)
+    )
+    assert not bad, (
+        f"DRIVER_ENVS entries must name one or more of {sorted(TEST_ENVS)}: {bad}"
+    )
+
+
+def test_every_test_environment_is_built_by_a_declared_extra() -> None:
+    """Each environment's install line names extras that pyproject declares.
+
+    ``pip install -e ".[nonexistent]"`` warns and installs the bare package, so a
+    renamed extra would leave an environment with none of its frameworks — every
+    one of its drivers NOT RUN — and only REQUIRE_ALL would notice.
+    """
+    extras = set(declared_extras(PYPROJECT.read_text()))
+    missing = []
+    for env, how in sorted(TEST_ENVS.items()):
+        m = re.search(r"\.\[([^\]]+)\]", how)
+        assert m, f"TEST_ENVS[{env!r}] = {how!r} names no extras"
+        missing += [f"{env}: {e}" for e in m.group(1).split(",") if e.strip() not in extras]
+    assert not missing, (
+        f"test environment install line(s) name extras pyproject.toml does not "
+        f"declare: {missing}"
+    )
+
+
+def test_drivers_graded_in_another_environment_are_named(record_property) -> None:
+    """Say which columns THIS run leaves to the other environment.
+
+    A driver that belongs only to another environment is not required here, so
+    its cells may skip as unavailable. That must never be silent: this names
+    those drivers, and where they ARE graded, on every run — the way
+    ``test_recorded_provider_gaps_are_visible`` does for the provider rails. It
+    never fails; the other environment's job is what grades them.
+    """
+    env = current_env()
+    elsewhere = sorted(
+        f"{name} (graded in {home})"
+        for name in DRIVER_ENVS
+        if (home := graded_elsewhere(name, env))
+    )
+    record_property("conformance_env", env)
+    record_property("conformance_graded_elsewhere", ",".join(elsewhere))
+    print(
+        f"\nCONFORMANCE ENVIRONMENT {env!r} ({ENV_VAR}); built by {TEST_ENVS[env]}"
+        + (
+            "\n  graded in another environment, not this one: " + "; ".join(elsewhere)
+            if elsewhere else ""
+        )
     )
 
 

@@ -86,361 +86,221 @@ dependencies = [
 # Framework/provider adapters are extras, not core deps (since 2026-07-23).
 # Every framework import in the package is function-local and guarded with an
 # ImportError naming its extra, so a core-only install stays importable.
-# langchain-core floored at 1.3.3, and the number is the CVE fix, not the
-# co-install minimum. The adapter itself works far lower — conformance grades
-# identically from 0.3.67 through 1.5.5 — so what sets this floor is
-# CVE-2026-44843 (High; unsafe deserialization through an over-broad load()
-# allowlist), which affects 1.0.0–1.3.2 and is fixed in 1.3.3 / 0.3.85. The
-# previous comment claimed ">=1.3.0 is CVE-clean"; it was not, by three patch
-# releases. CVE-2026-40087 (Moderate) is fixed earlier, in 1.2.28 / 0.3.84.
-# 0.3.x is deliberately out of support even though it works: it cannot pair
-# with a current langgraph, which requires langchain-core>=1.4.7.
 #
-# The floor is HIGHER on Python 3.10, and the reason is per-run skill attribution,
-# not a CVE. langchain-core routes async runnable bodies through
-# runnables/utils.py::coro_with_context, which before 1.4.8 could only carry its
-# config ContextVar into a task via asyncio.create_task(..., context=) — an
-# argument that does not exist below Python 3.11. On 3.10 it therefore fell back
-# to a plain create_task and dropped the context, so _ambient_run_scope() (see
-# decimalai/langchain.py) reads no parent_run_id and the Router files every
-# load_skill() unscoped. Concurrent runs then cross-contaminate: measured on
-# 1.3.3/py3.10, one run's activation is lost and another reports one it never
-# made. 1.4.8 replaced that branch with context.run(asyncio.create_task, coro),
-# which works on every version. Bisected: 1.3.0–1.4.7 fail on py3.10, 1.4.8+
-# pass, and py3.11+ passes throughout. So >=1.3.3 is a true claim on 3.11+ and
-# was a false one on 3.10 — this marker states each where it holds.
-langchain = [
-    "langchain-core>=1.3.3,<2; python_version >= '3.11'",  # Cap the major. Redundant while langgraph pins <2 itself, but bites for langchain-without-langgraph installs. Review the cap when 2.0 is announced — do not let it outlive its reason the way openai<3 did.
-    "langchain-core>=1.4.8,<2; python_version < '3.11'",   # See above: per-run scope needs context.run(create_task) — 3.10 has no create_task(context=).
-]
-# 2.26.0 is the effective floor (lowest that co-resolves with the modern
-# set). Resolve-verified; live-verify pending an OpenAI run (key quota-blocked).
-# The `openai` SDK is never imported by decimalai code — this extra exists so
-# `pip install "decimalai[openai]"` co-installs the provider SDK the
-# init(openai=True) one-liner instruments.
-openai = [
-    # NO major cap, deliberately. The old `<3` was defensive boilerplate and it
-    # did real damage: openai-agents 0.21.0 requires openai>=3.0.0,<4, so with
-    # the cap in place `pip install "decimalai[all]"` resolved openai-agents
-    # back to 0.20.0 — users were held a minor behind by OUR pin, not upstream's.
-    # Verified with `uv pip compile` before and after. openai 3.1.0 passes
-    # conformance at baseline. The conformance job is the control here, not a
-    # version range: a cap only ever guesses at breakage, and this one guessed
-    # wrong for six weeks. If a future major does break us, the job says so.
-    "openai>=2.26.0",
-]
-# 0.18.1, not 0.17.2. The old floor was a CONDITIONAL fiction — the same shape
-# as the llamaindex >=0.10.20 floor: 0.17.2 genuinely works, but only against an
-# `openai` version this package's own extra would not select, so the pair could
-# resolve into a window where the adapter is broken. Floors on two packages in
-# two different extras can falsify each other; only a resolve-then-run check
-# catches it, which is what conformance now does.
-openai-agents = ["openai-agents>=0.18.1"]
+# EVERY FLOOR IS THE NEWEST RELEASE, ON PURPOSE (raised 2026-10-14). The SDK
+# supports the current release of each framework and nothing older: no version
+# checks, shims or fallbacks for earlier APIs. A floor here is the version the
+# unit suite and the conformance matrix were RUN against. When a newer release
+# passes, raise the floor to it; do not keep a window open for versions nobody runs.
+#
+# TWO ENVIRONMENTS, because upstream has split on openai 3. openai-agents and
+# pydantic-ai-slim[openai] need openai>=3; crewai, litellm and
+# llama-index-llms-openai still pin openai<3. No single environment can hold both:
+#   * openai 3 — every runtime extra except `evals`, and `all`. What a user gets.
+#     Graded by `conformance-tests` (+ `dev`).
+#   * openai 2 — `evals`, `crewai-tests`, `llamaindex-tests`. Graded by
+#     `conformance-tests-openai2`, in its own environment.
+# Selecting one is DECIMAL_TEST_ENV=openai3|openai2 (tests/conformance/README.md,
+# "Two environments"). Verify any change here with `uv pip compile pyproject.toml
+# --extra <name>` for EVERY extra, `all` included: a floor in one extra can make
+# another unsatisfiable, and only a resolve says so.
+#
+# Caps: none on any runtime extra. A cap guesses at breakage that has not
+# happened; the floating conformance lane (conformance-latest.yml) tests it instead.
+#
+# langchain-core: newest release. It is also above the two floors that used to
+# need saying — the CVE-2026-44843 fix (1.3.3) and the py3.10 per-run scope fix
+# (1.4.8, context.run(create_task)) — so one marker-free line holds on every
+# supported Python. No `<2`: langchain and langgraph both cap <2 themselves, and
+# for a bare langchain-core install the cap predicted a release that does not exist.
+langchain = ["langchain-core>=1.6.10"]
+# The provider SDK the init(openai=True) one-liner instruments. decimalai code
+# never imports `openai`; this extra exists so `pip install "decimalai[openai]"`
+# co-installs it.
+openai = ["openai>=3.30.0"]
+openai-agents = ["openai-agents>=0.23.1"]
 # Runtime extra for the native Claude Agent SDK integration
-# (decimalai.init(claude_agent_sdk=True)). Floor mirrors claude-agent-sdk-tests;
-# NOT yet verified at the floor — refine by installing at the floor and importing.
-claude-agent-sdk = ["claude-agent-sdk>=0.1.0"]
-# Runtime extra for the Pydantic AI skill loader (decimalai.pydantic_ai.install).
-# Floor is conservative and NOT yet verified at the floor (the adapter only needs
-# Agent.__init__ + @agent.system_prompt, both stable since early releases) —
-# refine by installing at the floor and importing.
-pydantic-ai = ["pydantic-ai>=0.1.0"]
+# (decimalai.init(claude_agent_sdk=True)).
+claude-agent-sdk = ["claude-agent-sdk>=0.2.166"]
+# Runtime extra for the Pydantic AI skill loader (decimalai.pydantic_ai.instrument).
+# pydantic-ai-SLIM, not the `pydantic-ai` meta package: the meta package always
+# pulls slim's `logfire` extra, which needs opentelemetry-instrumentation-httpx
+# >=0.65b0 and so opentelemetry-api>=1.44, while google-adk 2.12 caps
+# opentelemetry-api<=1.42.1 — with it, `decimalai[all]` does not resolve. The three
+# provider extras are the ones the scaffold's `pip install "decimalai[pydantic-ai]"`
+# promises need no second install line (decimalai/cli/scaffold.py,
+# _PYDANTIC_AI_PROVIDERS).
+pydantic-ai = ["pydantic-ai-slim[openai,google,anthropic]>=2.56.0"]
 # Runtime extra for the native Google ADK plugin (decimalai.init(adk=True)).
-# Floor mirrors adk-tests (the version the adapter was built+verified against).
-adk = ["google-adk>=2.0.0"]
-langgraph = ["langgraph>=0.6.0"]
+adk = ["google-adk>=2.12.0"]
+langgraph = ["langgraph>=1.2.15"]
 # Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).
-# Floored at 0.12.0 — VERIFIED at the floor: a MockLLM query engine through the
-# real dispatcher exports a trace. The old 0.10.20 floor was fiction twice over:
-# llama_index.core.instrumentation does not exist there, and where it does exist
-# pre-0.10.30 the dispatcher calls handlers as span_enter(instance, id=...),
-# which raises TypeError inside decimalai/llamaindex.py and — unlike 0.12's
-# guarded dispatch — takes the user's query down with it (verified on 0.10.24).
-# Same floor the adapter's own ImportError message and [llamaindex-tests] state.
-llamaindex = ["llama-index-core>=0.12.0"]
-evals = ["litellm>=1.30"]
-# Everything above in one install. Self-referential extra — floors stay
-# defined once in their own extras.
+# The adapter's ImportError and [llamaindex-tests] state the same floor
+# (tests/test_llamaindex_tree_fidelity.py holds them to it).
+llamaindex = ["llama-index-core>=0.14.25"]
+# litellm, for the client-side LLM evaluators. OPENAI 2 WORLD: litellm pins
+# openai<3, so this extra cannot share an environment with `openai`,
+# `openai-agents` or `pydantic-ai` — which is why it is not in `all`.
+evals = ["litellm>=1.105.0"]
+# Every runtime extra that co-installs, in one line: the openai 3 world. `evals`
+# is left out because it cannot resolve beside `openai>=3.30.0` (see above);
+# install it in a separate environment. Self-referential, so floors stay defined
+# once in their own extras.
 all = [
-    "decimalai[langchain,openai,openai-agents,claude-agent-sdk,pydantic-ai,adk,langgraph,llamaindex,evals]",
+    "decimalai[langchain,openai,openai-agents,claude-agent-sdk,pydantic-ai,adk,langgraph,llamaindex]",
+]
+# The unit-test toolchain and nothing else, so the openai 2 environment can have
+# it without `dev`'s openai 3 frameworks.
+test-toolchain = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-mock>=3.16.0",
+    "responses>=0.26.3",
 ]
 dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "pytest-mock>=3.0",
-    "responses>=0.23",
-    # Refusal-path tests exercise the real BaseInstrumentor rather than a
-    # mock. Its first pkg_resources-free release pairs with the OTEL floor.
-    "opentelemetry-instrumentation>=0.49b0",
-    # Mirror the [langchain] extra exactly. This previously floored at 1.3.0 and
-    # called it "CVE-clean" — it was not: CVE-2026-44843 affects 1.0.0–1.3.2, so
-    # the floors job had been resolving a vulnerable langchain-core. pip-audit
-    # did not catch it because the audit job installs `.`, not `.[dev]`.
-    "langchain-core>=1.3.3; python_version >= '3.11'",
-    "langchain-core>=1.4.8; python_version < '3.11'",
-    # The `langchain` package itself, and langchain-openai — NOT redundant with
-    # langchain-core above. The scaffold's generated file imports
-    # `from langchain.chat_models import init_chat_model`, which lives in
-    # `langchain`, not `langchain-core`. Without these two, both langchain cases
-    # of tests/test_cli_init_scaffold_runs.py SKIPPED on every CI run — a
-    # permanent skip that read as a pass — so the framework 100% of `decimalai
-    # init` users get by default was the one whose execution test never ran.
-    # That is how the 2026-08-28 skill-delivery defect reached users green.
-    # Floored, and the floors job is why. Added unfloored on 2026-08-29, these
-    # turned CI red the same day in a way that looked like an unrelated import
-    # bug: `uv pip install --resolution lowest-direct` resolves an unfloored
-    # requirement to its FIRST EVER release, and `langchain==0.0.1` (2022) ships
-    # a top-level `tests/` package — `tests/__init__.py` and all — straight into
-    # site-packages. A real package there beats this repo's namespace `tests`
-    # directory, so `from tests.conformance import contract` stopped resolving
-    # and the floors job died at collection with `No module named
-    # tests.conformance`. Nothing was wrong with the import; the floor was.
-    #
-    # The tempting fix was `tests/__init__.py`, which does silence it — and
-    # would have left this job asserting a langchain floor of 0.0.1 while the
-    # scaffold-execution tests directly above ran against a 2022 stub. This job
-    # exists to make the floors true, so the floor is the thing to fix.
-    #
-    # 1.0.0 is the first langchain 1.x and is what these floors CLAIM we support.
-    # If the floors job goes red on it, raise the floor to whatever it proves —
-    # that is the job working, not the job failing.
-    "langchain>=1.3.0",
-    "langchain-openai>=1.0.0",
-    # Match the runtime extra's verified floor: 0.17.2 fails constructing its
-    # real RunContextWrapper against current OpenAI usage models.
-    "openai-agents>=0.18.1",
-    # langgraph — needed for the create_react_agent introspection test. Lightweight
-    # enough to include in `dev` (langgraph itself is small; the heavy bit
-    # is the compiled-graph tooling, not network).
-    # Floored at 0.6.0 — the lowest langgraph that ships `langgraph._internal`,
-    # which the modern langgraph-prebuilt imports (0.5.x and below break).
-    "langgraph>=1.2.0",
+    "decimalai[test-toolchain]",
+    # Refusal-path tests exercise the real BaseInstrumentor. 0.63b1, not the newer
+    # 0.66b1: each instrumentation release pins its semantic-conventions twin, and
+    # 0.64b0+ needs opentelemetry-api>=1.43, which google-adk's <=1.42.1 cap rules
+    # out of the `.[dev,conformance-tests]` environment CI builds.
+    "opentelemetry-instrumentation>=0.63b1",
+    # Mirrors the [langchain] extra.
+    "langchain-core>=1.6.10",
+    # `langchain` and `langchain-openai` are not redundant with langchain-core: the
+    # scaffold's generated file imports `from langchain.chat_models import
+    # init_chat_model`, and without them tests/test_cli_init_scaffold_runs.py
+    # SKIPS — a permanent skip that reads as a pass. Floored like every line here:
+    # `--resolution lowest-direct` takes an unfloored requirement to its first-ever
+    # release, and langchain 0.0.1 ships a top-level `tests/` package that shadows
+    # this repo's.
+    "langchain>=1.4.5",
+    "langchain-openai>=1.7.1",
+    "openai-agents>=0.23.1",
+    # For the create_react_agent introspection test.
+    "langgraph>=1.2.15",
     # agentversion (the OSS manifest spec) is an OPTIONAL runtime import for
-    # decimalai.export_manifest: present → canonical jcs-sha256 hash + a manifest
-    # that validates with zero warnings; absent → the SDK's own surface hash
-    # under an honest algorithm label (export_manifest never hard-requires it,
-    # so it stays out of the main `dependencies`). It's a *test* dep here so the
+    # decimalai.export_manifest (absent → the SDK's own surface hash under an
+    # honest label), so it stays out of `dependencies`. A test dep so the
     # converter's validate/diff assertions run in the default unit suite
-    # (tests/test_export_agentversion.py). Floored at >=0.2.0: the SDK now uses
-    # 0.2.0-only modules — agentversion.contract.contract_from_components (the
-    # shared contract assembler) and agentversion.a2a.manifest_to_agent_card
-    # (ManifestSnapshot.to_a2a_card) — so a 0.1.0 resolve fails test collection.
-    # >=0.2.1 specifically: the new behavioral_policy/environment contract
-    # surfaces + the tool_calling_mode/runtime_version lift land in 0.2.1's
-    # contract_from_components, which the conformance test compares against.
-    # NOTE: the release-gate constraints file still pins ==0.1.0 — regenerate it
-    # and re-verify at the floor before shipping.
-    "agentversion>=0.2.1",
+    # (tests/test_export_agentversion.py).
+    "agentversion>=0.2.3",
 ]
-# Optional extras needed only for live-LLM e2e tests (tests/integration/test_framework_live_llm.py).
+# Live-LLM e2e tests (tests/integration/test_framework_live_llm.py). openai 3 world.
 # Install with: pip install -e ".[live-llm-tests]"
 live-llm-tests = [
-    "google-genai>=1.65.0",
-    "langchain-google-genai>=4.2.2",
-    "langchain-openai>=0.3.34",
-    "langgraph>=1.2.0",
-    "openai>=2.26.0",
-    "openai-agents>=0.17.2",
-    # Anthropic/Claude provider lane: anthropic drives the native messages
-    # tool-use loop (_live_helpers.anthropic_tool_loop); langchain-anthropic
-    # backs the ChatAnthropic cells in the generic-framework lanes. Floors are
-    # resolve-verified at the floor: 0.3.0
-    # can't co-install with langchain-core 1.3.0 (lowest co-installable is 0.3.21),
-    # and langchain-anthropic 0.3.21 in turn requires anthropic>=0.69.0 — so the
-    # old >=0.40.0 / >=0.3.0 pair was an unreachable fiction. Live-verify still
-    # pending an ANTHROPIC_API_KEY run, but the install floors are now real.
-    "anthropic>=0.69.0,<1.0.0",
-    "langchain-anthropic>=0.3.21",
+    "google-genai>=2.30.1",
+    "langchain-google-genai>=4.4.2",
+    "langchain-openai>=1.7.1",
+    "langgraph>=1.2.15",
+    "openai>=3.30.0",
+    "openai-agents>=0.23.1",
+    # Anthropic/Claude provider lane: anthropic drives the native messages tool-use
+    # loop (_live_helpers.anthropic_tool_loop); langchain-anthropic backs the
+    # ChatAnthropic cells in the generic-framework lanes.
+    "anthropic>=1.13.0",
+    "langchain-anthropic>=1.7.6",
 ]
-# Optional extras for the live CrewAI OTEL test (tests/integration/test_framework_live_crewai.py).
-# CrewAI + its OpenInference bridges are heavy (~80 transitive pkgs) and pin a
-# native google-genai provider, so they live in their own extra rather than
-# bloating live-llm-tests. Install with: pip install -e ".[crewai-tests]"
-#
-# 1.15.3, raised from 1.14.6 on 2026-10-08. 1.14.6 could not be installed beside
-# decimalai at all (crewai 1.7.0-1.14.6 pin click~=8.1.7; decimalai needs
-# click>=8.2), so `--resolution lowest-direct` quietly took 1.14.7 — the first
-# release that relaxed that pin — and 1.14.7 fails conformance C4 (no completion
-# text on the llm_call), as do 1.15.0, 1.15.1 and 1.15.2. 1.15.3 passes the whole
-# CrewAI column in this extra's own environment (with [dev,providers-tests] for
-# the OpenAI instrumentor CrewAI 1.15 reaches its model through). Same floor, and
-# the same reason, as the conformance-tests line below.
+# The live CrewAI OTEL test (tests/integration/test_framework_live_crewai.py):
+# CrewAI on Gemini. OPENAI 2 WORLD (crewai pins openai<3), and a world of its own:
+# crewai's `google-genai` extra pins google-genai~=1.65.0, which google-adk and
+# providers-tests (google-genai>=2.30) rule out, so this extra shares an
+# environment with neither. The hermetic CrewAI column needs no Gemini binding and
+# lives in conformance-tests-openai2 instead.
+# Install with: pip install -e ".[crewai-tests]"
 crewai-tests = [
-    "crewai[google-genai]>=1.15.3",
-    "openinference-instrumentation-crewai>=1.1.8",
-    "openinference-instrumentation-google-genai>=1.0.2",
+    "crewai[google-genai]>=1.15.27",
+    "openinference-instrumentation-crewai>=1.1.21",
+    "openinference-instrumentation-google-genai>=1.4.13",
 ]
-# Optional extras for the live Google ADK test (tests/integration/test_framework_live_adk.py).
-# google-adk pulls a large transitive runtime (its own server/CLI), so it lives in
-# its own extra rather than bloating live-llm-tests. Floor is the version the
-# native-plugin adapter was built+verified against; refine by installing at the floor.
+# The live Google ADK test (tests/integration/test_framework_live_adk.py). google-adk
+# pulls a large transitive runtime (its own server/CLI), so it lives in its own extra.
 # Install with: pip install -e ".[adk-tests]"
 adk-tests = [
-    "google-adk>=2.0.0",
+    "google-adk>=2.12.0",
 ]
-# Optional extras for the live LlamaIndex test (tests/integration/test_framework_live_llamaindex.py).
-# Covers BOTH adapter paths: the native span handler (decimalai.llamaindex.install) and the OTEL
-# exporter via OpenInference. Pulls llama-index-core + the three provider LLM bindings + the
-# OpenInference LlamaIndex instrumentor. The native runtime extra (`llamaindex`) floors core at
-# 0.10.20 (where the SpanHandler API landed); this *test* extra floors higher because the current
-# google_genai binding + the OpenInference instrumentor need a modern core. Floors are conservative
-# and NOT yet verified at the floor (no llama-index install at authoring) — refine by
-# installing at the floor. Install with: pip install -e ".[llamaindex-tests]"
+# The live LlamaIndex test (tests/integration/test_framework_live_llamaindex.py):
+# the native span handler and the OTEL exporter via OpenInference, on three provider
+# bindings. OPENAI 2 WORLD: llama-index-llms-openai pins openai<3.
+# Install with: pip install -e ".[llamaindex-tests]"
 llamaindex-tests = [
-    "llama-index-core>=0.12.0",
-    "llama-index-llms-openai>=0.3.0",
-    "llama-index-llms-anthropic>=0.6.0",
-    "llama-index-llms-google-genai>=0.1.0",
-    "openinference-instrumentation-llama-index>=3.0.0",
+    "llama-index-core>=0.14.25",
+    "llama-index-llms-openai>=0.8.3",
+    "llama-index-llms-anthropic>=0.12.3",
+    "llama-index-llms-google-genai>=0.11.2",
+    "openinference-instrumentation-llama-index>=4.6.0",
 ]
-# Optional extras for the live Claude Agent SDK test
-# (tests/integration/test_framework_live_claude_agent_sdk.py). The Claude Agent SDK
-# is Anthropic's agent framework; its query() drives the Claude Code engine, so the
-# live test also needs the `claude` CLI on PATH (the test skips when it's absent) and
-# an ANTHROPIC_API_KEY. anthropic-only lane (FRAMEWORK_PROVIDERS). Floor is conservative
-# and NOT yet verified at the floor (no claude-agent-sdk install at authoring) — refine
-# by installing at the floor. Install with: pip install -e ".[claude-agent-sdk-tests]"
+# The live Claude Agent SDK test (tests/integration/test_framework_live_claude_agent_sdk.py).
+# query() drives the Claude Code engine, so the live test also needs the `claude`
+# CLI on PATH (it skips without one) and an ANTHROPIC_API_KEY.
+# Install with: pip install -e ".[claude-agent-sdk-tests]"
 claude-agent-sdk-tests = [
-    "claude-agent-sdk>=0.1.0",
+    "claude-agent-sdk>=0.2.166",
 ]
-# Optional extras for the live direct-provider test
-# (tests/integration/test_framework_live_providers.py). Covers the no-framework
-# one-liner: decimalai.init(openai=/anthropic=/google=True) / providers.instrument().
-# Each provider needs BOTH its SDK and its OpenInference instrumentor (the latter
-# is what providers.instrument() enables). All six floors are verified at the
-# floor: the lowest-direct resolution lands exactly these
-# versions, they co-install, and all three instrumentors import against their
-# floor SDK (needs the core opentelemetry>=1.28.0 floor — see the dependencies
-# block). anthropic stays at 0.40.0 here (not live-llm-tests' 0.69.0): this extra
-# has no langchain-anthropic to force it up, and the anthropic instrumentor imports
-# fine against SDK 0.40.0. Install with: pip install -e ".[providers-tests]"
-# ⚠ anthropic CAPPED at <1.0.0 in the TEST extras on 2026-08-23. anthropic 1.0.0
-# shipped 2026-08-20 and the OpenInference anthropic instrumentor stops capturing the
-# model turn against it: conformance goes from 14 pass to five FAILs (C3 llm_calls
-# empty, C4 rendered_input blank, C5 trace flat at one span, C8/C9 the skills rail
-# cannot prove what was in the prompt). Bisected on the DEPENDENCY, not the code —
-# 0.125.0 passes all 14, 1.0.0 fails five, with no source change between.
-# openinference-instrumentation-anthropic 1.1.2 (2026-08-07, predates the major)
-# declares `anthropic>=0.84.0` with no upper bound, so it admits 1.0.0 and the break
-# is upstream of us either way.
+# The live direct-provider test (tests/integration/test_framework_live_providers.py):
+# the no-framework one-liner, decimalai.init(openai=/anthropic=/google=True). Each
+# provider needs BOTH its SDK and the OpenInference instrumentor that
+# providers.instrument() enables. openai 3 world.
 #
-# On the [openai] extra's "NO major cap, deliberately" policy twelve lines up — this
-# does not contradict it, and the distinction is the point. That comment rejects a cap
-# that GUESSES at future breakage and says "if a future major does break us, the job
-# says so." The job said so. This cap is the response to a measured failure, not a
-# prediction of one, and it is scoped to the two test extras rather than anything a
-# user resolves.
-#
-# ⚠ WHAT THIS CAP DOES NOT DO: protect users. `anthropic` is in no runtime extra and
-# no core dep — a user brings their own, so nothing here constrains them. Someone on
-# anthropic 1.x today gets EMPTY llm_calls with no error, which is precisely the
-# silent no-op the C12 contract exists to forbid. The user-facing fix is a runtime
-# warning on the instrumentation path, not a version range; it is not in this change.
-#
-# ⚠ THE INSTRUMENTOR IS NOW CAPPED TOO, 2026-08-24, and this is the mechanism the
-# paragraph above predicted ("the break is upstream of us either way").
-# openinference-instrumentation-anthropic 2.0.0 declares `anthropic>=1.0.0`, so an
-# UNCAPPED instrumentor drags anthropic straight past the `<1.0.0` cap three lines
-# down and reinstates the exact failure that cap exists to prevent — the same five
-# conformance FAILs, led by "C3 llm_calls: no trace carried any llm_calls — the model
-# turn never reached the wire". A version range on one half of a pair whose other half
-# can force it is not a cap; it is a suggestion.
-# Bisected on the DEPENDENCY, not the code, the same way: re-running the last GREEN
-# commit (f603432, green 19:22, run 32767802803) with no source change went red on the
-# identical job. Same bytes, different resolution, different result.
-# 1.1.2 is the last 1.x and declares `anthropic>=0.84.0`, which the cap below admits.
-#
-# Lift BOTH caps together, when the instrumentor supports 1.x and conformance is green
-# against it. Do not lift either to make a build pass.
+# No caps. anthropic and openinference-instrumentation-anthropic were capped
+# (<1.0.0 / <2.0.0) after anthropic 1.0.0 emptied llm_calls under instrumentor
+# 1.1.2; anthropic 1.13.0 with instrumentor 3.0.3 passes the whole anthropic
+# conformance column (2026-10-14), so both caps went together, as their note asked.
+# Install with: pip install -e ".[providers-tests]"
 providers-tests = [
-    "openai>=2.26.0",
-    "anthropic>=0.40.0,<1.0.0",
-    "google-genai>=1.65.0",
-    # 0.1.45, raised from 0.1.18 on 2026-10-08: every release up to 0.1.44 calls
-    # `wrap_function_wrapper(module=...)`, a keyword wrapt 2.x no longer accepts,
-    # so `instrument()` raises and no OpenAI call is traced — the pydantic-ai and
-    # crewai conformance columns lose every llm_call (C3). wrapt is not ours to
-    # pin, and every fresh resolve today takes 2.x. Not an openai 2.x break:
-    # 0.1.18 passes the pydantic-ai column on openai 2.54.0 once wrapt is 1.17.
-    # Bisected on wrapt 2.4.0 + openai 2.54.0: 0.1.44 fails, 0.1.45 passes both
-    # columns (and the crewai column on openai 2.26.0).
-    "openinference-instrumentation-openai>=0.1.45",
-    "openinference-instrumentation-anthropic>=0.1.14,<2.0.0",
-    "openinference-instrumentation-google-genai>=1.0.2",
+    "openai>=3.30.0",
+    "anthropic>=1.13.0",
+    "google-genai>=2.30.1",
+    "openinference-instrumentation-openai>=0.1.65",
+    "openinference-instrumentation-anthropic>=3.0.3",
+    "openinference-instrumentation-google-genai>=1.4.13",
 ]
-# Every framework the HERMETIC conformance tier drives (tests/conformance, Tier A —
-# stub models + a local probe server, no provider key, no backend). This is the
-# install set for the `conformance` CI job and for the backend's release-gate
-# phase; it exists so that list lives in ONE place with floors, instead of being
-# retyped in a workflow file.
+# HERMETIC conformance (tests/conformance, Tier A — stub models + a local probe
+# server, no provider key, no backend), openai 3 world: the install set for ci.yml's
+# `conformance` job and the backend's release-gate phase P0, kept here so the list
+# lives in ONE place. Install with:
+#   pip install -e ".[dev,conformance-tests]"
+# then run with DECIMAL_TEST_ENV=openai3 DECIMAL_CONFORMANCE_REQUIRE_ALL=1.
 #
 # It matters that this is COMPLETE. A driver whose imports are missing is recorded
-# "NOT RUN" and the job still goes green — which is the exact shape of the failure
-# this suite exists to remove (a green suite that proved nothing). Install with:
-#   pip install -e ".[dev,conformance-tests]"
-#
-# Versions are resolve-verified together on 2026-08-15 (crewai 1.6.1, google-adk
-# 2.7.0, llama-index-core 0.14.23, claude-agent-sdk 0.2.139, pydantic-ai 2.31.0,
-# openai 2.54.0, langchain-core 1.5.5): all nine drivers import and run in one
-# venv. The floors below are NOT floor-verified — refine by installing at the
-# floor and running the tier. Exception: crewai, floor-verified 2026-10-08 (its
-# note below says what was run).
+# "NOT RUN", and only REQUIRE_ALL turns that into a failure. Which drivers belong to
+# which environment is DRIVER_ENVS in tests/conformance/test_coverage.py; a driver
+# added there for openai3 needs its install here.
 conformance-tests = [
-    # Every runtime framework extra in one line: langchain, langgraph, openai,
-    # openai-agents, claude-agent-sdk, pydantic-ai, adk, llamaindex, evals
-    # (litellm). The `-tests` extras beside them are deliberately NOT reused here
-    # — see the CrewAI note below; they install live-lane provider bindings this
-    # tier has no use for, and one of them makes the set unsatisfiable.
+    # langchain, langgraph, openai, openai-agents, claude-agent-sdk, pydantic-ai,
+    # adk, llamaindex.
     "decimalai[all]",
     # The raw-provider rails: the `anthropic` SDK plus the OpenInference
-    # instrumentors that drivers/anthropic.py and drivers/pydantic_ai.py depend
-    # on (init(anthropic=True) / init(openai=True) warn and SKIP without them,
-    # which would grade those drivers on a tracing path nothing turned on).
+    # instrumentors drivers/anthropic.py and drivers/pydantic_ai.py depend on
+    # (init(anthropic=True) / init(openai=True) warn and SKIP without them, which
+    # would grade those drivers on a tracing path nothing turned on).
     "decimalai[providers-tests]",
-    # CrewAI. Deliberately NOT the `crewai-tests` extra: that one installs
-    # crewai[google-genai], which pins google-genai<1.65.0 and is flatly
-    # UNSATISFIABLE alongside google-adk>=2.0.0 (which needs >=1.66) — verified
-    # with `uv pip compile --universal`. This tier's CrewAI driver reaches its
-    # model through the OPENAI SDK against a local stub (see the instrumentor
-    # note below), so the google-genai provider binding is a live-lane need it
-    # does not have.
-    #
-    # 1.15.3, raised from 1.6.1 on 2026-10-08 when the driver started grading
-    # the skills rail (decimalai/crewai.py). Each step below was RUN, not read:
-    #   * 1.6.1 resolved (`--resolution lowest-direct` still picks it) and could
-    #     not trace: openinference-instrumentation-crewai >= 1.0, which includes
-    #     the 1.1.8 floor two lines down, only instruments crewai >= 1.10.1, so
-    #     the column failed C4/C6/C7/C9/C10 on the unmodified adapter.
-    #   * 1.7.0 - 1.14.6 pin click~=8.1.7, and decimalai needs click>=8.2: not
-    #     installable beside this package at all.
-    #   * 1.14.7 relaxes the click pin but pins opentelemetry-sdk~=1.34, which
-    #     google-adk>=2.0 (>=1.36) rules out of this extra; on its own it fails C4.
-    #   * 1.15.0 fails C4 (no completion text on the llm_call), adapter unchanged,
-    #     and so do 1.15.1 and 1.15.2 (checked 2026-10-08).
-    #   * 1.15.3, 1.15.20 and 1.15.23 pass the whole column, skills rail and
-    #     both delivery cells included — 1.15.3 also with the crewai and litellm
-    #     instrumentor floors below, under lowest-direct resolution.
-    # The skill loader's own seam (crewai.hooks.register_before_llm_call_hook)
-    # exists from 1.5.0, so tracing, not the hook, is what sets this number.
-    "crewai>=1.15.3",
-    "openinference-instrumentation-crewai>=1.1.8",
-    # No AutoGen line, deliberately. Both lineages were retired as integrations
-    # (2026-08-16): `init(autogen=True)` is now an alias for the generic OTel
-    # exporter that warns, and drivers/generic_otel.py already grades that rail.
-    # drivers/crewai.py reads THREE instrumentors, because which one carries the
-    # LLM detail depends on the CrewAI version and the model string:
-    #   * CrewAI's own — the crew/task/tool spans, always;
-    #   * LiteLLM's    — the llm spans up to CrewAI 1.14, when an `openai/…`
-    #                    model went through litellm;
-    #   * OpenAI's     — the llm spans from CrewAI 1.15, where `LLM.__new__`
-    #                    returns crewai.llms.providers.openai.completion.
-    #                    OpenAICompletion and litellm is never imported (checked
-    #                    on 1.15.16: `crewai.llm._litellm_loaded is False`).
-    # The openai one arrives via decimalai[providers-tests] above and is activated
-    # automatically by init(crewai=True), so there is no line for it here — but
-    # on 1.15 it is the load-bearing one, and without it the CrewAI trace arrives
-    # with no llm_calls at all. The crewai-tests extra carries neither.
-    "openinference-instrumentation-litellm>=0.1.30",
+]
+# HERMETIC conformance, openai 2 world: the drivers whose framework cannot be
+# installed beside openai>=3, plus the unit tests that need those packages (the
+# DECIMAL_TEST_ENV=openai2 subset, tests/conftest.py). Self-sufficient — it carries
+# the test toolchain, so it never needs `dev`, whose openai 3 frameworks it cannot
+# co-install with. Install with:
+#   pip install -e ".[conformance-tests-openai2]"
+# then run with DECIMAL_TEST_ENV=openai2 (and DECIMAL_CONFORMANCE_REQUIRE_ALL=1).
+conformance-tests-openai2 = [
+    "decimalai[test-toolchain]",
+    # litellm: the eval runner's unit tests, AND the ADK driver's stub model — it
+    # reaches the stub through google.adk.models.lite_llm.LiteLlm, which is why
+    # google-adk is graded here rather than in the openai 3 environment.
+    "decimalai[evals]",
+    "decimalai[adk]",
+    "decimalai[llamaindex]",
+    "llama-index-llms-openai>=0.8.3",
+    "openinference-instrumentation-llama-index>=4.6.0",
+    # The CrewAI driver reads three instrumentors: CrewAI's own (crew/task/tool
+    # spans), OpenAI's (the llm spans — CrewAI 1.15 reaches its model through
+    # crewai.llms.providers.openai, and init(crewai=True) activates it), and
+    # LiteLLM's (the llm spans when a model string routes through litellm).
+    # Without the OpenAI one the CrewAI trace arrives with no llm_calls at all.
+    "crewai>=1.15.27",
+    "openinference-instrumentation-crewai>=1.1.21",
+    "openinference-instrumentation-openai>=0.1.65",
+    "openinference-instrumentation-litellm>=0.1.50",
 ]
 
 [project.scripts]
@@ -520,9 +380,10 @@ addopts = "-m 'not integration and not live_llm and not conformance_live and not
 # process-global state bites, and that is a defect it exists to catch). Those
 # globals then leak into the unit suite: running it inline turns 11 pre-existing
 # failures into 18. It is NOT the "exists but never runs" trap that let the
-# LlamaIndex adapter ship emitting nothing — ci.yml runs it as a required job on
-# every push and PR, and `make ci-workflows` picks that job up automatically.
-# Run it locally with: pytest tests/conformance
+# LlamaIndex adapter ship emitting nothing — ci.yml runs it as two required jobs on
+# every push and PR (one per test environment), and `make ci-workflows` picks them
+# up automatically. Run it locally with:
+#   DECIMAL_TEST_ENV=openai3 pytest tests/conformance -m conformance   (and openai2)
 # Only collect the real suite. examples/ holds runnable demo scripts — e.g.
 # examples/test_examples.py uses a def test(name, fn) mini-runner — that a bare
 # `pytest` from the repo root would otherwise mis-collect and error on.

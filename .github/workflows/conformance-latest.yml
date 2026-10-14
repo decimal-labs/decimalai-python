@@ -29,9 +29,21 @@ concurrency:
 
 jobs:
   latest:
-    name: Contract vs newest frameworks
+    # One job per test environment. No single environment can hold every
+    # framework: openai-agents / pydantic-ai need openai>=3, crewai / litellm pin
+    # openai<3 — tests/conformance/environments.py says which driver belongs
+    # where. Each leg floats ITS environment's install set and opens and closes
+    # ITS OWN advisory issue, so one environment recovering never closes the
+    # other's.
+    name: Contract vs newest frameworks (${{ matrix.test_env }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        test_env: [openai3, openai2]
+    env:
+      DECIMAL_TEST_ENV: ${{ matrix.test_env }}
     steps:
       - uses: actions/checkout@v6
 
@@ -40,21 +52,50 @@ jobs:
           python-version: "3.12"
 
       - name: Install the SDK and every framework, floated to newest
-        # --upgrade is the whole point: the `conformance-tests` extra carries
-        # floors, and this lane deliberately ignores the ceiling those floors
-        # imply by taking whatever is newest today.
+        # --upgrade is the whole point: this lane deliberately takes whatever is
+        # newest today. The extras come from environments.TEST_ENVS (the one place
+        # each environment is defined), and the requirements to float are read out
+        # of those extras with every `decimalai[...]` self-reference expanded — a
+        # bare `decimalai[all]` would otherwise float nothing but decimalai itself.
+        # The floors stay ON: `--upgrade` with `>=floor` still takes the newest
+        # release, and without them pip may "upgrade" one framework by quietly
+        # backtracking another below its floor (google-adk caps opentelemetry, so
+        # a floorless resolve can trade the newest google-adk for the newest
+        # opentelemetry-instrumentation).
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,conformance-tests]"
-          pip install --upgrade $(python - <<'PY'
-          import tomllib
-          d = tomllib.load(open("pyproject.toml", "rb"))
-          extra = d["project"]["optional-dependencies"]["conformance-tests"]
-          # Names only — drop the floors so pip resolves newest.
-          import re
-          print(" ".join(sorted({re.split(r"[<>=!~\[;]", s.strip())[0] for s in extra})))
+          EXTRAS=$(python - "$DECIMAL_TEST_ENV" <<'PY'
+          import re, sys
+          sys.path.insert(0, ".")
+          from tests.conformance.environments import TEST_ENVS
+          print(re.search(r"\.\[([^\]]+)\]", TEST_ENVS[sys.argv[1]]).group(1))
           PY
           )
+          echo "environment $DECIMAL_TEST_ENV installs .[$EXTRAS]"
+          pip install -e ".[$EXTRAS]"
+          python - "$EXTRAS" > floated-requirements.txt <<'PY'
+          import re, sys, tomllib
+          opt = tomllib.load(open("pyproject.toml", "rb"))["project"]["optional-dependencies"]
+          names, seen = set(), set()
+
+          def walk(extra):
+              if extra in seen:
+                  return
+              seen.add(extra)
+              for req in opt[extra]:
+                  m = re.match(r"\s*([A-Za-z0-9._-]+)\s*(\[[^\]]*\])?", req)
+                  if m.group(1).lower() == "decimalai":
+                      for sub in (m.group(2) or "").strip("[]").split(","):
+                          walk(sub.strip())
+                  else:
+                      names.add(req)  # the whole line: its own extras, floor, marker
+
+          for extra in sys.argv[1].split(","):
+              walk(extra.strip())
+          print("\n".join(sorted(names)))
+          PY
+          cat floated-requirements.txt
+          pip install --upgrade -r floated-requirements.txt
 
       - name: Record what we actually resolved
         # The version diff is the first thing a human wants when this goes red.
@@ -64,7 +105,8 @@ jobs:
         id: matrix
         # REQUIRE_ALL because a driver that cannot import its framework must be a
         # failure here, not a skip: on a floating lane, "the new release broke the
-        # import" is exactly the finding we are looking for.
+        # import" is exactly the finding we are looking for. Per environment: the
+        # drivers that belong to the other one are named, and graded by its leg.
         env:
           DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
         run: python -m pytest tests/conformance -q -rs -m conformance
@@ -73,28 +115,33 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-latest-versions
+          name: conformance-latest-versions-${{ matrix.test_env }}
           path: resolved-versions.txt
 
       - name: Open an advisory issue on red
         # Advisory, not blocking: this lane never gates a release. One open issue
-        # at a time — re-running nightly must not spam.
+        # at a time PER ENVIRONMENT — re-running nightly must not spam, and the
+        # openai3 leg keeps the original `conformance-latest` label.
         if: failure()
         uses: actions/github-script@v7
+        env:
+          TEST_ENV: ${{ matrix.test_env }}
         with:
           script: |
-            const title = "Conformance: an upstream framework release broke a contract row";
+            const env = process.env.TEST_ENV;
+            const label = env === "openai3" ? "conformance-latest" : `conformance-latest-${env}`;
+            const title = `Conformance (${env}): an upstream framework release broke a contract row`;
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
-              state: "open", labels: ["conformance-latest"],
+              state: "open", labels: [label],
             });
             const body = [
-              "The floating conformance lane went red. The pinned gate is unaffected, so releases are not blocked.",
+              `The floating conformance lane went red in the ${env} test environment. The pinned gate is unaffected, so releases are not blocked.`,
               "",
               `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               "",
               "Next steps are in `tests/conformance/README.md` under *When a new framework version breaks a row*:",
-              "download the `conformance-latest-versions` artifact to see which upstream release moved, then either",
+              `download the \`conformance-latest-versions-${env}\` artifact to see which upstream release moved, then either`,
               "fix the adapter, or — if the new upstream behaviour is correct and ours was not — record a new baseline",
               "and raise the floor.",
               "",
@@ -103,7 +150,7 @@ jobs:
             if (existing.data.length === 0) {
               await github.rest.issues.create({
                 owner: context.repo.owner, repo: context.repo.repo,
-                title, body, labels: ["conformance-latest"],
+                title, body, labels: [label],
               });
             } else {
               await github.rest.issues.createComment({
@@ -126,11 +173,15 @@ jobs:
         # would have kept the issue from being filed at all.
         if: success()
         uses: actions/github-script@v7
+        env:
+          TEST_ENV: ${{ matrix.test_env }}
         with:
           script: |
+            const env = process.env.TEST_ENV;
+            const label = env === "openai3" ? "conformance-latest" : `conformance-latest-${env}`;
             const open = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
-              state: "open", labels: ["conformance-latest"],
+              state: "open", labels: [label],
             });
             if (open.data.length === 0) return;
 
@@ -143,7 +194,7 @@ jobs:
             } catch { /* the artifact step is best-effort; the close is not */ }
 
             const body = [
-              "The floating conformance lane is green again — the full matrix passed against newest.",
+              `The floating conformance lane is green again in the ${env} test environment — its full matrix passed against newest.`,
               "",
               `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               "",

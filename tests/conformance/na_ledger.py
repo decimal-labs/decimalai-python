@@ -53,9 +53,9 @@ DECLARED_NA: Dict[str, str] = {
     "langchain:C13b": "model_can_load_skill_bodies",
     "anthropic:C13b": "model_can_load_skill_bodies",
     # ADK moved here from `has_skills_rail` on 2026-09-03. The rail exists and
-    # is graded (C8, C13, C14); what is absent is the LOADER, which is a
-    # narrower and permanent fact — ADK registers no load_skill tool, so the
-    # model cannot ask for a body.
+    # is graded (C8, C13, C14); what is absent is the LOADER. ADK ships its own
+    # SkillToolset, but this adapter registers no load_skill tool and does not
+    # bridge SkillToolset, so the model cannot ask DecimalAI for a body.
     "adk:C13b": "model_can_load_skill_bodies",
     # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
     # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
@@ -234,7 +234,9 @@ def skip_declared(kind: str, key: str, reason: str) -> NoReturn:
       SDK's own scaffold ledger rather than trusted.
     * ``unavailable`` — the framework is not installed. Refused outright when
       ``DECIMAL_CONFORMANCE_REQUIRE_ALL=1`` says this environment was supposed
-      to have every framework.
+      to have it — i.e. the driver BELONGS to the current ``DECIMAL_TEST_ENV``
+      (``environments.DRIVER_ENVS``). A driver that belongs only to the other
+      environment skips, with a reason naming where it is graded.
 
     Anything else FAILS instead of skipping. A skip is how an ungraded cell
     reaches the exit code as success, and "102 skipped" next to a green bar is
@@ -277,11 +279,18 @@ def skip_declared(kind: str, key: str, reason: str) -> NoReturn:
                 f"exemption."
             )
     elif kind == "unavailable":
-        if os.environ.get("DECIMAL_CONFORMANCE_REQUIRE_ALL") == "1":
+        from .environments import current_env, graded_elsewhere
+
+        home = graded_elsewhere(key.partition(":")[0])
+        if home is not None:
+            # Belongs to the other test environment: not required here, and the
+            # reason says where it IS graded, so the skip is never silent.
+            reason = f"{reason} — graded in the {home} environment, not {current_env()!r}"
+        elif os.environ.get("DECIMAL_CONFORMANCE_REQUIRE_ALL") == "1":
             pytest.fail(
                 f"{key} cannot run because its framework is not installed, and "
-                f"DECIMAL_CONFORMANCE_REQUIRE_ALL=1 says this environment was "
-                f"supposed to have every one of them.\n  {reason}"
+                f"DECIMAL_CONFORMANCE_REQUIRE_ALL=1 says this environment "
+                f"({current_env()!r}) was supposed to have it.\n  {reason}"
             )
     else:
         pytest.fail(

@@ -21,17 +21,21 @@ pip install decimalai
 uv pip install decimalai
 ```
 
-Requires **Python 3.10+** (`pip` won't install current releases on older Pythons).
+Requires **Python 3.10+** (`pip` won't install current releases on older Pythons). The `[adk]`, `[pydantic-ai]` and `[all]` extras need **Python 3.11+**: the google-adk and pydantic-ai-slim releases they install require it.
+
+Each framework extra supports the framework's latest release only, and floors it there.
 
 The core install is deliberately thin (tracing, CLI, manifests, skills). Framework and provider adapters ship as extras — install the one matching your stack:
 
 ```bash
 pip install "decimalai[langchain]"       # LangChain (add [langgraph] for LangGraph)
 pip install "decimalai[openai-agents]"   # OpenAI Agents SDK
-pip install "decimalai[all]"             # everything
+pip install "decimalai[all]"             # every framework adapter (not [evals]; see below)
 ```
 
 Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
+
+`[evals]` installs litellm, which pins `openai<3`, while `[openai-agents]` and `[pydantic-ai]` need `openai>=3`. So `[evals]` is not part of `[all]`, and it cannot be installed in the same environment as those two. CrewAI has no extra for the same reason: install `crewai` yourself, beside the adapters that run on `openai<3`.
 
 ## See it in 2 minutes
 
@@ -77,12 +81,14 @@ Browsing without an account? Explore the [public skill registry](https://app.dec
 
 ## Quick Start
 
-### LangChain / LangGraph — Zero-Code Tracing
+### LangChain / LangGraph — Zero-Code Tracing and Skills
 
 ```python
 import decimalai
 
-decimalai.init(langchain=True)  # That's it — chains, graphs and agents auto-traced
+# That's it — chains, graphs and agents are traced, and the agent's skills are
+# routed into every chat-model call. skills=False keeps it to tracing only.
+decimalai.init(langchain=True, agent_name="support")
 
 # Use LangChain as normal — nothing else changes
 from langchain_openai import ChatOpenAI
@@ -102,8 +108,10 @@ handler.
 ```python
 import decimalai
 
-decimalai.init(openai_agents=True)
+decimalai.init(openai_agents=True, agent_name="support")  # traces + skills menu + load_skill tool
 ```
+
+`init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and `init(crewai=True)` install the same thing as that adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both.
 
 ### Any Framework — Manual Tracing
 
@@ -232,7 +240,7 @@ router.update_skills()
 
 ### Skill Delivery at Runtime (`enable_skill_loader`)
 
-Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, enable the skill loader on your adapter's `instrument()`:
+Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, use the framework flag on `init()` (LangChain, OpenAI Agents, ADK and CrewAI turn the loader on with it), or enable the skill loader on your adapter's `instrument()`:
 
 ```python
 import decimalai
@@ -242,7 +250,7 @@ from decimalai.openai_agents import instrument  # or .langchain / .adk / .crewai
 instrument(enable_skill_loader=True)
 ```
 
-On CrewAI (crewai>=1.15.3) the loader rides CrewAI's own `before_llm_call` hook, and `instrument()` also turns on CrewAI tracing — the same exporter `init(crewai=True)` installs, once per process. Call it before the first `kickoff()`, because CrewAI copies its hook list into each agent executor when it builds one:
+On CrewAI (crewai>=1.15.27) the loader rides CrewAI's own `before_llm_call` hook, and `instrument()` also turns on CrewAI tracing — the same exporter `init(crewai=True)` installs, once per process. Call it before the first `kickoff()`, because CrewAI copies its hook list into each agent executor when it builds one:
 
 ```python
 import decimalai
@@ -262,8 +270,8 @@ You can read each run's trace as the LangChain and ADK adapters let you: `instru
 
 With the loader on, the router adds a ranked **menu** of relevant skills to the prompt (one short row per skill: name + when to use it). A menu row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
 
-- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt, trimmed to a token budget. The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk`, `crewai` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins. Pydantic AI also builds its prompt in full-menu mode (no query available), so bodies arrive via `load_skill` there.
-- **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch any offered skill's body mid-turn. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
+- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform ranked the skills by this turn's message and did not fall back to its default menu, so a "thanks!" gets the menu alone. The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk`, `crewai` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins.
+- **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch an offered skill's body mid-turn. It serves only skills the router has offered, never an arbitrary registry name. If another tool in the run is already called `load_skill` (an OpenAI `SandboxAgent`'s native skills, or your own tool on Pydantic AI), DecimalAI's is exposed as `decimalai_load_skill` instead and the menu names it. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
 - **Export to disk** — for runtimes that natively load skills from files (Claude Code, Cursor, ...), write them out with `router.export(...)` or `decimalai skills export` and let the runtime deliver them. Export takes no copy and needs no fork; you can export a skill you only linked.
 
 Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop the adapter controls):
@@ -271,11 +279,11 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | Adapter | Menu + body injection | `load_skill` tool | Notes |
 |---|---|---|---|
 | `decimalai.openai_agents` | ✅ | ✅ | tool auto-registers with the loader |
-| `decimalai.pydantic_ai` | ✅ menu / ❌ body injection | ✅ | full-menu mode (no query at prompt-build time) — bodies arrive via `load_skill` |
+| `decimalai.pydantic_ai` | ✅ | ✅ | routed once per run on the run's message, every turn of a conversation included; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.adk` | ✅ | ❌ injection-only | bodies appended to `system_instruction`; `enable_load_skill_tool` accepted but dormant (warns) |
-| `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.3), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
-| `decimalai.anthropic` | ✅ | ❌ injection-only | patches a single `messages.create()` — no loop to route a tool result back |
+| `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
+| `decimalai.anthropic` | ✅ | ❌ injection-only | patches `messages.create()`, `.stream()` and `.parse()` (sync and async; not `client.beta`) — no loop to route a tool result back |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself from `.claude/skills/` |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; use disk install |
 
@@ -358,7 +366,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
 | Pydantic AI | ✅ | `from decimalai.pydantic_ai import instrument` (no `init()` flag) |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
-| CrewAI | ✅ | `init(crewai=True)`; with skill delivery: `from decimalai.crewai import instrument` |
+| CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |
 | OpenTelemetry | ✅ | `init(otel=True)` |
 

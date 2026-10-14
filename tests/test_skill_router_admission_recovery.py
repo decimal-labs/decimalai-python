@@ -5,7 +5,21 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from decimalai.skill_router import SkillRouter, SkillRouterError, _ADMISSION_MAX_WAIT_S
+from decimalai import skill_router as sr
+from decimalai.skill_router import SkillRouter, SkillRouterError, _ADMISSION_MAX_WAIT_S, _CircuitBreaker
+
+
+@pytest.fixture(autouse=True)
+def _fresh_breaker(monkeypatch):
+    """Each test drives one request against its own breaker.
+
+    Since 2026-10-14 a 429 or 5xx on a hot path (`/route`, `/menu`, `/body`)
+    counts toward the process-wide breaker, as it should. These tests send
+    several in a row on purpose, so sharing one breaker opened it by the third
+    test and every later one was short-circuited instead of exercising
+    admission recovery.
+    """
+    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
 
 
 def response(status, headers=None, body=None):

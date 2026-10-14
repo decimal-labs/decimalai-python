@@ -5,12 +5,12 @@ Quick start::
     import decimalai
     decimalai.init()  # reads DECIMAL_API_KEY from env
 
-    # LangChain — one-liner
-    decimalai.init(langchain=True)
+    # LangChain — one-liner: traces, and the agent's skills in every prompt
+    decimalai.init(langchain=True, agent_name="support")
 
-    # Or turn on tracing yourself
+    # Or install the adapter yourself, with its own options
     from decimalai.langchain import instrument
-    instrument()
+    instrument(agent_name="support", enable_skill_loader=True)
 
     # Generic / any framework
     @decimalai.trace(agent_name="my-agent")
@@ -696,6 +696,59 @@ def _activate_crewai_instrumentation(
 _API_KEY_ENV_VARS = ("DECIMAL_API_KEY", "DECIMALAI_API_KEY")
 
 
+def _router_inputs(config: Any) -> tuple:
+    """The config an adapter's ``SkillRouter`` is built from.
+
+    Each skill-capable adapter builds one router lazily, from whatever config is
+    live at its first use (``_get_skill_router`` in each adapter module), and
+    keeps it — 30 s fragment cache and all — for the life of the process. The
+    key and base URL decide whose skills it serves; ``inject_skill_body`` and
+    ``load_skill_tool`` are folded into its ``inject_body`` at construction.
+    """
+    return (
+        config.api_key,
+        config.base_url,
+        config.inject_skill_body,
+        config.load_skill_tool,
+    )
+
+
+def _drop_adapter_skill_routers() -> None:
+    """Forget every adapter's ``SkillRouter``, so the next call builds a new one.
+
+    Called when a re-init changes what those routers were built from. Without
+    it, ``init(api_key=B)`` after ``init(api_key=A)`` sent org B's traces with
+    B's key while every adapter kept routing with A's — org A's skills in org
+    B's prompts, and nothing anywhere saying so.
+
+    Adapters are looked up in ``sys.modules``, never imported: one that has not
+    been imported has built no router, and importing it here would pull its
+    framework into a process that never asked for it.
+    """
+    prefix = __name__ + "."
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(prefix):
+            continue
+        if getattr(module, "_skill_router_singleton", None) is not None:
+            module._skill_router_singleton = None
+
+
+def _install_crewai_skill_loader() -> None:
+    """The skills half of ``init(crewai=True)``.
+
+    Not ``decimalai.crewai.instrument(enable_skill_loader=True)``: that call
+    also republishes the run observer, and ``init()`` passing none would drop an
+    ``on_trace`` the caller set with ``crewai.instrument(on_trace=...)`` before
+    a re-init. The tracing half is already in place — ``init`` just ran
+    ``_activate_crewai_instrumentation`` — so only the hook is left to add.
+    """
+    from . import crewai as _crewai_adapter
+    from .skill_router import _warn_if_disk_runtime_detected
+
+    _warn_if_disk_runtime_detected("crewai")
+    _crewai_adapter._install_skill_loader()
+
+
 def _api_key_from_env() -> str:
     """First non-empty key among the accepted env-var spellings.
 
@@ -735,6 +788,7 @@ def init(
     load_skill_tool: Optional[bool] = None,
     evidence: bool = False,
     evidence_directory: Optional[str] = None,
+    skills: bool = True,
 ) -> None:
     """Initialize the DecimalAI SDK.
 
@@ -750,6 +804,14 @@ def init(
         decimalai.init(claude_agent_sdk=True)  # Anthropic Claude Agent SDK
         decimalai.init(crewai=True)          # CrewAI
         decimalai.init(otel=True)            # Any OpenTelemetry framework
+
+    On the four frameworks with a skill loader — ``langchain``,
+    ``openai_agents``, ``adk`` and ``crewai`` — the flag both traces and
+    delivers the agent's skills, so ``init(langchain=True, agent_name="support")``
+    is the whole setup. It is the same install as calling that adapter's
+    ``instrument(agent_name=..., enable_skill_loader=True)`` after a bare
+    ``init()``; do one or the other, not both. ``skills=False`` keeps the flag
+    to tracing only.
 
     ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
     a supported integration: the flag is now an alias for ``otel=True`` that
@@ -779,22 +841,29 @@ def init(
             ``claude_agent_sdk``/``otel``/``crewai``/``autogen``) are ignored —
             no adapter is installed, no call is made to the DecimalAI API, and
             no skill files are written to disk.
-        langchain: If ``True``, instrument LangChain / LangGraph.
-        openai_agents: If ``True``, instrument the OpenAI Agents SDK.
+        langchain: If ``True``, instrument LangChain / LangGraph, and deliver
+            skills into every chat-model call (see ``skills``).
+        openai_agents: If ``True``, instrument the OpenAI Agents SDK, and
+            deliver skills: a menu in each Agent's instructions and a
+            ``load_skill`` tool for the bodies (see ``skills``).
         adk: If ``True``, instrument Google ADK (Agent Development Kit) via a
-            native ADK plugin. ADK is Gemini-native.
-        llamaindex: If ``True``, instrument LlamaIndex (v0.10.20+).
+            native ADK plugin, and deliver skills into each model request's
+            system instruction (see ``skills``). ADK is Gemini-native.
+        llamaindex: If ``True``, instrument LlamaIndex. Tracing only: this
+            adapter has no skill loader.
         claude_agent_sdk: If ``True``, instrument Anthropic's Claude Agent SDK
-            (``claude-agent-sdk``) by wrapping its ``query()`` stream. Anthropic-native.
-        crewai: If ``True``, instrument CrewAI. CrewAI emits no OTel spans by
-            itself, so this activates the OpenInference CrewAI instrumentor
-            (plus provider instrumentors for importable LLM SDKs); if
+            (``claude-agent-sdk``) by wrapping its ``query()`` stream.
+            Anthropic-native. Tracing only: this adapter has no skill loader.
+        crewai: If ``True``, instrument CrewAI, and deliver skills into each
+            agent's model calls through CrewAI's ``before_llm_call`` hook (see
+            ``skills``). CrewAI emits no OTel spans by itself, so this
+            activates the OpenInference CrewAI instrumentor (plus provider
+            instrumentors for importable LLM SDKs); if
             ``openinference-instrumentation-crewai`` isn't installed, a
             warning explains that no traces will be captured. A crew run
-            inside ``start_trace()`` is filed as that trace's child. Skill
-            delivery and the per-run ``on_trace`` observer are a separate,
-            explicit step:
-            ``decimalai.crewai.instrument(agent_name=..., enable_skill_loader=True)``.
+            inside ``start_trace()`` is filed as that trace's child. The
+            per-run ``on_trace`` observer is a separate step:
+            ``decimalai.crewai.instrument(on_trace=...)``.
         autogen: RETIRED. AutoGen / AG2 is no longer a supported integration —
             this flag now installs the generic OpenTelemetry exporter (exactly
             what ``otel=True`` does) and warns. Kept so existing code keeps
@@ -808,9 +877,15 @@ def init(
             (e.g. ``openai_agents``/``langchain``) or the call is captured
             twice — see :mod:`decimalai.providers`.
         anthropic: If ``True``, auto-trace direct Anthropic SDK calls.
+            Tracing only, deliberately: this flag is also the tracing half
+            under adapters that deliver skills themselves (Pydantic AI on an
+            Anthropic model), where a second injector would put every skill in
+            the prompt twice. For skills on raw ``messages.create()`` calls,
+            add ``decimalai.anthropic.instrument(enable_skill_loader=True)``.
         google: If ``True``, auto-trace direct Google GenAI
             (``google.genai``) SDK calls.
-        agent_name: Default agent name for auto-install integrations.
+        agent_name: Default agent name for auto-install integrations. It is
+            also the agent whose skills the flag form routes for.
         verify: If ``True`` (default), synchronously probe the backend
             during init to (a) validate the API key, (b) detect a
             wrong/unreachable ``base_url``, and (c) cache the backend's
@@ -824,8 +899,22 @@ def init(
         verify_timeout: Seconds before the verify probe gives up.
             On timeout, init() logs a warning and continues (does not
             raise) so a transiently slow backend doesn't break startup.
+        skills: Whether a framework flag above also turns on that adapter's
+            skill loader. ``True`` (default) makes the flag form deliver the
+            agent's skills; ``False`` installs tracing only, exactly as
+            ``instrument()`` does without ``enable_skill_loader``. Ignored when
+            no skill-capable framework flag is set, and when ``enabled`` is
+            ``False``. With the loader on, the default ``skill_authority``
+            ("auto") treats the router as the skills channel, so the LangChain
+            and OpenAI Agents adapters stop syncing local SKILL.md files to and
+            from the platform; pass ``skill_authority="harness"`` to keep both.
+
+    Re-initializing with a different key, base URL, ``inject_skill_body`` or
+    ``load_skill_tool`` drops every adapter's cached ``SkillRouter``, so the
+    next model call routes with the new configuration.
 
     Raises:
+        TypeError: If ``skills`` is not a bool.
         DecimalConfigError: If ``api_key`` is not provided and not in env,
             OR (when ``verify=True``) if the backend rejects the key
             (401/403) or is unreachable.
@@ -834,6 +923,17 @@ def init(
 
     from ._client import DecimalAIClient
     from ._config import DecimalConfig, DecimalConfigError
+
+    # `skills` is an on/off switch. The adapters' `instrument(skills=[...])` is
+    # a list of skill dicts for the manifest, and a list here would otherwise
+    # read as truthy — "on" — while meaning something else entirely.
+    if not isinstance(skills, bool):
+        raise TypeError(
+            "decimalai.init(skills=...) takes True or False: whether a framework "
+            f"flag also delivers the agent's skills. Got {type(skills).__name__}. "
+            "To declare skills for a manifest, pass skills=[...] to the "
+            "adapter's instrument() instead."
+        )
 
     # Resolve API key. Env fallback accepts DECIMAL_API_KEY (primary) and
     # DECIMALAI_API_KEY (alias), matching the CLI.
@@ -915,7 +1015,16 @@ def init(
     if load_skill_tool is not None:
         _config_kwargs["load_skill_tool"] = load_skill_tool
     config = DecimalConfig(**_config_kwargs)
+    previous_config = _cfg._config
     _cfg._config = config
+    # After the swap, so a router an adapter builds from here on reads the new
+    # config. Only when something the routers were built from changed: an
+    # identical re-init (the bare auto-init at import, then the caller's own
+    # init()) keeps them and their caches.
+    if previous_config is not None and (
+        _router_inputs(previous_config) != _router_inputs(config)
+    ):
+        _drop_adapter_skill_routers()
 
     if enabled:
         _cfg._client = DecimalAIClient(
@@ -1007,20 +1116,22 @@ def init(
                 "instrumentation; no adapter installed and no skills synced."
             )
     else:
-        # Auto-install langchain tracing if requested
+        # The flag form is what the quickstart teaches, so it installs what the
+        # agent needs: tracing AND the skill loader. Through 0.13.9 it called
+        # instrument() with the loader off, and a user who followed the docs got
+        # good traces and zero skills, with nothing saying so. `skills=False` is
+        # the tracing-only install.
         if langchain:
             from .langchain import instrument as _lc_install
-            _lc_install(agent_name=agent_name)
+            _lc_install(agent_name=agent_name, enable_skill_loader=skills)
 
-        # Auto-install OpenAI Agents tracing if requested
         if openai_agents:
             from .openai_agents import instrument as _oai_install
-            _oai_install(agent_name=agent_name)
+            _oai_install(agent_name=agent_name, enable_skill_loader=skills)
 
-        # Auto-install Google ADK tracing if requested
         if adk:
             from .adk import instrument as _adk_install
-            _adk_install(agent_name=agent_name)
+            _adk_install(agent_name=agent_name, enable_skill_loader=skills)
 
         # Auto-install LlamaIndex span handler if requested
         if llamaindex:
@@ -1049,6 +1160,10 @@ def init(
             _otel_provider = _otel_install(agent_name=agent_name)
             if crewai:
                 _activate_crewai_instrumentation(_otel_provider, agent_name=agent_name)
+                # Whether or not activation found its instrumentor: delivery
+                # rides CrewAI's own hook, not the spans.
+                if skills:
+                    _install_crewai_skill_loader()
             if autogen:
                 from .autogen import _warn_autogen_not_supported
                 _warn_autogen_not_supported()
@@ -1056,6 +1171,11 @@ def init(
     # Auto-trace direct provider-SDK calls (no framework) if requested.
     # Each flag enables the matching provider's OpenInference instrumentor,
     # routed through decimalai's OTEL exporter. See decimalai.providers.
+    #
+    # Tracing only, unlike the framework flags above. The docs pair these with
+    # adapters that deliver skills themselves (`init(anthropic=True)` under
+    # `decimalai.pydantic_ai`), so a skill loader here would be a second
+    # injector on the same model call.
     if openai or anthropic or google:
         from .providers import instrument as _provider_instrument
         _provider_instrument(
@@ -2097,7 +2217,9 @@ def _auto_init_from_env() -> None:
     """Auto-initialize from environment variables if configured.
 
     Two paths:
-    1. `DECIMAL_AUTO_TRACE=<framework>` — full framework auto-install.
+    1. `DECIMAL_AUTO_TRACE=<framework>` — full framework auto-install, the same
+       as passing that framework's flag to `init()`: on langchain,
+       openai-agents, adk and crewai that includes the skill loader.
     2. `DECIMAL_API_KEY` present AND `DECIMAL_AUTOINIT != "false"` — bare
        init() so users get ingest + atexit flush without a line of
        boilerplate. Opt out with `DECIMAL_AUTOINIT=false`.

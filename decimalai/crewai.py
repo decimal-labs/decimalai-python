@@ -34,51 +34,81 @@ delivered. Delivered is never promoted to activated: there is no ``load_skill``
 tool here, so the model has no way to ASK for a skill, and an activation
 recorded anyway would be a fabrication (conformance item C13).
 
-SUPPORTED: crewai >= 1.15.3, the lowest version on which the conformance column
-— tracing, the skills rail and the delivery cells — passes end to end (run on
-1.15.3, 1.15.20 and 1.15.23). The hook API itself exists from 1.5.0, but every
-delivery claim rides the run's trace, and below 1.15.3 the trace is the problem:
-the OpenInference CrewAI instrumentor only instruments crewai >= 1.10.1, crewai
-1.7–1.14 pin ``click<8.2`` and cannot be installed beside decimalai, and 1.15.0
-records no completion text. On an older crewai the hook still inserts the block;
-with no crew span to attribute it to, the trace never says so.
+SUPPORTED: crewai 1.15.27 with openinference-instrumentation-crewai 1.1.21 —
+the latest releases, and the only ones this adapter is written and run against.
+Older CrewAI releases are not supported, and nothing here works around them.
 
-THE SEAM, read out of the installed package (crewai 1.15.20 and 1.6.1) rather
-than remembered:
+THE SEAM, read out of the installed crewai 1.15.27 rather than remembered:
 
-* ``crewai.hooks.register_before_llm_call_hook`` is public, documented API,
-  present from crewai 1.5.0. Every agent executor copies the global hook list
-  when it is built (``CrewAgentExecutor.__init__``;
-  ``experimental.AgentExecutor._setup_executor`` on 1.15) and runs it in
-  ``utilities/agent_utils.py::_setup_before_llm_call_hooks`` immediately before
-  ``llm.call``. It is CrewAI's own extension point for exactly this, the way
-  ADK's ``before_model_callback`` is ADK's.
+* ``crewai.hooks.register_before_llm_call_hook`` is public, documented API.
+  Its registry is the generic hook dispatcher's ``PRE_MODEL_CALL`` list, so
+  this hook and an ``@on(InterceptionPoint.PRE_MODEL_CALL)`` hook share one
+  ordered queue. Every agent executor copies the global hook list when it is
+  built (``experimental.AgentExecutor._setup_executor``, the default; the
+  deprecated ``CrewAgentExecutor.__init__``), and
+  ``utilities/agent_utils.py::_prepare_llm_call`` runs that copy immediately
+  before ``llm.call``. It also marks the call as dispatched, so the LLM layer
+  does not run the hooks a second time. It is CrewAI's own extension point for
+  exactly this, the way ADK's ``before_model_callback`` is ADK's.
 * The hook context's ``messages`` IS the executor's live message list
   (``LLMCallHookContext.__init__``: ``self.messages = executor.messages``), and
-  ``get_llm_response`` hands that same list to ``llm.call`` after the hooks ran
-  (1.15: ``_prepare_llm_call`` yields ``executor_context.messages``; 1.6.1:
-  ``messages = executor_context.messages``). What the hook inserts is what the
-  provider is sent — and what the provider instrumentor records, which is how it
-  reaches the trace's ``rendered_input``.
+  ``_prepare_llm_call`` yields that same list to ``llm.call`` after the hooks
+  ran. What the hook inserts is what the provider is sent — and what the
+  provider instrumentor records, which is how it reaches the trace's
+  ``rendered_input``.
 * That list PERSISTS across the iterations of one task (tool call, observation,
   answer), so the block inserted for the previous call is still in it on the
   next one. It is replaced, never stacked: the inserted messages are
   :class:`_SkillMessage` instances, found and removed by type before the next
   insert.
-* A call dispatched with NO executor is left alone. On crewai >= 1.7 the LLM
-  layer also dispatches these hooks for calls that are not an agent turn —
-  CrewAI's own output converter, guardrails and planner, or ``llm.call()``
-  straight from user code (``BaseLLM._invoke_before_llm_call_hooks``, context
-  built with ``executor=None``). A skill body has no business in a JSON
-  conversion prompt, and claiming delivery for it would credit the skill with a
-  call the agent never made.
+* A call dispatched with NO executor is left alone. The LLM layer also
+  dispatches these hooks for calls that are not an agent turn — CrewAI's own
+  output converter, guardrails and planner, or ``llm.call()`` straight from
+  user code (``BaseLLM._invoke_before_llm_call_hooks``, context built with
+  ``executor=None``). A skill body has no business in a JSON conversion prompt,
+  and claiming delivery for it would credit the skill with a call the agent
+  never made.
 
 What the hook cannot reach, stated rather than discovered later: an executor
 built BEFORE ``instrument(enable_skill_loader=True)`` keeps the hook list it
-copied. crewai 1.15 builds an agent's executor on its first task and reuses it,
-so enable the loader before the first ``kickoff()``. ``Crew.kickoff()``,
-``Crew.kickoff_async()`` and ``Agent.kickoff()`` all dispatch through an
-executor and all get skills.
+copied. CrewAI builds an agent's executor on its first task and reuses it, so
+enable the loader before the first ``kickoff()``. ``Crew.kickoff()``,
+``Crew.kickoff_async()``, ``Crew.akickoff()``, ``Agent.kickoff()`` and
+``Agent.kickoff_async()`` all dispatch through an executor and all get skills.
+
+Threads and event loops
+-----------------------
+CrewAI hooks are synchronous by CrewAI's design (``crewai/hooks/dispatch.py``:
+they "may be invoked from async seams, so they must not block on heavy I/O").
+This hook cannot await, so the routing call is a blocking HTTP request on
+whatever thread CrewAI runs the hook on. Measured on 1.15.27
+(``tests/test_crewai_phase1.py``):
+
+* The default executor, ``AgentExecutor``, is a Flow, and a Flow runs every
+  sync step — the model call and its hooks included — through
+  ``asyncio.to_thread(ctx.run, ...)``. ``Crew.kickoff_async()`` is itself
+  ``asyncio.to_thread(self.kickoff)``. So on every kickoff entry point, sync or
+  async, the hook runs on a worker thread with the caller's context copied in,
+  and the caller's event loop keeps running while skills are routed.
+* The exception is the deprecated ``CrewAgentExecutor``
+  (``Agent(executor_class=CrewAgentExecutor)``) under ``Crew.akickoff()``. Its
+  native-async loop awaits ``aget_llm_response``, which runs the hooks inline on
+  the event-loop thread, so the routing call blocks that loop until it
+  returns. The adapter says so once, as a WARNING, and keeps delivering:
+  dropping skills there would trade a visible stall for silent non-delivery.
+
+CrewAI's own skills
+-------------------
+CrewAI ships Agent Skills of its own: ``Agent(skills=...)`` and
+``Crew(skills=...)``, merged onto each agent at kickoff. They render into
+CrewAI's system prompt — an ``<available_skills>`` catalog plus a native
+``load_skill`` tool for metadata-level skills, an always-on ``<skills>`` block
+for activated ones. With this loader on too, DecimalAI's routed menu lands
+right after that prompt. The model is then shown two skill catalogs with two
+different instructions, and a skill CrewAI loads natively is never recorded as
+a DecimalAI activation. Nothing here reconciles the two yet. The hook reads
+``context.agent.skills`` and warns once, the first time both catalogs are in
+the same model call, naming the native skills and any name both of them offer.
 
 The run's trace, handed back (``on_trace``) and filed under its caller
 ----------------------------------------------------------------------
@@ -109,6 +139,7 @@ in the batch processor for up to five seconds, or until the process exits.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from dataclasses import dataclass
@@ -138,6 +169,15 @@ _install_agent_name: Optional[str] = None
 
 _skill_router_singleton: Any = None
 
+#: One-shot warnings, once per process like
+#: ``skill_router._warn_if_disk_runtime_detected``: a crew makes a model call
+#: per step, and the same sentence on every one of them would bury it.
+_native_skills_warned = False
+_loop_block_warned = False
+
+#: At most this many native skill names in the two-catalogs warning.
+_MAX_NAMED_SKILLS = 10
+
 
 @dataclass(frozen=True)
 class _InstrumentationConfig:
@@ -159,9 +199,10 @@ _tracer_providers: List[Any] = []
 
 #: How long ``decimalai.flush()`` waits for this pipeline. The SDK's own
 #: ``BatchSpanProcessor.force_flush`` ignores its timeout (opentelemetry-sdk
-#: 1.42 exports everything, inline, under a lock), so the bound is enforced
-#: here. Five seconds is the sender's own per-trace wait, and leaves room inside
-#: the ten seconds a container runtime allows between SIGTERM and SIGKILL.
+#: 1.42.1 and 1.45.1 both export everything, inline, under a lock), so the
+#: bound is enforced here. Five seconds is the sender's own per-trace wait, and
+#: leaves room inside the ten seconds a container runtime allows between
+#: SIGTERM and SIGKILL.
 _FLUSH_TIMEOUT_S = 5.0
 
 #: The instrumentation scope the OpenInference CrewAI instrumentor's spans carry
@@ -352,6 +393,114 @@ def _insertion_point(messages: Sequence[Any]) -> tuple:
     return (cut, "system") if cut else (0, "user")
 
 
+# ── what the routing call shares the model call with ────────
+
+
+def _event_loop_running_here() -> bool:
+    """True when this thread is running an asyncio event loop right now."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _warn_if_blocking_the_loop() -> None:
+    """Say once that the routing call is about to block a running event loop.
+
+    CrewAI hooks are synchronous, so there is nothing to await: when CrewAI runs
+    one on the loop's own thread, the routing request stalls every coroutine on
+    that loop until it returns. On crewai 1.15.27 only the deprecated
+    ``CrewAgentExecutor``'s native-async path does that (see the module
+    docstring). The call still goes ahead — see ``_inject_skills``.
+    """
+    global _loop_block_warned
+    if _loop_block_warned or not _event_loop_running_here():
+        return
+    _loop_block_warned = True
+    logger.warning(
+        "DecimalAI CrewAI: CrewAI ran its before_llm_call hook on a thread with a "
+        "running asyncio event loop. CrewAI hooks are synchronous, so DecimalAI's "
+        "skill routing request blocks that event loop until it returns, stalling "
+        "every other coroutine on it. On crewai 1.15.27 only the deprecated "
+        "CrewAgentExecutor (Agent(executor_class=CrewAgentExecutor)) does this, "
+        "under Crew.akickoff(); the default AgentExecutor runs the hook on a "
+        "worker thread. Drop executor_class, or use Crew.kickoff_async(). Skills "
+        "are still delivered. Logged once per process."
+    )
+
+
+def _native_skills(context: Any) -> tuple:
+    """``(names, cataloged, always_on)`` for CrewAI's own skills on this agent.
+
+    Read exactly as CrewAI's prompt builder reads them
+    (``utilities/prompts.py::_build_skill_block``): the ``Skill`` objects in
+    ``agent.skills``, which by now include the crew's (``Crew(skills=...)`` is
+    merged onto each agent at kickoff). ``cataloged`` is CrewAI's own answer to
+    "is a ``load_skill`` tool registered": a metadata-level skill makes
+    ``build_skill_catalog`` non-empty, and only then does the agent get the
+    tool (``Agent._add_skill_loader_tool``). ``always_on`` is an activated
+    skill, rendered in full in a ``<skills>`` block on every call.
+    """
+    agent = getattr(context, "agent", None)
+    configured = getattr(agent, "skills", None) if agent is not None else None
+    if not configured or not isinstance(configured, (list, tuple)):
+        return [], False, False
+    from crewai.skills.loader import build_skill_catalog
+    from crewai.skills.models import INSTRUCTIONS, Skill
+
+    loaded = [skill for skill in configured if isinstance(skill, Skill)]
+    return (
+        [skill.name for skill in loaded],
+        bool(build_skill_catalog(loaded)),
+        any(skill.disclosure_level >= INSTRUCTIONS for skill in loaded),
+    )
+
+
+def _warn_if_two_catalogs(context: Any, offered: Optional[Sequence[str]]) -> None:
+    """Say once that CrewAI's skills and DecimalAI's menu are in one call.
+
+    Called only after DecimalAI's block landed, so the sentence is true of the
+    call it fires on. Detection only: both catalogs still go to the model, as
+    they did before this warning existed. Never raises — it runs after the
+    delivery, and a warning must not be able to cost one.
+    """
+    global _native_skills_warned
+    if _native_skills_warned:
+        return
+    try:
+        names, cataloged, always_on = _native_skills(context)
+        if not names:
+            return
+        _native_skills_warned = True
+        shown = ", ".join(names[:_MAX_NAMED_SKILLS])
+        if len(names) > _MAX_NAMED_SKILLS:
+            shown += f" (+{len(names) - _MAX_NAMED_SKILLS} more)"
+        native = " and ".join(
+            part for part, present in (
+                ("CrewAI's <available_skills> catalog with its own load_skill tool",
+                 cataloged),
+                ("CrewAI's always-on <skills> block", always_on),
+            ) if present
+        )
+        both = sorted(set(names) & set(offered or ()))
+        overlap = f" Names offered by both: {', '.join(both)}." if both else ""
+        role = getattr(getattr(context, "agent", None), "role", None)
+        logger.warning(
+            "DecimalAI CrewAI: agent %r has CrewAI's own skills configured "
+            "(Agent(skills=...) / Crew(skills=...): %s) and the DecimalAI skill "
+            "loader is on, so two skill catalogs are active in the same model "
+            "call: %s, and DecimalAI's routed menu. The model sees both, with "
+            "different instructions, and skills CrewAI loads natively are not "
+            "recorded as DecimalAI activations.%s To use one source, remove "
+            "skills= from the agent and crew, or leave enable_skill_loader off. "
+            "Logged once per process.",
+            role, shown, native, overlap,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("native CrewAI skill detection failed (non-fatal)", exc_info=True)
+
+
 def _inject_skills(context: Any) -> None:
     """Route this agent turn's skills and insert them into its messages.
 
@@ -375,6 +524,11 @@ def _inject_skills(context: Any) -> None:
     query = previous.query if previous is not None and previous.query else _query_for(
         context, messages
     )
+    # The routing request below is blocking I/O and there is nothing to await
+    # it with. On a running loop it stalls the loop; that is said out loud, and
+    # the call still goes ahead, because no skills at all would be the silent
+    # failure this adapter exists to prevent.
+    _warn_if_blocking_the_loop()
     scope = _scope()
     agent_name = _routing_agent_name()
     from .skill_router import (
@@ -454,6 +608,8 @@ def _inject_skills(context: Any) -> None:
     except Exception:
         logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
 
+    _warn_if_two_catalogs(context, offered)
+
 
 def _skill_hook(context: Any) -> None:
     """The ``before_llm_call`` hook. Never blocks the call and never raises.
@@ -484,10 +640,10 @@ def _install_skill_loader() -> bool:
         )
     except ImportError:
         logger.warning(
-            "enable_skill_loader=True but CrewAI's before_llm_call hook API is not "
-            "available (it arrived in crewai 1.5.0; the loader is supported on "
-            "crewai>=1.15.3 — pip install -U 'crewai>=1.15.3'). Skills will NOT be "
-            "delivered to this crew; tracing is unaffected."
+            "DecimalAI CrewAI skill loader: crewai cannot be imported, so there "
+            "is no CrewAI hook registry to install it into (pip install "
+            "'crewai>=1.15.27'). Skills will NOT be delivered; tracing is "
+            "unaffected."
         )
         return False
     with _install_lock:

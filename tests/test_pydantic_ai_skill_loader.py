@@ -7,8 +7,11 @@ framework introspection/handler tests.
 Adapter contract under test (decimalai/pydantic_ai.py):
   - ``install(enable_skill_loader=True)`` monkey-patches
     ``pydantic_ai.Agent.__init__`` so every newly constructed Agent gets
-    the DecimalAI skills system-prompt function registered via
-    ``self.system_prompt(...)`` (see _install_skill_loader / patched_init).
+    the DecimalAI skills function registered via ``self.instructions(...)``
+    (see _install_skill_loader / patched_init). Instructions, not a system
+    prompt, since 2026-10-14: Pydantic AI builds a plain system prompt only
+    when there is no message history, so turn 2 of a conversation was never
+    routed. tests/test_pydantic_ai_phase1.py drives the real Agent for that.
   - The registered function ``_skills_system_prompt`` calls
     ``SkillRouter.build_prompt_fragment()`` and returns the resulting
     prompt fragment (the actual skill knowledge K injected per turn),
@@ -26,6 +29,7 @@ import asyncio
 import os
 import sys
 import types
+from contextlib import asynccontextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,8 +40,8 @@ os.environ.setdefault("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING", "1")
 
 
 # ── Synthetic pydantic_ai.Agent ──────────────────────────────────
-# Matches only the surface the adapter touches: __init__ and a
-# .system_prompt(fn) registration method (which the real pydantic_ai
+# Matches only the surface the adapter touches: __init__ and an
+# .instructions(fn) registration method (which the real pydantic_ai
 # Agent exposes as both a decorator and a function call).
 
 
@@ -49,14 +53,20 @@ def _make_fake_pydantic_ai():
         def __init__(self, model=None, system_prompt=""):
             self.model = model
             self.base_system_prompt = system_prompt
-            # Functions registered via @agent.system_prompt / agent.system_prompt(fn)
-            self.registered_system_prompts = []
+            # Functions registered via @agent.instructions / agent.instructions(fn)
+            self.registered_instructions = []
 
-        def system_prompt(self, fn):
+        def instructions(self, fn):
             # Real pydantic_ai supports decorator AND function-call form;
             # both append the fn and return it.
-            self.registered_system_prompts.append(fn)
+            self.registered_instructions.append(fn)
             return fn
+
+        @asynccontextmanager
+        async def iter(self, prompt):
+            # Present because the real one is: `instrument()` brackets every run
+            # by patching `Agent.iter`, which every supported pydantic-ai has.
+            yield prompt
 
     mod.Agent = Agent
     return mod, Agent
@@ -73,17 +83,25 @@ def fake_pydantic_ai(monkeypatch):
 
     mod, Agent = _make_fake_pydantic_ai()
     original_init = Agent.__init__
+    original_iter = Agent.iter
 
     monkeypatch.setitem(sys.modules, "pydantic_ai", mod)
-    # Force a fresh install in every test (the adapter is install-once).
+    # Force a fresh install in every test (the adapter is install-once). The
+    # run scope and name capture are installed by the same `install()` call, so
+    # they are reset with it: left True, they would skip this fake class, and
+    # left True by THIS test, they would skip the next test's class.
     monkeypatch.setattr(pa, "_skill_loader_installed", False)
+    monkeypatch.setattr(pa, "_run_scope_installed", False)
+    monkeypatch.setattr(pa, "_name_capture_installed", False)
+    monkeypatch.setattr(pa, "_default_agent_name", None)
     # Don't leak a router singleton between tests.
     monkeypatch.setattr(pa, "_skill_router_singleton", None)
 
     yield mod, Agent, pa
 
-    # Undo the monkeypatch of Agent.__init__ so the synthetic class is clean.
+    # Undo the monkeypatches of Agent so the synthetic class is clean.
     Agent.__init__ = original_init
+    Agent.iter = original_iter
 
 
 # ── Install / patch contract ─────────────────────────────────────
@@ -92,7 +110,7 @@ def fake_pydantic_ai(monkeypatch):
 class TestSkillLoaderInstall:
     def test_install_registers_skills_prompt_on_new_agent(self, fake_pydantic_ai):
         """After install(enable_skill_loader=True), constructing an Agent
-        registers the DecimalAI skills system-prompt function."""
+        registers the DecimalAI skills instructions function."""
         _, Agent, pa = fake_pydantic_ai
 
         pa.install(enable_skill_loader=True)
@@ -100,9 +118,9 @@ class TestSkillLoaderInstall:
         agent = Agent("openai:gpt-4o", system_prompt="You are helpful")
 
         # The real observable effect: our function is now registered.
-        assert pa._skills_system_prompt in agent.registered_system_prompts
+        assert pa._skills_system_prompt in agent.registered_instructions
         # ...and exactly once (no double-registration on a single construct).
-        assert agent.registered_system_prompts.count(pa._skills_system_prompt) == 1
+        assert agent.registered_instructions.count(pa._skills_system_prompt) == 1
 
     def test_base_system_prompt_preserved(self, fake_pydantic_ai):
         """The patched __init__ still runs the original __init__ — the
@@ -123,7 +141,7 @@ class TestSkillLoaderInstall:
         pa.install()  # enable_skill_loader defaults False
 
         agent = Agent("openai:gpt-4o")
-        assert agent.registered_system_prompts == []
+        assert agent.registered_instructions == []
         assert pa._skill_loader_installed is False
 
     def test_install_is_idempotent(self, fake_pydantic_ai):
@@ -135,7 +153,7 @@ class TestSkillLoaderInstall:
         pa.install(enable_skill_loader=True)
 
         agent = Agent("openai:gpt-4o")
-        assert agent.registered_system_prompts.count(pa._skills_system_prompt) == 1
+        assert agent.registered_instructions.count(pa._skills_system_prompt) == 1
 
 
 # ── Registered-function behavior ─────────────────────────────────

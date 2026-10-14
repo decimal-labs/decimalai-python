@@ -19,6 +19,9 @@ Custom path (exclusive — replaces default OpenAI tracing)::
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import functools
 import logging
 import threading
 import warnings
@@ -354,8 +357,7 @@ def _drain_router_rails() -> tuple[Optional[str], List[str], List[str], List[str
     """Drain the Router singleton's process-global instance rails.
 
     Kept as the fallback for runs that produced no per-run rail (a caller
-    driving the Router outside `Runner.run`, or an Agents SDK old enough to
-    lack `get_current_trace`) and, on every send, as a RESET: an undrained
+    driving the Router outside `Runner.run`) and, on every send, as a RESET: an undrained
     global rail would otherwise leak into the next trace. When the run did
     record its own rail, `_send_trace` discards what this returns —
     those names are already attributed correctly and per-run, and under
@@ -691,14 +693,85 @@ def _handle_load_skill(name: str, *, agent_name: Optional[str] = None) -> str:
 
 _SKILL_TOOL_AGENT_ATTR = "__decimalai_skill_agent_name__"
 
+#: The name DecimalAI's tool normally has.
+_TOOL_NAME = "load_skill"
+#: Its name on an agent that already carries a native tool called `load_skill`.
+#: See `_skill_tool_name`.
+_NAMESPACED_TOOL_NAME = "decimalai_load_skill"
+#: Every name this adapter's own tool can have. An SDK affordance, not part of
+#: the agent's declared contract, so the manifest never lists it.
+_SKILL_TOOL_NAMES = frozenset({_TOOL_NAME, _NAMESPACED_TOOL_NAME})
 
-def _make_load_skill_tool(agent_name: Optional[str] = None) -> Any:
+
+def _skill_tool_name(agent: Any) -> str:
+    """The name DecimalAI's skill tool takes on THIS agent's tool list.
+
+    A `SandboxAgent` run executes a clone that carries the sandbox's capability
+    tools, and a lazily configured native `Skills` capability
+    (`Skills(lazy_from=...)`) is one of them: it registers its OWN tool named
+    `load_skill`, taking `skill_name`, that loads only the sandbox's skills. The
+    Agents SDK raises nothing for two tools with one name, and dispatch goes to
+    the last one registered. So:
+
+    * backing off (the old behaviour) left the DecimalAI menu with no loader at
+      all — the model called the native tool with a registry name and failed;
+    * registering a second `load_skill` would have lost dispatch to whichever
+      came last, with no error either way.
+
+    Namespacing keeps both catalogs loadable, and the prompt hint names the tool
+    that serves the menu above it (see `_skill_tool_hint`). Every other agent
+    keeps the plain name.
+    """
+    native = getattr(agent, "_sandbox_capability_tools", None) or ()
+    if any(getattr(tool, "name", None) == _TOOL_NAME for tool in native):
+        return _NAMESPACED_TOOL_NAME
+    return _TOOL_NAME
+
+
+#: Set once the namespaced tool has been announced, so it is said once per
+#: process rather than once per turn.
+_namespace_notice_emitted = False
+
+
+def _note_namespaced(agent: Any) -> None:
+    global _namespace_notice_emitted
+    if _namespace_notice_emitted:
+        return
+    _namespace_notice_emitted = True
+    logger.warning(
+        "DecimalAI: agent %r already has a native `load_skill` tool (the sandbox "
+        "Skills capability with lazy_from=), so DecimalAI's skill loader is "
+        "registered on it as `%s`. Both catalogs stay loadable: the native tool "
+        "loads the sandbox's skills, `%s` loads the DecimalAI skills listed in "
+        "the prompt. Activations are recorded the same way under either name.",
+        getattr(agent, "name", "<unnamed>"), _NAMESPACED_TOOL_NAME, _NAMESPACED_TOOL_NAME,
+    )
+
+
+def _skill_tool_hint(tool_name: str) -> str:
+    """The line appended to the menu telling the model how to read a body."""
+    from .skill_router import LOAD_SKILL_PROMPT_HINT
+
+    if tool_name == _TOOL_NAME:
+        return LOAD_SKILL_PROMPT_HINT
+    return (
+        f"If a skill listed above applies, call the {tool_name} tool with its "
+        "exact name to read its full instructions before using it. The load_skill "
+        "tool loads only the sandbox's own skills, not these. Load each skill at "
+        "most once, then answer the user directly using what you loaded."
+    )
+
+
+def _make_load_skill_tool(agent_name: Optional[str] = None, tool_name: str = _TOOL_NAME) -> Any:
     """Build the native load_skill FunctionTool (the progressive-disclosure path).
 
     The OpenAI Agents SDK owns its tool loop, so a load_skill tool result is
     routed back to the model mid-turn. This adapter therefore registers
     load_skill as a real tool; the langchain / anthropic adapters wrap a layer
-    with no tool loop, so they surface skills in the prompt instead."""
+    with no tool loop, so they surface skills in the prompt instead.
+
+    ``tool_name`` is `_TOOL_NAME` unless the agent already has a native tool by
+    that name (see `_skill_tool_name`)."""
     global _load_skill_tool_registration_failed
     try:
         from agents import function_tool
@@ -722,7 +795,10 @@ def _make_load_skill_tool(agent_name: Optional[str] = None) -> Any:
 
     load_skill.__doc__ = LOAD_SKILL_TOOL_DESCRIPTION
     try:
-        tool = function_tool(load_skill)
+        tool = (
+            function_tool(load_skill) if tool_name == _TOOL_NAME
+            else function_tool(load_skill, name_override=tool_name)
+        )
         setattr(tool, _SKILL_TOOL_AGENT_ATTR, agent_name)
     except Exception:
         _load_skill_tool_registration_failed = True
@@ -744,18 +820,24 @@ def _agent_has_load_skill_tool(agent: Any) -> bool:
     )
 
 
-def _load_skill_reachable(agent: Any) -> bool:
-    """Whether load_skill will be on the tool list this turn.
+def _load_skill_reachable(agent: Any) -> Optional[str]:
+    """The name of the skill tool on this turn's tool list, or None.
 
     An agent built BEFORE `instrument(enable_skill_loader=True)` doesn't
     carry the tool on `agent.tools` — `get_all_tools` appends it at
     resolution time instead — so checking the declared list alone would
     suppress the prompt hint for exactly the agents the retrofit exists
     to serve.
+
+    On an agent whose own `load_skill` is a sandbox capability's, that tool
+    is NOT the one serving the DecimalAI menu; the namespaced one is.
     """
-    if _agent_has_load_skill_tool(agent):
-        return True
-    return bool(_skill_loader_installed and _load_skill_tool_enabled())
+    name = _skill_tool_name(agent)
+    if name == _TOOL_NAME and _agent_has_load_skill_tool(agent):
+        return name
+    if _skill_loader_installed and _load_skill_tool_enabled():
+        return name
+    return None
 
 
 # Marks our own wrapped-instructions callable so the class-level
@@ -765,8 +847,45 @@ def _load_skill_reachable(agent: Any) -> bool:
 _BASE_INSTRUCTIONS_ATTR = "__decimalai_base_instructions__"
 
 
+_UNSET = object()
+
+
+async def _off_loop(fn: Any, *args: Any) -> Any:
+    """Run blocking ``fn(*args)`` on a worker thread, as if it had run inline.
+
+    The routing call is a synchronous HTTP request (a 5 s read budget, with
+    admission retries on top). Made from the event loop — which is where the
+    async ``get_system_prompt`` calls the instructions — it stalled every other
+    coroutine in the process, i.e. every concurrent conversation in an async
+    server, for as long as the platform took to answer.
+
+    ``fn`` runs in a COPY of this context (as ``asyncio.to_thread`` does), and
+    every context variable it changed is then set here as well, so the awaiting
+    coroutine is left with the same contextvar state an inline call would have
+    left: the router's per-call rails (offered and delivered names, versions)
+    and this module's own.
+    """
+    ctx = contextvars.copy_context()
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, functools.partial(ctx.run, fn, *args))
+    for var, value in ctx.items():
+        if var.get(_UNSET) is not value:
+            var.set(value)
+    return result
+
+
+async def _skill_aware_prompt_async(base: str, ctx: Any, agent: Any) -> str:
+    try:
+        return await _off_loop(_skill_aware_prompt, base, ctx, agent)
+    except Exception:
+        # Only the hand-off itself can land here (an executor that is shutting
+        # down); `_skill_aware_prompt` never raises. Never break a run for it.
+        logger.debug("off-loop skill routing failed (non-fatal)", exc_info=True)
+        return base
+
+
 def _make_skill_aware_instructions(base: str):
-    """Return a sync callable usable as `Agent.instructions`.
+    """Return a callable usable as `Agent.instructions`.
 
     The callable emits `base` FIRST and the routed skill fragment after it.
     `base` is the agent's own instructions — identical bytes on every turn —
@@ -774,94 +893,110 @@ def _make_skill_aware_instructions(base: str):
     turn. OpenAI auto-caches a request's stable leading prefix, so the varying
     half has to be the tail: in front, it pushed the agent's whole (often much
     larger) prompt off its cached prefix and made every call a full miss.
+
+    Called while an event loop is running on this thread — which is how the
+    Agents SDK calls it, from the async ``get_system_prompt`` — it returns an
+    awaitable that routes on a worker thread (see `_off_loop`); the SDK awaits
+    whatever the callable returns. Called with no loop running there is nothing
+    to stall, so it routes inline and returns the string.
     """
 
-    def instructions_fn(ctx: Any, agent: Any) -> str:
+    def instructions_fn(ctx: Any, agent: Any) -> Any:
         try:
-            router = _get_skill_router()
-            if router is None:
-                return base
-            run_key = _current_run_key()
-            # Only pass `scope` when there IS a run to scope to, so a router
-            # that predates the parameter is untouched on the unscoped path.
-            kwargs = {"scope": run_key} if run_key else {}
-            from .skill_router import (
-                _release_scoped_routing_rail,
-                consume_last_delivered_names,
-                consume_last_delivered_versions,
-                consume_last_offered_names,
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return _skill_aware_prompt(base, ctx, agent)
+        return _skill_aware_prompt_async(base, ctx, agent)
+
+    setattr(instructions_fn, _BASE_INSTRUCTIONS_ATTR, base)
+    return instructions_fn
+
+
+def _skill_aware_prompt(base: str, ctx: Any, agent: Any) -> str:
+    """`base`, then this turn's routed skill fragment. Blocking; never raises."""
+    try:
+        router = _get_skill_router()
+        if router is None:
+            return base
+        run_key = _current_run_key()
+        # Only pass `scope` when there IS a run to scope to, so a router
+        # that predates the parameter is untouched on the unscoped path.
+        kwargs = {"scope": run_key} if run_key else {}
+        from .skill_router import (
+            _release_scoped_routing_rail,
+            consume_last_delivered_names,
+            consume_last_delivered_versions,
+            consume_last_offered_names,
+        )
+        consume_last_delivered_versions()
+        try:
+            fragment, routing_id = router.build_prompt_fragment(
+                query=_extract_query(ctx),
+                agent_name=getattr(agent, "name", None),
+                **kwargs,
             )
+        except TypeError:
+            # Router from an older SDK — no per-run scope parameter.
             consume_last_delivered_versions()
             try:
                 fragment, routing_id = router.build_prompt_fragment(
                     query=_extract_query(ctx),
                     agent_name=getattr(agent, "name", None),
-                    **kwargs,
                 )
-            except TypeError:
-                # Router from an older SDK — no per-run scope parameter.
-                consume_last_delivered_versions()
-                try:
-                    fragment, routing_id = router.build_prompt_fragment(
-                        query=_extract_query(ctx),
-                        agent_name=getattr(agent, "name", None),
-                    )
-                except Exception:
-                    consume_last_delivered_versions()
-                    raise
             except Exception:
                 consume_last_delivered_versions()
                 raise
-            finally:
-                # The router keeps its own copy of this decision under the
-                # run's scope, for adapters that read it back from there. This
-                # one records it on its own run rail below, so the copy is
-                # released here or never. The body budget filed under the same
-                # scope stays: this run's load_skill calls still need it.
-                _release_scoped_routing_rail(router, kwargs.get("scope"))
-            if routing_id:
-                _set_routing_id(routing_id)
-            # Pull the names the Router offered for this call and
-            # accumulate against the active trace.
-            offered = consume_last_offered_names()
-            if offered:
-                _add_skills_offered(offered)
-            # Names whose BODY the Router injected count as delivered.
-            delivered = consume_last_delivered_names()
-            delivered_versions = copy_delivered_versions(consume_last_delivered_versions(), names=delivered)
-            if delivered:
-                _add_skills_delivered(delivered)
-            previous = _skills_delivered_versions_ctx.get()
-            _skills_delivered_versions_ctx.set((run_key, merge_delivered_versions(
-                previous[1] if previous and previous[0] == run_key else [], delivered_versions,
-            )) if run_key else None)
-            # The contextvar writes above are made inside the Task the
-            # runner gathers this callable in, so they die with it. Mirror
-            # everything onto THIS run's rail, which `_send_trace` can read.
-            _record_run_rail(
-                routing_id=routing_id,
-                offered=offered,
-                delivered=delivered,
-                delivered_versions=delivered_versions,
-                agent=agent,
-            )
-            if not fragment:
-                return base
-            # Tell the model how bodies arrive — only when load_skill will
-            # actually be on this turn's tool list. We append to the server
-            # fragment and leave its activation-statement instruction unchanged.
-            if _load_skill_reachable(agent):
-                from .skill_router import LOAD_SKILL_PROMPT_HINT
-                fragment = f"{fragment}\n{LOAD_SKILL_PROMPT_HINT}"
-            # base first, fragment second — see the docstring above.
-            return f"{base}\n\n{fragment}".strip() if base else fragment
         except Exception:
-            # Never break a run because of a Router hiccup.
-            logger.debug("Skill loader callable failed (non-fatal)", exc_info=True)
+            consume_last_delivered_versions()
+            raise
+        finally:
+            # The router keeps its own copy of this decision under the
+            # run's scope, for adapters that read it back from there. This
+            # one records it on its own run rail below, so the copy is
+            # released here or never. The body budget filed under the same
+            # scope stays: this run's load_skill calls still need it.
+            _release_scoped_routing_rail(router, kwargs.get("scope"))
+        if routing_id:
+            _set_routing_id(routing_id)
+        # Pull the names the Router offered for this call and
+        # accumulate against the active trace.
+        offered = consume_last_offered_names()
+        if offered:
+            _add_skills_offered(offered)
+        # Names whose BODY the Router injected count as delivered.
+        delivered = consume_last_delivered_names()
+        delivered_versions = copy_delivered_versions(consume_last_delivered_versions(), names=delivered)
+        if delivered:
+            _add_skills_delivered(delivered)
+        previous = _skills_delivered_versions_ctx.get()
+        _skills_delivered_versions_ctx.set((run_key, merge_delivered_versions(
+            previous[1] if previous and previous[0] == run_key else [], delivered_versions,
+        )) if run_key else None)
+        # The contextvar writes above are made inside the Task the
+        # runner gathers this callable in, so they die with it. Mirror
+        # everything onto THIS run's rail, which `_send_trace` can read.
+        _record_run_rail(
+            routing_id=routing_id,
+            offered=offered,
+            delivered=delivered,
+            delivered_versions=delivered_versions,
+            agent=agent,
+        )
+        if not fragment:
             return base
-
-    setattr(instructions_fn, _BASE_INSTRUCTIONS_ATTR, base)
-    return instructions_fn
+        # Tell the model how bodies arrive — only when the skill tool will
+        # actually be on this turn's tool list, and by the name it has there.
+        # We append to the server fragment and leave its activation-statement
+        # instruction unchanged.
+        tool_name = _load_skill_reachable(agent)
+        if tool_name:
+            fragment = f"{fragment}\n{_skill_tool_hint(tool_name)}"
+        # base first, fragment second — see `_make_skill_aware_instructions`.
+        return f"{base}\n\n{fragment}".strip() if base else fragment
+    except Exception:
+        # Never break a run because of a Router hiccup.
+        logger.debug("Skill loader callable failed (non-fatal)", exc_info=True)
+        return base
 
 
 # ── Class-level retrofit (works on Agents built before instrument()) ──
@@ -870,12 +1005,33 @@ def _make_skill_aware_instructions(base: str):
 # shape, since agents are module-level constants — silently got no skills
 # and no load_skill tool. `Agent.get_system_prompt` and
 # `Agent.get_all_tools` are resolved off the CLASS on every turn, so
-# patching them serves every agent regardless of when it was built.
+# patching them serves every agent regardless of when it was built — and
+# every subclass, including the dataclass ones (`SandboxAgent`) whose own
+# generated `__init__` the constructor patch never reaches at all.
 _agent_hooks_installed = False
 _HOOK_MARKER = "__decimalai_hooked__"
 # Emitted once, not per turn, when we retrofit an agent the constructor
 # patch missed.
 _retrofit_notice_emitted = False
+
+
+def _instructions_owner(agent: Any) -> Any:
+    """The agent whose `instructions` the USER wrote.
+
+    A `SandboxAgent` run does not execute the agent the user built: the
+    sandbox runtime executes a clone (`prepare_sandbox_agent`) whose
+    `instructions` is the sandbox's own builder callable, which composes the
+    SDK's sandbox prompt, the user's `instructions` as an "Agent instructions"
+    section, capability notes and the filesystem layout. Judged on the clone,
+    every sandbox run looked like "a callable the user wrote" and got no
+    skills: zero router calls. The SDK tags that clone with the user-visible
+    agent, and that agent's `instructions` is the one to judge.
+    """
+    if getattr(agent, "_sandbox_capability_tools", None) is None:
+        return agent  # not a sandbox execution clone (it sets this list)
+    from agents._public_agent import get_public_agent
+
+    return get_public_agent(agent)
 
 
 def _install_agent_hooks() -> bool:
@@ -896,6 +1052,8 @@ def _install_agent_hooks() -> bool:
     except ImportError:
         return False
 
+    # `getattr(..., None)`: a stand-in `agents` module (tests) may define
+    # neither; every supported openai-agents release defines both.
     original_gsp = getattr(Agent, "get_system_prompt", None)
     original_gat = getattr(Agent, "get_all_tools", None)
     if original_gsp is None or getattr(original_gsp, _HOOK_MARKER, False):
@@ -922,13 +1080,15 @@ def _install_agent_hooks() -> bool:
         # runner hands this exact value to the model as `system_instructions`
         # (agents/run_internal/run_loop.py -> ModelSettings ->
         # openai_responses.py `"instructions": system_instructions`), and it is
-        # the half of the prompt no span carries: `ResponseSpanData.__slots__`
-        # is ("response", "input", "usage") — there is no instructions slot, so
-        # without this capture the skills menu is invisible to the tracer.
+        # the half of the prompt no span carries: `ResponseSpanData` has no
+        # instructions slot, so without this capture the skills menu is
+        # invisible to the tracer.
         resolved = base
         if _skill_loader_installed:
             try:
-                current = getattr(self, "instructions", None)
+                # On a sandbox run `self` is the execution clone; the user's
+                # own `instructions` live on the agent they built.
+                current = getattr(_instructions_owner(self), "instructions", None)
                 if callable(current) and hasattr(current, _BASE_INSTRUCTIONS_ATTR):
                     # Built after instrument(): the constructor already wrapped
                     # `instructions`, and `original_gsp` just called it. Adding
@@ -938,9 +1098,10 @@ def _install_agent_hooks() -> bool:
                     pass  # a callable the user wrote — their judgment wins
                 else:
                     _note_retrofit(self)
-                    resolved = _make_skill_aware_instructions(base or "")(
-                        run_context, self
-                    )
+                    # After the WHOLE resolved prompt: on a sandbox run that is
+                    # the sandbox's composed prompt, so the varying fragment
+                    # still trails every stable byte.
+                    resolved = await _skill_aware_prompt_async(base or "", run_context, self)
             except Exception:
                 logger.debug(
                     "skill-aware prompt retrofit failed (non-fatal)", exc_info=True
@@ -962,8 +1123,10 @@ def _install_agent_hooks() -> bool:
                 return tools
             try:
                 agent_name = getattr(self, "name", None)
+                # `decimalai_load_skill` next to a sandbox's own `load_skill`.
+                tool_name = _skill_tool_name(self)
                 for index, existing in enumerate(tools):
-                    if getattr(existing, "name", None) != "load_skill":
+                    if getattr(existing, "name", None) != tool_name:
                         continue
                     if not hasattr(existing, _SKILL_TOOL_AGENT_ATTR):
                         return tools  # the user's own tool is left alone
@@ -971,11 +1134,13 @@ def _install_agent_hooks() -> bool:
                         return tools
                     # Agent.clone() can reuse the source agent's tool list. A
                     # clone or renamed agent must resolve its own saved pin.
-                    rebound = _make_load_skill_tool(agent_name)
+                    rebound = _make_load_skill_tool(agent_name, tool_name)
                     return [*tools[:index], *([rebound] if rebound is not None else []), *tools[index + 1:]]
-                tool = _make_load_skill_tool(agent_name)
+                tool = _make_load_skill_tool(agent_name, tool_name)
                 if tool is None:
                     return tools
+                if tool_name != _TOOL_NAME:
+                    _note_namespaced(self)
                 _note_retrofit(self)
                 # Return a new list — never mutate the caller's resolved
                 # tools or the agent's declared `tools` attribute.
@@ -1000,11 +1165,11 @@ def _note_retrofit(agent: Any) -> None:
         return
     _retrofit_notice_emitted = True
     logger.info(
-        "DecimalAI retrofitted skills onto agent %r, which was constructed "
-        "before instrument(enable_skill_loader=True). Skills and the "
-        "load_skill tool are attached per-run, so nothing is lost; "
-        "call instrument() before building your agents to have them "
-        "attached at construction instead.",
+        "DecimalAI attached skills to agent %r per run: it was built before "
+        "instrument(enable_skill_loader=True), or it is an Agent subclass with "
+        "its own constructor (such as SandboxAgent). Nothing is lost either way; "
+        "for a plain Agent, calling instrument() before building it attaches "
+        "them at construction instead.",
         getattr(agent, "name", "<unnamed>"),
     )
 
@@ -1069,17 +1234,9 @@ def _install_skill_loader() -> None:
             "constructed before this call are retrofitted per-run)"
         )
     else:
-        # No class hooks to patch → the constructor patch is all we have,
-        # and an already-built agent will silently get no skills. Say so.
-        warnings.warn(
-            "decimalai: this openai-agents build has no "
-            "Agent.get_system_prompt/get_all_tools to hook, so only Agents "
-            "constructed AFTER instrument(enable_skill_loader=True) receive "
-            "skills and the load_skill tool. Move instrument() above your "
-            "Agent(...) definitions, or upgrade openai-agents.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        # Only a stand-in `agents` module lands here: every supported release
+        # has both class methods. Still said out loud, because with no class
+        # hooks an already-built agent gets no skills.
         logger.warning(
             "DecimalAI SkillRouter loader installed WITHOUT run-time retrofit "
             "(OpenAI Agents) — agents built before this call get no skills"
@@ -1130,18 +1287,13 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
         tools_list = []
         for t in agent_tools:
             name = getattr(t, "name", None) or str(t)
-            if name == "load_skill":
+            if name in _SKILL_TOOL_NAMES:
                 continue
             tool_entry: Dict[str, Any] = {"name": name}
-            # FunctionTool has params_json_schema
+            # FunctionTool carries params_json_schema; hosted tools carry none.
             schema = getattr(t, "params_json_schema", None)
             if schema:
                 tool_entry["schema"] = schema
-            # Also try input_json_schema (some versions)
-            if not schema:
-                schema = getattr(t, "input_json_schema", None)
-                if schema:
-                    tool_entry["schema"] = schema
             tools_list.append(tool_entry)
         if tools_list:
             result["tools"] = tools_list
@@ -1176,6 +1328,74 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
     return result
 
 
+#: The ONE `DecimalTracingProcessor` this process registers. Every
+#: `instrument()` call used to add a fresh one, and the ordinary sequence —
+#: `init(openai_agents=True)`, then `instrument(enable_skill_loader=True)` to
+#: add skills — left two on the provider: each run was sent twice, under two
+#: trace ids, and only the copy that ended first carried the routing id and the
+#: loads (it pops the run's rail). Double the trace volume, and per-skill rates
+#: computed over a population half of which could never show an activation.
+_tracing_processor: Optional["DecimalTracingProcessor"] = None
+#: Whether `_tracing_processor` was ever handed to the provider. Consulted only
+#: when the provider's own list cannot be read (a custom TraceProvider).
+_tracing_processor_added = False
+_tracing_processor_lock = threading.Lock()
+
+
+def _processor_is_registered(processor: Any) -> bool:
+    """Whether ``processor`` is on the Agents SDK's live processor list.
+
+    The SDK has no public getter. Its `DefaultTraceProvider` keeps the list on
+    `_multi_processor._processors`, a tuple it replaces under a lock, which is
+    what this reads — so a processor the user removed with
+    `set_trace_processors(...)` is registered again by the next `instrument()`.
+    A custom provider may keep its list anywhere; then the answer is whether we
+    ever registered it.
+    """
+    try:
+        from agents.tracing import get_trace_provider
+
+        live = tuple(get_trace_provider()._multi_processor._processors)
+    except Exception:
+        return _tracing_processor_added
+    return any(p is processor for p in live)
+
+
+def _register_processor(
+    agent_name: Optional[str],
+    skills_registry: Optional[List[Dict[str, Any]]],
+    *,
+    exclusive: bool,
+    add_trace_processor: Any,
+    set_trace_processors: Any,
+) -> "DecimalTracingProcessor":
+    """Register this process's one processor, configured by THIS call.
+
+    A repeat call reconfigures the existing processor rather than adding a
+    second: its skills registry becomes this call's (the same registry a single
+    call would have produced), and its default agent name changes only when this
+    call names one — `instrument(enable_skill_loader=True)` after
+    `init(agent_name="support", openai_agents=True)` keeps "support".
+    """
+    global _tracing_processor, _tracing_processor_added
+    with _tracing_processor_lock:
+        processor = _tracing_processor
+        if processor is None:
+            processor = _tracing_processor = DecimalTracingProcessor(
+                agent_name=agent_name, skills_registry=skills_registry,
+            )
+        else:
+            if agent_name is not None:
+                processor.default_agent_name = agent_name
+            processor._skills_registry = skills_registry or []
+        if exclusive:
+            set_trace_processors([processor])
+        elif not _processor_is_registered(processor):
+            add_trace_processor(processor)
+        _tracing_processor_added = True
+        return processor
+
+
 def instrument(
     agent_name: Optional[str] = None,
     *,
@@ -1203,6 +1423,12 @@ def instrument(
         exclusive: If True, replaces ALL existing trace processors (including
             OpenAI's default). If False (default), adds alongside existing
             processors so traces still go to the OpenAI dashboard too.
+
+    Safe to call more than once — for instance ``init(openai_agents=True)``
+    and then ``instrument(enable_skill_loader=True)``. There is only ever one
+    DecimalAI processor, so each run is sent once; a later call can turn the
+    skill loader on, and replaces the skills registry and (when it names one)
+    the default agent name.
 
     Raises:
         ImportError: If ``openai-agents`` is not installed.
@@ -1358,15 +1584,13 @@ def instrument(
         except Exception:
             logger.debug("Skill sync setup failed (non-fatal)", exc_info=True)
 
-    processor = DecimalTracingProcessor(
-        agent_name=agent_name,
-        skills_registry=resolved_skills,
+    _register_processor(
+        agent_name,
+        resolved_skills,
+        exclusive=exclusive,
+        add_trace_processor=add_trace_processor,
+        set_trace_processors=set_trace_processors,
     )
-
-    if exclusive:
-        set_trace_processors([processor])
-    else:
-        add_trace_processor(processor)
 
     # If an Agent object was provided, introspect it for manifest
     if agent is not None:
@@ -1850,9 +2074,10 @@ class DecimalTracingProcessor:
         # Determine provider from model name
         provider = _infer_provider(model)
 
-        # Parse token usage
-        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
-        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        # Parse token usage. Every model the SDK ships (chat completions,
+        # LiteLLM, any-llm) writes the Responses-style keys onto the span.
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
 
         # Latency
         latency_ms = None
@@ -1957,15 +2182,15 @@ class DecimalTracingProcessor:
         status = Status.ERROR if span_error else Status.SUCCESS
 
         # Accumulate tools for manifest (names only from span data).
-        # `load_skill` is skipped for the same reason `_introspect_agent`
-        # skips it: it is an SDK affordance this adapter attaches at run
-        # time, so counting it would make the declared tool set — and
-        # therefore the manifest version — depend on whether the skill
-        # loader happened to be on.
+        # The skill tool (under either of its names) is skipped for the same
+        # reason `_introspect_agent` skips it: it is an SDK affordance this
+        # adapter attaches at run time, so counting it would make the declared
+        # tool set — and therefore the manifest version — depend on whether
+        # the skill loader happened to be on.
         span_tools = getattr(span_data, "tools", None) or []
         for tool_name in span_tools:
             name_str = str(tool_name)
-            if name_str == "load_skill":
+            if name_str in _SKILL_TOOL_NAMES:
                 continue
             if name_str not in acc.seen_tools:
                 acc.seen_tools[name_str] = {"name": name_str}
@@ -2344,7 +2569,8 @@ class DecimalTracingProcessor:
         # BEFORE `_infer_skill_rungs` below, and that order is a REVERSAL —
         # read this before moving it back.
         #
-        # `ResponseSpanData.__slots__` is ("response", "input", "usage"), so on
+        # `ResponseSpanData` has no instructions slot (only response, input,
+        # usage and a response id), so on
         # the Responses path (the SDK default) the span carries the input items
         # ALONE and this splice is the ONLY way the instructions ever reach
         # `rendered_input`. Splicing after the inference therefore made the
@@ -2649,7 +2875,8 @@ def _attach_system_prompts(
 ) -> None:
     """Prepend each call's system prompt to its ``rendered_input``.
 
-    ``ResponseSpanData`` carries ``(response, input, usage)`` and nothing else,
+    ``ResponseSpanData`` carries the response, input, usage and a response id
+    and nothing else,
     so ``span_data.input`` is the input-items list ALONE. The instructions —
     the half of the prompt the skills menu is injected into — never appear on
     the span, which is why a trace could claim to have offered a skill whose

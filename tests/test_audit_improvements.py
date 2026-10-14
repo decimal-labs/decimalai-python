@@ -446,7 +446,12 @@ class TestInitLangchain:
                 os.environ["DECIMAL_API_KEY"] = "dai_sk_test"
                 try:
                     decimalai.init(langchain=True, agent_name="test-agent")
-                    mock_install.assert_called_once_with(agent_name="test-agent")
+                    # The flag form turns the skill loader on: it is the
+                    # documented whole setup, and with the loader off it
+                    # delivered traces and zero skills.
+                    mock_install.assert_called_once_with(
+                        agent_name="test-agent", enable_skill_loader=True,
+                    )
                 finally:
                     os.environ.pop("DECIMAL_API_KEY", None)
 

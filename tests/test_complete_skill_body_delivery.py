@@ -37,9 +37,19 @@ def _record(body, **kwargs):
 
 @pytest.fixture(autouse=True)
 def _clear_delivery_rails():
+    from decimalai import skill_router as sr
+
     consume_last_delivered_names()
     consume_last_delivered_versions()
+    # `build_prompt_parts` and `load_skill` file a turn budget on the
+    # module-level ContextVar, and pytest runs every test in one context. Left
+    # in place, the next file's unscoped `load_skill` charged its loads to this
+    # file's budget object, and a later test there was told "'alpha' is already
+    # loaded" for a body it never received:
+    # test_langchain_run_scoped_skill_rails failed 2 when run after this file.
+    budget_token = sr._body_budget_ctx.set(None)
     yield
+    sr._body_budget_ctx.reset(budget_token)
     consume_last_delivered_names()
     consume_last_delivered_versions()
 

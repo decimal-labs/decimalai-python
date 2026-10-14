@@ -1,8 +1,8 @@
 """Tests for ADK error-path trace finalization (decimalai.adk).
 
 An invocation that raises out of ``Runner.run_async`` (e.g. a model 429)
-never reaches ``after_agent``/``after_run`` — ADK's node runtime only fires
-those on success. The plugin's ``on_run_error_callback`` must flush the
+never reaches ``after_agent``/``after_run`` — google-adk 2.12 fires those only
+on success, on both runtime paths. The plugin's ``on_run_error_callback`` must flush the
 otherwise-orphaned run state as an ERROR trace, without ever double-sending
 a run that already finalized on the success path.
 
@@ -43,7 +43,8 @@ def _reset_sdk(monkeypatch):
     cfg._client.register_manifest.return_value = {"manifest_id": "test-manifest-id", "status": "active"}
 
     # A previously imported real Runner can remain in sys.modules while the
-    # plugin import below is stubbed. Restore its caller-boundary patch too.
+    # plugin import below is stubbed. Nothing here should patch it; restore its
+    # run() anyway so a regression cannot leak into later test files.
     runners = sys.modules.get("google.adk.runners")
     runner = getattr(runners, "Runner", None)
     if runner is not None and callable(getattr(runner, "run", None)):

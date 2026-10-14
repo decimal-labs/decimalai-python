@@ -4,13 +4,94 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [0.13.9] — 2026-10-10
-
-- OpenAI Agents native skill loaders now honor the executing agent's saved installation scope and version pin, including prebuilt agents, clones and handoffs. Custom user loaders remain unchanged.
-- Parallel skill loads retain every delivered immutable version witness on the shared run, so the trace records the bodies that actually ran.
-- Full skill menus preserve the executing agent's scope.
-
 ## [Unreleased]
+
+### Breaking: every framework extra floors the framework's latest release
+
+Older framework releases are no longer supported, and the code paths that
+existed only for them are gone.
+
+- New floors: langchain-core 1.6.10, langchain 1.4.5, langgraph 1.2.15,
+  openai 3.30.0, openai-agents 0.23.1, pydantic-ai-slim 2.56.0, google-adk
+  2.12.0, anthropic 1.13.0, claude-agent-sdk 0.2.166, llama-index-core 0.14.25,
+  google-genai 2.30.1, litellm 1.105.0 (`[evals]`), crewai 1.15.27 (test
+  extras). The `anthropic<1.0.0` and `langchain-core<2` caps are removed.
+- `decimalai[pydantic-ai]` installs `pydantic-ai-slim[openai,google,anthropic]`
+  instead of the `pydantic-ai` meta package, whose logfire extra cannot be
+  installed beside google-adk.
+- `[evals]` is no longer part of `[all]`: litellm pins `openai<3`, and
+  `[openai-agents]` / `[pydantic-ai]` need `openai>=3`.
+- `[adk]`, `[pydantic-ai]` and `[all]` need Python 3.11+, because the google-adk
+  and pydantic-ai-slim releases they floor require it. The core package and
+  the other extras still install on Python 3.10.
+
+### Breaking: the `init()` framework flags deliver skills
+
+- `init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
+  `init(crewai=True)` now turn the skill loader on, the same install as that
+  adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Through
+  0.13.9 they installed tracing only, so the setup the docs teach traced well
+  and delivered no skills. `init(..., skills=False)` keeps a flag to tracing
+  only. The provider flags (`openai=`, `anthropic=`, `google=`) stay
+  tracing-only.
+- Re-running `init()` with a different API key, base URL, `inject_skill_body`
+  or `load_skill_tool` drops every adapter's cached skill router. Before, a
+  second `init(api_key=B)` sent traces as org B while routing org A's skills.
+
+### Fixed: silent non-delivery and crashes
+
+- Google ADK: `Runner(app=App(...))` and `InMemoryRunner(app=...)`, the shape
+  `adk web` builds, no longer raise `ValueError` after `init(adk=True)` or
+  `instrument()`. The DecimalAI plugin is added to a copy of the App, and an
+  explicit `DecimalaiPlugin` under any name is no longer doubled by the global
+  one.
+- OpenAI Agents: `SandboxAgent` gets the skills menu and a working `load_skill`
+  tool. When the sandbox's own Skills capability already registers
+  `load_skill`, DecimalAI's tool is exposed as `decimalai_load_skill`.
+  `instrument()` is safe to call more than once, including after
+  `init(openai_agents=True)`: one trace processor, one trace per run.
+- Pydantic AI: the skills menu is an instructions function routed once per run,
+  so every turn of a conversation (`message_history=`) is routed and traced,
+  not only the first. A second tool named `load_skill` no longer makes every
+  run raise `UserError`; DecimalAI's tool is exposed as `decimalai_load_skill`
+  then. Routing uses the agent name the trace is filed under, not the variable
+  name Pydantic AI infers for an unnamed `Agent`.
+- Anthropic: `messages.stream()` and `messages.parse()` (sync and async) get
+  skills, not only `messages.create()`.
+- LangChain: skills are routed for the agent the run's trace is filed under (a
+  per-call `CallbackHandler(agent_name=...)` or a named graph), not only for
+  `instrument(agent_name=...)`. Unnamed runs used to route as no agent, so
+  agent assignments and version pins were ignored.
+- The blocking routing call no longer runs on the event loop in the async
+  paths of the LangChain, OpenAI Agents, Pydantic AI and ADK adapters. CrewAI
+  hooks are synchronous by CrewAI's design; the adapter warns once when CrewAI
+  runs one on a running loop (only the deprecated `CrewAgentExecutor` under
+  `Crew.akickoff()` does).
+- CrewAI warns once when `Agent(skills=...)` / `Crew(skills=...)` puts CrewAI's
+  own skill catalog in the same model call as DecimalAI's menu.
+
+### Changed: skill routing
+
+- A skill body is injected only when the platform ranked the result by this
+  turn's message and did not mark it degraded. The top row of an unranked or
+  fallback menu no longer lands in turns like "thanks!".
+- `load_skill` serves only skills this router offered. A name the router never
+  offered is refused with a message the model can act on, so a prompt
+  injection cannot load an arbitrary registry skill by name.
+- The in-turn `/body` fetch uses the 5 s hot-path budget and the circuit
+  breaker, like `/route` and `/menu`. Disk export keeps the cold budget.
+- `routing_status()` turns unhealthy on 401, 402, 403, 429 and 5xx responses
+  (new `http_errors` and `last_status_code` fields), not only on timeouts. A
+  404 for an unknown skill name is not a failure.
+- A failed routing call is cached for the turn, so the other model calls of
+  that turn do not each wait out the timeout again. An open breaker is not
+  cached.
+- `load_skill` tells the model when the platform was unavailable instead of
+  saying the skill does not exist.
+- Routing no longer asks the platform for skill attachments it discarded.
+- Skill names with `#` or `?` are percent-encoded in `/body` requests.
+
+### Added
 
 - `decimalai agents create NAME` creates an agent from a terminal, the same
   call as the dashboard's create form. `--pack ROLE` starts it on the pack's
@@ -21,6 +102,13 @@ and patch releases are fixes.
   skill the server refuses (such as a plan limit) is named in the output. The
   same call is available as `DecimalAIClient.create_agent()`. `decimalai init`
   now points at it when the agent doesn't exist yet.
+
+## [0.13.9] — 2026-10-10
+
+- OpenAI Agents native skill loaders now honor the executing agent's saved installation scope and version pin, including prebuilt agents, clones and handoffs. Custom user loaders remain unchanged.
+- Parallel skill loads retain every delivered immutable version witness on the shared run, so the trace records the bodies that actually ran.
+- Full skill menus preserve the executing agent's scope.
+
 - ADK synchronous `Runner.run()` preserves the enclosing DecimalAI trace as
   its parent across ADK's worker thread. The handoff belongs to each invocation,
   including reused and concurrent runners; explicit plugin parents still win

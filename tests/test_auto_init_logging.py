@@ -17,6 +17,33 @@ import sys
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _undo_the_langchain_auto_install(monkeypatch):
+    """Put LangChain back the way the test found it.
+
+    `DECIMAL_AUTO_TRACE=langchain` with a key set runs the real
+    `init(langchain=True)` at import, and that now installs the skill loader
+    too, which rebinds BaseChatModel's four entry points for the whole process.
+    Left in place, every later test's chat model routes through a real
+    SkillRouter, fails to reach the platform and trips the shared circuit
+    breaker for the tests after it.
+    """
+    try:
+        from langchain_core.language_models.chat_models import BaseChatModel
+    except ImportError:
+        yield
+        return
+    import decimalai.langchain as lc
+
+    for entry_point in ("invoke", "ainvoke", "stream", "astream"):
+        monkeypatch.setattr(
+            BaseChatModel, entry_point, getattr(BaseChatModel, entry_point)
+        )
+    for name in ("_installed", "_skill_loader_installed", "_install_agent_name"):
+        monkeypatch.setattr(lc, name, getattr(lc, name))
+    yield
+
+
 def _reimport_decimalai(monkeypatch, env: dict[str, str]) -> None:
     """Reload decimalai with the given env so module-load auto-init runs."""
     for k, v in env.items():

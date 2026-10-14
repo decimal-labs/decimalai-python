@@ -28,6 +28,7 @@ global shared by every agent in the process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import types
 from datetime import datetime, timezone
@@ -549,8 +550,13 @@ def _fake_agents_module_with_class_hooks():
             self.tools = list(tools or [])
 
         async def get_system_prompt(self, run_context):
+            # The real SDK's contract (agents/agent.py, `get_system_prompt`):
+            # call the instructions callable once and await what it returns
+            # when that is awaitable. The adapter's wrapper returns an
+            # awaitable on a running loop, so it can route off the loop.
             if callable(self.instructions):
-                return self.instructions(run_context, self)
+                result = self.instructions(run_context, self)
+                return await result if inspect.isawaitable(result) else result
             return self.instructions
 
         async def get_all_tools(self, run_context):

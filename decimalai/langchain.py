@@ -8,19 +8,29 @@ Simple path (global, 2 lines)::
     from decimalai.langchain import instrument
     instrument()  # all LangChain calls are now traced
 
+With platform skills injected into every chat-model call (top-1 body by
+default; ``skill_body_top_k`` takes 1 to 3)::
+
+    instrument(agent_name="support", enable_skill_loader=True)
+
 Custom path (per-call control)::
 
     from decimalai.langchain import CallbackHandler
     agent.invoke(input, config={"callbacks": [CallbackHandler(agent_name="my-agent")]})
+
+Skills are routed for the agent the trace is filed under: the per-call
+handler's name, else the name of the graph or chain being run, else
+``instrument(agent_name=...)``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
 import warnings
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID, uuid4
@@ -475,6 +485,58 @@ def _clean_names(names: Any) -> List[str]:
     if not isinstance(names, (list, tuple, set)):
         return []
     return [n for n in names if isinstance(n, str) and n.strip()]
+
+
+def _routing_agent_name(config: Any = None) -> Optional[str]:
+    """The agent name this model call's skills are routed for.
+
+    It is the name the call's TRACE will be filed under, resolved in the same
+    order: the handler's own name, then the name detected from the run's root
+    chain, then ``instrument(agent_name=...)``. Routing used to send only the
+    last of those, which is None unless ``instrument()`` was given a name, so a
+    per-call ``CallbackHandler(agent_name="joke-bot")`` or a named
+    ``create_agent(name=...)`` graph traced as one agent and routed as none:
+    that agent's assignments, version pins and restricted skills were never
+    offered.
+
+    The handler is found the way LangChain will find it when this call
+    configures its callbacks: the ``config`` passed to the model call wins over
+    the config of the runnable that is executing (``ensure_config``'s
+    precedence for the ``callbacks`` key). The callback manager also carries
+    the id of the run that is calling the model, which the handler has already
+    indexed under its root run, so the detected name is THIS run's, even with
+    several runs in flight through one handler. With no handler of ours in
+    that config, the handler ``instrument()`` published is the one the
+    configure hook will add.
+
+    Returns None only when nothing names the run. The trace then falls back to
+    ``DEFAULT_AGENT_NAME``, a label rather than a choice anyone made, and
+    routing stays unscoped. Never raises: a failure here falls back to the
+    install name rather than costing the call its skills.
+    """
+    try:
+        callbacks = config.get("callbacks") if isinstance(config, dict) else None
+        if callbacks is None:
+            config_var = _lc_config_var()
+            ambient = config_var.get() if config_var is not None else None
+            if isinstance(ambient, dict):
+                callbacks = ambient.get("callbacks")
+        if isinstance(callbacks, (list, tuple)):
+            handlers, parent_run_id = list(callbacks), None
+        else:
+            handlers = list(getattr(callbacks, "handlers", None) or ())
+            parent_run_id = getattr(callbacks, "parent_run_id", None)
+        handler = next((h for h in handlers if isinstance(h, CallbackHandler)), None)
+        if handler is None and _installed:
+            published = _decimal_callback_var.get()
+            if isinstance(published, CallbackHandler):
+                handler = published
+        if handler is None:
+            return _install_agent_name
+        return handler._routing_agent_name(parent_run_id)
+    except Exception:
+        logger.debug("routing agent-name resolution failed (non-fatal)", exc_info=True)
+        return _install_agent_name
 
 
 # Resolved once. `_ambient_run_scope` runs on every routing call and every
@@ -1005,7 +1067,7 @@ def _is_sdk_injected(msg: Any) -> bool:
     return False
 
 
-def _inject_skills_into_input(input_value: Any) -> Any:
+def _inject_skills_into_input(input_value: Any, config: Any = None) -> Any:
     """Insert a SkillRouter-built system message into a chat model's input.
 
     Accepts the three input shapes LangChain's BaseChatModel.invoke sees: a
@@ -1017,6 +1079,13 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     Placement: immediately AFTER the caller's own leading system messages and
     before the conversation. With no system message at all it still goes first,
     which is what it always did.
+
+    ``config`` is the model call's own ``config`` argument; it is read only to
+    resolve the agent name (see `_routing_agent_name`).
+
+    This is BLOCKING: the Router makes synchronous HTTP calls (5 s route
+    budget, 30 s body budget). The async entry points therefore call it
+    through `_inject_skills_off_loop`, never directly.
     """
     # Shape dispatch FIRST. This used to run last, after the Router had
     # already been consulted and its routing_id + offered names stamped on
@@ -1048,9 +1117,10 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     # resolver only sees org-owned workspace-scope skills: an agent-scope Use —
     # the row every registry skill pulled onto one agent lands in — matches on
     # `SkillSubscription.agent_name`, so a router that doesn't send the name is
-    # offered NONE of them. Read at call time (not baked into the singleton in
-    # `_get_skill_router`) so a later `instrument(agent_name=...)` isn't ignored
-    # by a router built before it. `openai_agents`/`pydantic_ai` already pass it.
+    # offered NONE of them. Resolved per call (never baked into the singleton in
+    # `_get_skill_router`), and resolved the way the trace resolves it, so the
+    # agent a run is routed for is the agent its trace is filed under.
+    agent_name = _routing_agent_name(config)
     try:
         # The prefix/tail split. `prefix` is byte-identical turn to turn, so it
         # can sit inside the provider's cacheable region; `tail` is the one
@@ -1059,9 +1129,7 @@ def _inject_skills_into_input(input_value: Any) -> Any:
         # behaviour exactly, never an empty prompt.
         parts_fn = getattr(router, "build_prompt_parts", None)
         if callable(parts_fn):
-            prefix, tail, routing_id = parts_fn(
-                query=query, agent_name=_install_agent_name,
-            )
+            prefix, tail, routing_id = parts_fn(query=query, agent_name=agent_name)
         else:
             # A router object that predates the split still has to deliver
             # skills. Without this branch the AttributeError is caught below
@@ -1069,7 +1137,7 @@ def _inject_skills_into_input(input_value: Any) -> Any:
             # while injecting nothing, which is the silent no-op this whole
             # change exists to avoid. Degrade to the old primitive instead.
             prefix, routing_id = router.build_prompt_fragment(
-                query=query, agent_name=_install_agent_name,
+                query=query, agent_name=agent_name,
             )
             tail = ""
     except Exception:
@@ -1125,6 +1193,50 @@ def _inject_skills_into_input(input_value: Any) -> Any:
     return [*messages[:cut], *injected, *messages[cut:]]
 
 
+_UNSET = object()
+
+
+def _adopt_sdk_context_writes(ctx: Context) -> None:
+    """Copy into the current Context what the injection wrote into ``ctx``.
+
+    Only this SDK's own variables (named ``decimalai_*``): the call rails
+    `_open_call_rails` opened, the Router's ``last_*`` rails, and the Router's
+    per-turn body budget, which a later ``router.load_skill()`` in the same
+    coroutine reads. The result is the Context the call would have had if the
+    injection had run inline. Anything else a worker thread set stays in that
+    thread's copy.
+    """
+    for var, value in ctx.items():
+        if var.name.startswith("decimalai_") and var.get(_UNSET) is not value:
+            var.set(value)
+
+
+async def _inject_skills_off_loop(input_value: Any, config: Any = None) -> Any:
+    """`_inject_skills_into_input` for ``ainvoke`` / ``astream``, run off the loop.
+
+    The Router is a synchronous HTTP client. Called inline from a coroutine,
+    one slow routing call (5 s route budget, 30 s body budget) stalled every
+    other coroutine on the event loop, which in an async server is every other
+    conversation in the process.
+
+    The call runs in the loop's default executor, inside a COPY of the
+    caller's Context. That copy is what keeps per-run attribution intact: the
+    ambient run scope the Router files its rails under is read from
+    LangChain's ``var_child_runnable_config`` and from this call's
+    ``_call_scope_ctx`` token, and both are already set in the caller's
+    Context. Its writes are then copied back by `_adopt_sdk_context_writes`,
+    so the handler's ``on_chat_model_start`` reads the same call rails it
+    would have read had nothing moved.
+    """
+    ctx = copy_context()
+    loop = asyncio.get_running_loop()
+    injected = await loop.run_in_executor(
+        None, ctx.run, _inject_skills_into_input, input_value, config,
+    )
+    _adopt_sdk_context_writes(ctx)
+    return injected
+
+
 def _install_skill_loader() -> None:
     """Monkey-patch `BaseChatModel.invoke`/`ainvoke` to inject skills.
 
@@ -1151,7 +1263,7 @@ def _install_skill_loader() -> None:
         tokens = _open_call_rails()
         try:
             try:
-                input = _inject_skills_into_input(input)
+                input = _inject_skills_into_input(input, config)
             except Exception:
                 logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             return original_invoke(self, input, config=config, stop=stop, **kwargs)
@@ -1162,7 +1274,7 @@ def _install_skill_loader() -> None:
         tokens = _open_call_rails()
         try:
             try:
-                input = _inject_skills_into_input(input)
+                input = await _inject_skills_off_loop(input, config)
             except Exception:
                 logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             return await original_ainvoke(self, input, config=config, stop=stop, **kwargs)
@@ -1216,7 +1328,7 @@ def _install_skill_loader() -> None:
         tokens = _open_call_rails()
         try:
             try:
-                input = _inject_skills_into_input(input)
+                input = _inject_skills_into_input(input, config)
             except Exception:
                 logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             yield from original_stream(self, input, config=config, stop=stop, **kwargs)
@@ -1233,7 +1345,7 @@ def _install_skill_loader() -> None:
         tokens = _open_call_rails()
         try:
             try:
-                input = _inject_skills_into_input(input)
+                input = await _inject_skills_off_loop(input, config)
             except Exception:
                 logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             async for chunk in original_astream(
@@ -1336,20 +1448,49 @@ def instrument(
     that LangSmith uses for its built-in tracing.
 
     Args:
-        agent_name: Default agent name for all traces. If None, the name
-            is auto-detected from the chain/agent being executed, and
-            falls back to ``"langchain-agent"`` when the executed
-            runnable carries no usable name.
+        agent_name: Default agent name for all traces, and the agent skills
+            are routed for. If None, each run is named by a per-call
+            ``CallbackHandler(agent_name=...)`` or else by the name of the
+            chain/graph being executed (``create_agent(name=...)``), and
+            falls back to ``"langchain-agent"`` when nothing names it. Skill
+            routing uses the same name the trace is filed under, except that
+            it sends no name in that last case, which routes against the
+            org-wide skill set.
         tools: Explicit tool descriptors for manifest hashing. If omitted,
             tools are auto-detected from LangChain bind_tools.
         prompts: Explicit prompt dict {"system": "..."}. If omitted,
             prompts are auto-extracted from ChatPromptTemplate.
         models: Explicit model config dict. If omitted, model is
             auto-detected from LLM invocations.
+        skills: Explicit skill descriptors for the manifest. If omitted and
+            disk sync is on, local SKILL.md files are discovered.
+        skill_dirs: Directories to discover SKILL.md files in.
+        evals: SDK-defined evals to register and run on each trace.
+        builtin_evals: Run the platform's built-in evals too (default True).
+        enable_skill_loader: Inject platform-routed skills into every chat
+            model call (``invoke``, ``ainvoke``, ``stream``, ``astream`` on
+            any ``BaseChatModel``), as system messages placed right after the
+            caller's own system messages. Each call gets the skill menu; a
+            call whose latest user message the platform ranked skills against
+            also gets the full body of the top ``skill_body_top_k`` of them.
+            The async entry points run the routing call in a worker thread, so
+            it never blocks the event loop. Off by default.
+        enable_load_skill_tool: Accepted for symmetry with the tool-loop
+            adapters; LangChain has no ``load_skill`` tool, so this only
+            warns and skills stay injected.
+        disk_sync: Upload local SKILL.md files and pull platform skills to
+            disk. None derives it from ``init(skill_authority=...)``; with the
+            default ("auto") it is off when the loader is on.
         on_trace: Optional observer of each completed trace before export.
             Receives a copy. Observer errors are logged and do not stop export.
-        skill_body_top_k: Number of ranked skill bodies to inject (1–3), still
-            subject to the router's body and token budgets. Defaults to one.
+        skill_body_top_k: How many routed skills get their full BODY injected
+            on each model call, from 1 to 3 (default 1). The other offered
+            skills appear in the menu by name and description only, and the
+            model cannot load them on this adapter, so a value above 1 is how
+            a turn that needs two skills gets both. Bodies stay subject to the
+            router's per-body size cap and per-turn token budget: a body that
+            does not fit is left out, never trimmed. Any other value raises
+            ``ValueError``.
         priority_skills: Offered skill names that get body slots first, e.g.
             reply format. Does not add skills the server did not offer.
         runtime_policy: Optional application constraints repeated after skill
@@ -1358,6 +1499,8 @@ def instrument(
 
     Raises:
         ImportError: If ``langchain-core`` is not installed.
+        ValueError: If ``skill_body_top_k`` is not an integer from 1 to 3, or
+            ``runtime_policy`` is given without ``enable_skill_loader=True``.
 
     Example::
 
@@ -1365,10 +1508,10 @@ def instrument(
         decimalai.init()
 
         from decimalai.langchain import instrument
-        instrument()
+        instrument(agent_name="support", enable_skill_loader=True)
 
         # All LangChain calls are now traced — no callbacks needed
-        agent.invoke({"input": "What is AAPL?"})
+        agent.invoke({"messages": [{"role": "user", "content": "What is AAPL?"}]})
     """
     global _installed, _explicit_manifest_config, _evals, _builtin_evals_enabled
     global _install_agent_name
@@ -2223,32 +2366,22 @@ class CallbackHandler(_CallbackBase):
 
         # ── When is this run finished? ──
         #
-        # `parent_run_id is None` marks the true outermost callback and is kept
-        # as-is, because it is what every top-level `chain.invoke()` produces.
-        # Matching instead on `span_id == self._root_run_id` broke on
-        # langchain-core 1.5.x, which reuses the root run_id for child steps
-        # (ChatPromptTemplate's events arrive with run_id == parent_run_id ==
-        # root), so that check fired at the PROMPT step's end and sent the
-        # trace before the LLM call existed. Do not reintroduce it.
+        # `parent_run_id is None` marks the outermost callback of a top-level
+        # `chain.invoke()`, and closes that run.
         #
-        # But `parent_run_id is None` is not SUFFICIENT, and that is a real bug
-        # rather than a theoretical one. A sub-agent invoked from inside an
+        # It is not SUFFICIENT on its own. A sub-agent invoked from inside an
         # orchestrator's tool — the documented multi-agent pattern, its own
         # CallbackHandler passed to the nested `.invoke()` — runs inside the
-        # outer run tree. LangChain hands that handler exactly ONE chain end,
-        # carrying `run_id == parent_run_id == root`, and never one with a null
-        # parent. So the sub-agent's trace was built, held, and never sent: on
-        # 2026-09-03, journey C saw the orchestrator trace land and
-        # `spec_trace=None` on every run, and the in-repo live test hit the
-        # same wall while its "timed out" message got misread as a provider
-        # quota skip.
+        # outer run tree, so every chain end that handler sees, its own root's
+        # included, carries the orchestrator's run as `parent_run_id` (checked
+        # on langchain-core 1.6.10). Closing on a null parent alone left the
+        # sub-agent's trace built, held, and never sent: on 2026-09-03 journey
+        # C saw the orchestrator trace land and `spec_trace=None` on every run.
         #
-        # `open_chains` closes both cases without guessing from ids: it is the
+        # `open_chains` closes that case without guessing from ids: it is the
         # number of chain callbacks still open on THIS state, so zero means
-        # every chain that started has ended. The 1.5.x prompt step cannot
-        # trigger it — that step ends while its enclosing chain is still open,
-        # so the balance is >= 1 there — and a nested sub-agent root reaches
-        # zero exactly when its own run is done.
+        # every chain that started has ended, and a nested sub-agent root
+        # reaches zero exactly when its own run is done.
         #
         # The emptiness guard in `_close_run` still keeps all-skipped runs
         # (e.g. a bare RunnablePassthrough) from sending empty traces.
@@ -2331,13 +2464,35 @@ class CallbackHandler(_CallbackBase):
         the process.
         """
         state = state if state is not None else self._current
+        return self._resolved_agent_name(state) or DEFAULT_AGENT_NAME
+
+    def _resolved_agent_name(self, state: Optional[_RunState]) -> Optional[str]:
+        """Handler name -> name detected from the run's root chain -> install name.
+
+        The ONE ladder both consumers read: `_agent_name_or_default` (the
+        trace) and `_routing_agent_name` (which agent the Router serves). Kept
+        in one place so the two cannot drift apart again.
+        """
         detected = state.detected_agent_name if state is not None else None
-        return (
-            self._explicit_agent_name
-            or detected
-            or _install_agent_name
-            or DEFAULT_AGENT_NAME
-        )
+        return self._explicit_agent_name or detected or _install_agent_name
+
+    def _routing_agent_name(self, parent_run_id: Optional[UUID]) -> Optional[str]:
+        """The name the run that owns ``parent_run_id`` will be traced under.
+
+        Called from inside the patched model call, BEFORE this call's own
+        callbacks fire, so the run is looked up by the id of the runnable that
+        is calling the model: this handler indexed it under its root when that
+        runnable's ``on_chain_start`` arrived. Read-only (`_state_for` would
+        add the id to the run). A call with no enclosing run, a bare
+        ``llm.invoke()``, has no detected name to find, and neither does its
+        trace, so both fall through to the handler and install names.
+        """
+        state: Optional[_RunState] = None
+        if parent_run_id is not None:
+            with self._state_lock:
+                root = self._root_of.get(parent_run_id)
+                state = self._runs.get(root) if root is not None else None
+        return self._resolved_agent_name(state)
 
     def _resolve_agent_name(
         self,

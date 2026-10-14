@@ -84,22 +84,32 @@ jobs:
           cat > /tmp/conformance_gate.py <<'PY'
           import json, os, subprocess, sys, yaml
 
-          # Read the conformance job's DISPLAY NAME out of ci.yml at the released
-          # commit, rather than hardcoding it here. A check run is named after its
+          # Read the required jobs' DISPLAY NAMES out of ci.yml at the released
+          # commit, rather than hardcoding them here. A check run is named after its
           # job's `name:`, so this is the one form that survives a rename: rename
           # the job and the gate follows it in the same commit. A hardcoded string
           # would turn a rename into a permanently red release gate, and the fix
           # for a red release gate is always to delete it.
+          #
+          # THREE jobs, not one. No single environment can hold every framework
+          # (openai-agents / pydantic-ai need openai>=3; crewai / litellm pin
+          # openai<3), so the adapters are graded in two conformance jobs, and the
+          # CrewAI / LiteLLM unit cases that skip in `test` run in `test-openai2`.
+          # A release graded in only one environment ships the other's adapters
+          # unverified.
           WF = ".github/workflows/ci.yml"
+          REQUIRED = ("conformance", "conformance-openai2", "test-openai2")
           with open(WF) as fh:
               jobs = (yaml.safe_load(fh) or {}).get("jobs") or {}
-          if "conformance" not in jobs:
+          absent = [j for j in REQUIRED if j not in jobs]
+          if absent:
               sys.exit(
-                  f"::error::{WF} has no `conformance` job. This gate exists to prove "
-                  "the released commit was graded against every framework adapter; if "
-                  "the job moved, point this gate at its new home rather than deleting it."
+                  f"::error::{WF} has no {', '.join(f'`{j}`' for j in absent)} job. This "
+                  "gate exists to prove the released commit was graded against every "
+                  "framework adapter, in both test environments; if a job moved, point "
+                  "this gate at its new home rather than deleting it."
               )
-          want = jobs["conformance"].get("name") or "conformance"
+          wanted = [jobs[j].get("name") or j for j in REQUIRED]
 
           repo, sha = os.environ["REPO"], os.environ["SHA"]
 
@@ -126,35 +136,50 @@ jobs:
           waited = 0
           runs = check_runs()
           while True:
-              mine = [r for r in runs if r.get("name") == want]
-              if not mine or all(r.get("status") == "completed" for r in mine):
+              pending = [
+                  (want, [r for r in runs if r.get("name") == want]) for want in wanted
+              ]
+              pending = [
+                  (want, mine) for want, mine in pending
+                  if mine and not all(r.get("status") == "completed" for r in mine)
+              ]
+              if not pending:
                   break
               if waited >= DEADLINE_S:
-                  print(f"::warning::{want!r} still running after {waited // 60} min — giving up the wait")
+                  names = ", ".join(repr(w) for w, _ in pending)
+                  print(f"::warning::{names} still running after {waited // 60} min — giving up the wait")
                   break
-              print(f"⏳ {want!r} is {mine[0].get('status')} on {sha}; waited {waited}s of {DEADLINE_S}s")
+              for want, mine in pending:
+                  print(f"⏳ {want!r} is {mine[0].get('status')} on {sha}; waited {waited}s of {DEADLINE_S}s")
               time.sleep(INTERVAL_S)
               waited += INTERVAL_S
               runs = check_runs()
 
-          mine = [r for r in runs if r.get("name") == want]
-          if not mine:
-              seen = "\n".join(f"    - {r.get('name')}: {r.get('conclusion')}" for r in runs) or "    (none)"
-              sys.exit(
-                  f"::error::No check run named {want!r} on {sha}.\n"
-                  f"  The conformance matrix never graded this commit, so this release\n"
-                  f"  would ship eleven framework adapters that nothing verified.\n"
-                  f"  `pytest tests/` in the job above selects ZERO of them.\n"
-                  f"  Cut the release from a commit CI has actually run. Seen:\n{seen}"
-              )
-          bad = [r for r in mine if r.get("status") != "completed" or r.get("conclusion") != "success"]
-          if bad:
-              detail = "\n".join(
-                  f"    - {r.get('status')}/{r.get('conclusion')}  {r.get('html_url')}" for r in bad
-              )
-              sys.exit(f"::error::{want!r} did not pass on {sha}:\n{detail}")
+          failures = []
+          for want in wanted:
+              mine = [r for r in runs if r.get("name") == want]
+              if not mine:
+                  seen = "\n".join(f"    - {r.get('name')}: {r.get('conclusion')}" for r in runs) or "    (none)"
+                  failures.append(
+                      f"No check run named {want!r} on {sha}.\n"
+                      f"  That job never graded this commit, so this release would ship\n"
+                      f"  framework adapters that nothing verified in its environment.\n"
+                      f"  `pytest tests/` in the job above selects ZERO conformance tests.\n"
+                      f"  Cut the release from a commit CI has actually run. Seen:\n{seen}"
+                  )
+                  continue
+              bad = [r for r in mine if r.get("status") != "completed" or r.get("conclusion") != "success"]
+              if bad:
+                  detail = "\n".join(
+                      f"    - {r.get('status')}/{r.get('conclusion')}  {r.get('html_url')}" for r in bad
+                  )
+                  failures.append(f"{want!r} did not pass on {sha}:\n{detail}")
+                  continue
+              print(f"✅ {want!r} passed on {sha} ({len(mine)} run(s))")
+          if failures:
+              sys.exit("::error::" + "\n".join(failures))
 
-          print(f"✅ {want!r} passed on {sha} ({len(mine)} run(s)) — adapters were graded")
+          print(f"✅ all of {', '.join(repr(w) for w in wanted)} passed on {sha} — adapters were graded")
           PY
           python /tmp/conformance_gate.py
 

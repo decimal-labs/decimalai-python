@@ -57,7 +57,10 @@ import pytest
 
 pytest.importorskip("opentelemetry.sdk.trace")
 
-os.environ.setdefault("CREWAI_TELEMETRY_OPT_OUT", "true")
+# crewai 1.15.27 reads these (crewai_core/telemetry.py `_is_telemetry_disabled`);
+# it does not read CREWAI_TELEMETRY_OPT_OUT.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
 
 #: The instrumentation scope the OpenInference CrewAI instrumentor's spans carry.

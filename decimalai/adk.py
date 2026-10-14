@@ -15,11 +15,23 @@ Simple path (global — every ``Runner`` is traced)::
     runner = Runner(agent=my_agent, app_name="support", session_service=svc)
     # all runner.run_async(...) invocations are now traced
 
-Explicit path (add the plugin to your own ``Runner``)::
+The global install covers every way ADK 2.12 builds a runner:
+``Runner(agent=...)``, ``Runner(app=App(...))``, ``InMemoryRunner(app=...)``,
+and the ``Runner(app=...)`` that ``adk web`` / ``adk run`` / ``api_server``
+construct. For an ``app=`` runner the plugin goes into the runner's copy of
+``App.plugins``; the caller's ``App`` is not modified.
 
+Explicit path (attach the plugin yourself — ADK's ``App`` is where plugins go)::
+
+    from google.adk.apps import App
     from decimalai.adk import DecimalaiPlugin
-    runner = Runner(agent=my_agent, app_name="support", session_service=svc,
-                    plugins=[DecimalaiPlugin(agent_name="support")])
+    app = App(name="support", root_agent=my_agent,
+              plugins=[DecimalaiPlugin(agent_name="support")])
+    runner = Runner(app=app, session_service=svc)
+
+An explicit DecimalAI plugin answers for its runner: with the global install
+also on, the shared plugin is not added beside it, so an invocation is traced
+once.
 
 Skills (opt-in)::
 
@@ -31,12 +43,21 @@ With the loader on, every model turn is routed through ``SkillRouter`` and the
 result is appended to ``llm_request.config.system_instruction`` from the
 plugin's ``before_model_callback`` — the same hook, and the same field, ADK's
 own ``GlobalInstructionPlugin`` uses (``google/adk/plugins/
-global_instruction_plugin.py:86-121``). ``base_llm_flow.py`` hands that exact
-request object to ``llm.generate_content_async`` a few lines later
-(``base_llm_flow.py:1735-1803``), so what is appended here is what the model is
-sent. ADK registers no ``load_skill`` tool, so prompt injection is the ONLY
-body channel this adapter has — which is the ``has_tool_loop=False`` answer
-``DecimalConfig.resolve_inject_body`` gives bodies-by-default for.
+global_instruction_plugin.py:86-121``). ``flows/llm_flows/core/_model_call.py``
+runs that hook (line 194) and hands the same request object to
+``llm.generate_content_async`` (line 261), so what is appended here is what the
+model is sent. The router call is a blocking HTTP round-trip, so it runs on a
+worker thread and never on ADK's event loop.
+
+ADK itself ships a native skill mechanism — ``google.adk.tools.skill_toolset.
+SkillToolset``, with ``list_skills`` / ``load_skill`` / ``load_skill_resource``
+tools and an optional ``SkillRegistry`` — but this adapter does not plug
+DecimalAI skills into it. It registers no tool of its own either: prompt
+injection is the ONLY body channel this adapter has, which is the
+``has_tool_loop=False`` answer ``DecimalConfig.resolve_inject_body`` gives
+bodies-by-default for. A ``SkillToolset`` the caller adds to their agent works
+as ADK built it; DecimalAI neither routes its skills nor records its
+``load_skill`` calls as activations.
 
 ADK is built around Gemini; the release gate pairs this adapter with the
 ``google`` provider only.
@@ -50,8 +71,7 @@ import threading
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import wraps
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from ._skill_witness import copy_delivered_versions
@@ -134,6 +154,16 @@ _PluginClass: Any = None
 _skill_loader_enabled = False
 _skill_router_singleton: Any = None
 
+#: Logged when a caller asks for ``enable_load_skill_tool``. The leading clause
+#: is the refusal marker the conformance suite matches on the run, so it stays
+#: word for word.
+_LOAD_SKILL_TOOL_REFUSAL = (
+    "enable_load_skill_tool is not supported on the adk adapter (this adapter "
+    "registers no load_skill tool and does not bridge ADK's SkillToolset, so "
+    "the model cannot ask for a DecimalAI skill body); staying on prompt "
+    "injection. Use openai_agents or pydantic_ai for the native load_skill tool."
+)
+
 
 @dataclass(frozen=True)
 class _InstrumentationConfig:
@@ -144,45 +174,6 @@ class _InstrumentationConfig:
 
 _instrument_lock = threading.Lock()
 _instrument_config = _InstrumentationConfig()
-_sync_run_lock = threading.Lock()
-_SYNC_PARENT_ATTR = "_decimalai_invocation_parent_trace_id"
-_MISSING_PARENT = object()
-
-
-def _preserve_sync_run_parent() -> None:
-    """Hand the caller's parent to the invocation before ADK starts its thread.
-
-    Runner.run creates a plain worker thread, so its before_run callback cannot
-    read the caller's ContextVars. Carry only the parent on an invocation-owned
-    RunConfig copy. The private attribute stays out of ADK's serialized metadata;
-    neither the caller's config nor a shared plugin is mutated.
-    """
-    try:
-        from google.adk.runners import Runner
-    except ImportError:
-        return
-    with _sync_run_lock:
-        original_run = getattr(Runner, "run", None)
-        if not callable(original_run) or getattr(original_run, "_decimalai_parent_wrapped", False):
-            return
-
-        @wraps(original_run)
-        def run_with_parent(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
-            # This is a generator: capture when iteration starts, as the native
-            # Runner does, rather than when a deferred iterator is constructed.
-            from google.adk.agents.run_config import RunConfig
-
-            from .generic import _get_current_trace
-
-            enclosing = _get_current_trace()
-            config = kwargs.get("run_config")
-            config = (config if config is not None else RunConfig()).model_copy()
-            object.__setattr__(config, _SYNC_PARENT_ATTR, enclosing.get_trace_id() if enclosing else None)
-            kwargs["run_config"] = config
-            yield from original_run(self, *args, **kwargs)
-
-        run_with_parent._decimalai_parent_wrapped = True  # type: ignore[attr-defined]
-        Runner.run = run_with_parent  # type: ignore[method-assign]
 
 
 def _now() -> datetime:
@@ -282,16 +273,17 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
 # ── SkillRouter delivery ────────────────────────────────────
 #
 # ADK's prompt seam, established from the installed package rather than from
-# memory (google-adk 2.8.0):
+# memory (google-adk 2.12.0):
 #
 #   * ``BasePlugin.before_model_callback(*, callback_context, llm_request)``
-#     receives the live ``LlmRequest`` BY REFERENCE. ``base_llm_flow.py`` runs
-#     it inside ``_call_llm_async`` (line 1735) and then passes that same object
-#     to ``llm.generate_content_async(llm_request, ...)`` (line 1801). Nothing
+#     receives the live ``LlmRequest`` BY REFERENCE.
+#     ``flows/llm_flows/core/_model_call.py::call_llm_async`` runs it (line 194)
+#     and then passes that same object to
+#     ``llm.generate_content_async(llm_request, ...)`` (line 261). Nothing
 #     copies it in between.
 #   * ``LlmRequest.append_instructions(list[str])`` is PUBLIC API and appends to
 #     ``config.system_instruction`` with a ``"\n\n"`` join
-#     (``models/llm_request.py:262-279``).
+#     (``models/llm_request.py:266-283``).
 #   * ADK's own ``GlobalInstructionPlugin`` writes
 #     ``llm_request.config.system_instruction`` from this hook, which is the
 #     first-party proof that the seam is a supported extension point rather
@@ -323,9 +315,10 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
-            # ADK registers no `load_skill` tool, so there is no on-demand
-            # fetch to defer to: injection is the only body channel. That is
-            # exactly the case `resolve_inject_body` answers True for.
+            # This adapter registers no `load_skill` tool (and does not bridge
+            # ADK's own SkillToolset), so there is no on-demand fetch to defer
+            # to: injection is the only body channel. That is exactly the case
+            # `resolve_inject_body` answers True for.
             inject_body=config.resolve_inject_body(has_tool_loop=False),
         )
         return _skill_router_singleton
@@ -385,7 +378,7 @@ def _append_system_text(llm_request: Any, texts: List[str]) -> bool:
 
     The non-str case is here because ``append_instructions`` DROPS the text and
     only logs a warning when ``system_instruction`` is a ``types.Content`` or a
-    part list (``models/llm_request.py:274-279``) — a caller who set
+    part list (google-adk 2.12.0, ``models/llm_request.py:276-282``) — a caller who set
     ``generate_content_config=GenerateContentConfig(system_instruction=Content(...))``
     would otherwise get a beautifully traced run with none of their skills in
     it, silently, which is the exact failure this rail exists to prevent.
@@ -416,6 +409,15 @@ def _append_system_text(llm_request: Any, texts: List[str]) -> bool:
 
 def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
     """Route this turn's skills and append them to the system instruction.
+
+    Blocking: the router call is a synchronous HTTP round-trip. The plugin
+    therefore never calls this on ADK's event loop — ``before_model_callback``
+    awaits it through ``asyncio.to_thread``, which runs it on a worker thread
+    in a COPY of the caller's context (OpenTelemetry's current span and the
+    generic tracer's enclosing trace come with it). The router call and the
+    drain of its per-call rails below MUST stay in this one function for that
+    reason: the rails are ContextVars, and a value the router sets in the
+    worker's copy is gone once the worker returns.
 
     Nothing is claimed that was not verified: the offered / delivered / routing
     rails are stamped onto the run only after the appended prefix has been read
@@ -599,12 +601,7 @@ def _plugin_class() -> Any:
             # paths is the same silent no-op this adapter's own comments keep
             # warning about.
             if enable_load_skill_tool:
-                logger.warning(
-                    "enable_load_skill_tool is not supported on the adk adapter "
-                    "(no load_skill tool is registered, so the model cannot ask "
-                    "for a body); staying on prompt injection. Use openai_agents "
-                    "or pydantic_ai for the native load_skill tool."
-                )
+                logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
             self.agent_name = agent_name
             self.project = project
             self.parent_trace_id = parent_trace_id
@@ -704,14 +701,15 @@ def _plugin_class() -> Any:
             state.enable_skill_loader = settings.enable_skill_loader
             state.parent_trace_id = self.parent_trace_id
             if not state.parent_trace_id:
-                captured = getattr(getattr(invocation_context, "run_config", None), _SYNC_PARENT_ATTR, _MISSING_PARENT)
-                if captured is not _MISSING_PARENT:
-                    state.parent_trace_id = captured
-                else:
-                    from .generic import _get_current_trace
-                    enclosing = _get_current_trace()
-                    if enclosing is not None:
-                        state.parent_trace_id = enclosing.get_trace_id()
+                # The caller's enclosing generic trace, read from the context
+                # this callback runs in. That holds for the sync entry point
+                # too: google-adk 2.12's ``Runner.run`` starts its worker
+                # thread under ``contextvars.copy_context().run``, so the
+                # caller's ContextVars arrive here intact.
+                from .generic import _get_current_trace
+                enclosing = _get_current_trace()
+                if enclosing is not None:
+                    state.parent_trace_id = enclosing.get_trace_id()
             state.root_agent_name = getattr(agent, "name", None)
             state.user_input_preview = _content_to_text(
                 getattr(invocation_context, "user_content", None)
@@ -786,13 +784,14 @@ def _plugin_class() -> Any:
             state.spans.append(span)
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any):  # noqa: ANN001
-            # Primary end-of-invocation signal. ADK 2.x runs an LlmAgent root
-            # through the node runtime, which fires before_run but *not*
-            # after_run (see runners._run_node_async — after_run is only wired
-            # in the legacy _run_with_trace path). The root agent's after_agent
-            # is the last callback of the invocation, so finalize here — but
-            # only for the *root*: in a multi-agent run each sub-agent also
-            # fires after_agent, and we want exactly one trace per invocation.
+            # Primary end-of-invocation signal. The root agent's after_agent is
+            # the last agent callback of a successful invocation, so finalize
+            # here — but only for the *root*: in a multi-agent run each
+            # sub-agent also fires after_agent, and we want exactly one trace
+            # per invocation. google-adk 2.12 also fires after_run on success
+            # on both runtime paths (the node runtime that runs an LlmAgent
+            # root, and ``_run_with_trace`` for other BaseAgent roots), later;
+            # ``_complete``'s pop makes whichever arrives second a no-op.
             inv_id = getattr(callback_context, "invocation_id", None)
             state = self._get_run(inv_id)
             if state is None:
@@ -818,8 +817,9 @@ def _plugin_class() -> Any:
             return None
 
         async def after_run_callback(self, *, invocation_context: Any):  # noqa: ANN001
-            # Fallback for the legacy (non-node) runtime path, which does fire
-            # after_run. No-ops when after_agent already finalized this run.
+            # Fallback for an invocation whose root after_agent never fired
+            # (e.g. a before_run plugin that ended the run early). No-ops when
+            # after_agent already finalized this run.
             await self._complete(getattr(invocation_context, "invocation_id", None))
             return None
 
@@ -852,9 +852,13 @@ def _plugin_class() -> Any:
             # to push the one line that actually reaches the model off the end
             # of the callback. Never raises out — a Router failure degrades to
             # an unskilled turn, it does not break the caller's model call.
+            # Off the loop: the router call blocks on HTTP, and a slow
+            # platform must stall this turn only — not every other coroutine
+            # on ADK's event loop. This invocation awaits it, so nothing else
+            # touches this request or this turn's rails meanwhile.
             if state.enable_skill_loader:
                 try:
-                    _inject_skills_into_request(state, llm_request)
+                    await asyncio.to_thread(_inject_skills_into_request, state, llm_request)
                 except Exception:
                     logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             model = getattr(llm_request, "model", None)
@@ -1200,11 +1204,16 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
             to answer for this plugin alone, which is what the explicit
             ``plugins=[DecimalaiPlugin(...)]`` path needs — it never calls
             ``instrument()``, so there is no module flag to inherit.
-        enable_load_skill_tool: Accepted and DORMANT — ADK registers no
-            ``load_skill`` tool, so the model cannot ask for a body. True logs
-            a warning naming the adapters that do have the tool loop and stays
-            on prompt injection. See ``instrument()`` for why it is accepted
-            rather than rejected.
+        enable_load_skill_tool: Accepted and DORMANT — this adapter
+            registers no ``load_skill`` tool (ADK's own ``SkillToolset`` is not
+            wired to DecimalAI skills), so the model cannot ask for a body.
+            True logs a warning naming the adapters that do have the tool loop
+            and stays on prompt injection. See ``instrument()`` for why it is
+            accepted rather than rejected.
+
+    Attach it through ADK's ``App`` — ``App(..., plugins=[DecimalaiPlugin()])``
+    — which is ADK's supported place for plugins; ``Runner(plugins=...)`` still
+    works but ADK deprecates it.
 
     ⚠ This factory's signature is a SECOND place every parameter must be
     listed. It forwards by explicit keyword, so a parameter added to
@@ -1214,7 +1223,6 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     ``enable_load_skill_tool`` to the class alone took every ADK conformance
     item from green to "the documented snippet ran and NOTHING was POSTed".
     """
-    _preserve_sync_run_parent()
     return _plugin_class()(
         agent_name=agent_name, name=name, project=project,
         parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,
@@ -1230,7 +1238,21 @@ def instrument(
     """Install DecimalAI tracing globally for google-adk.
 
     Monkeypatches ``Runner.__init__`` so a single shared DecimalAI plugin is
-    auto-injected into every ``Runner`` created afterwards. Idempotent.
+    auto-injected into every ``Runner`` created afterwards — ``InMemoryRunner``
+    and the runners ADK's own CLI and server build included. Idempotent.
+
+    How it is injected depends on the shape ADK was given, because ADK refuses
+    ``app=`` together with ``plugins=``:
+
+    * ``Runner(app=...)``: the runner is built from a copy of the ``App`` whose
+      ``plugins`` list carries the shared plugin first. The caller's ``App`` is
+      not modified (the same move ADK's own evaluator makes).
+    * ``Runner(agent=...)`` / ``Runner(node=...)``: the shared plugin is put
+      first in the ``plugins`` argument.
+
+    Either way, a runner that already carries a DecimalAI plugin — by type, or
+    by the shared plugin's name — is left alone, so an explicit
+    ``DecimalaiPlugin`` answers for its runner and nothing is traced twice.
 
     Args:
         agent_name: Optional DecimalAI trace label. When omitted, uses the
@@ -1240,15 +1262,18 @@ def instrument(
             rails on the exporter worker thread. Exceptions are isolated from
             tracing and execution. Updating instrument() affects new invocations only.
         enable_skill_loader: When True, every model turn is routed through
-            ``SkillRouter`` and the routed skills — bodies included, since ADK
-            has no ``load_skill`` tool to fetch them on demand — are appended
-            to ``llm_request.config.system_instruction`` before the request
-            goes out. Off by default, like every other adapter's loader.
+            ``SkillRouter`` and the routed skills — bodies included, since this
+            adapter registers no ``load_skill`` tool to fetch them on demand —
+            are appended to ``llm_request.config.system_instruction`` before
+            the request goes out. Off by default, like every other adapter's
+            loader.
         enable_load_skill_tool: Accepted and DORMANT, exactly as on the
-            langchain adapter. ADK registers no ``load_skill`` tool, so the
-            model has no way to ASK for a body and the strongest rung this rail
-            can reach is DELIVERED. Passing True logs a warning naming the
-            adapters that do have the tool loop, and stays on prompt injection.
+            langchain adapter. This adapter registers no ``load_skill`` tool
+            and does not connect DecimalAI skills to ADK's own
+            ``SkillToolset``, so the model has no way to ASK for a DecimalAI
+            body and the strongest rung this rail can reach is DELIVERED.
+            Passing True logs a warning naming the adapters that do have the
+            tool loop, and stays on prompt injection.
 
             It is accepted rather than rejected on purpose: silently ignoring
             the flag is how an adapter ends up graded as if it had a channel it
@@ -1259,12 +1284,7 @@ def instrument(
     """
     global _install_agent_name, _runner_patched, _skill_loader_enabled, _instrument_config
     if enable_load_skill_tool:
-        logger.warning(
-            "enable_load_skill_tool is not supported on the adk adapter "
-            "(no load_skill tool is registered, so the model cannot ask for a "
-            "body); staying on prompt injection. Use openai_agents or "
-            "pydantic_ai for the native load_skill tool."
-        )
+        logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
     with _instrument_lock:
         _install_agent_name = agent_name
         # Preserve the loader's existing sticky opt-in, and atomically publish
@@ -1292,11 +1312,31 @@ def instrument(
         shared_plugin._follow_instrument_config = True
         original_init = Runner.__init__
 
+        def carries_decimalai(plugins: Any) -> bool:
+            # By type, so a renamed explicit DecimalaiPlugin counts; by name,
+            # because ADK refuses two plugins with one name.
+            return any(
+                isinstance(p, type(shared_plugin))
+                or getattr(p, "name", None) == shared_plugin.name
+                for p in plugins or ()
+            )
+
         def patched_init(self, **kwargs):  # Runner.__init__ is keyword-only
-            plugins = list(kwargs.pop("plugins", None) or [])
-            if not any(getattr(p, "name", None) == shared_plugin.name for p in plugins):
-                plugins.insert(0, shared_plugin)
-            kwargs["plugins"] = plugins
+            app = kwargs.get("app")
+            if app is not None:
+                # ADK refuses app= with plugins= (`Runner._resolve_app`), so the
+                # plugin goes INTO the app. A `plugins=` the caller passed
+                # alongside it is left as given, and ADK refuses it with its
+                # own message. A copy, so the caller's App is not mutated.
+                if not carries_decimalai(app.plugins):
+                    kwargs["app"] = app.model_copy(
+                        update={"plugins": [shared_plugin, *app.plugins]},
+                    )
+            else:
+                plugins = list(kwargs.pop("plugins", None) or [])
+                if not carries_decimalai(plugins):
+                    plugins.insert(0, shared_plugin)
+                kwargs["plugins"] = plugins
             original_init(self, **kwargs)
 
         Runner.__init__ = patched_init  # type: ignore[method-assign]

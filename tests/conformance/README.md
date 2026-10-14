@@ -40,13 +40,23 @@ itself is wrong for *every* framework.
 
 ## Running it
 
-There is no Makefile in this repo. The one command is:
+There is no Makefile in this repo. The matrix is graded in **two environments**
+(see [Two environments](#two-environments) for why), one command each:
 
 ```bash
-pip install -e ".[dev,conformance-tests]"    # the eleven frameworks the drivers drive
-python -m pytest tests/conformance -q -rs -m conformance   # ~30s; -rs prints every N/A reason
-# -m conformance is required — the marker is deselected by default so this suite
-# never shares a process with the unit suite (it mutates adapter globals on purpose).
+# openai 3 — every driver except crewai and adk
+pip install -e ".[dev,conformance-tests]"
+DECIMAL_TEST_ENV=openai3 python -m pytest tests/conformance -q -rs -m conformance
+
+# openai 2 — crewai and adk, in a SEPARATE venv (it cannot share one with the above)
+pip install -e ".[conformance-tests-openai2]"
+DECIMAL_TEST_ENV=openai2 python -m pytest tests/conformance -q -rs -m conformance
+
+# ~40s each; -rs prints every N/A reason, and names the drivers graded in the other
+# environment. -m conformance is required — the marker is deselected by default so
+# this suite never shares a process with the unit suite (it mutates adapter globals
+# on purpose). Add DECIMAL_CONFORMANCE_REQUIRE_ALL=1 to make every driver that
+# BELONGS to the environment a hard requirement, the way CI runs it.
 ```
 
 Other useful forms:
@@ -77,25 +87,63 @@ each with the reason. Set `DECIMAL_CONFORMANCE_REPORT_JSON=<path>` to also get
 it as JSON (the release gate does this so its report can name the drivers that
 did not run).
 
+## Two environments
+
+No single environment can install every framework the SDK supports. Upstream has
+split on openai 3: openai-agents and pydantic-ai-slim[openai] need `openai>=3`,
+while crewai, litellm and llama-index-llms-openai still pin `openai<3`. So:
+
+| `DECIMAL_TEST_ENV` | Built by | Drivers it must run |
+|---|---|---|
+| `openai3` (the default when unset) | `pip install -e ".[dev,conformance-tests]"` | langchain, openai-agents, pydantic-ai, anthropic, claude-agent-sdk, llamaindex, generic-otel |
+| `openai2` | `pip install -e ".[conformance-tests-openai2]"` | crewai, adk, llamaindex, generic-otel |
+
+ADK sits in the openai 2 world for one reason: its driver's stub model is LiteLLM's
+custom provider, reached through ADK's `LiteLlm`, and litellm pins `openai<3`.
+google-adk itself installs in both, and its unit tests and `J1` journey run in the
+openai 3 one. llamaindex and generic-otel need neither openai, so both grade them.
+
+The map lives in `environments.py` (`DRIVER_ENVS`), and `test_coverage.py` fails on
+a driver that is in no environment. With `DECIMAL_CONFORMANCE_REQUIRE_ALL=1`, a
+driver that belongs to the current environment and cannot import its framework is
+a failure; a driver that belongs only to the other one is named on every run
+(`test_drivers_graded_in_another_environment_are_named`) and graded by the other
+job. An unknown `DECIMAL_TEST_ENV` value fails the run rather than defaulting.
+
+`DECIMAL_TEST_ENV=openai2` also narrows the **unit** suite to the files that need
+the openai 2 packages (`tests/conftest.py`, `OPENAI2_UNIT_TESTS`: the CrewAI,
+LiteLLM-evals and LlamaIndex tests), and refuses to start when those packages are
+missing, so that slice cannot pass by skipping:
+
+```bash
+DECIMAL_TEST_ENV=openai2 .venv-openai2/bin/python -m pytest tests/ -q
+```
+
+`bin/wt land` runs it whenever the checkout has a `.venv-openai2`, and warns loudly
+when it does not (the landing gate's per-repo suite definition).
+
 ## Where it runs
 
 | Lane | What it is | Blocks? |
 |---|---|---|
-| `.github/workflows/ci.yml` job `conformance` | Tier A on every push and PR. No secrets. | yes |
-| `make ci-workflows` (platform) | the same job, executed locally from the same YAML | yes |
-| `make release-gate` → phase P0 | Tier A inside the pinned release gate | yes |
-| `make release-gate-conformance` | phase P0 alone, ~90s, no key, no backend | yes |
+| `.github/workflows/ci.yml` jobs `conformance` + `conformance-openai2` | Tier A on every push and PR, one job per environment. No secrets. | yes — `publish.yml` requires both |
+| `.github/workflows/ci.yml` job `test-openai2` | the openai 2 slice of the unit suite | yes — `publish.yml` requires it |
+| `.github/workflows/conformance-latest.yml` (`openai3`, `openai2` legs) | Tier A against the **newest** frameworks, nightly | no — advisory, one issue per environment |
+| `make ci-workflows` (platform) | the same jobs, executed locally from the same YAML | yes |
+| `make release-gate` → phase P0 | Tier A inside the pinned release gate | yes — openai 3 environment only, until the gate grows a second venv |
+| `make release-gate-conformance` | phase P0 alone, ~90s, no key, no backend | yes — same caveat |
 | `make release-gate-latest` (canary) | Tier A against the **newest** frameworks | no — advisory |
 
-the local CI runner needed no change to pick the job up: it parses each
-repo's workflow YAML and runs the same `run:` blocks, so adding the job was
+the local CI runner needed no change to pick the jobs up: it parses each
+repo's workflow YAML and runs the same `run:` blocks, so adding a job was
 enough.
 
-The CI job runs the coverage guard **before** installing the frameworks —
+The openai 3 job runs the coverage guard **before** installing the frameworks —
 "somebody added a framework and skipped the driver" then fails in seconds rather
-than after a multi-minute install — and sets
-`DECIMAL_CONFORMANCE_REQUIRE_ALL=1` for the matrix, which turns "a driver could
-not import its framework" from a silent skip into a failure.
+than after a multi-minute install. It is environment-independent, so one job runs
+it for both. Both jobs set `DECIMAL_TEST_ENV` and
+`DECIMAL_CONFORMANCE_REQUIRE_ALL=1` for the matrix, which turns "a driver that
+belongs here could not import its framework" from a silent skip into a failure.
 
 ## Adding a framework
 
@@ -474,17 +522,17 @@ second set of assertions.
 | | Pinned lane | Floating lane |
 |---|---|---|
 | Runs in | `ci.yml`, every push and PR | `conformance-latest.yml`, nightly |
-| Versions from | pinned constraints + the SDK's declared floors | newest, resolved live |
-| Which frameworks | the `conformance-tests` extra | the full floating matrix |
-| A red row | **blocks the release** | opens an issue; blocks nothing |
+| Versions from | the SDK's declared floors (each the newest release when it was set) | newest, resolved live |
+| Which frameworks | `conformance-tests` (openai 3) and `conformance-tests-openai2` (openai 2), one job each | the same two extras, every requirement floated to newest |
+| A red row | **blocks the release** | opens an issue for that environment; blocks nothing |
 
 The mechanism is one command. Both lanes shell
-`pytest tests/conformance -m conformance`; the floating lane simply upgrades
-every framework to newest inside a clean-room wheel venv first, then runs the
-identical phase with different versions underneath. The tests do not know which
-lane they are in — the advisory/blocking distinction is structural (the nightly
-is its own scheduled lane and was never a PR check), not a flag the assertions
-read.
+`pytest tests/conformance -m conformance` with `DECIMAL_TEST_ENV` set; the
+floating lane upgrades every requirement of its environment's extras (floors kept
+as lower bounds, so nothing resolves below one) before running the identical
+phase. The tests do not know which lane they are in — the advisory/blocking
+distinction is structural (the nightly is its own scheduled lane and was never a
+PR check), not a flag the assertions read.
 
 The floating matrix grew a second block for the frameworks that have a
 conformance driver but no live-matrix lane (crewai, google-adk, llama-index-core,
@@ -495,8 +543,9 @@ because Tier A is hermetic — no model spend, no backend.
 Two commands worth knowing:
 
 ```bash
-# pinned, ~30s, no key, no backend — "did I break an adapter?"
-python -m pytest tests/conformance -q -m conformance
+# pinned, ~40s per environment, no key, no backend — "did I break an adapter?"
+DECIMAL_TEST_ENV=openai3 python -m pytest tests/conformance -q -m conformance   # in .venv
+DECIMAL_TEST_ENV=openai2 python -m pytest tests/conformance -q -m conformance   # in .venv-openai2
 
 # floating: newest frameworks vs the contract, still no key and no backend
 #   → the nightly `Conformance (latest frameworks)` workflow, or
@@ -505,13 +554,17 @@ python -m pytest tests/conformance -q -m conformance
 
 ### Which versions we support, and why
 
-Floors are claims we have RUN, not numbers we picked. Three in this repo were
-fiction before anyone checked: `llama-index-core>=0.10.20` (the module the
-adapter imports does not exist there), `openai-agents>=0.17.2` (true alone,
-false against an `openai` our own extra would select), and
-`langchain-core>=1.3.0` (documented "CVE-clean" while admitting three patch
-releases that carry CVE-2026-44843). Verify a floor by installing at it and
-running that framework's driver — the suite makes this cheap.
+**The newest release of each framework, and nothing older.** Every floor in
+`pyproject.toml` is the version the unit suite and this matrix were run against
+when it was set; there are no version checks, shims or fallbacks for earlier
+releases. When a newer release passes, raise the floor to it.
+
+Floors are claims we have RUN, not numbers we picked. Verify one by installing
+exactly the floors (`uv pip install --resolution lowest-direct`) and running the
+matrix in that environment — the suite makes this cheap. On 2026-10-14 every
+extra was resolved with `uv pip compile pyproject.toml --extra <name>` on Python
+3.10, 3.12 and 3.13, at both `highest` and `lowest-direct`, and the openai 2
+matrix was run at exactly its floors.
 
 Two traps a version range cannot express, both found by resolving and then
 running:
@@ -525,18 +578,29 @@ running:
   where you can name what it protects and when to review it. The conformance
   job is the better control, because it tests the thing the cap is guessing at.
 
-Support window, per framework, from the observed release cadence:
+Floors, per framework, as of 2026-10-14 — each the newest release that day:
 
-| Framework | Floor | Cap | Note |
-|---|---|---|---|
-| langchain-core | `>=1.3.3` | `<2` | Floor is the CVE fix, not compatibility — the adapter grades identically from 0.3.67 to 1.5.5. New minor every 6-7 weeks. |
-| langgraph | `>=0.6.0` | none | Never imported by the SDK; the floor is a statement about what we test. langgraph `>=1.2` forces langchain-core `>=1.4.7` — a pairing rule our floors cannot express. |
-| openai | `>=2.26.0` | none | Cap removed; see above. A new minor almost weekly. |
-| openai-agents | `>=0.18.1` | none | Minors are the breaking unit, every ~2.5 weeks; a meaningful cap would need editing fortnightly. Hold the line with conformance. |
-| llama-index-core | `>=0.12.0` | none | Verified at the floor after the previous one proved fictional. |
-| google-adk | `>=2.0.0` | none | 2.x is young; watch it. |
-| crewai | `>=1.15.3` | none | Was `>=1.6.1` in `pyproject.toml` until 2026-10-08, and fiction: 1.6.1 cannot trace (the OpenInference instrumentor only instruments crewai `>=1.10.1`), 1.7–1.14.6 pin `click<8.2` and cannot install beside decimalai, 1.14.7 relaxes that pin but pins `opentelemetry-sdk~=1.34` (no google-adk beside it) and fails C4, and 1.15.0–1.15.2 fail C4. The `crewai-tests` extra floors at 1.15.3 too, for the same reason. 1.15.3 is the lowest that passes the whole column, skills rail and delivery cells included. The skill loader's hook API exists from 1.5.0, so tracing sets the floor. Breaks in PATCH releases, so a major cap would protect little — the nightly floating lane is the control. |
-| pydantic-ai, claude-agent-sdk | `>=0.1.0` | none | Both floors are unverified `>=0.1.0` — the shape of a floor nobody has run. Verify before claiming them. |
+| Framework | Floor | Env | Cap | Note |
+|---|---|---|---|---|
+| langchain-core | `>=1.6.10` | openai3 | none | Above both old special floors (the CVE-2026-44843 fix in 1.3.3, the py3.10 run-scope fix in 1.4.8), so one line holds on every Python. langchain and langgraph cap `<2` upstream. |
+| langgraph | `>=1.2.15` | openai3 | none | Never imported by the SDK; the floor is a statement about what we test. |
+| openai | `>=3.30.0` | openai3 | none | The provider SDK `init(openai=True)` instruments. A new minor almost weekly. |
+| openai-agents | `>=0.23.1` | openai3 | none | Needs openai `>=3`. Minors are the breaking unit, every ~2.5 weeks. |
+| pydantic-ai-slim | `>=2.56.0` | openai3 | none | Slim with `[openai,google,anthropic]`, not the `pydantic-ai` meta package: its `logfire` extra needs opentelemetry `>=1.44`, which google-adk's `<=1.42.1` rules out of `decimalai[all]`. Needs Python 3.11+. |
+| claude-agent-sdk | `>=0.2.166` | openai3 | none | |
+| anthropic (+ instrumentor) | `>=1.13.0` (`>=3.0.3`) | openai3 | none | The `<1.0.0` / `<2.0.0` caps were lifted together: this pair passes the whole anthropic column. |
+| google-adk | `>=2.12.0` | both | none | Needs Python 3.11+, and caps opentelemetry at `<=1.42.1` — which is why `dev` floors opentelemetry-instrumentation at 0.63b1, not the newer 0.66b1. Its conformance driver needs litellm, so it is graded in openai2. |
+| llama-index-core | `>=0.14.25` | both | none | |
+| crewai | `>=1.15.27` | openai2 | none | Pins openai `<3`. Breaks in PATCH releases, so a major cap would protect little — the nightly floating lane is the control. |
+| litellm | `>=1.105.0` | openai2 | none | Pins openai `<3`, so `evals` is left out of `decimalai[all]`. |
+| llama-index-llms-openai | `>=0.8.3` | openai2 | none | Pins openai `<3`. |
+
+Two consequences worth knowing. **Python 3.10:** google-adk 2.12 and
+pydantic-ai-slim 2.56 need Python 3.11+, so on 3.10 `decimalai[adk]`,
+`decimalai[pydantic-ai]`, `decimalai[all]` and both conformance extras do not
+resolve — pip refuses loudly. The core package and every other extra still support
+3.10. **`decimalai[all]` is not everything:** it is every runtime extra that
+co-installs, i.e. the openai 3 world; `evals` needs a separate environment.
 
 ### When a new framework version breaks a row
 

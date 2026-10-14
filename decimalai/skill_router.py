@@ -30,6 +30,7 @@ from pathlib import Path
 from threading import Lock
 from threading import local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -257,7 +258,15 @@ LOAD_SKILL_PROMPT_HINT = (
 #
 # "Hot path" = a call that happens INSIDE a user's turn, so its latency is the
 # customer's latency. Everything else (CLI, publish, scans) can afford to wait.
+#
+# The body fetch is one too (2026-10-14). `build_prompt_fragment` fetches the
+# injected body and `load_skill` fetches a body mid-turn, and both used to get
+# the 30 s cold budget with no breaker: a brownout that the 5 s route budget
+# had already given up on still held the turn for up to 30 s per body. Disk
+# export also reads `/body`, from the CLI, and opts out with `hot=False`.
 _HOT_PATHS = ("/api/v1/skills/route", "/api/v1/skills/menu")
+_SKILLS_PREFIX = "/api/v1/skills/"
+_BODY_SUFFIX = "/body"
 _ADMISSION_MAX_RETRIES = 2
 _ADMISSION_MAX_WAIT_S = 5.0
 
@@ -357,8 +366,77 @@ def _empty_menu_reason(e: "SkillRouterError") -> str:
     return "transport"
 
 
+def _is_body_path(path: str) -> bool:
+    return path.startswith(_SKILLS_PREFIX) and path.endswith(_BODY_SUFFIX)
+
+
 def _is_hot_path(path: str) -> bool:
-    return any(path.startswith(p) for p in _HOT_PATHS)
+    # Exact match for route/menu: a prefix test also caught every per-skill
+    # path whose NAME starts with "route" or "menu" (`/skills/routes-planner/
+    # publish` got the 5 s budget and tripped the breaker agents depend on).
+    return path in _HOT_PATHS or _is_body_path(path)
+
+
+def _skill_body_path(name: str) -> str:
+    """``/api/v1/skills/{name}/body`` with the name percent-encoded.
+
+    Raw, a ``#`` or ``?`` in the name ended the path: ``weird#name`` requested
+    ``/skills/weird`` with a fragment. ``/`` stays literal because the backend
+    declares the route as ``{skill_name:path}`` for namespaced registry names
+    (``owner/name``, about 2/3 of the registry), and that is the spelling every
+    proxy in front of it already passes through.
+    """
+    return f"{_SKILLS_PREFIX}{quote(name, safe='/')}{_BODY_SUFFIX}"
+
+
+def _is_health_failure(path: str, status: int) -> bool:
+    """Does this HTTP status mean agents are running without skills?
+
+    Until 2026-10-14 the breaker called ANY response a success, so a revoked
+    key (401) or a 503 storm left ``routing_status().healthy`` True while every
+    turn ran with an empty menu. Auth, plan gate (402), admission (429) and
+    server errors are failures. A 404 from ``/body`` is the platform answering
+    "no skill by that name" — an answer, not an outage — while a 404 from
+    ``/route`` or ``/menu`` means the endpoint itself is missing (wrong base URL,
+    a proxy eating the path). Other 4xx are about one request, not the platform.
+    """
+    if status >= 500 or status in (401, 402, 403, 429):
+        return True
+    return status == 404 and not _is_body_path(path)
+
+
+def _routing_call_failed(result: Dict[str, Any]) -> bool:
+    """Is this routing result the SDK's own empty stand-in for a failed call?
+
+    ``get_menu`` / ``smart_route`` swallow their errors into
+    ``{"skills": [], "prompt_fragment": "", "strategy": "none", ...}``. The
+    platform never sends ``strategy: "none"``; it answers ``full_menu`` or
+    ``smart_routing``, even for a workspace with no skills.
+    """
+    return result.get("strategy") == "none" and not result.get("routing_id")
+
+
+def _ranked_by_this_query(result: Dict[str, Any]) -> bool:
+    """Did the platform rank this result by the query it was asked?
+
+    Only then is its top row a body worth injecting. The platform answers a
+    query with its effectiveness-ordered menu in two cases — a workspace small
+    enough to show whole (``strategy: "full_menu"``, with ``query_ranked`` False
+    when no query term matched a row) and every retrieval fallback (flagged
+    ``degraded``). Injecting the top row there put the workspace's best-rated
+    skill, up to 6k tokens of it, into turns like "thanks!" (audit R2).
+
+    Reads the platform's own signals and nothing else: ``degraded`` (or a
+    ``degraded_reason``) refuses; ``query_ranked``, when sent, decides; a
+    ``full_menu`` result without it is unranked by definition. Hybrid retrieval
+    (``smart_routing``) ranks by the query and does not send ``query_ranked``.
+    """
+    if result.get("degraded") is True or result.get("degraded_reason"):
+        return False
+    ranked = result.get("query_ranked")
+    if ranked is not None:
+        return ranked is True
+    return result.get("strategy") != "full_menu"
 
 
 class _CircuitBreaker:
@@ -394,11 +472,16 @@ class _CircuitBreaker:
         # Counters for `routing_status()`. Monotonic for the life of the
         # process — a health check wants "has this ever degraded", not a
         # gauge that a recovery quietly resets to zero.
+        # `timeouts` counts transport failures (a read timeout, a refused
+        # connection); `http_errors` counts responses that arrived but mean
+        # no skills (see `_is_health_failure`). Both feed the same breaker.
         self.timeouts = 0
+        self.http_errors = 0
         self.opens = 0
         self.suppressed = 0
         self.last_error: Optional[str] = None
         self.last_error_at: Optional[float] = None
+        self.last_status_code: Optional[int] = None
         self.last_success_at: Optional[float] = None
 
     def _current_cooldown(self) -> float:
@@ -421,10 +504,25 @@ class _CircuitBreaker:
             self.suppressed += 1
             return True
 
-    def record_failure(self, error: Optional[BaseException] = None) -> None:
+    def record_failure(
+        self,
+        error: Optional[BaseException] = None,
+        *,
+        status_code: Optional[int] = None,
+    ) -> None:
+        """Count one failed hot-path call.
+
+        ``status_code`` set means the platform answered with a status that
+        leaves agents without skills (401/403/429/5xx…); unset means the call
+        never got an answer (timeout, refused connection).
+        """
         with self._lock:
             self._consecutive_failures += 1
-            self.timeouts += 1
+            if status_code is None:
+                self.timeouts += 1
+            else:
+                self.http_errors += 1
+                self.last_status_code = status_code
             if error is not None:
                 self.last_error = f"{type(error).__name__}: {error}"
                 self.last_error_at = time.time()
@@ -435,11 +533,10 @@ class _CircuitBreaker:
                 # ERROR, not warning. While this is open every agent in the
                 # process answers without skills and nothing else says so.
                 logger.error(
-                    "SkillRouter: %d consecutive transport failures — pausing "
-                    "skill routing for %.0fs. Agents will run WITHOUT SKILLS "
-                    "until the platform is reachable. Last error: %s. If this "
-                    "is slowness rather than an outage, raise %s (currently "
-                    "%.1fs).",
+                    "SkillRouter: %d consecutive failures — pausing skill "
+                    "routing for %.0fs. Agents will run WITHOUT SKILLS until "
+                    "the platform answers. Last error: %s. If this is slowness "
+                    "rather than an outage, raise %s (currently %.1fs).",
                     self._consecutive_failures, self._current_cooldown(),
                     self.last_error, _HOT_PATH_READ_ENV, _hot_path_read_budget(),
                 )
@@ -472,8 +569,8 @@ class RoutingStatus:
 
     __slots__ = (
         "healthy", "breaker_open", "consecutive_failures", "timeouts",
-        "opens", "suppressed", "read_budget_s", "last_error",
-        "last_error_at", "last_success_at",
+        "http_errors", "opens", "suppressed", "read_budget_s", "last_error",
+        "last_error_at", "last_status_code", "last_success_at",
     )
 
     def __init__(self, **kw):
@@ -483,7 +580,7 @@ class RoutingStatus:
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
             f"RoutingStatus(healthy={self.healthy}, breaker_open={self.breaker_open}, "
-            f"timeouts={self.timeouts}, opens={self.opens}, "
+            f"timeouts={self.timeouts}, http_errors={self.http_errors}, opens={self.opens}, "
             f"read_budget_s={self.read_budget_s})"
         )
 
@@ -491,10 +588,11 @@ class RoutingStatus:
 def routing_status() -> RoutingStatus:
     """Is skill routing actually working in this process?
 
-    `healthy` is False while the breaker is open OR after any hot-path timeout
-    that has not been followed by a success — i.e. it answers "are my agents
-    getting their skills right now", which is the question a 200 response
-    cannot.
+    `healthy` is False while the breaker is open OR after any hot-path failure
+    that has not been followed by a success — a timeout, or a response such as
+    401, 403, 429 or 5xx that leaves the turn without skills. It answers "are
+    my agents getting their skills right now", which is the question a 200 from
+    the agent cannot. A 404 for an unknown skill name is not a failure.
     """
     b = _hot_path_breaker
     with b._lock:
@@ -504,11 +602,13 @@ def routing_status() -> RoutingStatus:
             breaker_open=open_now,
             consecutive_failures=b._consecutive_failures,
             timeouts=b.timeouts,
+            http_errors=b.http_errors,
             opens=b.opens,
             suppressed=b.suppressed,
             read_budget_s=_hot_path_read_budget(),
             last_error=b.last_error,
             last_error_at=b.last_error_at,
+            last_status_code=b.last_status_code,
             last_success_at=b.last_success_at,
         )
 
@@ -1077,6 +1177,20 @@ class SkillRouter:
         # not one of its own scopes. Cleared automatically the moment all four
         # unscoped rails are empty, so it describes only undrained content.
         self._unscoped_rail_owners: "OrderedDict[str, None]" = OrderedDict()
+        # What `load_skill` may serve: every name `build_prompt_fragment` put
+        # in front of the model — the routed rows, the stable menu (which holds
+        # every hinted name), and injected bodies. Per run under `scope=`, and
+        # once more for the whole router, which is what an unscoped load (or a
+        # scope this router never routed for) is checked against: unscoped
+        # callers have no run identity, and refusing a concurrent
+        # conversation's own offer would break a working path to close a
+        # hole the process-wide set already closes. Not drained by
+        # `_release_scoped_routing_rail` — the run's loads come after its route.
+        # Bounded LRU like the rails; `_has_routed` keeps a router that never
+        # routed (a hand-built menu, a direct `load_skill`) unrestricted.
+        self._loadable_by_scope: "OrderedDict[str, set]" = OrderedDict()
+        self._loadable_any: "OrderedDict[str, None]" = OrderedDict()
+        self._has_routed = False
         # One lock for every per-scope store. `otel._skill_rails` and
         # `openai_agents._run_rails` both take one; these did not, and the
         # `get` -> `move_to_end` -> `popitem` sequences below are not atomic.
@@ -1123,8 +1237,15 @@ class SkillRouter:
         path: str,
         json: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
+        *,
+        hot: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Make an HTTP request to the platform API.
+
+        Args:
+            hot: whether this call sits inside a user's turn (5 s read budget,
+                circuit breaker, counted by ``routing_status()``). Decided by the
+                path when omitted; disk export passes ``False`` for ``/body``.
 
         Raises:
             SkillRouterError: on transport failure, non-2xx response, or
@@ -1138,7 +1259,7 @@ class SkillRouter:
             {k: v for k, v in params.items() if v is not None} if params else None
         )
 
-        hot = _is_hot_path(path)
+        hot = _is_hot_path(path) if hot is None else hot
         if hot and _hot_path_breaker.is_open():
             # Short-circuit rather than pay the timeout again. See _CircuitBreaker.
             raise SkillRouterError(
@@ -1187,8 +1308,6 @@ class SkillRouter:
             raise SkillRouterError(
                 f"SkillRouter transport error on {method} {path}: {e}"
             ) from e
-        if hot:
-            _hot_path_breaker.record_success()
 
         if resp.status_code >= 400:
             # Surface the server's structured error body (FastAPI ``detail``) —
@@ -1217,19 +1336,36 @@ class SkillRouter:
                 }
             except Exception:
                 resp_headers = None
-            raise SkillRouterError(
+            error = SkillRouterError(
                 message,
                 status_code=resp.status_code,
                 detail=detail,
                 headers=resp_headers,
             )
+            if hot:
+                if _is_health_failure(path, resp.status_code):
+                    _hot_path_breaker.record_failure(error, status_code=resp.status_code)
+                else:
+                    # The platform answered (an unknown skill name, a request
+                    # it rejected) — it is up, and that is what the breaker
+                    # tracks.
+                    _hot_path_breaker.record_success()
+            raise error
 
         try:
-            return resp.json()
+            data = resp.json()
         except (json_module.JSONDecodeError, ValueError) as e:
-            raise SkillRouterError(
+            error = SkillRouterError(
                 f"SkillRouter got non-JSON response from {method} {path}: {e}"
-            ) from e
+            )
+            if hot:
+                # A 200 that is not JSON (an HTML login or challenge page from
+                # a proxy) delivers no skills either.
+                _hot_path_breaker.record_failure(error, status_code=resp.status_code)
+            raise error from e
+        if hot:
+            _hot_path_breaker.record_success()
+        return data
 
     def get_menu(
         self,
@@ -1282,7 +1418,8 @@ class SkillRouter:
             # Graceful degradation: prompt assembly shouldn't break if the
             # platform is unreachable. Log loudly so callers can see *why*.
             logger.warning("get_menu failed, returning empty menu: %s", e)
-            return {"skills": [], "prompt_fragment": "", "strategy": "none"}
+            return {"skills": [], "prompt_fragment": "", "strategy": "none",
+                    "degraded_reason": _empty_menu_reason(e)}
 
         if result:
             self._menu_cache.set(cache_key, result)
@@ -1404,14 +1541,22 @@ class SkillRouter:
         if agent_name is not None:
             params["agent_name"] = agent_name
 
+        # Why the last fetch on this thread returned nothing, for `load_skill`:
+        # None means "no such skill" (a 404) or success; a reason string means
+        # the platform could not answer, which the model must not be told is a
+        # missing skill. Same thread-local handoff as the hash, for the same
+        # reason (see `_body_hash_tls`).
+        _body_hash_tls.unavailable = None
         try:
             result = self._request(
                 "GET",
-                f"/api/v1/skills/{skill_name}/body",
+                _skill_body_path(skill_name),
                 params=params,
             )
         except SkillRouterError as e:
             logger.warning("get_skill_body(%s) failed: %s", skill_name, e)
+            if getattr(e, "status_code", None) != 404:
+                _body_hash_tls.unavailable = _empty_menu_reason(e)
             return None
         return result if isinstance(result, dict) else None
 
@@ -1436,22 +1581,33 @@ class SkillRouter:
 
         Always returns a STRING (never raises): either the trimmed body block
         the adapter feeds back as the tool result, or an explanatory message
-        (budget exhausted / not found) the model can act on. Enforces the
-        per-turn body guardrail: ``max_loaded_bodies``, ``body_token_budget``,
-        ``per_body_char_limit`` cap, ``body_load_deadline_s``. Records the
-        load on the active trace (``skills_loaded_by_agent``) so the
-        offered-vs-loaded join closes server-side.
+        (not offered / budget exhausted / not found / platform unavailable) the
+        model can act on. Enforces the per-turn body guardrail:
+        ``max_loaded_bodies``, ``body_token_budget``, ``per_body_char_limit``
+        cap, ``body_load_deadline_s``. Records the load on the active trace
+        (``skills_loaded_by_agent``) so the offered-vs-loaded join closes
+        server-side.
+
+        Serves only a skill this router put in front of the model — see
+        :meth:`_not_offered_refusal`. ``/body`` itself serves any public
+        registry skill by name, so without this a prompt injection naming a
+        planted skill could load it.
 
         Args:
             scope: an opaque key naming the RUN this load belongs to (the
-                adapter's trace id). Budget accounting and the loaded-names
-                rail are kept per scope, so concurrent runs sharing one
-                router singleton stop consuming each other's turn budget.
-                Omit it and the legacy single-slot fallback applies.
+                adapter's trace id). Budget accounting, the offered-skills
+                check and the loaded-names rail are kept per scope, so
+                concurrent runs sharing one router singleton stop consuming
+                each other's turn budget. Omit it and the single-slot
+                fallback applies.
         """
         name = (name or "").strip()
         if not name:
             return "load_skill error: a skill name is required."
+
+        refusal = self._not_offered_refusal(name, scope)
+        if refusal is not None:
+            return refusal
 
         # A caller that names its run is the most precise answer available,
         # so it wins outright: falling back to the ContextVar there would
@@ -1497,6 +1653,7 @@ class SkillRouter:
         _body_hash_tls.value = None
         _body_hash_tls.partial = None
         _body_hash_tls.identity = None
+        _body_hash_tls.unavailable = None
         body = self.get_skill_body(
             name,
             max_chars=self.per_body_char_limit,
@@ -1505,10 +1662,20 @@ class SkillRouter:
         content_hash = getattr(_body_hash_tls, "value", None)
         identity = getattr(_body_hash_tls, "identity", None) or {}
         partial = getattr(_body_hash_tls, "partial", None)
+        unavailable = getattr(_body_hash_tls, "unavailable", None)
         if partial is True or (partial is None and _body_is_known_partial(body)):
             return (
                 f"load_skill budget exhausted: {name!r} was returned as a partial body. "
                 "Its complete instructions were not loaded. Proceed with what is already loaded."
+            )
+        if body is None and unavailable:
+            # Not "no skill named X": the skill exists, the platform did not
+            # answer. Telling the model it is missing invites it to guess
+            # another name, or to claim the skill does not exist.
+            return (
+                f"load_skill: {name!r} could not be loaded right now — the skills "
+                f"platform is unavailable ({unavailable}). Its instructions were not "
+                "loaded. Proceed without it and do not retry this turn."
             )
         if body is None or not body.strip():
             return (
@@ -1618,6 +1785,55 @@ class SkillRouter:
             "scopes. A run still in flight loses its recorded skill activity. "
             "Raise SkillRouter._MAX_SCOPED_RAILS if this recurs.",
             what, scope, self._MAX_SCOPED_RAILS,
+        )
+
+    def _remember_loadable(self, scope: Optional[str], names: List[str]) -> None:
+        """Record what one routing call put in front of the model, for load_skill.
+
+        Called on every routing call, a failed one included: a run whose route
+        failed was offered nothing, and that has to be recorded too.
+        """
+        with self._rail_lock:
+            self._has_routed = True
+            for name in names:
+                self._loadable_any[name] = None
+                self._loadable_any.move_to_end(name)
+            while len(self._loadable_any) > self._MAX_SCOPED_RAILS:
+                self._loadable_any.popitem(last=False)
+            if scope is None:
+                return
+            allowed = self._loadable_by_scope.get(scope)
+            if allowed is None:
+                allowed = self._loadable_by_scope[scope] = set()
+            allowed.update(names)
+            self._loadable_by_scope.move_to_end(scope)
+            while len(self._loadable_by_scope) > self._MAX_SCOPED_RAILS:
+                self._loadable_by_scope.popitem(last=False)
+
+    def _not_offered_refusal(self, name: str, scope: Optional[str]) -> Optional[str]:
+        """None if ``load_skill(name)`` may proceed, else the tool message.
+
+        A name passes when this run (``scope``) was offered it, or — for an
+        unscoped call, or a scope this router never routed for — when this
+        router offered it to any run. A router that has not routed at all has
+        nothing to check against and stays unrestricted.
+        """
+        with self._rail_lock:
+            if not self._has_routed:
+                return None
+            allowed = self._loadable_by_scope.get(scope) if scope is not None else None
+            if allowed is None:
+                offered = name in self._loadable_any
+            else:
+                offered = name in allowed
+        if offered:
+            return None
+        logger.info("load_skill refused %r: not offered by this router for this run", name)
+        return (
+            f"load_skill: {name!r} was not offered for this request, so it was not "
+            "loaded. Only the skills listed under '## Recommended Skills' or "
+            "'## Available Skills' can be loaded — use one of those exact names, or "
+            "answer without a skill."
         )
 
     def _budget_for(self, scope: Optional[str]) -> Optional[_BodyLoadBudget]:
@@ -2104,8 +2320,17 @@ class SkillRouter:
 
         Errors are swallowed: a failed platform call returns
         ``("", None)`` so prompt assembly never blocks on a transient
-        network blip. The warning is logged so ops can see it. Errors
-        are NOT cached — the next call after a failure retries.
+        network blip. The warning is logged and ``routing_status()`` turns
+        unhealthy. A failure IS cached, for the same window as a success, so
+        the other LLM calls of the turn do not each pay the timeout again
+        (until 2026-10-14 every call retried). A new run (another ``scope``)
+        or another query retries; so does ``bypass_cache=True``. An open
+        breaker is not cached: it costs nothing and should stop answering
+        for the run the moment the breaker closes.
+
+        Bodies are injected only for a result the platform ranked by THIS
+        query and did not mark degraded (see ``_ranked_by_this_query``).
+        Otherwise the menu goes in alone.
 
         Args:
             query: The user message — used for semantic routing when
@@ -2158,7 +2383,12 @@ class SkillRouter:
         if not bypass_cache:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
-                fragment, routing_id, offered_names, delivered_names, split_parts, delivered_versions = cached
+                (fragment, routing_id, offered_names, delivered_names, split_parts,
+                 delivered_versions, loadable) = cached
+                # The hit re-offers the same menu, so it re-files the same
+                # loadable names — a no-op unless the run's entry was evicted
+                # from the bounded store since the miss.
+                self._remember_loadable(scope, loadable)
                 # A cache hit must re-emit the split exactly as the miss did.
                 # Without this, the second LLM call of a turn loses the prefix
                 # and the adapter falls back to the fragment — the injected
@@ -2202,17 +2432,25 @@ class SkillRouter:
                     query,
                     top_k=top_k,
                     category=category,
+                    # The route inlines up to 100 KB of scripts per skill when
+                    # asked, and nothing on this path reads them — they cost
+                    # transfer inside the 5 s budget and were thrown away.
+                    # Disk export fetches attachments through its own routes.
+                    include_attachments=False,
                     agent_name=effective_agent,  # pass the per-call override through
                 )
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment smart_route failed: %s", e)
-                return "", None
+                result = {"skills": [], "prompt_fragment": "", "strategy": "none",
+                          "degraded_reason": _empty_menu_reason(e)}
         else:
             try:
                 result = self.get_menu(category=category, agent_name=effective_agent, scope=scope)
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment get_menu failed: %s", e)
-                return "", None
+                result = {"skills": [], "prompt_fragment": "", "strategy": "none",
+                          "degraded_reason": _empty_menu_reason(e)}
+        routing_failed = _routing_call_failed(result)
 
         fragment = result.get("prompt_fragment", "") or ""
         routing_id = result.get("routing_id")
@@ -2257,13 +2495,18 @@ class SkillRouter:
         # append it. This rides the same 30s fragment cache, so within one user turn the body is
         # fetched once (one get_skill_body call), not per LLM call. A missing body degrades
         # gracefully to the menu-only fragment.
-        # Only inject when the result is RELEVANCE-RANKED (smart routing). In full-menu mode the
-        # "top" skill isn't ranked by the query, so injecting its body would be arbitrary — there
-        # we keep the menu only.
+        # Only inject when the PLATFORM says the result is ranked by this query
+        # and not degraded. Asking for a route was never enough: the platform
+        # answers a route with its effectiveness-ordered menu for small
+        # workspaces and on every retrieval fallback, and the top row of that
+        # is not about this query — "thanks!" got the best-rated skill's body.
         # Fetch with a bounded character cap, but inject only complete bodies.
         # Partial server responses and oversized old-server bodies are omitted;
         # the same total token budget applies to the first and later bodies.
-        smart_routed = bool(query) and self.strategy in ("auto", "semantic")
+        smart_routed = (
+            bool(query) and self.strategy in ("auto", "semantic")
+            and _ranked_by_this_query(result)
+        )
         delivered_names: List[str] = []
         delivered_versions: List[Dict[str, str]] = []
         if effective_inject and routed_names and smart_routed:
@@ -2346,6 +2589,19 @@ class SkillRouter:
         _body_budget_ctx.set(fresh_budget)
         self._remember_budget(fresh_budget, scope)
 
+        # What load_skill may serve for this run: everything this call put in
+        # front of the model. The stable menu is included on the fragment path
+        # too — it is this agent's own eligible set, and it holds every hinted
+        # name — so the check never refuses a skill the platform resolved for
+        # this agent; it refuses names the platform never offered at all.
+        loadable = list(dict.fromkeys(
+            routed_names + offered_names + delivered_names + [
+                n for n in (result.get("stable_menu_skills") or [])
+                if isinstance(n, str) and n
+            ]
+        ))
+        self._remember_loadable(scope, loadable)
+
         # Mirror onto the instance rails before stamping — the adapters
         # whose contextvars never reach trace-send read the routing
         # telemetry off the router itself.
@@ -2359,17 +2615,23 @@ class SkillRouter:
         # or an idempotent double-set there.
         _stamp_active_trace(routing_id, offered_names, delivered_names, delivered_versions)
 
-        # Cache the success path. We don't cache errors — next call
-        # retries on the assumption the failure was transient. The cached
-        # value carries offered/delivered so cache hits can re-emit them;
-        # the public return stays a 2-tuple.
+        # Cache the result, a failed call included. A failure used to be
+        # retried by every LLM call of the turn — each one paying the full 5 s
+        # timeout until three of them opened the breaker. Cached, the turn pays
+        # it once; the next run (another scope) or query asks again. An open
+        # breaker is the exception: it cost nothing, and caching it would keep
+        # this run skill-less after the breaker closes. The cached value
+        # carries offered/delivered so cache hits can re-emit them; the public
+        # return stays a 2-tuple.
         split_parts = (split_prefix, split_tail) if split_prefix else None
         _last_split_parts_ctx.set(split_parts)
 
-        if fragment or routing_id:
+        cache_failure = routing_failed and result.get("degraded_reason") != "circuit_open"
+        if fragment or routing_id or cache_failure:
             self._fragment_cache.set(
                 cache_key,
-                (fragment, routing_id, offered_names, delivered_names, split_parts, delivered_versions),
+                (fragment, routing_id, offered_names, delivered_names, split_parts,
+                 delivered_versions, loadable),
             )
         return fragment, routing_id
 
@@ -2920,7 +3182,10 @@ class SkillRouter:
         behaves exactly as before.
         """
         try:
-            resp = self._request("GET", f"/api/v1/skills/{name}/body")
+            # Cold: export runs from the CLI, not inside a turn. The 5 s budget
+            # would fail it on a slow platform, and its failures would open the
+            # breaker that the same process's agents route through.
+            resp = self._request("GET", _skill_body_path(name), hot=False)
         except Exception:
             return None
         if not isinstance(resp, dict):

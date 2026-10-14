@@ -576,9 +576,19 @@ class TestUtilities:
 class TestInitIntegration:
     """Test that init(openai_agents=True) works."""
 
-    def test_init_with_openai_agents_flag(self):
-        """init(openai_agents=True) should call install()."""
+    def test_init_with_openai_agents_flag(self, monkeypatch):
+        """init(openai_agents=True) should call install() — with the skill
+        loader on, since the flag form is the documented whole setup.
+
+        The loader patches `agents.Agent.__init__`, which a MagicMock module
+        cannot take, so it is counted here rather than run; its real install is
+        covered by the openai_agents loader tests.
+        """
+        import decimalai.openai_agents as oa
+
         mock_add = MagicMock()
+        loader = MagicMock()
+        monkeypatch.setattr(oa, "_install_skill_loader", loader)
 
         with patch.dict("sys.modules", {
             "agents": MagicMock(),
@@ -599,3 +609,4 @@ class TestInitIntegration:
             )
 
             mock_add.assert_called_once()
+            loader.assert_called_once_with()

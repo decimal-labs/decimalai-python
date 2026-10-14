@@ -54,6 +54,94 @@ def pytest_configure(config):
     decimalai at module-level get the right behavior.
     """
     os.environ.setdefault("DECIMALAI_SKIP_VERIFY", "1")
+    _check_openai2_environment()
+
+
+# ── 5. The openai 2 environment runs its own slice of the unit suite ───────────
+#
+# No environment can install every framework the SDK supports: openai-agents and
+# pydantic-ai need openai>=3, while crewai, litellm and llama-index-llms-openai pin
+# openai<3. The default environment (`.venv`, `.[dev]`) is the openai 3 one, and in
+# it the cases below that need the real crewai/litellm SKIP. So those files are run a
+# second time, in the environment built from `.[conformance-tests-openai2]`:
+#
+#     DECIMAL_TEST_ENV=openai2 .venv-openai2/bin/python -m pytest tests/ -q
+#
+# collects ONLY these files (the rest of the unit suite imports openai 3 frameworks
+# that environment cannot hold), and refuses to start if the packages that make the
+# skips go away are missing — so the slice cannot pass by skipping. bin/wt land runs
+# it whenever `.venv-openai2` exists (the landing gate's suite definition). tests/conformance
+# is never filtered here: it reads DECIMAL_TEST_ENV itself (tests/conformance/environments.py).
+OPENAI2_UNIT_TESTS = (
+    "test_crewai_*.py",          # crewai + its OpenInference instrumentor
+    "unit/test_llm_evals.py",    # litellm, through decimalai.evals
+    "unit/test_prebuilt_evals.py",
+    "test_llamaindex_*.py",      # llama-index-core beside llama-index-llms-openai
+    "test_version_floors_phase1.py",  # the extras admit what THIS environment runs
+)
+
+#: Importable in the openai 2 environment, or the slice above would pass by
+#: skipping the very cases it exists to run. Found, not imported: find_spec loads
+#: only a dotted name's parent packages, so crewai itself is not imported at startup.
+OPENAI2_REQUIRED_MODULES = (
+    "crewai",
+    "openinference.instrumentation.crewai",
+    "litellm",
+    "llama_index.core",
+    "llama_index.llms.openai",
+)
+
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _test_env() -> str:
+    """DECIMAL_TEST_ENV, validated against the environments the suite defines."""
+    if not (os.environ.get("DECIMAL_TEST_ENV") or "").strip():
+        return "openai3"  # the default; no import, so a plain run is unchanged
+    from tests.conformance.environments import current_env
+
+    try:
+        return current_env()
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from None
+
+
+def _check_openai2_environment() -> None:
+    if _test_env() != "openai2":
+        return
+    import importlib.util
+
+    missing = []
+    for mod in OPENAI2_REQUIRED_MODULES:
+        try:
+            found = importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(mod)
+    if missing:
+        raise pytest.UsageError(
+            f"DECIMAL_TEST_ENV=openai2, but {', '.join(missing)} cannot be imported "
+            f"here, so the openai 2 slice would pass by skipping. Build this "
+            f'environment with: pip install -e ".[conformance-tests-openai2]"'
+        )
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Under DECIMAL_TEST_ENV=openai2, collect only OPENAI2_UNIT_TESTS (+ conformance)."""
+    if _test_env() != "openai2":
+        return None
+    import fnmatch
+
+    path = str(collection_path)
+    rel = os.path.relpath(path, _TESTS_DIR).replace(os.sep, "/")
+    if rel.startswith("..") or rel == "." or rel.split("/", 1)[0] == "conformance":
+        return None
+    if os.path.isdir(path):
+        return None   # descend; files are decided one by one
+    if not os.path.basename(rel).startswith("test_"):
+        return None
+    return None if any(fnmatch.fnmatch(rel, pat) for pat in OPENAI2_UNIT_TESTS) else True
 
 
 @pytest.fixture(autouse=True)

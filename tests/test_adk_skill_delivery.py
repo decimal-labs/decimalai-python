@@ -4,16 +4,16 @@
 frameworks whose "generated file would trace correctly and deliver none of the
 agent's skills". That was wrong, and this file is the refutation.
 
-The seam, read out of google-adk 2.8.0 rather than remembered:
+The seam, read out of google-adk 2.12.0 rather than remembered:
 
 * ``BasePlugin.before_model_callback(*, callback_context, llm_request)`` gets
-  the live ``LlmRequest`` BY REFERENCE. ``flows/llm_flows/base_llm_flow.py``
-  runs it at line 1735 and passes that same object to
-  ``llm.generate_content_async(llm_request, ...)`` at line 1801, with no copy in
-  between.
+  the live ``LlmRequest`` BY REFERENCE.
+  ``flows/llm_flows/core/_model_call.py::call_llm_async`` runs it at line 194
+  and passes that same object to ``llm.generate_content_async(llm_request, ...)``
+  at line 261, with no copy in between.
 * ``LlmRequest.append_instructions(list[str])`` is public API and appends to
   ``config.system_instruction`` with a ``"\\n\\n"`` join
-  (``models/llm_request.py:262-279``).
+  (``models/llm_request.py:266-283``).
 * ADK's OWN ``GlobalInstructionPlugin`` writes
   ``llm_request.config.system_instruction`` from this very hook
   (``plugins/global_instruction_plugin.py:86-121``) — first-party proof that
@@ -214,8 +214,8 @@ def _reset_sdk(monkeypatch):
     if HAS_REAL_ADK:
         from google.adk.runners import Runner
 
-        # The plugin factory now preserves parents at Runner.run's caller
-        # boundary as well as patching the constructor during instrument().
+        # instrument() patches the constructor process-wide; restore it (and
+        # Runner.run, which nothing here should touch) after every test.
         monkeypatch.setattr(Runner, "run", Runner.run)
         monkeypatch.setattr(Runner, "__init__", Runner.__init__)
 
@@ -1294,22 +1294,29 @@ class TestRealAdkParentLink:
         if failure == "extraction":
             assert payloads[0].get("manifest_id") is None
 
-    def test_explicit_plugin_and_global_instrument_share_one_idempotent_parent_patch(self, monkeypatch):
+    def test_explicit_plugin_and_global_instrument_leave_run_alone_and_patch_init_once(self, monkeypatch):
+        # Until 2026-10-14 the plugin factory wrapped Runner.run to carry the
+        # caller's parent into ADK's worker thread, which started with empty
+        # contextvars before 2.12. google-adk 2.12 starts that thread under
+        # `contextvars.copy_context().run` itself, so the wrapper is gone; the
+        # parent-link tests below now pass on ADK's own context copy.
         from google.adk.runners import Runner
 
         import decimalai.adk as adk
 
-        original = getattr(Runner.run, "__wrapped__", Runner.run)
-        monkeypatch.setattr(Runner, "run", original)
-        monkeypatch.setattr(Runner, "__init__", Runner.__init__)
+        original_run, original_init = Runner.run, Runner.__init__
+        monkeypatch.setattr(Runner, "run", original_run)
+        monkeypatch.setattr(Runner, "__init__", original_init)
         adk.DecimalaiPlugin()
-        wrapped = Runner.run
-        assert wrapped is not original
-        assert wrapped.__wrapped__ is original
+        assert Runner.run is original_run
+        assert Runner.__init__ is original_init
+        adk.instrument()
+        patched = Runner.__init__
+        assert patched is not original_init
         adk.DecimalaiPlugin()
         adk.instrument()
-        adk.instrument()
-        assert Runner.run is wrapped
+        assert Runner.__init__ is patched
+        assert Runner.run is original_run
 
     @staticmethod
     def _runner(monkeypatch, observed, *, instrumented, explicit_parent=None, barrier=None):
@@ -1433,9 +1440,11 @@ class TestRealAdkParentLink:
         assert not hasattr(config, "_decimalai_invocation_parent_trace_id")
         assert len(configs) == 3
         assert all(value.model_dump(mode="json") == original for value in configs)
-        if synchronous:
-            assert all(value is not config for value in configs)
-            assert len({id(value) for value in configs}) == 3
+        # The sync path used to hand ADK a per-invocation COPY of the config,
+        # because the removed Runner.run wrapper wrote the parent onto it. With
+        # nothing written there is nothing to copy; the invariant that remains
+        # is that no invocation's config ever carries a DecimalAI attribute.
+        assert not any(hasattr(value, "_decimalai_invocation_parent_trace_id") for value in configs)
 
     @pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-plugin", "global-instrument"])
     @pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
@@ -1466,9 +1475,11 @@ class TestRealAdkParentLink:
         assert len(set(expected.values())) == 2
         assert config.model_dump(mode="json") == original
         assert not hasattr(config, "_decimalai_invocation_parent_trace_id")
-        if synchronous:
-            assert len(configs) == 2 and configs[0] is not configs[1]
-            assert all(value is not config for value in configs)
+        # Per-invocation copies were the removed Runner.run wrapper's doing
+        # (see test_reused_runner_and_config_capture_each_parent_and_standalone_root);
+        # the parents above are now separated by ADK's own context copy.
+        assert len(configs) == 2
+        assert not any(hasattr(value, "_decimalai_invocation_parent_trace_id") for value in configs)
 
     @pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
     def test_explicit_plugin_parent_wins_over_caller_and_standalone(self, monkeypatch, synchronous):

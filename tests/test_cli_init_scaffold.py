@@ -255,10 +255,9 @@ class TestSkillLoaderIsOn:
     #: An allow-list of one rather than a blanket ban, because "no flag" and
     #: "exactly one flag" are the same rule seen from two adapters. On langchain
     #: and openai-agents `instrument()` installs the span source itself, so any
-    #: flag here is a SECOND one: `init(langchain=True)` installs tracing with
-    #: the loader off and the later `instrument()` cannot undo the disk-mirror
-    #: decision it already made, and `init(openai_agents=True)` registers a
-    #: second trace processor that double-sends every trace. On pydantic-ai
+    #: flag here is a SECOND install of the same adapter: on langchain the first
+    #: one wins and the explicit call's `agent_name` is dropped with a warning,
+    #: and on openai-agents the adapter is installed twice. On pydantic-ai
     #: `instrument()` installs NO span source (that adapter ships the skills rail
     #: and the run boundary; Pydantic AI emits no spans of its own), so `otel=True`
     #: is the first one rather than the second — and without it the generated file

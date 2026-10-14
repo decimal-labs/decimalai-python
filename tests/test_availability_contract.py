@@ -36,6 +36,23 @@ from decimalai.skill_router import (
 UNREACHABLE = "http://127.0.0.1:9"  # discard port: refuses immediately
 
 
+@pytest.fixture(autouse=True)
+def _restore_the_process_breaker(monkeypatch):
+    """Give each test its own breaker and put the process one back afterwards.
+
+    Several tests below swap `skill_router._hot_path_breaker` for one they can
+    drive (an open breaker with a 30-60 s cooldown, among others). Assigned
+    directly and never restored, the last of them stayed installed for the rest
+    of the pytest process: run in one process before it,
+    `test_skill_router_admission_recovery.py` failed 11 of 18 at the
+    circuit-open branch (audit R15). monkeypatch restores the original at
+    teardown even when a test reassigns the attribute itself.
+    """
+    from decimalai import skill_router as sr
+
+    monkeypatch.setattr(sr, "_hot_path_breaker", _CircuitBreaker())
+
+
 def _serve(handler_cls):
     """A throwaway server on an ephemeral port.
 
@@ -127,11 +144,24 @@ class TestLoadAgentSurvivesAnOutage:
 
 
 class TestTheHotPathCannotHoldAUserTurn:
-    def test_route_and_menu_are_hot_paths_and_everything_else_is_not(self):
+    def test_route_menu_and_body_are_hot_paths_and_everything_else_is_not(self):
+        """`/body` is in-turn too, and this assertion used to say it was not.
+
+        `build_prompt_fragment` fetches the injected body and `load_skill`
+        fetches one mid-turn. Pinned as cold, both ran on the 30 s budget with
+        no breaker — measured on 2026-10-13: route read=5.0 s, body read=30.0 s
+        in the same turn — so a brownout the route had already given up on
+        could still hold the turn for 30 s per body. Disk export reads `/body`
+        from the CLI and opts out explicitly (`hot=False`).
+        """
         assert _is_hot_path("/api/v1/skills/route")
         assert _is_hot_path("/api/v1/skills/menu")
-        assert not _is_hot_path("/api/v1/skills/x/body")
+        assert _is_hot_path("/api/v1/skills/x/body")
+        assert _is_hot_path("/api/v1/skills/a5c-ai/keychain-credential-manager/body")
         assert not _is_hot_path("/api/v1/skills/x/publish")
+        # A skill whose NAME starts with "route" or "menu" is not the route.
+        assert not _is_hot_path("/api/v1/skills/routes-planner/publish")
+        assert not _is_hot_path("/api/v1/skills/menu-builder")
 
     def test_the_hot_path_read_budget_is_seconds_not_the_cold_30(self):
         """A 30s budget inside a user's turn turns a platform brownout into an

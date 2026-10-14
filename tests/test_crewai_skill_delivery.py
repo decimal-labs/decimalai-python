@@ -4,14 +4,15 @@ Until 2026-10-08 ``decimalai/cli/scaffold.py::NO_PROMPT_SEAM`` listed CrewAI, an
 that was true: tracing worked, and nothing in the SDK could put a skill into a
 CrewAI prompt. ``decimalai/crewai.py`` now registers a ``before_llm_call`` hook.
 
-The seam, read out of crewai 1.15.20 and 1.6.1 rather than remembered:
+The seam, read out of crewai 1.15.27 (the only supported release) rather than
+remembered:
 
-* ``crewai.hooks.register_before_llm_call_hook`` is public API from 1.5.0. Every
-  agent executor copies the global hook list when it is built and runs it in
-  ``utilities/agent_utils.py::_setup_before_llm_call_hooks``, right before
+* ``crewai.hooks.register_before_llm_call_hook`` is public API. Every agent
+  executor copies the global hook list when it is built, and
+  ``utilities/agent_utils.py::_prepare_llm_call`` runs it right before
   ``llm.call``.
 * ``LLMCallHookContext.messages`` IS the executor's live message list, and
-  ``get_llm_response`` sends that same list once the hooks ran.
+  ``_prepare_llm_call`` hands that same list to ``llm.call`` once the hooks ran.
 * The list persists across the iterations of one task, so the block from the
   previous call is still there on the next one — and CrewAI appends user-role
   reflection prompts of its own between calls.
@@ -46,8 +47,11 @@ from unittest.mock import MagicMock
 import pytest
 
 # CrewAI phones home and can prompt interactively on a first run. Off before any
-# crewai module loads, exactly as the conformance driver does.
-os.environ.setdefault("CREWAI_TELEMETRY_OPT_OUT", "true")
+# crewai module loads. crewai 1.15.27 reads CREWAI_DISABLE_TELEMETRY /
+# CREWAI_DISABLE_TRACKING (crewai_core/telemetry.py `_is_telemetry_disabled`)
+# and CREWAI_TRACING_ENABLED; it does not read CREWAI_TELEMETRY_OPT_OUT.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
 
 
@@ -312,7 +316,7 @@ class TestSeamWithoutCrewAI:
         assert len(_blocks(ctx.messages)) == 1
 
     def test_a_call_with_no_executor_is_left_alone(self, use_router):
-        """crewai >= 1.7 dispatches these hooks for calls that are not an agent
+        """CrewAI dispatches these hooks for calls that are not an agent
         turn too — its output converter, guardrails, planner — with
         ``executor=None``. A skill body in a JSON-conversion prompt is noise, and
         claiming delivery for it would credit a call the agent never made."""
@@ -598,15 +602,18 @@ class TestInstrument:
         assert "enable_load_skill_tool is not supported on the crewai adapter" in caplog.text
         assert fake_hooks == [dc._skill_hook], "the refusal must not cost the injection rail"
 
-    def test_a_crewai_without_the_hook_api_warns_and_does_not_raise(
+    def test_a_missing_crewai_warns_and_does_not_raise(
         self, monkeypatch, caplog,
     ):
+        """Every supported crewai (1.15.27) has the hook API, so the only way
+        to miss it is for crewai not to import at all. That still says so, out
+        loud, and names the one supported release."""
         import decimalai.crewai as dc
 
         monkeypatch.setitem(sys.modules, "crewai.hooks", None)
         with caplog.at_level(logging.WARNING, logger="decimalai.crewai"):
             assert dc._install_skill_loader() is False
-        assert "crewai>=1.15.3" in caplog.text
+        assert "crewai>=1.15.27" in caplog.text
 
     def test_tracing_is_installed_once(self, fake_hooks, monkeypatch):
         """``instrument()`` installs what ``init(crewai=True)`` does — once. A

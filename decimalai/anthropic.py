@@ -10,12 +10,18 @@ One-line setup::
 
     import anthropic
     client = anthropic.Anthropic()
-    # Every `client.messages.create(...)` now has skills injected into `system`.
+    # Every `client.messages.create()`, `.stream()` and `.parse()` call now
+    # has skills injected into `system` — sync and async clients alike.
 
-`instrument()` monkey-patches `anthropic.resources.messages.Messages.create`
-(and the async counterpart) so the `system` argument is augmented with
-the platform-routed skill fragment before the request is sent. User
-``system`` content is preserved and kept FIRST; the skill fragment is
+`instrument()` monkey-patches ``create``, ``stream`` and ``parse`` on
+`anthropic.resources.messages.Messages` and `AsyncMessages`, so the `system`
+argument is augmented with the platform-routed skill fragment before the
+request is built. All three are patched because in anthropic 1.x the
+``stream()`` and ``parse()`` helpers build their own request and never go
+through ``create()``. The beta surface (``client.beta.messages.*``, including
+``tool_runner()``) is NOT patched; use :func:`skill_system` there.
+
+User ``system`` content is preserved and kept FIRST; the skill fragment is
 appended after it, so the caller's own instructions stay in the cacheable
 prefix (the fragment is rebuilt per query and so differs on every call —
 in front, it would break the prompt cache for everything behind it).
@@ -25,19 +31,22 @@ Manual / explicit path::
     from decimalai.anthropic import skill_system
 
     resp = client.messages.create(
-        model="claude-opus-4-7",
+        model="claude-opus-5-5",
         system=skill_system("You are helpful", query=user_msg),
         messages=[{"role": "user", "content": user_msg}],
     )
 
-Note on Anthropic Skills (beta): Anthropic's first-party Skills
-primitive is intentionally not intercepted by this adapter. If you
-use Skills, treat DecimalAI as the registry/router that Skills point
-at, not as a replacement for Anthropic's runtime skill plumbing.
+Note on Anthropic's own Agent Skills (generally available since 2026-08-19:
+``client.skills`` and ``container={"skills": [...]}`` on the Messages API):
+this adapter does not upload to or attach those. It delivers DecimalAI-routed
+skills through the system prompt only, and leaves a ``container`` you pass
+untouched.
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import warnings
 from contextvars import ContextVar
@@ -79,8 +88,8 @@ def _scope() -> Optional[str]:
 # ── SkillRouter dynamic loader ──────────────────────────────
 _skill_loader_installed = False
 # Set by `instrument(agent_name=...)`. Forwarded on every auto-injected
-# `messages.create()` so agent-scope skills resolve; None keeps the old
-# org-wide-only behaviour.
+# `messages.create()` / `.stream()` / `.parse()` so agent-scope skills
+# resolve; None keeps the old org-wide-only behaviour.
 _install_agent_name: Optional[str] = None
 _skill_router_singleton: Any = None
 
@@ -232,7 +241,7 @@ def skill_system(
 
 
 def _inject_skills_into_create_kwargs(kwargs: dict) -> None:
-    """Mutate Messages.create kwargs in place: add/augment the system param."""
+    """Mutate create/stream/parse kwargs in place: add/augment the system param."""
     base = kwargs.get("system")
     messages = kwargs.get("messages") or []
     query = _extract_query_from_anthropic_messages(messages)
@@ -245,8 +254,62 @@ def _inject_skills_into_create_kwargs(kwargs: dict) -> None:
     )
 
 
+#: The ``Messages`` / ``AsyncMessages`` methods that send a message. In
+#: anthropic 1.x each builds its own request, so each needs its own patch.
+_PATCHED_METHODS = ("create", "stream", "parse")
+
+# Set while a patched method is injecting, so a patched method that calls
+# another one (say a ``stream()`` built on ``create(stream=True)``) injects
+# once, in the outer call. A ContextVar rather than a global: concurrent calls
+# on other threads or asyncio tasks each start with it unset.
+_injecting: ContextVar[bool] = ContextVar(
+    "decimalai_anthropic_injecting", default=False,
+)
+
+
+def _inject_once(kwargs: dict) -> Any:
+    """Inject unless an outer patched call already did. Returns a reset token,
+    or None when this call is the inner one and must leave kwargs alone."""
+    if _injecting.get():
+        return None
+    token = _injecting.set(True)
+    try:
+        _inject_skills_into_create_kwargs(kwargs)
+    except Exception:
+        logger.debug("Skill injection failed (non-fatal)", exc_info=True)
+    return token
+
+
+def _patch(original: Any) -> Any:
+    """Wrap one SDK method so skills are injected into its ``system`` kwarg."""
+    if inspect.iscoroutinefunction(original):
+        @functools.wraps(original)
+        async def patched_async(self, *args, **kwargs):
+            token = _inject_once(kwargs)
+            try:
+                return await original(self, *args, **kwargs)
+            finally:
+                if token is not None:
+                    _injecting.reset(token)
+        return patched_async
+
+    # Plain functions: every sync method, AsyncMessages.stream() (returns an
+    # async context manager) and AsyncMessages.create (anthropic's
+    # @required_args wrapper is a plain function that returns the coroutine).
+    # Each binds kwargs when called, so injecting before the call is enough.
+    @functools.wraps(original)
+    def patched(self, *args, **kwargs):
+        token = _inject_once(kwargs)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if token is not None:
+                _injecting.reset(token)
+    return patched
+
+
 def _install_skill_loader() -> None:
-    """Monkey-patch Anthropic's Messages.create / AsyncMessages.create."""
+    """Monkey-patch create/stream/parse on Anthropic's Messages and AsyncMessages."""
     global _skill_loader_installed
     if _skill_loader_installed:
         return
@@ -259,25 +322,19 @@ def _install_skill_loader() -> None:
         )
         return
 
-    original_create = Messages.create
-    original_acreate = AsyncMessages.create
-
-    def patched_create(self, *args, **kwargs):
-        try:
-            _inject_skills_into_create_kwargs(kwargs)
-        except Exception:
-            logger.debug("Skill injection failed (non-fatal)", exc_info=True)
-        return original_create(self, *args, **kwargs)
-
-    async def patched_acreate(self, *args, **kwargs):
-        try:
-            _inject_skills_into_create_kwargs(kwargs)
-        except Exception:
-            logger.debug("Skill injection failed (non-fatal)", exc_info=True)
-        return await original_acreate(self, *args, **kwargs)
-
-    Messages.create = patched_create  # type: ignore[method-assign]
-    AsyncMessages.create = patched_acreate  # type: ignore[method-assign]
+    for cls in (Messages, AsyncMessages):
+        for name in _PATCHED_METHODS:
+            original = getattr(cls, name, None)
+            if original is None:
+                # Say so rather than skip quietly: calls through this method
+                # would otherwise run without skills and nothing would show it.
+                logger.warning(
+                    "anthropic %s.%s not found; calls through it will NOT "
+                    "receive DecimalAI skills",
+                    cls.__name__, name,
+                )
+                continue
+            setattr(cls, name, _patch(original))
     _skill_loader_installed = True
     logger.info("DecimalAI SkillRouter loader installed (Anthropic)")
 
@@ -303,8 +360,9 @@ def instrument(
 
     Args:
         enable_skill_loader: When True, monkey-patch
-            ``client.messages.create()`` so skills auto-inject into
-            ``system`` before each request.
+            ``client.messages.create()``, ``.stream()`` and ``.parse()`` (sync
+            and async) so skills auto-inject into ``system`` before each
+            request.
         agent_name: Scopes the routed skill menu to this agent. Required for
             agent-scope skills (a registry skill pulled onto one agent) to be
             offered at all — without it the router only sees org-owned

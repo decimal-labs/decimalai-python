@@ -412,13 +412,21 @@ def test_llamaindex_core_floor_is_stated_consistently():
     """The runtime extra, the test extra, and the adapter's own ImportError
     must name the same floor. They said 0.10.20 / 0.12.0 / 0.12.0 — and at
     0.10.24 the dispatcher calls span_enter(instance, id=...), which raises
-    TypeError straight through the user's query."""
+    TypeError straight through the user's query.
+
+    The number itself is read from pyproject, not typed here: floors track the
+    newest release now, so a hardcoded copy would only ever be a second place to
+    forget on a bump. What this holds is that there is ONE number."""
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     floors = set(re.findall(r'"llama-index-core>=([0-9][^,"]*)"', pyproject))
-    assert floors == {"0.12.0"}, f"pyproject states llama-index-core floors {floors}"
+    assert len(floors) == 1, f"pyproject states llama-index-core floors {floors}"
 
     adapter = (REPO_ROOT / "decimalai" / "llamaindex.py").read_text()
-    assert set(re.findall(r"llama-index-core>=([0-9][0-9.]*)", adapter)) == {"0.12.0"}
+    stated = set(re.findall(r"llama-index-core>=([0-9][0-9.]*)", adapter))
+    assert stated == floors, (
+        f"decimalai/llamaindex.py names llama-index-core floor(s) {sorted(stated)}, "
+        f"pyproject.toml declares {sorted(floors)}"
+    )
 
 
 # ── 5. End to end through the real dispatcher ────────────────────────
