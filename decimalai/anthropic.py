@@ -97,6 +97,12 @@ _skill_router_singleton: Any = None
 def _get_skill_router() -> Any:
     """Lazily construct a SkillRouter using the SDK's global config."""
     global _skill_router_singleton
+    # The kill switch: a later init(enabled=False) withholds the router (kept
+    # for a re-enable) from a loader an earlier init installed.
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
     if _skill_router_singleton is not None:
         return _skill_router_singleton
     try:
@@ -240,17 +246,38 @@ def skill_system(
     return fragment
 
 
+def _routing_agent_name() -> Optional[str]:
+    """The DecimalAI agent an auto-patched call's skills are routed for.
+
+    The name the TRACE is filed under, so routing and attribution agree: the
+    run-scoped name the OTel rail stamps onto every span of this run
+    (``decimalai.otel._active_agent_name``, set by ``providers.agent_run(...)``
+    and by ``providers.instrument(agent_name=...)``) first, then this adapter's
+    own ``instrument(agent_name=...)``. Agent-scope skills (every registry
+    skill pulled onto one agent), version pins and restricted skills only
+    resolve when the name is sent, so routing a named run as nobody offered
+    none of them while its trace said it had been routed.
+    """
+    try:
+        from .otel import _active_agent_name
+
+        name = _active_agent_name.get()
+    except Exception:
+        name = None
+    return name or _install_agent_name
+
+
 def _inject_skills_into_create_kwargs(kwargs: dict) -> None:
     """Mutate create/stream/parse kwargs in place: add/augment the system param."""
     base = kwargs.get("system")
     messages = kwargs.get("messages") or []
     query = _extract_query_from_anthropic_messages(messages)
-    # Forward the installed agent name so agent-scope Use rows resolve — see the
-    # note in `decimalai.langchain._inject_skills_into_input`. `skill_system`
-    # has always accepted `agent_name`; the auto-patch path just never sent it,
-    # so registry skills pulled onto one agent were silently never offered.
+    # Forward the agent's name so agent-scope Use rows resolve — see
+    # `_routing_agent_name`. `skill_system` has always accepted `agent_name`;
+    # the auto-patch path first sent none, then only the install name, so a run
+    # named with `agent_run(...)` was routed for no agent (or the wrong one).
     kwargs["system"] = skill_system(
-        base, query=query, agent_name=_install_agent_name,
+        base, query=query, agent_name=_routing_agent_name(),
     )
 
 
@@ -366,8 +393,11 @@ def instrument(
         agent_name: Scopes the routed skill menu to this agent. Required for
             agent-scope skills (a registry skill pulled onto one agent) to be
             offered at all — without it the router only sees org-owned
-            workspace-scope skills. Callers who assemble ``system`` themselves
-            can keep passing it per-call to :func:`skill_system` instead.
+            workspace-scope skills. A run named with
+            ``decimalai.providers.agent_run(name)`` is routed for THAT name,
+            the one its trace is filed under; this is the fallback outside
+            one. Callers who assemble ``system`` themselves can keep passing
+            it per-call to :func:`skill_system` instead.
         enable_load_skill_tool: Accepted but DORMANT on this adapter —
             the patch layer is a single
             ``messages.create()`` call, which cannot route a tool result

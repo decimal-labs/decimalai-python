@@ -203,10 +203,57 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return fanout_threads(_one)(ctxs)
 
 
+def _rail_on() -> None:
+    """The rail, as the docs install it — a no-op once the skills phase has.
+
+    ``instrument()`` is one-shot per process: a repeat call reconfigures
+    nothing (it says so). So the agent name the skills phase installed stays
+    the install name for every phase after it, which is what makes the
+    per-call name below a different answer from the install's.
+    """
+    from decimalai.langchain import instrument
+
+    instrument(enable_skill_loader=True)
+
+
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail on an unnamed graph, named per call: ``CallbackHandler(agent_name=...)``.
+
+    The graph carries no name of its own (LangGraph calls it ``LangGraph``),
+    and the process-wide install was named for a different agent by the skills
+    phase. The per-call handler is the documented way to name this run — and
+    the adapter documents that skills are routed for the agent the trace is
+    filed under: the handler's name first.
+    """
+    from decimalai.langchain import CallbackHandler
+
+    _rail_on()
+    handler = CallbackHandler(agent_name=ctx.agent_name)
+    graph = _graph(ctx, _stub_model(ctx))
+    return graph.invoke({"messages": _messages(ctx)}, config={"callbacks": [handler]})
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns: the second invoke carries the first's messages, then a new one.
+
+    The LangGraph way to continue a conversation without a checkpointer — the
+    state's message list, extended. Both turns run through the process-wide
+    handler, named for this agent by the skills phase.
+    """
+    from langchain_core.messages import HumanMessage
+
+    _rail_on()
+    first, second = ctxs
+    turn_one = _graph(first, _stub_model(first)).invoke({"messages": _messages(first)})
+    history = list(turn_one["messages"]) + [HumanMessage(content=user_message(second))]
+    return _graph(second, _stub_model(second)).invoke({"messages": history})
+
+
 DRIVER = Driver(
     name="langchain",
     covers=frozenset({"langchain", "langgraph"}),
     requires=("langchain_core", "langgraph"),
+    frameworks=("langchain-core", "langgraph"),
     entrypoint="decimalai.langchain.CallbackHandler / instrument()",
     run=run,
     run_concurrent=fanout_threads(run),
@@ -214,6 +261,8 @@ DRIVER = Driver(
     run_degenerate=run_degenerate,
     run_skills=run_skills,
     run_nested=run_nested,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

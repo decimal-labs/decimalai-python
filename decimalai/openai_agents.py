@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import inspect
 import logging
 import threading
 import warnings
@@ -456,6 +457,12 @@ _skill_router_singleton: Any = None
 def _get_skill_router() -> Any:
     """Lazily construct a SkillRouter using the SDK's global config."""
     global _skill_router_singleton
+    # The kill switch: a later init(enabled=False) withholds the router (kept
+    # for a re-enable) from a loader an earlier init installed.
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
     if _skill_router_singleton is not None:
         return _skill_router_singleton
     try:
@@ -1158,6 +1165,82 @@ def _install_agent_hooks() -> bool:
     return True
 
 
+#: Set once `_install_final_output_guard` has wrapped the SDK's check.
+_final_output_guard_installed = False
+
+
+def _is_decimalai_skill_tool(tool: Any) -> bool:
+    """DecimalAI's own skill tool, by the mark `_make_load_skill_tool` sets.
+
+    By mark, never by name: a tool the user wrote and called ``load_skill`` is
+    theirs, and their ``tool_use_behavior`` applies to it as written.
+    """
+    return tool is not None and hasattr(tool, _SKILL_TOOL_AGENT_ATTR)
+
+
+def _install_final_output_guard() -> bool:
+    """Keep DecimalAI's load_skill result out of the agent's ``tool_use_behavior``.
+
+    The loader puts ``load_skill`` on every Agent, and the menu hint asks the
+    model to call it before using a skill. The Agents SDK decides whether a
+    turn's tool results END the run from the agent's ``tool_use_behavior``:
+    ``"stop_on_first_tool"`` returns the first tool's output as the final
+    answer, and a ``ToolsToFinalOutputFunction`` is handed every result. So an
+    agent built to answer with its own tool's output answered the user with a
+    skill body, and a custom function saw a tool it never declared.
+
+    The SDK makes that decision in ONE function (it serves ``run``,
+    ``run_sync``, ``run_streamed`` and resumed runs alike); the guard hands it
+    the turn's results minus DecimalAI's. A turn that called only DecimalAI's
+    tool is then not final, so the model is asked again with the body in hand,
+    exactly as on the default ``"run_llm_again"``. ``stop_at_tool_names`` gets
+    every result unchanged: it stops only at the tools it names.
+
+    Returns True when the guard is in place. When the SDK has moved the
+    function this cannot apply, and says so once, loudly: an agent with a
+    non-default ``tool_use_behavior`` can then end on a skill body.
+    """
+    global _final_output_guard_installed
+    if _final_output_guard_installed:
+        return True
+    try:
+        from agents.run_internal import turn_resolution
+    except Exception:
+        turn_resolution = None
+    original = getattr(turn_resolution, "check_for_final_output_from_tools", None)
+    if original is None or not inspect.iscoroutinefunction(original):
+        logger.warning(
+            "DecimalAI could not keep its load_skill tool out of tool_use_behavior "
+            "on this openai-agents release: an Agent with "
+            "tool_use_behavior=\"stop_on_first_tool\" (or a custom "
+            "ToolsToFinalOutputFunction) may end its run with a skill body. Pass "
+            "load_skill_tool=False to init() to deliver skills in the prompt instead."
+        )
+        return False
+    if getattr(original, _HOOK_MARKER, False):
+        _final_output_guard_installed = True
+        return True
+
+    @functools.wraps(original)
+    async def guarded(agent, tool_results, context_wrapper, *args, **kwargs):  # type: ignore[no-untyped-def]
+        results = tool_results
+        try:
+            if not isinstance(getattr(agent, "tool_use_behavior", None), dict):
+                results = [
+                    r for r in tool_results
+                    if not _is_decimalai_skill_tool(getattr(r, "tool", None))
+                ]
+        except Exception:
+            logger.debug("final-output guard could not filter (non-fatal)", exc_info=True)
+            results = tool_results
+        return await original(agent, results, context_wrapper, *args, **kwargs)
+
+    setattr(guarded, _HOOK_MARKER, True)
+    turn_resolution.check_for_final_output_from_tools = guarded
+    _final_output_guard_installed = True
+    return True
+
+
 def _note_retrofit(agent: Any) -> None:
     """Log once that we served an Agent the constructor patch never saw."""
     global _retrofit_notice_emitted
@@ -1227,6 +1310,9 @@ def _install_skill_loader() -> None:
 
     Agent.__init__ = patched_init  # type: ignore[method-assign]
     _skill_loader_installed = True
+    # Before any run can call the tool: its result must never be the run's
+    # answer (see `_install_final_output_guard`).
+    _install_final_output_guard()
 
     if _install_agent_hooks():
         logger.info(

@@ -246,6 +246,12 @@ class _SkillMessage(dict):
 def _get_skill_router() -> Any:
     """Lazily construct a SkillRouter using the SDK's global config."""
     global _skill_router_singleton
+    # The kill switch: a later init(enabled=False) withholds the router (kept
+    # for a re-enable) from a loader an earlier init installed.
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
     if _skill_router_singleton is not None:
         return _skill_router_singleton
     with _install_lock:

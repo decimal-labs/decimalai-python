@@ -349,3 +349,75 @@ def test_docstring_does_not_call_agent_skills_beta():
     assert "stream()" in doc and "parse()" in doc, (
         "the module docstring should say which calls get skills"
     )
+
+
+# ── whose skills: the run's agent, the one its trace is filed under ──────────
+#
+# The documented skills setup on this adapter is
+# ``instrument(enable_skill_loader=True)`` with no name, and the run is named
+# with ``providers.agent_run(name)`` — the name the trace is filed under. The
+# patch used to route with the INSTALL name only, so that run was routed for
+# no agent at all: the org-wide skill set, never that agent's assignments,
+# version pins or restricted skills, while its trace said it had been routed.
+
+
+@pytest.fixture
+def no_ambient_agent():
+    """``_active_agent_name`` is a process-wide ContextVar other tests set
+    without resetting; start each of these from "no run is named"."""
+    from decimalai.otel import _active_agent_name
+
+    token = _active_agent_name.set(None)
+    try:
+        yield
+    finally:
+        _active_agent_name.reset(token)
+
+
+def _routed_names(sdk) -> List[Any]:
+    return [call.get("agent_name") for call in sdk.router.calls]
+
+
+@pytest.mark.parametrize("path", ["create", "stream", "async create", "async parse"])
+def test_a_run_named_by_agent_run_routes_for_that_agent(sdk, no_ambient_agent, path):
+    from decimalai import providers
+
+    sdk.install()  # the documented setup: no agent_name on the adapter
+    with providers.agent_run("support"):
+        CALL_PATHS[path](sdk)
+
+    assert _routed_names(sdk) == ["support"], (
+        "the run is filed under 'support', so it must be routed for 'support' — "
+        "a call that names no agent is offered none of that agent's skills"
+    )
+
+
+def test_the_run_name_outranks_the_install_name(sdk, no_ambient_agent):
+    """A process serving two agents names each run with ``agent_run``; the
+    adapter's one install name must not route both of them as itself."""
+    from decimalai import providers
+
+    sdk.da.instrument(agent_name="support-agent", enable_skill_loader=True)
+    with providers.agent_run("billing-agent"):
+        _create(sdk)
+        _astream(sdk)
+    _create(sdk)  # outside any named run: the install name, as before
+
+    assert _routed_names(sdk) == ["billing-agent", "billing-agent", "support-agent"]
+
+
+def test_no_run_and_no_install_name_still_routes_unscoped(sdk, no_ambient_agent):
+    sdk.install()
+    _create(sdk)
+    assert _routed_names(sdk) == [None]
+
+
+def test_an_explicit_skill_system_agent_name_is_left_alone(sdk, no_ambient_agent):
+    """Callers who build ``system`` themselves pass the name per call; that
+    argument is theirs and is forwarded as given."""
+    from decimalai import providers
+
+    with providers.agent_run("billing-agent"):
+        sdk.da.skill_system(BASE, query=QUESTION, agent_name="refund-bot")
+
+    assert _routed_names(sdk) == ["refund-bot"]

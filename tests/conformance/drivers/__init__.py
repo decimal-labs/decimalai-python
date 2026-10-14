@@ -227,13 +227,19 @@ def observed_since(mark: int) -> List[Dict[str, Any]]:
 #: Every capability flag, and the contract items it gates. Declared here so a
 #: driver author sees the cost of turning a flag off: the items it silences.
 CAPABILITY_ITEMS: Mapping[str, Tuple[str, ...]] = {
-    "has_tools": ("C5",),
+    # C17 rides has_tools: a framework with no tool loop has no tool call to
+    # record, done or not.
+    "has_tools": ("C5", "C17"),
     # C14 is gated by has_skills_rail and by rail_can_deliver_bodies, and by
     # nothing else. It must NOT appear under model_can_load_skill_bodies: an
     # adapter with no tool loop is exactly the one for which prompt injection is
     # the only body channel, so exempting it would exempt the case the item
     # exists to catch.
-    "has_skills_rail": ("C8", "C13", "C13b", "C14"),
+    # C18 and C19 grade routing, so a framework that is never routed has
+    # nothing for either to read. They need no flag of their own: every rail
+    # framework names its agents and holds conversations, and test_coverage
+    # refuses a registered rail driver without the two hooks that run them.
+    "has_skills_rail": ("C8", "C13", "C13b", "C14", "C18", "C19"),
     "supports_concurrency": ("C9",),
     "supports_error_path": ("C10",),
     "supports_degenerate": ("C7b",),
@@ -393,6 +399,44 @@ class Capabilities:
 
 
 @dataclass(frozen=True)
+class Shape:
+    """A SECOND documented way to install, build or start a run of this framework.
+
+    The phases above run each framework's main documented snippet. A framework
+    usually documents more than one way in — ADK's ``Runner(app=App(...))``
+    beside ``Runner(agent=...)``, OpenAI Agents' ``SandboxAgent`` beside
+    ``Agent``, ``messages.stream()`` beside ``messages.create()``, the init flag
+    followed by ``instrument()`` — and every one of those was found broken in
+    the 2026-10-13 integration audit while the main snippet was green: a crash
+    at construction, zero router calls, every run sent twice.
+
+    So a driver names the second shapes it knows about, and each runs as its own
+    phase (``shape:<name>``) graded by ``contract.grade_shape`` (the S1 axis)
+    against the run contract: it constructs and runs, each run ships exactly one
+    accepted trace under the agent asked for, and a ``routed`` shape is routed
+    like the main snippet is. The phases are ordinary phases too, so C2, C6,
+    C11, C12, C17 and C18 read them as well.
+
+    ``run`` is handed ``lanes`` contexts, one per run, each with its own agent
+    name and sentinels. Like every hook, it holds no assertions.
+    """
+
+    #: Short id, used in the phase name, the test id and the matrix.
+    name: str
+    #: What the shape is and where the SDK or the docs give it. Printed with
+    #: the result, so a red cell says what was being run.
+    doc: str
+    #: Runs the shape once per lane.
+    run: FanoutFn
+    #: How many runs the shape makes. Each must ship exactly one trace.
+    lanes: int = 1
+    #: Whether the shape runs with the skills rail on, and so must be routed:
+    #: a routing call made for each run, its routing_id on that run's trace, the
+    #: offered menu in front of the model.
+    routed: bool = False
+
+
+@dataclass(frozen=True)
 class Driver:
     """One framework's way of running its documented snippet. No assertions."""
 
@@ -423,6 +467,28 @@ class Driver:
     #: ``decimalai.start_trace()`` it opens itself — the caller's enclosing
     #: trace — so the driver neither opens nor sees it.
     run_nested: Optional[RunFn] = None
+    #: The skills rail on an agent the FRAMEWORK does not name the way DecimalAI
+    #: does — unnamed where the framework allows it, named something else where
+    #: it requires a name — with the DecimalAI agent named once, where the
+    #: adapter documents taking it. Handed a ctx whose agent name differs from
+    #: every other phase's. C18 grades that the agent the run was ROUTED for is
+    #: the agent its trace is FILED under; C6 grades that it is the one asked for.
+    run_unnamed: Optional[RunFn] = None
+    #: Two turns of ONE conversation with the skills rail on: ``ctxs[0]`` is the
+    #: first turn, ``ctxs[1]`` the second, which carries the first turn's history
+    #: in whatever form the framework documents (``message_history=``, the
+    #: previous result's input list, the same session, the message list). The
+    #: second turn's prompt sentinel CONTAINS the first's, so a stub keyed on the
+    #: longest sentinel answers each turn as itself. C19 grades both turns routed.
+    run_conversation: Optional[FanoutFn] = None
+    #: Second documented shapes, each its own phase — see ``Shape``.
+    shapes: Tuple[Shape, ...] = ()
+    #: The framework distributions whose SDK floor gates this driver: one
+    #: installed below the floor ``pyproject.toml`` declares makes the driver
+    #: unavailable, with the reason (see ``floors.py``). Name the framework
+    #: itself, never a provider SDK such as ``openai``, whose floor belongs to
+    #: one test environment and not the other.
+    frameworks: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """A claimed capability must come with the hook that exercises it.
@@ -432,27 +498,60 @@ class Driver:
         that never ran, which sends the reader hunting an adapter bug that is
         really a driver omission. Fail at construction with the real reason.
         """
+        # `run_unnamed` / `run_conversation` are not required HERE, though a rail
+        # needs both: C18 and C19 already fail by name when their phase did not
+        # run, so the misdirection this guard exists to prevent cannot happen,
+        # and a Driver built ad hoc (a unit test's stand-in) need not grow hooks
+        # it never runs. `test_coverage.test_every_rail_driver_runs_the_unnamed_
+        # and_conversation_shapes` requires them of every REGISTERED driver.
         required = {
-            "has_skills_rail": "run_skills",
-            "supports_concurrency": "run_concurrent",
-            "supports_error_path": "run_error",
-            "supports_degenerate": "run_degenerate",
-            "has_invocation_observer": "run_nested",
+            "has_skills_rail": ("run_skills",),
+            "supports_concurrency": ("run_concurrent",),
+            "supports_error_path": ("run_error",),
+            "supports_degenerate": ("run_degenerate",),
+            "has_invocation_observer": ("run_nested",),
         }
-        for flag, hook in required.items():
-            if getattr(self.capabilities, flag) and getattr(self, hook) is None:
+        for flag, hooks in required.items():
+            for hook in hooks:
+                if getattr(self.capabilities, flag) and getattr(self, hook) is None:
+                    raise ValueError(
+                        f"driver {self.name!r} declares {flag}=True but has no "
+                        f"{hook}(). Either implement the hook or set {flag}=False "
+                        f"with a reason."
+                    )
+        names = [s.name for s in self.shapes]
+        if len(set(names)) != len(names):
+            raise ValueError(
+                f"driver {self.name!r} declares shapes with duplicate names: {names}"
+            )
+        for shape in self.shapes:
+            if not isinstance(shape, Shape) or shape.lanes < 1 or not shape.doc.strip():
                 raise ValueError(
-                    f"driver {self.name!r} declares {flag}=True but has no {hook}(). "
-                    f"Either implement the hook or set {flag}=False with a reason."
+                    f"driver {self.name!r}: shape {getattr(shape, 'name', shape)!r} must "
+                    f"be a Shape with at least one lane and a doc saying what it runs"
+                )
+            if shape.routed and not self.capabilities.has_skills_rail:
+                raise ValueError(
+                    f"driver {self.name!r}: shape {shape.name!r} is routed=True on a "
+                    f"driver with no skills rail — there is nothing to route"
                 )
 
     @property
+    def below_floor(self) -> List[str]:
+        """Why each of this driver's frameworks is too old to grade, if any is."""
+        from ..floors import below_floor
+
+        return [why for dist in self.frameworks if (why := below_floor(dist))]
+
+    @property
     def available(self) -> bool:
-        return all(_importable(m) for m in self.requires)
+        return all(_importable(m) for m in self.requires) and not self.below_floor
 
     @property
     def missing_requirements(self) -> List[str]:
-        return [m for m in self.requires if not _importable(m)]
+        """What stops this driver running: an import that does not resolve, or a
+        framework installed below the SDK's floor."""
+        return [m for m in self.requires if not _importable(m)] + self.below_floor
 
 
 def _importable(module: str) -> bool:

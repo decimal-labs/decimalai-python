@@ -51,6 +51,34 @@ TRACE_SOURCE_TYPE_ALLOWED = frozenset({
 TRACE_TIMESTAMP_MAX_PAST_DAYS = 365 * 5
 TRACE_TIMESTAMP_MAX_FUTURE_DAYS = 1
 
+# ── Ported router vocabulary (the platform's skill service) ──────────────────
+
+#: The activation instruction the platform appends to every menu, verbatim.
+MENU_INSTRUCTION = (
+    "When a skill above applies, follow its instructions and then answer the "
+    "user directly. Do not reply with only a statement about which skill you "
+    "are using."
+)
+
+#: The only two strategy values the platform's router sends.
+ROUTER_STRATEGIES = frozenset({"full_menu", "smart_routing"})
+
+#: Every key the probe's routing answers carry, by strategy. Each must be a key
+#: the platform's own answer carries; `test_probe_router_matches_the_platform`
+#: checks that against the platform source whenever it is on disk.
+ROUTER_RESPONSE_KEYS = {
+    "full_menu": frozenset({
+        "strategy", "stable_menu", "menu_instruction", "routing_hint",
+        "stable_menu_skills", "skill_count", "skills", "prompt_fragment",
+        "query_ranked", "desc_tokens", "rows_total", "truncated", "routing_id",
+    }),
+    "smart_routing": frozenset({
+        "strategy", "query_used", "candidates_evaluated", "skills",
+        "prompt_fragment", "stable_menu", "menu_instruction", "routing_hint",
+        "stable_menu_skills", "routing_id", "extracted_keywords", "query_ranked",
+    }),
+}
+
 # sha256 over the backend source of `validate_element_shapes` + `_validate_payload`
 # + the four allowlist/bound constants they read (see
 # test_conformance.py::test_backend_validator_has_not_drifted for the exact
@@ -521,13 +549,7 @@ class Probe:
             return self._route_skills(body)
 
         if method == "GET" and path == "/api/v1/skills/menu":
-            fragment, routing_id = self._skill_fragment()
-            return 200, {
-                "skills": self.skills,
-                "prompt_fragment": fragment,
-                "routing_id": routing_id,
-                "strategy": "menu",
-            }, []
+            return self._menu(query)
 
         m = re.fullmatch(r"/api/v1/skills/([^/]+)/body", path)
         if method == "GET" and m:
@@ -805,25 +827,146 @@ class Probe:
             "latest_version": {"version_number": 1},
         }
 
-    def _skill_fragment(self, query: Optional[str] = None) -> Tuple[str, Optional[str]]:
-        if not self.skills:
-            return "", None
+    # ── the router: the platform's two answers ───────────────
+    #
+    # Field for field, the two shapes the platform's skill service returns
+    # (`get_menu` and `smart_route`): the two strategy values it sends —
+    # "full_menu" and "smart_routing", never anything else — `query_ranked`,
+    # the prefix/tail split (`stable_menu`, `menu_instruction`, `routing_hint`,
+    # `stable_menu_skills`) and the markdown the prompt fragment is rendered as.
+    # The SDK reads every one of those: `query_ranked` (and, without it, the
+    # strategy) decides whether a body is injected at all, and the split decides
+    # what the langchain adapter puts in front of the model. A probe answering in
+    # a vocabulary the platform never speaks ("semantic", "menu", a bullet list)
+    # graded the SDK against a server that does not exist.
+    #
+    # `POST /skills/route` answers the way the platform's HYBRID RETRIEVAL path
+    # does — the path a workspace whose menu does not fit the show-all budget
+    # takes: `smart_routing`, every returned row retrieved against the query, so
+    # `query_ranked` is true whenever a row came back. It deliberately does not
+    # port the show-all-under-budget short-circuit, which answers a small
+    # workspace with `get_menu(query=...)`: there `query_ranked` is true only when
+    # a query term matches the top row's name or description, the conformance
+    # prompt matches neither fixture skill, and the router would — correctly —
+    # inject no body. Every injected-delivery cell would then grade the router's
+    # refusal instead of the adapter's channel. The fixture is a workspace the
+    # router ranks for this query, and the shape says so in the field the SDK
+    # reads, rather than in a strategy name the SDK has to guess from.
+    #
+    # Not modelled, because nothing in the hermetic tier exercises it: the
+    # `degraded` flag (absent here as on a healthy platform), scores and
+    # attachments. `test_probe_router_matches_the_platform` re-reads the
+    # platform's own source whenever it is on disk and fails if the strategy
+    # values, the field names or the instruction text this mirrors move.
+
+    def _mint_routing_id(self, query: Optional[str]) -> str:
+        """Every routing answer persists a decision with an id; record its query.
+
+        The query is the provenance that makes a leaked routing decision
+        deterministic (C8), and that tells one conversation turn's decision from
+        another's (C19). ``None`` for a menu, which is asked no query.
+        """
         routing_id = "rt_" + uuid.uuid4().hex[:24]
         with self._lock:
             self.routing_queries[routing_id] = query
-        lines = ["Available skills:"]
-        for s in self.skills:
-            lines.append(f"- {s['name']}: {s.get('description', '')}")
-        return "\n".join(lines), routing_id
+        return routing_id
+
+    def _menu_rows(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": s["name"], "description": s.get("description", ""), "version": 1}
+            for s in self.skills
+        ]
+
+    @staticmethod
+    def _stable_menu(rows: Sequence[Dict[str, Any]]) -> str:
+        """The cacheable prefix: heading + table, no trailing instruction."""
+        if not rows:
+            return ""
+        lines = [
+            "## Available Skills", "", "| Skill | Description |",
+            "|-------|-------------|",
+        ]
+        lines += [f"| {r['name']} | {r['description']} |" for r in rows]
+        return "\n".join(lines) + "\n"
+
+    def _menu_payload(self, query: Optional[str]) -> Dict[str, Any]:
+        """``get_menu``'s answer — the plain ``GET /skills/menu`` shape."""
+        rows = self._menu_rows()
+        prompt = ["## Available Skills", "", "| Skill | Description |", "|-------|-------------|"]
+        prompt += [f"| {r['name']} | {r['description']} |" for r in rows]
+        prompt += ["", MENU_INSTRUCTION]
+        return {
+            "strategy": "full_menu",
+            "stable_menu": self._stable_menu(rows),
+            "menu_instruction": MENU_INSTRUCTION,
+            "routing_hint": "",
+            "stable_menu_skills": [r["name"] for r in rows],
+            "skill_count": len(rows),
+            "skills": rows,
+            "prompt_fragment": "\n".join(prompt),
+            # The plain menu endpoint takes no query, so nothing ranked it.
+            "query_ranked": False,
+            "desc_tokens": sum(
+                len(f"| {r['name']} | {r['description']} |") // 4 for r in rows
+            ),
+            "rows_total": len(rows),
+            "truncated": False,
+            "routing_id": self._mint_routing_id(query),
+        }
+
+    def _menu(self, query: Dict[str, List[str]]) -> Tuple[int, Any, List[str]]:
+        # `agent_name` / `category` / `project_id` are accepted and recorded (the
+        # request log keeps the query string); the fixture is one workspace, so
+        # nothing is filtered by them.
+        return 200, self._menu_payload(None), []
 
     def _route_skills(self, body: Any) -> Tuple[int, Any, List[str]]:
+        """``smart_route``'s answer, from the hybrid-retrieval path."""
         query = body.get("query") if isinstance(body, dict) else None
-        fragment, routing_id = self._skill_fragment(query)
+        if not query:
+            # The platform's own 400, word for word.
+            return 400, {"detail": "query is required"}, ["query is required"]
+        if not self.skills:
+            # An empty workspace never reaches retrieval: the platform answers
+            # with the (empty) menu, ranked by nothing.
+            return 200, self._menu_payload(query), []
+        rows = self._menu_rows()
+        top = []
+        for i, r in enumerate(rows):
+            # Min-max normalised, as the platform's `relevance` is: the first
+            # row is 1.0 and the last 0.0 by construction.
+            relevance = 1.0 if len(rows) == 1 else round(1.0 - i / (len(rows) - 1), 3)
+            top.append({
+                "skill_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "skill:" + r["name"])),
+                "name": r["name"],
+                "description": r["description"],
+                "version": r["version"],
+                "relevance": relevance,
+                "performance": 0.5,
+                "score": relevance,
+                "activation_count": 0,
+                "trend": "new",
+            })
+        prompt = [
+            "## Recommended Skills", "",
+            "| Skill | Description | Relevance |", "|-------|-------------|-----------|",
+        ]
+        prompt += [f"| {e['name']} | {e['description']} | {e['relevance']:.0%} |" for e in top]
+        prompt += ["", MENU_INSTRUCTION]
         return 200, {
-            "skills": self.skills,
-            "prompt_fragment": fragment,
-            "routing_id": routing_id,
-            "strategy": "semantic",
+            "strategy": "smart_routing",
+            "query_used": query[:200],
+            "candidates_evaluated": len(top),
+            "skills": top,
+            "prompt_fragment": "\n".join(prompt),
+            "stable_menu": self._stable_menu(rows),
+            "menu_instruction": MENU_INSTRUCTION,
+            "routing_hint": f"Most relevant for this request: {top[0]['name']}.",
+            "stable_menu_skills": [r["name"] for r in rows],
+            "routing_id": self._mint_routing_id(query),
+            "extracted_keywords": [],
+            # Every row came out of retrieval against this query.
+            "query_ranked": bool(top),
         }, []
 
     # ── views the contract reads ─────────────────────────────

@@ -59,6 +59,14 @@ bodies-by-default for. A ``SkillToolset`` the caller adds to their agent works
 as ADK built it; DecimalAI neither routes its skills nor records its
 ``load_skill`` calls as activations.
 
+Its calls are traced like every other tool call, results included: each
+result lands on the ``ToolCallRecord`` of the model turn that asked for it
+(matched by function-call id), as a bounded JSON-safe copy. A ``load_skill`` /
+``load_skill_resource`` / ``run_skill_script`` result keeps the skill's name,
+the file path and the frontmatter's ``name`` and ``metadata`` whole, so the
+trace says which skill was read; the body, a resource's content and a script's
+output are bounded like any other tool output.
+
 ADK is built around Gemini; the release gate pairs this adapter with the
 ``google`` provider only.
 """
@@ -66,6 +74,7 @@ ADK is built around Gemini; the release gate pairs this adapter with the
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import warnings
@@ -218,16 +227,201 @@ def _map_finish_reason(raw: Any, has_tool_calls: bool) -> FinishReason:
     return FinishReason.STOP
 
 
-def _function_calls_from_content(content: Any) -> List[Tuple[str, Dict[str, Any]]]:
-    """Extract (name, args) for every function_call part in a genai Content."""
-    out: List[Tuple[str, Dict[str, Any]]] = []
+def _function_calls_from_content(content: Any) -> List[Any]:
+    """Every named ``function_call`` part of a genai Content, as the objects.
+
+    The objects themselves, not copies of their name and args: the record a
+    model turn creates has to be found again when that call's tool finishes
+    (see ``_ModelToolCall``), and the object is what carries the call's id.
+    """
+    out: List[Any] = []
     parts = getattr(content, "parts", None) or []
     for p in parts:
         fc = getattr(p, "function_call", None)
         if fc is not None and getattr(fc, "name", None):
-            args = getattr(fc, "args", None)
-            out.append((fc.name, dict(args) if isinstance(args, dict) else {}))
+            out.append(fc)
     return out
+
+
+# ── Tool results ────────────────────────────────────────────
+#
+# A tool's result is recorded on the ToolCallRecord of the model turn that
+# asked for it. What is recorded is a bounded, JSON-safe copy, never the object
+# the tool returned: a tool may return anything, and the exporter serializes
+# the whole trace with ``model_dump(mode="json")`` (and the ``on_trace``
+# observer receives a deep copy), so ONE result with no JSON form, or one that
+# refuses to be copied, used to be able to lose the entire trace.
+
+#: Longest preview a tool span carries.
+_PREVIEW_LIMIT = 500
+#: Characters kept from any one string inside a recorded tool result.
+_TOOL_RESULT_STR_LIMIT = 2000
+#: Entries kept from any one dict or list inside a recorded tool result.
+_TOOL_RESULT_ITEM_LIMIT = 50
+#: Containers nested deeper than this are recorded as their text.
+_TOOL_RESULT_DEPTH_LIMIT = 8
+#: Most characters one recorded result may take, measured as JSON text.
+_TOOL_RESULT_TOTAL_LIMIT = 8000
+#: Most values one conversion visits, whatever the shape of what it walks.
+_TOOL_RESULT_NODE_LIMIT = 5000
+
+#: google-adk's ``SkillToolset`` tools whose results say which skill was read.
+#: Matched by class (``google.adk.tools.skill_toolset``), not by tool name: a
+#: caller's own function tool may be called ``load_skill`` too.
+_SKILL_TOOL_MODULE = "google.adk.tools.skill_toolset"
+_SKILL_TOOL_CLASSES = frozenset({"LoadSkillTool", "LoadSkillResourceTool", "RunSkillScriptTool"})
+
+
+def _clip(text: str, limit: Optional[int]) -> str:
+    """``text`` cut to ``limit`` characters, saying how much was cut."""
+    if limit is None or len(text) <= limit:
+        return text
+    return f"{text[:limit]}…[truncated, {len(text) - limit} more chars]"
+
+
+def _as_text(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 — a broken __str__ must not cost the record
+        return f"<{type(value).__name__}>"
+
+
+def _json_safe(
+    value: Any, *, str_limit: Optional[int], item_limit: Optional[int],
+    node_limit: int = _TOOL_RESULT_NODE_LIMIT,
+) -> Any:
+    """A copy of ``value`` made only of JSON types, cut to the given limits.
+
+    ``None`` for a limit keeps everything at that level, which is how the parts
+    of a skill tool's result that identify the skill are kept whole. Nesting
+    and the number of values visited are always bounded, so a value that
+    references itself, or shares one child many times, cannot make the walk
+    run away.
+    """
+    remaining = [node_limit]
+
+    def walk(v: Any, depth: int) -> Any:
+        remaining[0] -= 1
+        if remaining[0] < 0:
+            return "…"
+        if v is None or isinstance(v, (bool, int, float)):
+            return v
+        if isinstance(v, str):
+            # A str subclass (a str Enum, say) is recorded as the plain string.
+            return _clip(v if type(v) is str else str.__str__(v), str_limit)
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return f"<{memoryview(v).nbytes} bytes>"
+        if depth >= _TOOL_RESULT_DEPTH_LIMIT:
+            return _clip(_as_text(v), str_limit)
+        if isinstance(v, dict):
+            items = list(v.items())
+            kept = items if item_limit is None else items[:item_limit]
+            out: Dict[str, Any] = {str(k): walk(child, depth + 1) for k, child in kept}
+            if len(kept) < len(items):
+                out["…"] = f"{len(items) - len(kept)} more entries"
+            return out
+        if isinstance(v, (list, tuple, set, frozenset)):
+            seq = list(v)
+            kept_seq = seq if item_limit is None else seq[:item_limit]
+            out_list = [walk(child, depth + 1) for child in kept_seq]
+            if len(kept_seq) < len(seq):
+                out_list.append(f"… {len(seq) - len(kept_seq)} more items")
+            return out_list
+        dump = getattr(v, "model_dump", None)
+        if callable(dump):  # pydantic: genai types, ADK's own models
+            try:
+                return walk(dump(mode="json"), depth + 1)
+            except Exception:  # noqa: BLE001 — fall through to the text form
+                pass
+        return _clip(_as_text(v), str_limit)
+
+    return walk(value, 0)
+
+
+def _json_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _bounded_tool_result(result: Any) -> Any:
+    """``result`` as JSON types, at most ``_TOOL_RESULT_TOTAL_LIMIT`` chars of JSON.
+
+    Keeps the result's structure where it can: strings are cut first, then cut
+    harder, and only a result that is still too big becomes its cut JSON text.
+    """
+    text = ""
+    for str_limit in (_TOOL_RESULT_STR_LIMIT, _TOOL_RESULT_STR_LIMIT // 10):
+        safe = _json_safe(result, str_limit=str_limit, item_limit=_TOOL_RESULT_ITEM_LIMIT)
+        text = _json_text(safe)
+        if len(text) <= _TOOL_RESULT_TOTAL_LIMIT:
+            return safe
+    return _clip(text, _TOOL_RESULT_TOTAL_LIMIT)
+
+
+def _is_skill_tool(tool: Any) -> bool:
+    """True for ADK's ``load_skill`` / ``load_skill_resource`` / ``run_skill_script``."""
+    return any(
+        cls.__module__ == _SKILL_TOOL_MODULE and cls.__name__ in _SKILL_TOOL_CLASSES
+        for cls in type(tool).__mro__
+    )
+
+
+def _skill_tool_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """A SkillToolset result with what identifies the skill kept whole and first.
+
+    ``skill_name``, ``file_path`` and the frontmatter's ``name`` and
+    ``metadata`` are what say WHICH skill (and, through metadata, which version
+    of it) the model read, so none of them is cut. They also go first, so the
+    span preview, which is cut at ``_PREVIEW_LIMIT``, still names the skill.
+    Everything else — the body, a resource's content, a script's output — is
+    bounded like any other tool output.
+    """
+    head: Dict[str, Any] = {
+        key: _json_safe(result[key], str_limit=None, item_limit=None)
+        for key in ("skill_name", "file_path") if key in result
+    }
+    frontmatter = result.get("frontmatter")
+    if isinstance(frontmatter, dict):
+        identity = {
+            key: _json_safe(frontmatter[key], str_limit=None, item_limit=None)
+            for key in ("name", "metadata") if key in frontmatter
+        }
+        rest_fm = _bounded_tool_result(
+            {k: v for k, v in frontmatter.items() if k not in identity}
+        )
+        head["frontmatter"] = {
+            **identity, **(rest_fm if isinstance(rest_fm, dict) else {"…": rest_fm}),
+        }
+    rest = _bounded_tool_result({k: v for k, v in result.items() if k not in head})
+    return {**head, **(rest if isinstance(rest, dict) else {"…": rest})}
+
+
+def _recorded_tool_result(tool: Any, result: Any) -> Any:
+    """What a ToolCallRecord carries for ``result``: bounded, JSON-safe."""
+    if isinstance(result, dict) and _is_skill_tool(tool):
+        return _skill_tool_result(result)
+    return _bounded_tool_result(result)
+
+
+@dataclass
+class _ModelToolCall:
+    """A tool call a model turn asked for, still waiting for its result.
+
+    ``after_model_callback`` sees the model's ``FunctionCall`` before ADK has
+    given it an id when the model supplied none: ADK assigns its ``adk-…`` id
+    afterwards, IN PLACE on the same object, and that id is the
+    ``tool_context.function_call_id`` the tool callbacks see. So the object is
+    kept and its id read when the tool finishes.
+    """
+
+    record: ToolCallRecord
+    function_call: Any
+    call_id: Optional[str]
+
+    def current_id(self) -> Optional[str]:
+        fc_id = self.call_id or getattr(self.function_call, "id", None)
+        return str(fc_id) if fc_id else None
 
 
 def _introspect_agent(agent: Any) -> Dict[str, Any]:
@@ -306,6 +500,12 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
 def _get_skill_router() -> Any:
     """Lazily construct a SkillRouter using the SDK's global config."""
     global _skill_router_singleton
+    # The kill switch: a later init(enabled=False) withholds the router (kept
+    # for a re-enable) from a loader an earlier init installed.
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
     if _skill_router_singleton is not None:
         return _skill_router_singleton
     try:
@@ -518,6 +718,7 @@ class _RunState:
         "trace_id", "agent_name", "root_agent_name", "started_at", "ended_at",
         "user_input_preview", "final_output_preview",
         "llm_calls", "spans", "pending_llm", "pending_tools", "agent_stack",
+        "open_tool_calls", "failed_tool_calls",
         "status", "error_code", "error_message", "manifest",
         "routing_id", "skills_offered", "skills_delivered",
         "skills_delivered_versions",
@@ -548,6 +749,15 @@ class _RunState:
         self.pending_llm: List[Tuple[LlmCallRecord, TraceSpan]] = []
         # key -> (ToolCallRecord, TraceSpan, started_at)
         self.pending_tools: Dict[str, Tuple[ToolCallRecord, TraceSpan, datetime]] = {}
+        # Tool calls the model asked for whose result has not arrived yet, in
+        # the order the model asked. A finished tool claims its own entry (by
+        # call id, else by name and args), and its result goes on that entry's
+        # record — the record the model turn already put in `llm_calls`.
+        self.open_tool_calls: List[_ModelToolCall] = []
+        # call id -> record of a call whose tool raised. ADK runs after_tool
+        # for it too when another plugin answers the error, and that answer is
+        # what the model got; it belongs on the same record, not a second one.
+        self.failed_tool_calls: Dict[str, ToolCallRecord] = {}
         # Open agent spans, outermost first: before_agent pushes, after_agent
         # pops. ADK nests sub-agents inside their parent's agent callback, so
         # the top of this stack is the span everything else hangs off.
@@ -931,10 +1141,20 @@ def _plugin_class() -> Any:
             if text:
                 rec.output = {"role": "model", "content": text}
                 state.final_output_preview = text
-            # Tool calls requested by the model in this turn.
+            # Tool calls requested by the model in this turn. Each record is
+            # the ONE record of its call: the tool callbacks fill in its result
+            # when the tool finishes, through `open_tool_calls`.
             fcs = _function_calls_from_content(content)
-            for fname, fargs in fcs:
-                rec.tool_calls.append(ToolCallRecord(tool_name=fname, args=fargs))
+            for fc in fcs:
+                fargs = getattr(fc, "args", None)
+                tool_rec = ToolCallRecord(
+                    tool_name=str(fc.name), args=dict(fargs) if isinstance(fargs, dict) else {},
+                )
+                rec.tool_calls.append(tool_rec)
+                fc_id = getattr(fc, "id", None)
+                state.open_tool_calls.append(
+                    _ModelToolCall(tool_rec, fc, str(fc_id) if fc_id else None)
+                )
             rec.finish_reason = _map_finish_reason(
                 getattr(llm_response, "finish_reason", None), bool(fcs)
             )
@@ -951,7 +1171,7 @@ def _plugin_class() -> Any:
             self._close_span(
                 span,
                 output=text or (
-                    "→ " + ", ".join(name for name, _ in fcs) if fcs else None
+                    "→ " + ", ".join(str(fc.name) for fc in fcs) if fcs else None
                 ),
                 error=bool(err_msg),
             )
@@ -999,44 +1219,119 @@ def _plugin_class() -> Any:
             state.pending_tools[self._tool_key(tool, tool_context)] = (rec, span, started)
             return None
 
+        @staticmethod
+        def _claim_model_tool_call(
+            state: _RunState, tool_name: str, call_id: Optional[str], args: Dict[str, Any],
+        ) -> Optional[ToolCallRecord]:
+            """The record the model turn created for this call, taken off the
+            open list so no later call can claim it too.
+
+            By call id first: the model's own id when it gave one, else the id
+            ADK assigned (see ``_ModelToolCall``). Without an id to go on, the
+            oldest open call of this tool, preferring one whose args are these
+            args, so two parallel calls of one tool that finish out of order
+            still get their own results. An open call carrying a DIFFERENT id
+            is never taken.
+            """
+            open_calls = state.open_tool_calls
+            if call_id:
+                for i, entry in enumerate(open_calls):
+                    if entry.current_id() == call_id:
+                        return open_calls.pop(i).record
+            candidates = [
+                i for i, entry in enumerate(open_calls)
+                if entry.record.tool_name == tool_name
+                and not (call_id and entry.current_id())
+            ]
+            if not candidates:
+                return None
+            for i in candidates:
+                if open_calls[i].record.args == args:
+                    return open_calls.pop(i).record
+            return open_calls.pop(candidates[0]).record
+
+        def _record_tool_outcome(
+            self, state: _RunState, tool: Any, tool_args: Any, tool_context: Any,
+            *, result: Any = None, error: Optional[BaseException] = None,
+        ) -> None:
+            """Put a finished tool call's result (or error) on its ONE record,
+            and close its span.
+
+            The record is the one the model turn created. Only a call no model
+            turn recorded (a turn this plugin never saw complete) gets a record
+            of its own, attached to the latest model call, so the call is never
+            lost and never counted twice.
+            """
+            key = self._tool_key(tool, tool_context)
+            pending = state.pending_tools.pop(key, None)
+            ended = _now()
+            tool_name = str(getattr(tool, "name", None) or "tool")
+            args = dict(tool_args) if isinstance(tool_args, dict) else {}
+            raw_id = getattr(tool_context, "function_call_id", None)
+            call_id = str(raw_id) if raw_id else None
+
+            if error is not None:
+                recorded: Any = {
+                    "error": _clip(f"{type(error).__name__}: {error}", _TOOL_RESULT_STR_LIMIT),
+                }
+                preview: Optional[str] = str(error)[:_PREVIEW_LIMIT]
+            else:
+                recorded = _recorded_tool_result(tool, result)
+                preview = _json_text(recorded)[:_PREVIEW_LIMIT] if result is not None else None
+
+            # A tool that raised, answered afterwards by another plugin's
+            # on_tool_error: same call, same record, now with that answer.
+            target = state.failed_tool_calls.pop(call_id, None) if call_id else None
+            if target is None:
+                target = self._claim_model_tool_call(state, tool_name, call_id, args)
+            if target is None:
+                target = pending[0] if pending is not None else ToolCallRecord(
+                    tool_name=tool_name, args=args,
+                )
+                if state.llm_calls:
+                    state.llm_calls[-1].tool_calls.append(target)
+            target.result = recorded
+            if error is not None:
+                target.status = Status.ERROR
+                if call_id:
+                    state.failed_tool_calls[call_id] = target
+
+            if pending is not None:
+                _rec, span, started = pending
+                target.latency_ms = int((ended - started).total_seconds() * 1000)
+                span.ended_at = ended
+                if error is not None:
+                    span.status = Status.ERROR
+                span.output_preview = preview
+                state.spans.append(span)
+
         async def after_tool_callback(self, *, tool: Any, tool_args: Any, tool_context: Any, result: Any):  # noqa: ANN001
             state = self._get_run(getattr(tool_context, "invocation_id", None))
             if state is None:
                 return None
-            key = self._tool_key(tool, tool_context)
-            pending = state.pending_tools.pop(key, None)
-            if pending is None:
-                return None
-            rec, span, started = pending
-            ended = _now()
-            rec.result = result
-            rec.latency_ms = int((ended - started).total_seconds() * 1000)
-            span.ended_at = ended
-            span.output_preview = str(result)[:500] if result is not None else None
-            state.spans.append(span)
-            # Attach the tool record to the most recent LLM call if it didn't
-            # already capture this function_call, so tool counts stay accurate.
-            if state.llm_calls and not any(
-                tc.tool_name == rec.tool_name for tc in state.llm_calls[-1].tool_calls
-            ):
-                state.llm_calls[-1].tool_calls.append(rec)
+            try:
+                self._record_tool_outcome(state, tool, tool_args, tool_context, result=result)
+            except Exception:
+                # Never out of the callback: ADK's PluginManager re-raises a
+                # plugin's exception, which fails the caller's run. Loud,
+                # because this call's result is now missing from the trace.
+                logger.warning(
+                    "DecimalAI ADK: could not record the result of tool %r; the trace "
+                    "will not carry it", getattr(tool, "name", None), exc_info=True,
+                )
             return None
 
         async def on_tool_error_callback(self, *, tool: Any, tool_args: Any, tool_context: Any, error: Exception):  # noqa: ANN001
             state = self._get_run(getattr(tool_context, "invocation_id", None))
             if state is None:
                 return None
-            key = self._tool_key(tool, tool_context)
-            pending = state.pending_tools.pop(key, None)
-            if pending is not None:
-                rec, span, started = pending
-                ended = _now()
-                rec.status = Status.ERROR
-                rec.latency_ms = int((ended - started).total_seconds() * 1000)
-                span.status = Status.ERROR
-                span.ended_at = ended
-                span.output_preview = str(error)[:500]
-                state.spans.append(span)
+            try:
+                self._record_tool_outcome(state, tool, tool_args, tool_context, error=error)
+            except Exception:
+                logger.warning(
+                    "DecimalAI ADK: could not record the error of tool %r; the trace "
+                    "will not carry it", getattr(tool, "name", None), exc_info=True,
+                )
             state.status = Status.ERROR
             state.error_message = str(error)
             return None
@@ -1247,8 +1542,12 @@ def instrument(
     * ``Runner(app=...)``: the runner is built from a copy of the ``App`` whose
       ``plugins`` list carries the shared plugin first. The caller's ``App`` is
       not modified (the same move ADK's own evaluator makes).
-    * ``Runner(agent=...)`` / ``Runner(node=...)``: the shared plugin is put
-      first in the ``plugins`` argument.
+    * ``Runner(agent=...)`` / ``Runner(node=...)``: the runner is built from
+      the ``App`` ADK itself would wrap that agent in, with the shared plugin
+      in it — not from ``plugins=``, which ADK deprecates and warns about on
+      every construction.
+    * ``Runner(..., plugins=[...])`` (the caller's own, deprecated): the shared
+      plugin is put first in that list.
 
     Either way, a runner that already carries a DecimalAI plugin — by type, or
     by the shared plugin's name — is left alone, so an explicit
@@ -1321,6 +1620,15 @@ def instrument(
                 for p in plugins or ()
             )
 
+        def _wraps_cleanly(kwargs: dict) -> bool:
+            # Exactly one of agent / node (ADK refuses the rest itself), and an
+            # app_name when it is an agent (ADK requires one; for a node it
+            # defaults to the node's name).
+            agent, node = kwargs.get("agent"), kwargs.get("node")
+            if (agent is None) == (node is None):
+                return False
+            return node is not None or bool(kwargs.get("app_name"))
+
         def patched_init(self, **kwargs):  # Runner.__init__ is keyword-only
             app = kwargs.get("app")
             if app is not None:
@@ -1332,11 +1640,36 @@ def instrument(
                     kwargs["app"] = app.model_copy(
                         update={"plugins": [shared_plugin, *app.plugins]},
                     )
-            else:
-                plugins = list(kwargs.pop("plugins", None) or [])
+            elif kwargs.get("plugins") is None and _wraps_cleanly(kwargs):
+                # A bare agent or node, and no `plugins=`: build the App ADK
+                # would build from it (`Runner._resolve_app`), with the plugin
+                # in it. Passing `plugins=` instead made ADK warn that the
+                # argument is deprecated on every runner, to a user who never
+                # passed one.
+                from google.adk.apps.app import App
+
+                root = kwargs.pop("agent", None)
+                if root is None:
+                    root = kwargs.pop("node")
+                    kwargs.pop("agent", None)
+                    name = kwargs.get("app_name") or getattr(root, "name", "default")
+                else:
+                    kwargs.pop("node", None)
+                    name = kwargs["app_name"]
+                kwargs.pop("plugins", None)
+                kwargs["app"] = App.model_construct(
+                    name=name, root_agent=root, plugins=[shared_plugin],
+                )
+            elif kwargs.get("plugins") is not None:
+                # The caller passed `plugins=`: ADK's deprecated path, and its
+                # warning, are theirs. Add the plugin where they put theirs.
+                plugins = list(kwargs.pop("plugins"))
                 if not carries_decimalai(plugins):
                     plugins.insert(0, shared_plugin)
                 kwargs["plugins"] = plugins
+            # Anything else is a combination ADK refuses (both agent and node,
+            # neither, an agent with no app_name): handed over untouched, so the
+            # caller gets ADK's own error and no warning ADK would not give.
             original_init(self, **kwargs)
 
         Runner.__init__ = patched_init  # type: ignore[method-assign]

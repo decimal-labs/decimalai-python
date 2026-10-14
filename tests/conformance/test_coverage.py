@@ -531,13 +531,66 @@ def test_no_driver_is_silently_unavailable() -> None:
     assert not unavailable, (
         f"DECIMAL_CONFORMANCE_REQUIRE_ALL=1 is set in the {env!r} test environment "
         f"({ENV_VAR}), and these drivers that belong to it cannot run because "
-        "their framework is not installed:\n"
-        + "\n".join(f"  {name}: missing {mods}" for name, mods in sorted(unavailable.items()))
+        "their framework is not installed, or is installed below the SDK's floor:\n"
+        + "\n".join(f"  {name}: {mods}" for name, mods in sorted(unavailable.items()))
         + "\n\nThese would have been reported NOT RUN and skipped, leaving the job "
         "green while proving nothing about those adapters. This environment is "
         f"built by `{TEST_ENVS[env]}`; add the missing distribution(s) to that "
         "extra in pyproject.toml — it is the single source for what this "
-        "environment needs installed."
+        "environment needs installed — or rebuild an environment that holds a "
+        "framework older than its floor."
+    )
+
+
+def test_every_rail_driver_runs_the_unnamed_and_conversation_shapes() -> None:
+    """C18 and C19 apply to every rail, so every rail driver runs their phases.
+
+    Not enforced in ``Driver.__post_init__`` (an ad-hoc Driver in a unit test
+    need not grow hooks it never runs), so it is enforced here, over the
+    registered drivers, with no framework installed. Without the hook the two
+    items would still fail by name on the run — this fails on the commit.
+    """
+    missing = sorted(
+        f"{d.name}: {hook}"
+        for d in all_drivers()
+        if d.capabilities.has_skills_rail
+        for hook in ("run_unnamed", "run_conversation")
+        if getattr(d, hook) is None
+    )
+    assert not missing, (
+        f"rail driver(s) without the hook C18 / C19 grade: {missing}. Every rail "
+        f"framework names its agents and holds conversations; write the hook "
+        f"(see drivers.Driver for what each must run)."
+    )
+
+
+def test_every_driver_floor_gate_reads_a_declared_floor() -> None:
+    """A driver's ``frameworks`` must each have a floor in pyproject.toml.
+
+    ``Driver.frameworks`` is what keeps a driver from grading a framework the SDK
+    no longer supports. A name pyproject declares no floor for gates nothing —
+    a misspelling, or a framework whose floor was dropped — and would read like
+    protection while providing none.
+    """
+    from .floors import _canonical, declared_floors
+
+    floors = declared_floors()
+    assert floors, "read no floors out of pyproject.toml — the parser has drifted"
+    ungated = sorted(
+        f"{d.name}: {dist}"
+        for d in all_drivers()
+        for dist in d.frameworks
+        if _canonical(dist) not in floors
+    )
+    assert not ungated, (
+        f"driver framework(s) with no floor in pyproject.toml: {ungated}. Name the "
+        f"distribution exactly as an extra requires it."
+    )
+    openai = sorted(d.name for d in all_drivers() if "openai" in map(_canonical, d.frameworks))
+    assert not openai, (
+        f"driver(s) {openai} gate on `openai`, whose floor (openai 3) is one test "
+        f"environment's: in the openai 2 environment it would make every such "
+        f"driver unavailable. Gate on the framework distribution itself."
     )
 
 

@@ -57,6 +57,7 @@ from . import (
     Ctx,
     Driver,
     FrameworkLimit,
+    Shape,
     fanout_threads,
     stub_script,
     tool_result,
@@ -123,8 +124,58 @@ def _reply(ctx: Ctx, body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _sse(message: Dict[str, Any]) -> bytes:
+    """One Messages-API response as the server-sent events ``stream: true`` gets.
+
+    The event sequence the Messages API documents for streaming: a
+    ``message_start`` with no content, each content block as
+    start / delta / stop (text as a ``text_delta``, a tool call's input as one
+    ``input_json_delta``), then ``message_delta`` with the stop reason and the
+    output token count, then ``message_stop``. The SDK's ``MessageStream``
+    rebuilds the same ``Message`` the non-streaming ``_reply`` would have
+    returned from these, so both paths answer the same script.
+    """
+    events: List[Tuple[str, Dict[str, Any]]] = [(
+        "message_start",
+        {"type": "message_start", "message": {
+            **message, "content": [], "stop_reason": None,
+            "usage": {"input_tokens": message["usage"]["input_tokens"], "output_tokens": 1},
+        }},
+    )]
+    for index, block in enumerate(message["content"]):
+        if block["type"] == "tool_use":
+            start = {**block, "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+        else:
+            start = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": block["text"]}
+        events += [
+            ("content_block_start",
+             {"type": "content_block_start", "index": index, "content_block": start}),
+            ("content_block_delta",
+             {"type": "content_block_delta", "index": index, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": index}),
+        ]
+    events += [
+        ("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
+            "usage": {"output_tokens": message["usage"]["output_tokens"]},
+        }),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(
+        f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events
+    ).encode("utf-8")
+
+
 def _start_provider(ctx: Ctx, *, fail: bool = False) -> Tuple[Any, str]:
-    """A real HTTP Anthropic stand-in for one run. Returns (server, base_url)."""
+    """A real HTTP Anthropic stand-in for one run. Returns (server, base_url).
+
+    Answers ``stream: true`` requests (``messages.stream()``) as server-sent
+    events and everything else as one JSON body — the two ways the Messages API
+    answers the same request.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -152,9 +203,12 @@ def _start_provider(ctx: Ctx, *, fail: bool = False) -> Tuple[Any, str]:
                 }
             else:
                 status, payload = 200, _reply(ctx, body)
-            data = json.dumps(payload).encode("utf-8")
+            streamed = status == 200 and bool(body.get("stream"))
+            data = _sse(payload) if streamed else json.dumps(payload).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header(
+                "Content-Type", "text/event-stream" if streamed else "application/json"
+            )
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -203,18 +257,35 @@ def _client(base_url: str) -> Any:
     return anthropic.Anthropic(api_key="sk-ant-conformance-stub", base_url=base_url)
 
 
+def _send(client: Any, *, stream: bool, **kwargs: Any) -> Any:
+    """One model request: ``messages.create()``, or ``messages.stream()`` read
+    to its final message the way the SDK's helpers document."""
+    if not stream:
+        return client.messages.create(**kwargs)
+    with client.messages.stream(**kwargs) as events:
+        return events.get_final_message()
+
+
 def _loop(
-    ctx: Ctx, client: Any, *, tools: bool = True, system: Optional[str] = SYSTEM_PROMPT
+    ctx: Ctx, client: Any, *, tools: bool = True, system: Optional[str] = SYSTEM_PROMPT,
+    history: Sequence[Dict[str, Any]] = (), stream: bool = False,
 ) -> Any:
-    """The documented Anthropic tool-use loop, verbatim in shape."""
+    """The documented Anthropic tool-use loop, verbatim in shape.
+
+    ``history`` is the conversation so far — earlier turns' user and assistant
+    messages, ahead of this turn's user message, which is how a raw-SDK
+    application continues a conversation.
+    """
     kwargs: Dict[str, Any] = {"model": STUB_MODEL, "max_tokens": 512}
     if system is not None:
         kwargs["system"] = system
     if tools:
         kwargs["tools"] = _tools(ctx)
 
-    messages: List[Dict[str, Any]] = [{"role": "user", "content": user_message(ctx)}]
-    first = client.messages.create(messages=messages, **kwargs)
+    messages: List[Dict[str, Any]] = [
+        *history, {"role": "user", "content": user_message(ctx)},
+    ]
+    first = _send(client, stream=stream, messages=messages, **kwargs)
     uses = [b for b in first.content if getattr(b, "type", None) == "tool_use"]
     if not uses:
         return first
@@ -231,12 +302,13 @@ def _loop(
         {"role": "assistant", "content": [b.model_dump() for b in first.content]},
         {"role": "user", "content": results},
     ]
-    return client.messages.create(messages=messages, **kwargs)
+    return _send(client, stream=stream, messages=messages, **kwargs)
 
 
 def _run(
     ctx: Ctx, *, fail: bool = False, tools: bool = True,
     system: Optional[str] = SYSTEM_PROMPT,
+    history: Sequence[Dict[str, Any]] = (), stream: bool = False,
 ) -> Any:
     _instrument(ctx)
     server, base_url = _start_provider(ctx, fail=fail)
@@ -250,7 +322,9 @@ def _run(
         # This is the one thing a raw-SDK user must say themselves: there is no
         # run object for a library to hook, so the boundary has to be declared.
         with providers.agent_run(ctx.agent_name):
-            return _loop(ctx, client, tools=tools, system=system)
+            return _loop(
+                ctx, client, tools=tools, system=system, history=history, stream=stream,
+            )
     finally:
         # Close before the server goes away: a keep-alive socket left to the
         # garbage collector raises a ResourceWarning from whichever phase
@@ -297,6 +371,53 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return fanout_threads(run)(ctxs)
 
 
+def _rail_on() -> None:
+    """The docs' one-line skills setup — ``instrument(enable_skill_loader=True)``,
+    with no agent name, exactly as ``frameworks.mdx`` shows it. A no-op once the
+    skills phase has patched the client."""
+    from decimalai.anthropic import instrument
+
+    instrument(enable_skill_loader=True)
+
+
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail, with the run named where a raw-SDK run is named: ``agent_run()``.
+
+    There is no agent object on this rail at all. The documented way to say
+    whose run this is is the run boundary, ``providers.agent_run(name)``, and
+    the documented skills setup names no agent — so this is the docs' setup,
+    for an agent the skills phase did not run.
+    """
+    _rail_on()
+    return _run(ctx)
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns: the second ``messages.create()`` loop is sent the first turn's
+    user message and the assistant's answer ahead of the new user message."""
+    _rail_on()
+    first, second = ctxs
+    answer = _run(first)
+    text = "".join(
+        getattr(b, "text", "") or "" for b in getattr(answer, "content", None) or []
+    )
+    history = [
+        {"role": "user", "content": user_message(first)},
+        {"role": "assistant", "content": text or "(no answer)"},
+    ]
+    return _run(second, history=history)
+
+
+def _stream_shape(ctxs: Sequence[Ctx]) -> Any:
+    """The same tool loop, every request sent with ``client.messages.stream()``.
+
+    The Messages API's documented streaming helper. In anthropic 1.x it builds
+    its own request and never goes through ``messages.create()``.
+    """
+    _rail_on()
+    return [_run(ctx, stream=True) for ctx in ctxs]
+
+
 DRIVER = Driver(
     name="anthropic",
     # The docs' capability table has no raw-Anthropic row: this rail is
@@ -304,12 +425,26 @@ DRIVER = Driver(
     # slug here would fail the coverage guard's orphan check, and rightly so.
     covers=frozenset(),
     requires=("anthropic", "openinference.instrumentation.anthropic"),
+    frameworks=("anthropic", "openinference-instrumentation-anthropic"),
     entrypoint="decimalai.providers.instrument(anthropic=True) / decimalai.anthropic.instrument()",
     run=run,
     run_concurrent=fanout_threads(run),
     run_error=run_error,
     run_degenerate=run_degenerate,
     run_skills=run_skills,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
+    shapes=(
+        Shape(
+            name="messages_stream",
+            doc=(
+                "the tool-use loop sent with client.messages.stream() under "
+                "decimalai.anthropic.instrument(enable_skill_loader=True)"
+            ),
+            run=_stream_shape,
+            routed=True,
+        ),
+    ),
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

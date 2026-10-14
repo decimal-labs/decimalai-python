@@ -22,9 +22,15 @@ The skills rail IS graded here. It was declared absent until 2026-09-03, and
 that declaration outlived the fact by five days: `decimalai/adk.py` grew a real
 rail on 2026-08-29 (21cfcbc, "ADK can deliver a skill body — the 'no prompt
 seam' entry was wrong"), while this file was last touched 2026-08-18. What
-remains genuinely absent is the LOADER — ADK registers no ``load_skill`` tool,
-so the model cannot ask for a body and the strongest rung reachable here is
-DELIVERED. C13b is declared N/A for that narrower reason; C8 and C14 are graded.
+remains absent is the LOADER — the adapter registers no ``load_skill`` tool and
+does not bridge ADK's own ``SkillToolset`` — so the model cannot ask DecimalAI
+for a body and the strongest rung reachable here is DELIVERED. C13b is declared
+N/A for that narrower reason; C8 and C14 are graded.
+
+The plugins-on-the-Runner form above is the one the docs page shows; ADK 2.12
+deprecates it (``plugins`` belongs in the ``App``) but still runs it. The App
+form — the SDK's own documented explicit path, and the shape ``adk web`` builds —
+is the ``app_runner`` shape, run after the global install.
 
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
@@ -48,6 +54,7 @@ from . import (
     Driver,
     DriverError,
     FrameworkLimit,
+    Shape,
     stub_script,
     tool_result,
     trace_observer,
@@ -377,10 +384,106 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return asyncio.run(_gather_skills(ctxs))
 
 
+def _global_install(ctx: Ctx) -> None:
+    """``decimalai.adk.instrument(agent_name=..., enable_skill_loader=True)``.
+
+    The process-wide form (what ``init(adk=True, agent_name=...)`` installs):
+    every Runner built afterwards gets the shared DecimalAI plugin, unless it
+    already carries one of its own. Runs only after the skills phase, so it
+    patches ``Runner.__init__`` for the phases that test it and no earlier one.
+    """
+    from decimalai.adk import instrument
+
+    instrument(agent_name=ctx.agent_name, enable_skill_loader=True)
+
+
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail on an agent ADK names one way and DecimalAI another.
+
+    ADK requires every agent to have a name, and it must be a Python
+    identifier, so the ADK agent here is called ``conformance_adk_…`` while the
+    DecimalAI agent is ``conformance-adk-…``. Nothing on the Runner names it:
+    the DecimalAI name is given once, at the global install, and the Runner is
+    the plain ``Runner(agent=..., app_name=..., session_service=...)``.
+    """
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+
+    _HANDLER.register(ctx)
+    _global_install(ctx)
+    runner = Runner(
+        agent=_agent(ctx), app_name=_node_name(ctx),
+        session_service=InMemorySessionService(),
+    )
+    return asyncio.run(_drive(ctx, runner))
+
+
+async def _converse(runner: Any, first: Ctx, second: Ctx) -> Any:
+    from google.genai import types
+
+    session = await runner.session_service.create_session(
+        app_name=runner.app_name, user_id="conformance",
+    )
+    out = []
+    for ctx in (first, second):
+        message = types.Content(role="user", parts=[types.Part(text=user_message(ctx))])
+        async for event in runner.run_async(
+            user_id="conformance", session_id=session.id, new_message=message,
+        ):
+            out.append(event)
+    return out
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns in ONE session: the second ``run_async`` on the same session
+    id, which is how ADK carries a conversation's history."""
+    first, second = ctxs
+    for ctx in ctxs:
+        _HANDLER.register(ctx)
+    runner = _runner(first, _agent(first), skills=True)
+    return asyncio.run(_converse(runner, first, second))
+
+
+def _app_runner_shape(ctxs: Sequence[Ctx]) -> Any:
+    """``Runner(app=App(...))`` after the global install — the shape ``adk web``,
+    ``adk run`` and ``adk api_server`` build — in its two documented forms.
+
+    Lane 0: ``InMemoryRunner(app=App(name, root_agent))`` with no DecimalAI
+    plugin in the App, so the shared plugin of the global install traces it,
+    as it traces every runner ADK's own tooling builds. Lane 1: the SDK's
+    documented explicit path, ``App(..., plugins=[DecimalaiPlugin(...)])`` and
+    ``Runner(app=app, session_service=...)``, under that same global install.
+    """
+    from google.adk.apps import App
+    from google.adk.runners import InMemoryRunner, Runner
+    from google.adk.sessions import InMemorySessionService
+
+    from decimalai.adk import DecimalaiPlugin
+
+    out = []
+    first, second = ctxs
+    _HANDLER.register(first)
+    _global_install(first)
+    adk_web = InMemoryRunner(app=App(name=_node_name(first), root_agent=_agent(first)))
+    out.append(asyncio.run(_drive(first, adk_web)))
+
+    _HANDLER.register(second)
+    explicit = Runner(
+        app=App(
+            name=_node_name(second), root_agent=_agent(second),
+            plugins=[DecimalaiPlugin(agent_name=second.agent_name, enable_skill_loader=True)],
+        ),
+        session_service=InMemorySessionService(),
+    )
+    out.append(asyncio.run(_drive(second, explicit)))
+    return out
+
+
 DRIVER = Driver(
     name="adk",
     covers=frozenset({"google-adk"}),
     requires=("google.adk", "litellm"),
+    frameworks=("google-adk",),
     entrypoint="decimalai.adk.DecimalaiPlugin",
     run=run,
     run_concurrent=run_concurrent,
@@ -388,6 +491,21 @@ DRIVER = Driver(
     run_degenerate=run_degenerate,
     run_skills=run_skills,
     run_nested=run_nested,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
+    shapes=(
+        Shape(
+            name="app_runner",
+            doc=(
+                "Runner(app=App(...)) after decimalai.adk.instrument() — "
+                "InMemoryRunner(app=App(name, root_agent)) as adk web builds it, then "
+                "Runner(app=App(..., plugins=[DecimalaiPlugin(...)]), session_service=...)"
+            ),
+            run=_app_runner_shape,
+            lanes=2,
+            routed=True,
+        ),
+    ),
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,
@@ -397,11 +515,13 @@ DRIVER = Driver(
         supports_degenerate=True,
         reasons={
             "model_can_load_skill_bodies": (
-                "this rail is prompt-injection only. ADK registers no load_skill "
-                "tool — decimalai/adk.py says so in as many words ('ADK registers no "
-                "`load_skill` tool, so prompt injection is the ONLY') — so the model "
-                "has no way to ASK for a body and the strongest rung observable here "
-                "is DELIVERED. Delivery is not activation. C13 still applies and is "
+                "this rail is prompt-injection only. The adapter registers no "
+                "load_skill tool and does not bridge ADK's own SkillToolset — "
+                "decimalai/adk.py says so when asked ('this adapter registers no "
+                "load_skill tool and does not bridge ADK's SkillToolset, so the model "
+                "cannot ask for a DecimalAI skill body') — so the model has no way to "
+                "ASK DecimalAI for a body and the strongest rung observable here is "
+                "DELIVERED. Delivery is not activation. C13 still applies and is "
                 "graded: with no loader, a delivered body is exactly what is most "
                 "likely to be promoted to a fabricated activation."
             ),
@@ -409,12 +529,15 @@ DRIVER = Driver(
         delivery_limits={
             TOOL_LOADED: FrameworkLimit(
                 reason=(
-                    "ADK's plugin hooks observe a turn; they do not own a tool loop "
-                    "this adapter could route a load_skill RESULT back through, and "
-                    "no such tool is registered in the first place. The tool-loaded "
-                    "channel does not exist here at any setting of any flag. Prompt "
-                    "injection is the whole rail — which is why the injected cell is "
-                    "graded strictly and is not allowed to be N/A."
+                    "The seam is ADK's plugin hooks: before_model edits one model "
+                    "request, and the adapter registers no load_skill tool for a body "
+                    "to come back from (ADK itself ships SkillToolset, which the "
+                    "adapter does not bridge to DecimalAI skills). So there is no "
+                    "tool-loaded channel at any setting of any flag — the SEAM's "
+                    "limit, the same kind langchain's invoke-layer patch and "
+                    "crewai's before_llm_call hook declare. Prompt injection is the "
+                    "whole rail — which is why the injected cell is graded strictly "
+                    "and is not allowed to be N/A."
                 ),
                 adapter_module="decimalai/adk.py",
                 refusal_marker=(

@@ -171,3 +171,161 @@ def test_enabled_langchain_still_syncs_and_writes(platform, fresh_sdk):
     assert any(p.endswith("SKILL.md") for p in written), (
         "enabled=True no longer writes skills to disk: " + repr(written)
     )
+
+
+# ── A later init(enabled=False) stops a skill loader an earlier init installed ──
+#
+# `init(langchain=True)` (and the openai_agents / adk / crewai flags) install
+# the skill loader, which patches the framework for the life of the process. A
+# later `init(enabled=False)` cleared the trace client, so traces stopped, but
+# every loader kept routing: each user message still went to /skills/route and
+# skills were still injected, after the caller had turned the SDK off.
+
+_ROUTE = {
+    "strategy": "smart_routing",
+    "skills": [{"name": "refund-policy", "description": "Refund rules"}],
+    "prompt_fragment": "## Recommended Skills\n| refund-policy | Refund rules |",
+    "routing_id": "rt_" + "a" * 24,
+}
+_ADAPTERS = ("langchain", "openai_agents", "adk", "crewai", "anthropic", "pydantic_ai")
+
+
+class _RoutingPlatform(_FakePlatform):
+    def __call__(self, method: str, url: Any, **kwargs: Any) -> httpx.Response:
+        url = str(url)
+        if url.endswith("/skills/route") or url.endswith("/skills/menu"):
+            self.calls.append(f"{method} {url}")
+            return httpx.Response(200, json=_ROUTE)
+        return super().__call__(method, url, **kwargs)
+
+    def skill_calls(self) -> List[str]:
+        return [c for c in self.calls if "/skills/route" in c or "/skills/menu" in c
+                or c.endswith("/body")]
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS)
+def test_every_adapters_router_is_withheld_while_disabled(monkeypatch, adapter):
+    """The one door every loader's routing, body and load_skill calls go
+    through. Disabled, it opens to nothing; enabled again, the same router."""
+    import importlib
+
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    module = importlib.import_module(f"decimalai.{adapter}")
+    router = object()
+    monkeypatch.setattr(module, "_skill_router_singleton", router)
+
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(
+        api_key="dai_sk_test", base_url="http://localhost:9", enabled=False,
+    ))
+    assert module._get_skill_router() is None, (
+        f"decimalai.{adapter} still hands out its router after init(enabled=False)"
+    )
+    assert module._skill_router_singleton is router, "kept for when it is re-enabled"
+
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(
+        api_key="dai_sk_test", base_url="http://localhost:9", enabled=True,
+    ))
+    assert module._get_skill_router() is router
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS)
+def test_a_disabled_config_builds_no_router(monkeypatch, adapter):
+    import importlib
+
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    module = importlib.import_module(f"decimalai.{adapter}")
+    monkeypatch.setattr(module, "_skill_router_singleton", None)
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(
+        api_key="dai_sk_test", base_url="http://localhost:9", enabled=False,
+    ))
+    assert module._get_skill_router() is None
+    assert module._skill_router_singleton is None
+
+
+def test_langchain_loader_stops_routing_after_a_disabled_reinit(monkeypatch, fresh_sdk):
+    """The real loader on the real BaseChatModel: routes while enabled, makes
+    no call to the platform once disabled, and routes again when re-enabled."""
+    import decimalai
+    import decimalai.langchain as dlc
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    fake = _RoutingPlatform()
+    monkeypatch.setattr(httpx, "request", fake)
+    monkeypatch.setattr(dlc, "_skill_router_singleton", None)
+    seen: List[Any] = []
+    real_generate = FakeListChatModel._generate
+
+    def recording_generate(self, messages, *args, **kwargs):
+        seen.append(" ".join(str(m.content) for m in messages))
+        return real_generate(self, messages, *args, **kwargs)
+
+    monkeypatch.setattr(FakeListChatModel, "_generate", recording_generate)
+    llm = FakeListChatModel(responses=["ok"] * 3)
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", langchain=True)
+    llm.invoke("how do refunds work?")
+    assert fake.skill_calls(), "control: the enabled loader did not route at all"
+    assert "Recommended Skills" in seen[-1]
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=False)
+    before = list(fake.skill_calls())
+    llm.invoke("can I return an opened box?")
+    assert fake.skill_calls() == before, (
+        "init(enabled=False) did not stop the skill loader: "
+        + repr(fake.skill_calls()[len(before):])
+    )
+    assert "Recommended Skills" not in seen[-1]
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=True)
+    llm.invoke("what is the restocking fee?")
+    assert len(fake.skill_calls()) > len(before), "re-enabling did not resume routing"
+    assert "Recommended Skills" in seen[-1]
+
+
+def test_openai_agents_loader_stops_routing_after_a_disabled_reinit(monkeypatch, tmp_path):
+    agents = pytest.importorskip("agents")
+    import asyncio
+
+    import decimalai
+    import decimalai._config as cfg
+    import decimalai.openai_agents as oa
+    from agents.run_internal import turn_resolution
+    from agents.tracing import get_trace_provider, set_trace_processors
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING", "1")
+    monkeypatch.setattr(cfg, "_config", None, raising=False)
+    monkeypatch.setattr(cfg, "_client", None, raising=False)
+    for method in ("__init__", "get_system_prompt", "get_all_tools"):
+        monkeypatch.setattr(agents.Agent, method, getattr(agents.Agent, method))
+    monkeypatch.setattr(turn_resolution, "check_for_final_output_from_tools",
+                        turn_resolution.check_for_final_output_from_tools)
+    for name in ("_skill_loader_installed", "_agent_hooks_installed",
+                 "_final_output_guard_installed", "_installed"):
+        if hasattr(oa, name):
+            monkeypatch.setattr(oa, name, False)
+    monkeypatch.setattr(oa, "_skill_router_singleton", None)
+    monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
+    provider = get_trace_provider()
+    monkeypatch.setattr(provider._multi_processor, "_processors",
+                        tuple(provider._multi_processor._processors))
+    set_trace_processors([])
+    fake = _RoutingPlatform()
+    monkeypatch.setattr(httpx, "request", fake)
+
+    def prompt(agent, text):
+        ctx = agents.RunContextWrapper(context=None, turn_input=[{"role": "user", "content": text}])
+        return asyncio.run(agent.get_system_prompt(ctx)) or ""
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", openai_agents=True)
+    agent = agents.Agent(name="support", instructions="You help.")
+    assert "Recommended Skills" in prompt(agent, "how do refunds work?"), "control"
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=False)
+    before = list(fake.skill_calls())
+    assert "Recommended Skills" not in prompt(agent, "can I return an opened box?")
+    assert fake.skill_calls() == before

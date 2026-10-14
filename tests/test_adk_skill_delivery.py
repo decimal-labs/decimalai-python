@@ -653,7 +653,10 @@ class TestInvocationObserver:
         monkeypatch.setitem(sys.modules, "google.adk.runners", runners)
         first, second = [], []
         adk.instrument(agent_name="first", on_trace=first.append)
-        plugin = Runner().plugins[0]
+        # `plugins=[]`: the patch prepends the shared plugin to a caller's list.
+        # A bare `Runner()` is a shape real ADK refuses, and the patch now hands
+        # those over untouched so ADK's own error is what the caller sees.
+        plugin = Runner(plugins=[]).plugins[0]
         original_patch = Runner.__init__
         ic1 = SimpleNamespace(agent=_agent(), invocation_id="first")
         ic2 = SimpleNamespace(agent=_agent(), invocation_id="second")
@@ -667,7 +670,7 @@ class TestInvocationObserver:
 
         asyncio.run(drive())
         assert Runner.__init__ is original_patch
-        assert Runner().plugins[0] is plugin
+        assert Runner(plugins=[]).plugins[0] is plugin
         assert [trace.agent_name for trace in first] == ["first"]
         assert [trace.agent_name for trace in second] == ["second"]
         assert {trace.agent_name for trace in _flushed_traces()} == {"first", "second"}

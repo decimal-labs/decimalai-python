@@ -103,6 +103,15 @@ custom provider, reached through ADK's `LiteLlm`, and litellm pins `openai<3`.
 google-adk itself installs in both, and its unit tests and `J1` journey run in the
 openai 3 one. llamaindex and generic-otel need neither openai, so both grade them.
 
+A driver is never graded against a framework older than the SDK's floor. Each
+names the distributions whose floor gates it (`Driver.frameworks`), the floors
+are read from `pyproject.toml` itself (`floors.py`), and one installed below its
+floor makes the driver unavailable with that reason — NOT RUN, and under
+`DECIMAL_CONFORMANCE_REQUIRE_ALL=1` a failure in an environment the driver
+belongs to. It exists because a driver runs wherever its imports resolve: an
+openai 2 environment held openai-agents 0.20.0 (openai-agents needs openai 3 from
+0.21), and its column was being graded there, against a release the SDK dropped.
+
 The map lives in `environments.py` (`DRIVER_ENVS`), and `test_coverage.py` fails on
 a driver that is in no environment. With `DECIMAL_CONFORMANCE_REQUIRE_ALL=1`, a
 driver that belongs to the current environment and cannot import its framework is
@@ -177,6 +186,10 @@ The whole driver surface:
 | `run_degenerate(ctx)` | a run with no model and no tools |
 | `run_skills(ctxs)` | the skills rail, one run per lane |
 | `run_nested(ctx)` | the snippet once more, with `trace_observer(ctx)` as the adapter's `on_trace` — the harness wraps it in its own `decimalai.start_trace()` |
+| `run_unnamed(ctx)` | the rail on an agent the framework does not name the DecimalAI way (required with a rail) |
+| `run_conversation(ctxs)` | two turns of one conversation, `ctxs[1]` carrying `ctxs[0]`'s history (required with a rail) |
+| `shapes` | second documented shapes, each a `Shape(name, doc, run, lanes, routed)` |
+| `frameworks` | the distributions whose `pyproject.toml` floor gates the driver |
 
 Everything a driver needs arrives on `Ctx`, and the contract asserts against the
 **same** `Ctx`. The sentinels are load-bearing: `ctx.prompt_sentinel` must go
@@ -253,15 +266,20 @@ a property of one driver's run, not something another framework may inject.
 | `concurrent` | N lanes, distinct agents | C9 |
 | `nested` | the snippet inside a `decimalai.start_trace()` the harness opens, with the suite's observer as `on_trace` | C15 C16 |
 | `skills` | the rail, N lanes, one agent | C8 |
+| `unnamed` | the rail on an agent the framework does not name the DecimalAI way, under a new agent name | C18 |
+| `conversation` | two turns of one conversation, the second carrying the first's history | C19 |
+| `shape:<name>` | each second documented shape the driver declares (`drivers.Shape`) | S1 |
 
-`skills` runs last on purpose: on several adapters, enabling the rail is an
-irreversible process-wide monkey-patch that would double-trace every other
-phase. `DRIVER_MODULES` is ordered for the same reason — the drivers that enable
-a process-wide OpenInference instrumentor run last.
+`skills` runs last among the first eight on purpose: on several adapters,
+enabling the rail is an irreversible process-wide monkey-patch that would
+double-trace every other phase. The three kinds of phase after it all run with
+the rail already on. `DRIVER_MODULES` is ordered for the same reason — the
+drivers that enable a process-wide OpenInference instrumentor run last.
 
-C2, C6, C11 and C12 grade **every** phase. `nested` runs before `skills`: on
-langchain the rail is a process-wide handler that would trace the nested run a
-second time, beside the per-call handler carrying the observer.
+C2, C6, C11, C12, C17 and C18 grade **every** phase, the new ones included.
+`nested` runs before `skills`: on langchain the rail is a process-wide handler
+that would trace the nested run a second time, beside the per-call handler
+carrying the observer.
 
 ## The probe
 
@@ -305,10 +323,31 @@ fingerprint covers the two validator functions and the four constants they read,
 would be switched off within a month. Re-read those by hand when the guard
 fires.
 
+**It answers routing the way the platform does.** `POST /skills/route` and
+`GET /skills/menu` return the platform router's own shapes, field for field:
+`strategy` is `smart_routing` or `full_menu` (the only two values the platform
+sends), `query_ranked` says whether the order is about the query, and the
+prefix/tail split (`stable_menu`, `menu_instruction`, `routing_hint`,
+`stable_menu_skills`) rides beside a `prompt_fragment` rendered as the
+platform renders it. Those fields are not decoration: the SDK injects a skill
+body only when `query_ranked` is true, and the langchain adapter builds its
+prompt from the split. `/route` answers as the platform's hybrid-retrieval path
+does (`query_ranked` true whenever a row came back); it does not port the
+show-all-under-budget short-circuit, where a two-skill workspace whose skill
+names share no word with the prompt is — correctly — not ranked, and every
+injected-delivery cell would grade the router's refusal instead of the adapter's
+channel. Measured: with `query_ranked: false` on `/route`, all four openai 3
+`D1[injected]` cells go red, so those cells grade injection on a ranked result
+and nothing weaker. `test_probe_router_matches_the_platform` re-reads the
+platform's router source whenever the platform repo is beside this one and fails
+when a strategy, a field the probe sends, `query_ranked` or the menu instruction
+text moves.
+
 **Routing provenance.** The probe records which query each `routing_id` was
-minted for. That turns "two lanes happened to collide" into a deterministic
-statement: *this run reports a routing decision the router made for that other
-run*.
+minted for, and every routing request lands in its log with the `agent_name` it
+named. That turns "two lanes happened to collide" into a deterministic
+statement — *this run reports a routing decision the router made for that other
+run* — and is what C18 and C19 join traces against.
 
 ## The contract (v1)
 
@@ -332,7 +371,11 @@ run*.
 | C14 `skills_body_delivered` | a skill's **body** reached the model, by any channel |
 | C15 `invocation_observer` | the adapter's `on_trace` is handed each run's trace once — a detached `RunTrace` matching the wire — and an observer that raises costs neither the run nor its trace |
 | C16 `parent_link` | a run made inside the caller's `decimalai.start_trace()` ships as that trace's child (`parent_trace_id`) |
+| C17 `tool_result` | a tool call recorded as done (`status=success`) carries what the tool returned |
+| C18 `routed_as_traced` | the agent a run is routed for is the agent its trace is filed under — including an agent the framework does not name |
+| C19 `conversation_routed` | every turn of a conversation is routed, on that turn's own message |
 | D1 `delivery_channel` | …and each channel delivers **on its own**, with the other switched off |
+| S1 `entry_shape` | a second documented way into the framework constructs, ships one trace per run under the agent asked for, and is routed |
 | J1 `journey` | the whole path: an agent on the platform → `decimalai init` → a file that runs → its prompt and a skill body in front of the model |
 
 C7b is the second clause of C7, split out so a framework with no degenerate form
@@ -368,9 +411,66 @@ that gives them one — and that commit is graded on the link too.
 Exact token counts are **not** asserted here — a stub model's numbers are
 arbitrary. Presence and plausibility are Tier A's job; exact counts are Tier B's.
 
+### The 2026-10-13 audit's silent failures (C17, C18, C19, S1)
+
+Each of these went live with a cell that was red on the code before the Phase 1
+fixes and green after them, run with the same task environments:
+
+| Cell | The defect it is red for |
+|---|---|
+| `adk:C17` | every ADK tool call was recorded as `success` with `result: null` |
+| `langchain:C18` | a run named per call (`CallbackHandler(agent_name=...)`) was routed as the process's install name |
+| `pydantic-ai:C18` | an unnamed `Agent` was routed as `agent`, the variable name Pydantic AI infers |
+| `pydantic-ai:C19` | the second turn of a `message_history=` conversation was never routed |
+| `adk:S1[app_runner]` | `Runner(app=App(...))`, the `adk web` shape, raised `ValueError` after the global install |
+| `openai-agents:S1[sandbox_agent]` | a `SandboxAgent` run made zero router calls |
+| `openai-agents:S1[init_flag_then_instrument]` | `init(openai_agents=True)` then `instrument()` shipped every run three times |
+| `anthropic:S1[messages_stream]` | `messages.stream()` got no skills |
+
+**C17** reads every `llm_calls[].tool_calls[]` entry in every phase. A record
+that says the call **finished** must carry what the tool returned; a record the
+adapter only saw REQUESTED — the OTel rail reads it off the model span, and the
+tool runs where no hook of ours sees it — is written `status=running` and is
+not asked for a result it never had. `ToolCallRecord.status` defaults to
+`success`, which is exactly how a resultless record ends up claiming a success.
+
+**C18** joins each trace's `routing_id` to the routing request that minted it
+(the probe's own log: the `agent_name` in the `POST /skills/route` body or the
+`GET /skills/menu` query) and compares that name with the trace's
+`agent_name`. Routing is agent-scoped on the platform, so a run traced as one
+agent and routed as another (or as none) is offered none of its own skills, and
+nothing anywhere errors. Every rail driver has a `run_unnamed` hook for the case
+that bit: an agent the framework does not name the DecimalAI way, under an agent
+name no earlier phase used, with the DecimalAI name given once, where the
+adapter documents taking it.
+
+**C19** runs two turns of one conversation in whatever form the framework
+documents (`message_history=`, the previous result's input list, the same ADK
+session, a message list) and requires a routing decision per turn, minted for
+that turn's own message — read from the probe's record of the query each
+routing id was minted for.
+
+### The shape axis (S1)
+
+C1–C19 grade each framework's MAIN documented snippet. Frameworks document more
+than one way in, and the audit found the other ways broken while the main one
+was green. A driver names the second shapes it knows as `drivers.Shape` entries;
+each runs as its own phase (`shape:<name>`, last of all) in the SAME child
+process as the per-driver matrix, and `contract.grade_shape` holds it to the run
+contract: it constructs and runs without raising, every run ships exactly one
+accepted trace under the agent asked for, and a `routed` shape has its own
+routing id on each trace and the offered menu in front of the model. Its cells
+are (driver, shape) pairs, like the delivery axis's (driver, mode): a driver
+with no second shape has no cell rather than an N/A.
+
+Today's shapes: `adk:app_runner` (`InMemoryRunner(app=App(...))` as `adk web`
+builds it, then `Runner(app=App(..., plugins=[DecimalaiPlugin(...)]))`, both
+after the global install), `openai-agents:sandbox_agent`,
+`openai-agents:init_flag_then_instrument` and `anthropic:messages_stream`.
+
 ### The delivery axis (D1)
 
-C1–C16 grade one capture per driver, in whatever configuration that adapter
+C1–C19 grade one capture per driver, in whatever configuration that adapter
 resolves to on its own. D1 is a **second axis over the same capture style**: one
 child process per *(driver, body channel)*, with the **other channel switched
 off** in that process's environment.
@@ -411,7 +511,7 @@ that channel. An adapter that grows the capability stops being excused.
 
 ### The journey axis (J1)
 
-C1–C16 and D1 all grade **one adapter**, handed a `Ctx` by a driver that already
+C1–C19, S1 and D1 all grade **one adapter**, handed a `Ctx` by a driver that already
 knows the agent's name, already holds the skills, and never once runs the
 product's own entry point. J1 grades what a user actually does:
 
@@ -674,8 +774,20 @@ Stated so nobody mistakes a green cell for a guarantee.
 - **Tool-call argument fidelity.** Nothing asserts that
   `llm_calls[].tool_calls[].args` is the argument dict the model produced. On
   LangChain it is currently `{"input": "{'query': '…'}"}` — the dict
-  stringified under an invented key. Worth a C14; deliberately out of v1 scope.
-  (Renumbered from "C13", which now names the activation item above.)
+  stringified under an invented key. Worth an item of its own; deliberately out
+  of v1 scope. (Renumbered from "C13", which now names the activation item above.)
+- **A tool result the adapter never recorded.** C17 holds a record that CLAIMS a
+  finished call to carrying the result, and accepts one recorded as requested
+  (`status=running`) with none. So it does not catch an adapter that could have
+  seen the result and wrote the call down as requested anyway: the CrewAI trace
+  carries the tool's output on its `conformance_lookup.run` span while its
+  `tool_calls[]` entry stays `running` with no result, and C17 passes it. Nor
+  does it hold the result's FORM: on LangChain the result is the `ToolMessage`
+  repr (`content='…' name='…' tool_call_id='…'`), which carries the text.
+- **Second shapes nobody declared.** S1 grades the shapes drivers name. A
+  framework's other documented entry points — streaming on the agent
+  frameworks, `Agent.kickoff()` on CrewAI outside a conversation, the async
+  entry points — have no S1 cell until a driver declares one.
 - **What the model DOES with a delivered skill.** C14, D1 and J1 all stop at the
   same line: the body was in the context the model was handed. The model here is
   a stub, so nothing in Tier A says a real one read it, followed it, or answered

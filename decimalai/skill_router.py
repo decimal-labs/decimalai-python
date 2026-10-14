@@ -377,16 +377,37 @@ def _is_hot_path(path: str) -> bool:
     return path in _HOT_PATHS or _is_body_path(path)
 
 
-def _skill_body_path(name: str) -> str:
-    """``/api/v1/skills/{name}/body`` with the name percent-encoded.
+_REGISTRY_SKILLS_PREFIX = "/api/v1/registry/skills/"
 
-    Raw, a ``#`` or ``?`` in the name ended the path: ``weird#name`` requested
-    ``/skills/weird`` with a fragment. ``/`` stays literal because the backend
-    declares the route as ``{skill_name:path}`` for namespaced registry names
-    (``owner/name``, about 2/3 of the registry), and that is the spelling every
-    proxy in front of it already passes through.
+
+def _path_part(value: Any) -> str:
+    """One caller-supplied value (a skill name, an id, a file path) as URL path text.
+
+    Raw, a ``#`` or ``?`` ended the path: ``weird#name`` requested
+    ``/skills/weird`` with a fragment, and a space or ``%`` was sent as
+    whatever the transport made of it. ``/`` stays literal: the body route is
+    ``{skill_name:path}`` for namespaced registry names (``owner/name``, about
+    2/3 of the registry) and attachment paths are nested, while the other
+    per-skill routes are one segment, where an encoded ``%2F`` is decoded back
+    to ``/`` before routing and would not match either. Keeping it literal
+    means every name that worked before produces the same bytes.
     """
-    return f"{_SKILLS_PREFIX}{quote(name, safe='/')}{_BODY_SUFFIX}"
+    return quote(str(value), safe="/")
+
+
+def _skill_path(ref: Any, suffix: str = "") -> str:
+    """``/api/v1/skills/{ref}{suffix}`` with ``ref`` encoded (see ``_path_part``)."""
+    return f"{_SKILLS_PREFIX}{_path_part(ref)}{suffix}"
+
+
+def _registry_skill_path(ref: Any, suffix: str = "") -> str:
+    """``/api/v1/registry/skills/{ref}{suffix}`` with ``ref`` encoded."""
+    return f"{_REGISTRY_SKILLS_PREFIX}{_path_part(ref)}{suffix}"
+
+
+def _skill_body_path(name: str) -> str:
+    """``/api/v1/skills/{name}/body`` with the name percent-encoded."""
+    return _skill_path(name, _BODY_SUFFIX)
 
 
 def _is_health_failure(path: str, status: int) -> bool:
@@ -420,23 +441,86 @@ def _ranked_by_this_query(result: Dict[str, Any]) -> bool:
     """Did the platform rank this result by the query it was asked?
 
     Only then is its top row a body worth injecting. The platform answers a
-    query with its effectiveness-ordered menu in two cases — a workspace small
-    enough to show whole (``strategy: "full_menu"``, with ``query_ranked`` False
-    when no query term matched a row) and every retrieval fallback (flagged
-    ``degraded``). Injecting the top row there put the workspace's best-rated
-    skill, up to 6k tokens of it, into turns like "thanks!" (audit R2).
+    query with its effectiveness-ordered menu when the workspace is small
+    enough to show whole and on every retrieval fallback (``strategy:
+    "full_menu"``). When no query term matched a row, that order ignores the
+    query, and injecting its top row put the workspace's best-rated skill, up
+    to 6k tokens of it, into turns like "thanks!" (audit R2).
 
-    Reads the platform's own signals and nothing else: ``degraded`` (or a
-    ``degraded_reason``) refuses; ``query_ranked``, when sent, decides; a
-    ``full_menu`` result without it is unranked by definition. Hybrid retrieval
-    (``smart_routing``) ranks by the query and does not send ``query_ranked``.
+    ``query_ranked`` is the platform's answer, and it decides whenever it is
+    sent. ``degraded`` does NOT: it says how the result was retrieved (embedder
+    down, a retrieval leg failed), not whether its order is about the query.
+    A degraded result can be either kind — lexical-only hybrid retrieval, in
+    which every row matched a query term, or a fallback menu whose top row a
+    term matched, are both ranked (injecting there is how the SDK behaved
+    before embeddings existed); a fallback menu nothing matched is not.
+
+    Without ``query_ranked`` (a platform that predates it on hybrid results):
+    ``full_menu`` is unranked, and hybrid retrieval (``smart_routing``) ranks
+    by the query by construction, degraded or not.
     """
-    if result.get("degraded") is True or result.get("degraded_reason"):
-        return False
     ranked = result.get("query_ranked")
     if ranked is not None:
         return ranked is True
     return result.get("strategy") != "full_menu"
+
+
+#: A failed routing call that took at least this long is cached for the turn.
+#: Edge aborts, auth and plan refusals and most 5xx come back in milliseconds;
+#: a timeout or an admission wait costs seconds.
+_SLOW_FAILURE_S = 1.0
+
+
+def _failure_worth_caching(result: Dict[str, Any], elapsed_s: float) -> bool:
+    """Should this failed routing call be cached for the rest of the turn?
+
+    Only when retrying it would cost the turn time again: a timeout (the 5 s
+    read budget, every time) or any failure that took ``_SLOW_FAILURE_S`` or
+    more (a 429 whose admission retries waited out their ``Retry-After``).
+
+    Not a fast failure — an edge 429 with no ``Retry-After``, a 503, a 401 —
+    which costs nothing to repeat and is usually gone on the next call. A run
+    of them is the circuit breaker's job: it counts them, and three in a row
+    open it. Not an open breaker either: that skipped the call, so it cost
+    nothing, and caching it would keep the run skill-less after it closes.
+    """
+    reason = result.get("degraded_reason")
+    if reason == "circuit_open":
+        return False
+    return reason == "timeout" or elapsed_s >= _SLOW_FAILURE_S
+
+
+def _bodies_without_ranking(
+    result: Dict[str, Any], routed_names: List[str], prioritized: List[str],
+) -> List[str]:
+    """The bodies worth injecting from a result NOT ranked by this query.
+
+    The top row of such a result is the workspace's best-rated skill, not the
+    one this turn is about, so it is not injected on that basis (audit R2).
+    Two bodies are the right ones regardless of the query, because there is no
+    other to pick:
+
+    * ``prioritized`` — the developer's ``priority_skills`` the platform
+      offered this agent: shared guidance (reply format, house style) that
+      applies to every reply. A name it did not offer is never here.
+    * the agent's ONLY skill — a ``full_menu`` whose ``rows_total`` is 1 is the
+      platform saying this menu is the agent's whole eligible set, and it is
+      one skill. Any turn that needs a body needs this one. The SDK cannot
+      tell "thanks!" from a reworded question, so small talk gets it too.
+
+    A single row that is a SLICE of a larger set (a capped fallback menu, a
+    top-k retrieval, a platform that does not say how big the set is) is not
+    the agent's only skill, and stays menu-only.
+    """
+    names = list(prioritized)
+    only = (
+        result.get("strategy") == "full_menu"
+        and result.get("rows_total") == 1
+        and len(routed_names) == 1
+    )
+    if only and routed_names[0] not in names:
+        names.append(routed_names[0])
+    return names
 
 
 class _CircuitBreaker:
@@ -1177,20 +1261,27 @@ class SkillRouter:
         # not one of its own scopes. Cleared automatically the moment all four
         # unscoped rails are empty, so it describes only undrained content.
         self._unscoped_rail_owners: "OrderedDict[str, None]" = OrderedDict()
-        # What `load_skill` may serve: every name `build_prompt_fragment` put
-        # in front of the model — the routed rows, the stable menu (which holds
-        # every hinted name), and injected bodies. Per run under `scope=`, and
-        # once more for the whole router, which is what an unscoped load (or a
-        # scope this router never routed for) is checked against: unscoped
-        # callers have no run identity, and refusing a concurrent
-        # conversation's own offer would break a working path to close a
-        # hole the process-wide set already closes. Not drained by
-        # `_release_scoped_routing_rail` — the run's loads come after its route.
-        # Bounded LRU like the rails; `_has_routed` keeps a router that never
-        # routed (a hand-built menu, a direct `load_skill`) unrestricted.
-        self._loadable_by_scope: "OrderedDict[str, set]" = OrderedDict()
-        self._loadable_any: "OrderedDict[str, None]" = OrderedDict()
-        self._has_routed = False
+        # The routing decision each run's `load_skill` calls belong to, sent as
+        # `routing_id` on the body request. The platform serves owned,
+        # installed and assigned skills whatever it says, and serves a skill
+        # reachable ONLY through the public registry just when that decision
+        # offered it. The SDK cannot make that call itself: the menu caps at
+        # about eight rows, so an owned skill below the cut looks exactly like
+        # a planted public name from here.
+        #
+        # Value: the run's latest `routing_id`, or "" when its routing call
+        # returned none (it failed — the run was offered nothing). Per run
+        # under `scope=`, plus the latest for the whole router, which an
+        # unscoped load (or a scope this router never routed for) sends. That
+        # may be a concurrent run's decision, which is safe for the skills that
+        # matter: an owned or installed skill, or one assigned to the agent the
+        # load names, is served whichever decision is named. Not drained by
+        # `_release_scoped_routing_rail` — a run's loads come after its route.
+        # Bounded LRU like the rails. `_last_run_routing_id` None means this
+        # router never routed (a hand-built menu, a direct `load_skill`), and
+        # those loads send no `routing_id` at all.
+        self._run_routing_ids: "OrderedDict[str, str]" = OrderedDict()
+        self._last_run_routing_id: Optional[str] = None
         # One lock for every per-scope store. `otel._skill_rails` and
         # `openai_agents._run_rails` both take one; these did not, and the
         # `get` -> `move_to_end` -> `popitem` sequences below are not atomic.
@@ -1523,6 +1614,7 @@ class SkillRouter:
         *,
         max_chars: Optional[int] = None,
         agent_name: Optional[str] = None,
+        routing_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Like :meth:`get_skill_body` but returns the whole server record.
 
@@ -1532,6 +1624,13 @@ class SkillRouter:
         receiving them, so every activation the SDK reported carried
         ``skill_hash: null`` — breaking the join that attributes a measured lift to
         the skill VERSION the model actually read.
+
+        ``routing_id`` names the routing decision this fetch belongs to, for a
+        loop that loads skills inside an agent run: the platform then serves a
+        skill reachable only through the public registry just when that
+        decision offered it (owned, installed and assigned skills are served
+        either way), and ``""`` means a run that was offered nothing.
+        :meth:`load_skill` sends it for you. Omitted, nothing changes.
         """
         params: Dict[str, Any] = {}
         if version is not None:
@@ -1540,6 +1639,10 @@ class SkillRouter:
             params["max_chars"] = max_chars
         if agent_name is not None:
             params["agent_name"] = agent_name
+        if routing_id is None:
+            routing_id = getattr(_body_hash_tls, "load_routing_id", None)
+        if routing_id is not None:
+            params["routing_id"] = routing_id
 
         # Why the last fetch on this thread returned nothing, for `load_skill`:
         # None means "no such skill" (a 404) or success; a reason string means
@@ -1581,33 +1684,32 @@ class SkillRouter:
 
         Always returns a STRING (never raises): either the trimmed body block
         the adapter feeds back as the tool result, or an explanatory message
-        (not offered / budget exhausted / not found / platform unavailable) the
+        (budget exhausted / not found / platform unavailable) the
         model can act on. Enforces the per-turn body guardrail:
         ``max_loaded_bodies``, ``body_token_budget``, ``per_body_char_limit``
         cap, ``body_load_deadline_s``. Records the load on the active trace
         (``skills_loaded_by_agent``) so the offered-vs-loaded join closes
         server-side.
 
-        Serves only a skill this router put in front of the model — see
-        :meth:`_not_offered_refusal`. ``/body`` itself serves any public
-        registry skill by name, so without this a prompt injection naming a
-        planted skill could load it.
+        Names the run's routing decision on the request (``routing_id``, see
+        :meth:`_run_routing_id`). The platform then serves any skill the org
+        owns, has installed or has assigned, and serves a skill reachable only
+        through the public registry just when that decision offered it — so a
+        prompt injection naming a planted public skill gets "no skill named",
+        while a skill of the org's own that the menu cap pushed off this
+        turn's menu still loads.
 
         Args:
             scope: an opaque key naming the RUN this load belongs to (the
-                adapter's trace id). Budget accounting, the offered-skills
-                check and the loaded-names rail are kept per scope, so
-                concurrent runs sharing one router singleton stop consuming
-                each other's turn budget. Omit it and the single-slot
-                fallback applies.
+                adapter's trace id). Budget accounting, the routing decision
+                sent with the load and the loaded-names rail are kept per
+                scope, so concurrent runs sharing one router singleton stop
+                consuming each other's turn budget. Omit it and the
+                single-slot fallback applies.
         """
         name = (name or "").strip()
         if not name:
             return "load_skill error: a skill name is required."
-
-        refusal = self._not_offered_refusal(name, scope)
-        if refusal is not None:
-            return refusal
 
         # A caller that names its run is the most precise answer available,
         # so it wins outright: falling back to the ContextVar there would
@@ -1654,11 +1756,20 @@ class SkillRouter:
         _body_hash_tls.partial = None
         _body_hash_tls.identity = None
         _body_hash_tls.unavailable = None
-        body = self.get_skill_body(
-            name,
-            max_chars=self.per_body_char_limit,
-            agent_name=agent_name or self.agent_name,
-        )
+        # The run's routing decision rides the same thread-local into
+        # `get_skill_body_record`, for the same reason as the hash: a new
+        # keyword on `get_skill_body` would break every stub of it. Set for
+        # exactly this call and cleared even if it raises, so no other fetch
+        # on this thread (an injected body, an export) ever carries it.
+        _body_hash_tls.load_routing_id = self._run_routing_id(scope)
+        try:
+            body = self.get_skill_body(
+                name,
+                max_chars=self.per_body_char_limit,
+                agent_name=agent_name or self.agent_name,
+            )
+        finally:
+            _body_hash_tls.load_routing_id = None
         content_hash = getattr(_body_hash_tls, "value", None)
         identity = getattr(_body_hash_tls, "identity", None) or {}
         partial = getattr(_body_hash_tls, "partial", None)
@@ -1787,54 +1898,33 @@ class SkillRouter:
             what, scope, self._MAX_SCOPED_RAILS,
         )
 
-    def _remember_loadable(self, scope: Optional[str], names: List[str]) -> None:
-        """Record what one routing call put in front of the model, for load_skill.
+    def _remember_run_routing(self, scope: Optional[str], routing_id: Optional[str]) -> None:
+        """Record the decision one routing call made, for this run's load_skill.
 
-        Called on every routing call, a failed one included: a run whose route
-        failed was offered nothing, and that has to be recorded too.
+        Called on every routing call, a cache hit and a failed one included: a
+        run whose route failed was offered nothing, recorded as ``""``.
         """
+        value = routing_id if isinstance(routing_id, str) else ""
         with self._rail_lock:
-            self._has_routed = True
-            for name in names:
-                self._loadable_any[name] = None
-                self._loadable_any.move_to_end(name)
-            while len(self._loadable_any) > self._MAX_SCOPED_RAILS:
-                self._loadable_any.popitem(last=False)
+            self._last_run_routing_id = value
             if scope is None:
                 return
-            allowed = self._loadable_by_scope.get(scope)
-            if allowed is None:
-                allowed = self._loadable_by_scope[scope] = set()
-            allowed.update(names)
-            self._loadable_by_scope.move_to_end(scope)
-            while len(self._loadable_by_scope) > self._MAX_SCOPED_RAILS:
-                self._loadable_by_scope.popitem(last=False)
+            self._run_routing_ids[scope] = value
+            self._run_routing_ids.move_to_end(scope)
+            while len(self._run_routing_ids) > self._MAX_SCOPED_RAILS:
+                self._run_routing_ids.popitem(last=False)
 
-    def _not_offered_refusal(self, name: str, scope: Optional[str]) -> Optional[str]:
-        """None if ``load_skill(name)`` may proceed, else the tool message.
+    def _run_routing_id(self, scope: Optional[str]) -> Optional[str]:
+        """The ``routing_id`` a load in ``scope`` sends, or None to send none.
 
-        A name passes when this run (``scope``) was offered it, or — for an
-        unscoped call, or a scope this router never routed for — when this
-        router offered it to any run. A router that has not routed at all has
-        nothing to check against and stays unrestricted.
+        This run's latest decision; for an unscoped load, or a scope this
+        router never routed for, the router's latest. None only when this
+        router has never routed.
         """
         with self._rail_lock:
-            if not self._has_routed:
-                return None
-            allowed = self._loadable_by_scope.get(scope) if scope is not None else None
-            if allowed is None:
-                offered = name in self._loadable_any
-            else:
-                offered = name in allowed
-        if offered:
-            return None
-        logger.info("load_skill refused %r: not offered by this router for this run", name)
-        return (
-            f"load_skill: {name!r} was not offered for this request, so it was not "
-            "loaded. Only the skills listed under '## Recommended Skills' or "
-            "'## Available Skills' can be loaded — use one of those exact names, or "
-            "answer without a skill."
-        )
+            if scope is not None and scope in self._run_routing_ids:
+                return self._run_routing_ids[scope]
+            return self._last_run_routing_id
 
     def _budget_for(self, scope: Optional[str]) -> Optional[_BodyLoadBudget]:
         """This run's turn budget, or the legacy single slot when unscoped."""
@@ -2321,16 +2411,21 @@ class SkillRouter:
         Errors are swallowed: a failed platform call returns
         ``("", None)`` so prompt assembly never blocks on a transient
         network blip. The warning is logged and ``routing_status()`` turns
-        unhealthy. A failure IS cached, for the same window as a success, so
-        the other LLM calls of the turn do not each pay the timeout again
-        (until 2026-10-14 every call retried). A new run (another ``scope``)
-        or another query retries; so does ``bypass_cache=True``. An open
-        breaker is not cached: it costs nothing and should stop answering
-        for the run the moment the breaker closes.
+        unhealthy. A SLOW failure (a timeout, an admission wait) is cached,
+        for the same window as a success, so the other LLM calls of the turn
+        do not each pay that time again (until 2026-10-14 every call
+        retried). A new run (another ``scope``) or another query retries; so
+        does ``bypass_cache=True``. A fast failure (an edge 429, a 5xx, a
+        401) is not cached: retrying it costs nothing, and the circuit
+        breaker stops a run of them. Nor is an open breaker: it costs nothing
+        and should stop answering for the run the moment the breaker closes.
 
-        Bodies are injected only for a result the platform ranked by THIS
-        query and did not mark degraded (see ``_ranked_by_this_query``).
-        Otherwise the menu goes in alone.
+        Bodies are injected for a result the platform ranked by THIS query
+        (see ``_ranked_by_this_query``) — degraded retrieval included, when
+        its rows still matched the query. From any other result only the
+        bodies no ranking could change are injected: offered
+        ``priority_skills``, and the agent's only skill (see
+        ``_bodies_without_ranking``). Otherwise the menu goes in alone.
 
         Args:
             query: The user message — used for semantic routing when
@@ -2384,11 +2479,11 @@ class SkillRouter:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, loadable) = cached
-                # The hit re-offers the same menu, so it re-files the same
-                # loadable names — a no-op unless the run's entry was evicted
-                # from the bounded store since the miss.
-                self._remember_loadable(scope, loadable)
+                 delivered_versions) = cached
+                # The hit re-offers the same decision, so this run's loads name
+                # it — the cache key carries the scope, so the miss filed it
+                # under this run already unless the bounded store evicted it.
+                self._remember_run_routing(scope, routing_id)
                 # A cache hit must re-emit the split exactly as the miss did.
                 # Without this, the second LLM call of a turn loses the prefix
                 # and the adapter falls back to the fragment — the injected
@@ -2426,6 +2521,9 @@ class SkillRouter:
         _last_delivered_versions_ctx.set(None)
         _last_split_parts_ctx.set(None)
 
+        # How long the routing call took: a failure is cached only when
+        # retrying it would cost the turn that time again (see below).
+        route_started = time.monotonic()
         if query and self.strategy in ("auto", "semantic"):
             try:
                 result = self.smart_route(
@@ -2451,6 +2549,7 @@ class SkillRouter:
                 result = {"skills": [], "prompt_fragment": "", "strategy": "none",
                           "degraded_reason": _empty_menu_reason(e)}
         routing_failed = _routing_call_failed(result)
+        route_elapsed = time.monotonic() - route_started
 
         fragment = result.get("prompt_fragment", "") or ""
         routing_id = result.get("routing_id")
@@ -2495,26 +2594,37 @@ class SkillRouter:
         # append it. This rides the same 30s fragment cache, so within one user turn the body is
         # fetched once (one get_skill_body call), not per LLM call. A missing body degrades
         # gracefully to the menu-only fragment.
-        # Only inject when the PLATFORM says the result is ranked by this query
-        # and not degraded. Asking for a route was never enough: the platform
-        # answers a route with its effectiveness-ordered menu for small
-        # workspaces and on every retrieval fallback, and the top row of that
-        # is not about this query — "thanks!" got the best-rated skill's body.
+        # Only inject when the PLATFORM says the result is ranked by this
+        # query. Asking for a route was never enough: the platform answers a
+        # route with its effectiveness-ordered menu for small workspaces and on
+        # every retrieval fallback, and when no query term matched, the top row
+        # of that is not about this query — "thanks!" got the best-rated
+        # skill's body. A degraded result whose rows did match is ranked.
         # Fetch with a bounded character cap, but inject only complete bodies.
         # Partial server responses and oversized old-server bodies are omitted;
         # the same total token budget applies to the first and later bodies.
-        smart_routed = (
-            bool(query) and self.strategy in ("auto", "semantic")
-            and _ranked_by_this_query(result)
-        )
+        #
+        # Two kinds of body need no ranking, because there is no wrong one to
+        # pick (see `_bodies_without_ranking`): the agent's ONLY skill, and the
+        # `priority_skills` the developer reserved a slot for. Without them a
+        # small workspace's reworded question ("I want my money back" against
+        # "refund-policy: Refund rules" shares no word, so the platform says
+        # unranked) left the injection-only adapters a menu row the model
+        # cannot open.
+        routed_for_query = bool(query) and self.strategy in ("auto", "semantic")
+        prioritized = [name for name in self.priority_skills if name in routed_names]
+        if routed_for_query and _ranked_by_this_query(result):
+            body_names = prioritized + [name for name in routed_names if name not in prioritized]
+        elif routed_for_query:
+            body_names = _bodies_without_ranking(result, routed_names, prioritized)
+        else:
+            body_names = []
         delivered_names: List[str] = []
         delivered_versions: List[Dict[str, str]] = []
-        if effective_inject and routed_names and smart_routed:
+        if effective_inject and routed_names and body_names:
             bodies = []
             body_tokens = 0
             count_cap = min(self.inject_body_top_k, self.max_loaded_bodies)
-            prioritized = [name for name in self.priority_skills if name in routed_names]
-            body_names = prioritized + [name for name in routed_names if name not in prioritized]
             for name in body_names[:count_cap]:
                 body_options: Dict[str, Any] = {"max_chars": self.per_body_char_limit}
                 if effective_agent is not None:
@@ -2589,18 +2699,10 @@ class SkillRouter:
         _body_budget_ctx.set(fresh_budget)
         self._remember_budget(fresh_budget, scope)
 
-        # What load_skill may serve for this run: everything this call put in
-        # front of the model. The stable menu is included on the fragment path
-        # too — it is this agent's own eligible set, and it holds every hinted
-        # name — so the check never refuses a skill the platform resolved for
-        # this agent; it refuses names the platform never offered at all.
-        loadable = list(dict.fromkeys(
-            routed_names + offered_names + delivered_names + [
-                n for n in (result.get("stable_menu_skills") or [])
-                if isinstance(n, str) and n
-            ]
-        ))
-        self._remember_loadable(scope, loadable)
+        # The decision this run's load_skill calls name, so the platform can
+        # tell a skill this run was shown from a public name it never offered.
+        # A failed call files "" — the run was offered nothing.
+        self._remember_run_routing(scope, routing_id)
 
         # Mirror onto the instance rails before stamping — the adapters
         # whose contextvars never reach trace-send read the routing
@@ -2615,23 +2717,25 @@ class SkillRouter:
         # or an idempotent double-set there.
         _stamp_active_trace(routing_id, offered_names, delivered_names, delivered_versions)
 
-        # Cache the result, a failed call included. A failure used to be
-        # retried by every LLM call of the turn — each one paying the full 5 s
-        # timeout until three of them opened the breaker. Cached, the turn pays
-        # it once; the next run (another scope) or query asks again. An open
-        # breaker is the exception: it cost nothing, and caching it would keep
-        # this run skill-less after the breaker closes. The cached value
+        # Cache the result, and a failed call when it was SLOW. A slow failure
+        # used to be retried by every LLM call of the turn — each one paying
+        # the full 5 s timeout (or an admission wait) until three of them
+        # opened the breaker. Cached, the turn pays it once; the next run
+        # (another scope) or query asks again. A FAST failure is not cached
+        # (see `_failure_worth_caching`): retrying it costs nothing, and on an
+        # unscoped caller (LangChain) a cached one also took skills from every
+        # other run asking the same question for 30 s. The cached value
         # carries offered/delivered so cache hits can re-emit them; the public
         # return stays a 2-tuple.
         split_parts = (split_prefix, split_tail) if split_prefix else None
         _last_split_parts_ctx.set(split_parts)
 
-        cache_failure = routing_failed and result.get("degraded_reason") != "circuit_open"
+        cache_failure = routing_failed and _failure_worth_caching(result, route_elapsed)
         if fragment or routing_id or cache_failure:
             self._fragment_cache.set(
                 cache_key,
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, loadable),
+                 delivered_versions),
             )
         return fragment, routing_id
 
@@ -2787,7 +2891,7 @@ class SkillRouter:
         Returns:
             Skill descriptor with all metadata.
         """
-        return self._request("GET", f"/api/v1/skills/{name}")
+        return self._request("GET", _skill_path(name))
 
     def create_skill(
         self,
@@ -2886,7 +2990,7 @@ class SkillRouter:
             payload["change_summary"] = change_summary
         if author is not None:
             payload["author"] = author
-        return self._request("PUT", f"/api/v1/skills/{skill_id}", json=payload)
+        return self._request("PUT", _skill_path(skill_id), json=payload)
 
     def delete_skill(self, skill_id: str) -> Dict[str, Any]:
         """Deactivate (soft-delete) a skill.
@@ -2894,7 +2998,7 @@ class SkillRouter:
         Args:
             skill_id: The skill UUID.
         """
-        return self._request("DELETE", f"/api/v1/skills/{skill_id}")
+        return self._request("DELETE", _skill_path(skill_id))
 
     # ── Versions ─────────────────────────────────────────
 
@@ -2907,7 +3011,7 @@ class SkillRouter:
         Returns:
             List of version descriptors, newest first.
         """
-        result = self._request("GET", f"/api/v1/skills/{name}/versions")
+        result = self._request("GET", _skill_path(name, "/versions"))
         return result.get("versions", [])
 
     def get_version(
@@ -2923,7 +3027,7 @@ class SkillRouter:
             Version descriptor with body_markdown.
         """
         return self._request(
-            "GET", f"/api/v1/skills/{name}/versions/{version_number}"
+            "GET", _skill_path(name, f"/versions/{_path_part(version_number)}")
         )
 
     # ── Analytics ────────────────────────────────────────
@@ -3048,7 +3152,7 @@ class SkillRouter:
         if directory:
             params["directory"] = directory
         result = self._request(
-            "GET", f"/api/v1/skills/{skill_id}/attachments", params=params
+            "GET", _skill_path(skill_id, "/attachments"), params=params
         )
         return result.get("attachments", [])
 
@@ -3068,7 +3172,7 @@ class SkillRouter:
         """
         return self._request(
             "GET",
-            f"/api/v1/skills/{skill_id}/attachments/{attachment_id}",
+            _skill_path(skill_id, f"/attachments/{_path_part(attachment_id)}"),
         )
 
     def get_attachment_by_path(
@@ -3087,7 +3191,7 @@ class SkillRouter:
         """
         return self._request(
             "GET",
-            f"/api/v1/skills/{skill_id}/attachments/by-path/{file_path}",
+            _skill_path(skill_id, f"/attachments/by-path/{_path_part(file_path)}"),
         )
 
     def upload_attachment(
@@ -3124,7 +3228,7 @@ class SkillRouter:
             payload["skill_version_id"] = skill_version_id
 
         return self._request(
-            "POST", f"/api/v1/skills/{skill_id}/attachments", json=payload
+            "POST", _skill_path(skill_id, "/attachments"), json=payload
         )
 
     def upload_attachments_bulk(
@@ -3143,7 +3247,7 @@ class SkillRouter:
         """
         return self._request(
             "POST",
-            f"/api/v1/skills/{skill_id}/attachments/bulk",
+            _skill_path(skill_id, "/attachments/bulk"),
             json={"files": files},
         )
 
@@ -3163,7 +3267,7 @@ class SkillRouter:
         """
         return self._request(
             "DELETE",
-            f"/api/v1/skills/{skill_id}/attachments/{attachment_id}",
+            _skill_path(skill_id, f"/attachments/{_path_part(attachment_id)}"),
         )
 
     # ── Disk Export ─────────────────────────────────────────
@@ -3294,10 +3398,10 @@ class SkillRouter:
 
         public = _pull(
             lambda: self._request(
-                "GET", f"/api/v1/registry/skills/{skill_id}/attachments",
+                "GET", _registry_skill_path(skill_id, "/attachments"),
             ).get("attachments", []),
             lambda aid: self._request(
-                "GET", f"/api/v1/registry/skills/{skill_id}/attachments/{aid}",
+                "GET", _registry_skill_path(skill_id, f"/attachments/{_path_part(aid)}"),
             ),
         )
         return public or []
@@ -3460,7 +3564,7 @@ class SkillRouter:
         if author_display_name:
             params["author_display_name"] = author_display_name
         return self._request(
-            "POST", f"/api/v1/skills/{name}/publish", params=params,
+            "POST", _skill_path(name, "/publish"), params=params,
         )
 
     def unpublish_skill(self, name: str) -> Dict[str, Any]:
@@ -3477,7 +3581,7 @@ class SkillRouter:
             cleared).
         """
         return self._request(
-            "POST", f"/api/v1/skills/{name}/unpublish",
+            "POST", _skill_path(name, "/unpublish"),
         )
 
     def merge_upstream(
@@ -3520,7 +3624,7 @@ class SkillRouter:
             )
         return self._request(
             "POST",
-            f"/api/v1/skills/{name}/merge-upstream",
+            _skill_path(name, "/merge-upstream"),
             params={"mode": mode},
         )
 
@@ -3586,7 +3690,7 @@ class SkillRouter:
         # one wrong id into two round trips.
         try:
             return self._request(
-                "POST", f"/api/v1/registry/skills/{registry_id}/fork",
+                "POST", _registry_skill_path(registry_id, "/fork"),
                 params=params,
             )
         except SkillRouterError as e:
@@ -3814,7 +3918,7 @@ class SkillRouter:
         if agents:
             params["agents"] = ",".join(agents)
         return self._request(
-            "POST", f"/api/v1/registry/skills/{registry_id}/use", params=params,
+            "POST", _registry_skill_path(registry_id, "/use"), params=params,
         )
 
     def preview(self, name: str) -> Optional[Dict[str, Any]]:
@@ -3873,7 +3977,7 @@ class SkillRouter:
 
         registry_id = match["id"]
         try:
-            detail = self._request("GET", f"/api/v1/registry/skills/{registry_id}")
+            detail = self._request("GET", _registry_skill_path(registry_id))
         except SkillRouterError as e:
             logger.warning("preview(%s) detail failed: %s", name, e)
             return None

@@ -182,6 +182,33 @@ def _restore_decimalai_modules():
 
 
 @pytest.fixture(autouse=True)
+def _restore_sdk_config():
+    """Put the SDK's global config back after each test.
+
+    ``decimalai.init()`` writes process-global state (``_config._config``,
+    ``_config._client``, ``decimalai._global_client``) and many tests call it
+    without undoing it. A test that ran ``init(enabled=False)`` used to leave
+    the whole session DISABLED: harmless while only the trace senders read the
+    flag, but every adapter's skill router now honours the kill switch too, so
+    a leaked disabled config switched skills off in whichever test ran next.
+    """
+    cfg = sys.modules.get("decimalai._config")
+    pkg = sys.modules.get("decimalai")
+    saved = (
+        getattr(cfg, "_config", None), getattr(cfg, "_client", None),
+        getattr(pkg, "_global_client", None),
+    )
+    try:
+        yield
+    finally:
+        cfg = sys.modules.get("decimalai._config") if cfg is None else cfg
+        if cfg is not None:
+            cfg._config, cfg._client = saved[0], saved[1]
+        if pkg is not None:
+            pkg._global_client = saved[2]
+
+
+@pytest.fixture(autouse=True)
 def _clear_langchain_global_handler():
     """Drop the process-global LangChain handler an install leaves behind.
 

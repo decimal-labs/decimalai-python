@@ -124,7 +124,7 @@ def observations(request: pytest.FixtureRequest) -> Dict[str, Optional[Observati
             continue
         if not driver.available:
             _UNAVAILABLE[driver.name] = (
-                f"missing import(s): {', '.join(driver.missing_requirements)}"
+                f"cannot run: {'; '.join(driver.missing_requirements)}"
             )
             out[driver.name] = None
             continue
@@ -179,7 +179,7 @@ def delivery_observations(
                 continue
             if not driver.available:
                 _UNAVAILABLE[driver.name] = (
-                    f"missing import(s): {', '.join(driver.missing_requirements)}"
+                    f"cannot run: {'; '.join(driver.missing_requirements)}"
                 )
                 out[(driver.name, mode)] = None
                 continue
@@ -229,7 +229,9 @@ def journey_captures(
         if driver.name not in wanted:
             continue
         framework = journey_framework(driver.name)
-        if framework is None:
+        if framework is None or driver.below_floor:
+            # No journey to walk, or one on a framework older than the SDK's
+            # floor — test_journey skips both, declared, before it looks here.
             out[driver.name] = None
             continue
         pairs.append((driver.name, framework))

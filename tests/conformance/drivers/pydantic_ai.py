@@ -66,20 +66,11 @@ def _wire() -> OpenAIWire:
 
 
 def _model() -> Any:
-    """Pydantic AI's OpenAI chat model, pointed at the stub server.
-
-    ``OpenAIChatModel`` is the current name; older releases called the same
-    class ``OpenAIModel``. Both are accepted so the floating lane (which
-    resolves newest) and the pinned lane can run the same driver.
-    """
+    """Pydantic AI's OpenAI chat model, pointed at the stub server."""
+    from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    try:
-        from pydantic_ai.models.openai import OpenAIChatModel as _Model
-    except ImportError:  # pragma: no cover - older pydantic-ai
-        from pydantic_ai.models.openai import OpenAIModel as _Model
-
-    return _Model(
+    return OpenAIChatModel(
         STUB_MODEL_NAME, provider=OpenAIProvider(openai_client=_wire().async_client())
     )
 
@@ -197,6 +188,39 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return fanout_threads(_go)(list(ctxs))
 
 
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail on an UNNAMED Agent, named by ``instrument(agent_name=...)``.
+
+    ``Agent(model, ...)`` with no ``name=`` — Pydantic AI then infers one from
+    the variable the Agent is assigned to (``agent`` here), which is nothing
+    anybody chose. The adapter documents ``instrument(agent_name=...)`` as the
+    name such a run is filed under, so that is the one DecimalAI name given.
+    """
+    from pydantic_ai import Agent
+
+    from decimalai.pydantic_ai import instrument
+
+    _setup(ctx, skills_rail=True)
+    instrument(agent_name=ctx.agent_name, enable_skill_loader=True)
+    agent = Agent(_model(), system_prompt=SYSTEM_PROMPT, tools=[_tool(ctx)])
+    return agent.run_sync(user_message(ctx))
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns of one conversation: ``run_sync(..., message_history=...)``.
+
+    The second run is handed the first run's ``all_messages()``, Pydantic AI's
+    documented way to continue a conversation — and the case its
+    ``@agent.system_prompt`` functions are NOT re-run for.
+    """
+    first, second = ctxs
+    _setup(first, skills_rail=True)
+    _wire().register(second, script=_skill_script(second))
+    agent = _agent(first)
+    turn_one = agent.run_sync(user_message(first))
+    return agent.run_sync(user_message(second), message_history=turn_one.all_messages())
+
+
 DRIVER = Driver(
     name="pydantic-ai",
     covers=frozenset({"pydantic-ai"}),
@@ -205,12 +229,15 @@ DRIVER = Driver(
     # `init(openai=True)` warns and skips, and the driver would be graded on a
     # tracing path the environment never turned on.
     requires=("pydantic_ai", "openai", "openinference"),
+    frameworks=("pydantic-ai-slim",),
     entrypoint="decimalai.pydantic_ai.instrument() + decimalai.init(openai=True)",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
     run_degenerate=None,
     run_skills=run_skills,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

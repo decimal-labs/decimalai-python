@@ -89,8 +89,11 @@ from ._openai_wire import STUB_API_KEY, OpenAIWire
 # CrewAI phones home by default and, on a first run, prints an interactive
 # tracing-preference panel. Both are turned off here — at import, before any
 # crewai module loads — so the hermetic tier stays hermetic and nothing blocks
-# waiting on a prompt.
-os.environ.setdefault("CREWAI_TELEMETRY_OPT_OUT", "true")
+# waiting on a prompt. These are the names crewai 1.15 reads
+# (`crewai_core.telemetry`'s `_is_telemetry_disabled`); the older
+# `CREWAI_TELEMETRY_OPT_OUT` is read by nothing in it.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
 
 
@@ -293,6 +296,67 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
         _flush()
 
 
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail, with the run named only where the TRACE is named.
+
+    A CrewAI ``Agent`` has a role, not a name, so the DecimalAI name is always
+    given by DecimalAI. Here it is given once, by the tracing half of the
+    documented setup (``decimalai.otel.instrument(agent_name=...)``, what
+    ``init(crewai=True, agent_name=...)`` runs), and the skill loader — on since
+    the skills phase, which installed it for a different agent — is not told.
+    """
+    _wire().register(ctx)
+    _instrument(ctx)
+    try:
+        return _crew(ctx).kickoff()
+    finally:
+        _flush()
+
+
+def _standalone_agent(ctx: Ctx) -> Any:
+    from crewai import LLM, Agent
+    from crewai.tools import tool
+
+    @tool(ctx.tool_name)
+    def lookup(query: str) -> str:
+        """Look a value up for the conformance run."""
+        return tool_result(ctx, query)
+
+    return Agent(
+        role="Conformance Fixture",
+        goal=SYSTEM_PROMPT,
+        backstory=SYSTEM_PROMPT,
+        llm=LLM(
+            model=f"openai/{STUB_MODEL_NAME}", base_url=_wire().base_url,
+            api_key=STUB_API_KEY, temperature=0.0,
+        ),
+        tools=[lookup],
+        verbose=False,
+    )
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns through ``Agent.kickoff(messages)``, CrewAI's standalone-agent
+    entry point, which takes a conversation as a message list: the second call
+    is handed the first turn's user message and the agent's answer ahead of the
+    new user message."""
+    first, second = ctxs
+    for ctx in ctxs:
+        _wire().register(ctx)
+    _instrument(first)
+    agent = _standalone_agent(first)
+    try:
+        answer = agent.kickoff(user_message(first))
+        history = [
+            {"role": "user", "content": user_message(first)},
+            {"role": "assistant", "content": str(getattr(answer, "raw", answer))},
+            {"role": "user", "content": user_message(second)},
+        ]
+        return agent.kickoff(history)
+    finally:
+        _flush()
+
+
 DRIVER = Driver(
     name="crewai",
     covers=frozenset({"crewai"}),
@@ -304,6 +368,7 @@ DRIVER = Driver(
         "openinference.instrumentation.openai",
         "opentelemetry.sdk",
     ),
+    frameworks=("crewai",),
     entrypoint=(
         "decimalai.otel.instrument() + _activate_crewai_instrumentation() "
         "(what init(crewai=True) runs) + LiteLLMInstrumentor; the skills phase adds "
@@ -315,6 +380,8 @@ DRIVER = Driver(
     run_error=run_error,
     run_skills=run_skills,
     run_nested=run_nested,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
     capabilities=Capabilities(
         has_skills_rail=True,
         model_can_load_skill_bodies=False,

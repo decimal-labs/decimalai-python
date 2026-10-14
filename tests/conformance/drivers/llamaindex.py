@@ -280,4 +280,5 @@ DRIVER = Driver(
             ),
         },
     ),
+    frameworks=("llama-index-core",),
 )

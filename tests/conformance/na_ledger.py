@@ -78,6 +78,15 @@ DECLARED_NA: Dict[str, str] = {
     "claude-agent-sdk:C13": "has_skills_rail",
     "claude-agent-sdk:C13b": "has_skills_rail",
     "claude-agent-sdk:C14": "has_skills_rail",
+    # C18 (the agent routed for is the agent traced) and C19 (every
+    # conversation turn routed) grade routing calls, and these three are never
+    # routed. Added 2026-10-14 with the items; graded on all six rail drivers.
+    "llamaindex:C18": "has_skills_rail",
+    "llamaindex:C19": "has_skills_rail",
+    "generic-otel:C18": "has_skills_rail",
+    "generic-otel:C19": "has_skills_rail",
+    "claude-agent-sdk:C18": "has_skills_rail",
+    "claude-agent-sdk:C19": "has_skills_rail",
     # No run that emits a trace without a model call, so there is no degenerate
     # form for a manifest to be fabricated from.
     "crewai:C7b": "supports_degenerate",
@@ -120,7 +129,10 @@ DECLARED_NA: Dict[str, str] = {
 # run (langchain, adk, crewai) and N/A on the six whose instrument() takes no
 # on_trace — a set read off the SDK's signatures rather than declared here.
 # Every one of the twelve comes off the day its adapter gains an observer.
-NA_BUDGET = 30
+# Raised 30 -> 36 on 2026-10-14 by two new ITEMS, C18 and C19, which grade
+# routing and are N/A on exactly the three drivers that have no rail (the same
+# three, by the same flag, as C8). C17 added none: every driver has tools.
+NA_BUDGET = 36
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -136,8 +148,8 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # A patched `messages.create()` is one provider request; the tool loop is the
     # caller's own while-loop, which this adapter never sees.
     "anthropic:tool_loaded": "decimalai/anthropic.py",
-    # ADK's plugin hooks observe a turn and own no tool loop, and no load_skill
-    # tool is registered for a result to come back from.
+    # The adapter's seam is ADK's plugin hooks, and it registers no load_skill
+    # tool for a result to come back from (nor bridges ADK's own SkillToolset).
     "adk:tool_loaded": "decimalai/adk.py",
     # CrewAI's before_llm_call hook edits one call's messages and registers no
     # tool. CrewAI itself runs a tool loop, so this is the SEAM's limit, the same
@@ -210,6 +222,10 @@ ENVIRONMENT_SKIPS: Dict[str, str] = {
     "test_backend_validator_has_not_drifted": (
         "the platform repo is a private sibling checkout; the port is checked "
         "wherever both repos are present"
+    ),
+    "test_probe_router_matches_the_platform": (
+        "the platform repo is a private sibling checkout; the probe's routing "
+        "answers are checked against its router wherever both repos are present"
     ),
     "test_no_driver_is_silently_unavailable": (
         "opt-in via DECIMAL_CONFORMANCE_REQUIRE_ALL=1 — a developer with only "

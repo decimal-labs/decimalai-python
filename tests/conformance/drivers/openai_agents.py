@@ -42,6 +42,7 @@ from . import (
     Capabilities,
     Ctx,
     Driver,
+    Shape,
     StubTurn,
     fanout_threads,
     stub_script,
@@ -249,16 +250,138 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return fanout_threads(_one)(pairs)
 
 
+def _rail_on() -> None:
+    """The skills phase's install again, with no agent name: it is the Agent's
+    own ``name`` that names a run here. ``exclusive=True`` for the reason the
+    module docstring gives — the stock exporter would ship to OpenAI."""
+    from decimalai.openai_agents import instrument
+
+    instrument(exclusive=True, enable_skill_loader=True)
+
+
+def run_unnamed(ctx: Ctx) -> Any:
+    """The rail on an Agent named only by its own ``name=``.
+
+    An OpenAI Agents ``Agent`` cannot be unnamed — ``name`` is required — so
+    the case here is the other half of the same question: no DecimalAI name is
+    given for this run at all (the install was named for a different agent by
+    the skills phase), and the framework object's name is the only one there is.
+    """
+    from agents import Runner
+
+    _rail_on()
+    _wire().register(ctx, script=_skill_script(ctx))
+    return Runner.run_sync(_agent(ctx), user_message(ctx))
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """Two turns: the second run's input is the first's ``to_input_list()`` plus
+    a new user message — the SDK's documented manual conversation pattern."""
+    from agents import Runner
+
+    _rail_on()
+    first, second = ctxs
+    for ctx in ctxs:
+        _wire().register(ctx, script=_skill_script(ctx))
+    agent = _agent(first)
+    turn_one = Runner.run_sync(agent, user_message(first))
+    history = turn_one.to_input_list() + [
+        {"role": "user", "content": user_message(second)}
+    ]
+    return Runner.run_sync(agent, history)
+
+
+def _sandbox_shape(ctxs: Sequence[Ctx]) -> Any:
+    """A ``SandboxAgent`` with the rail on, run in a local sandbox session.
+
+    ``agents.sandbox.SandboxAgent`` is a ``@dataclass`` subclass of ``Agent``
+    with its own generated ``__init__``, and a sandbox run executes a CLONE of
+    it whose ``instructions`` is the sandbox's own prompt builder. The run is
+    the SDK's documented local form: ``RunConfig(sandbox=SandboxRunConfig(
+    client=UnixLocalSandboxClient()))``. The model only calls the conformance
+    tool, so no sandbox command ever runs.
+    """
+    from agents import RunConfig, Runner
+    from agents.sandbox import SandboxAgent, SandboxRunConfig
+    from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
+
+    _rail_on()
+    out = []
+    for ctx in ctxs:
+        _wire().register(ctx)
+        agent = SandboxAgent(
+            name=ctx.agent_name,
+            instructions=SYSTEM_PROMPT,
+            tools=[_tool(ctx)],
+            model=_model(),
+        )
+        out.append(Runner.run_sync(
+            agent, user_message(ctx),
+            run_config=RunConfig(sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())),
+        ))
+    return out
+
+
+def _init_flag_shape(ctxs: Sequence[Ctx]) -> Any:
+    """``decimalai.init(openai_agents=True)``, then ``instrument(enable_skill_loader=True)``.
+
+    The documented one-liner followed by the documented way to add skills to it
+    — the adapter's ``instrument()`` says it is safe to call after the init
+    flag. Neither call is exclusive, which is how a user makes them; the stock
+    OpenAI exporter is already off in this process (every earlier phase
+    installed exclusively), so nothing leaves 127.0.0.1.
+    """
+    from agents import Runner
+
+    import decimalai
+    from decimalai.openai_agents import instrument
+
+    out = []
+    for ctx in ctxs:
+        _wire().register(ctx)
+        decimalai.init(
+            api_key=ctx.api_key, base_url=ctx.base_url, verify=False,
+            openai_agents=True, agent_name=ctx.agent_name,
+        )
+        instrument(enable_skill_loader=True)
+        out.append(Runner.run_sync(_agent(ctx), user_message(ctx)))
+    return out
+
+
 DRIVER = Driver(
     name="openai-agents",
     covers=frozenset({"openai-agents"}),
     requires=("agents", "openai"),
+    frameworks=("openai-agents",),
     entrypoint="decimalai.openai_agents.instrument(agent=...) / enable_skill_loader",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
     run_degenerate=run_degenerate,
     run_skills=run_skills,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
+    shapes=(
+        Shape(
+            name="sandbox_agent",
+            doc=(
+                "agents.sandbox.SandboxAgent under instrument(enable_skill_loader="
+                "True), run with RunConfig(sandbox=SandboxRunConfig(client="
+                "UnixLocalSandboxClient()))"
+            ),
+            run=_sandbox_shape,
+            routed=True,
+        ),
+        Shape(
+            name="init_flag_then_instrument",
+            doc=(
+                "decimalai.init(openai_agents=True, agent_name=...) followed by "
+                "instrument(enable_skill_loader=True), then Runner.run_sync"
+            ),
+            run=_init_flag_shape,
+            routed=True,
+        ),
+    ),
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,

@@ -80,6 +80,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any, Optional, Tuple
@@ -138,6 +139,12 @@ _skill_router_singleton: Any = None
 def _get_skill_router() -> Any:
     """Lazily construct a SkillRouter using the SDK's global config."""
     global _skill_router_singleton
+    # The kill switch: a later init(enabled=False) withholds the router (kept
+    # for a re-enable) from a loader an earlier init installed.
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
     if _skill_router_singleton is not None:
         return _skill_router_singleton
     try:
@@ -262,14 +269,20 @@ def _load_skill_tool_enabled() -> bool:
         return True
 
 
-def _handle_load_skill(name: str) -> str:
-    """Tool callback — always returns a string the model can act on."""
+def _handle_load_skill(name: str, agent_name: Optional[str] = None) -> str:
+    """Tool callback — always returns a string the model can act on.
+
+    ``agent_name`` is the name this run was ROUTED under (``_run_agent_name``).
+    Without it the platform resolves the body for no agent: it misses the
+    agent's own Use rows, so it serves the registry's latest version instead of
+    the agent's pin, or nothing at all for a Use target the registry hides.
+    """
     router = _get_skill_router()
     if router is None:
         return "load_skill error: skill router unavailable."
     try:
         scope = _scope()
-        body = router.load_skill(name, scope=scope)
+        body = router.load_skill(name, scope=scope, agent_name=agent_name)
         if scope is not None:
             # Only names the router actually served a body for reach this rail
             # — a budget refusal or a not-found never records, so
@@ -578,8 +591,21 @@ def _install_skill_loader() -> None:
             try:
                 from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
 
+                # Weak: the tool lives on the agent, and a strong reference
+                # would make every Agent a reference cycle.
+                agent_ref = weakref.ref(self)
+
                 def load_skill(name: str) -> str:
-                    return _handle_load_skill(name)
+                    # Resolved per call, the same way routing resolves it, so
+                    # the body is loaded for the agent the menu was built for.
+                    agent = agent_ref()
+                    return _handle_load_skill(
+                        name,
+                        agent_name=(
+                            _run_agent_name(agent) if agent is not None
+                            else _default_agent_name
+                        ),
+                    )
 
                 # Keyed `decimalai_load_skill`, shown to the model as
                 # `load_skill` unless that name is taken (see _exposed_tool_name).

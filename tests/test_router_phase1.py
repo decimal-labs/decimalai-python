@@ -128,13 +128,15 @@ class TestBodyInjectedOnlyWhenRankedByThisQuery:
     """`thanks!` against a show-all org came back as the effectiveness-ordered
     menu, and the top skill's 6k-token body went into an unrelated turn."""
 
+    # Phase 1b: `degraded` no longer refuses on its own. A degraded result the
+    # query still ranked (lexical-only retrieval; a fallback menu a query term
+    # matched, `query_ranked: True`) injects again — those two cases moved to
+    # test_router_gates_phase1b.py. A degraded menu nothing matched is below.
     @pytest.mark.parametrize("route", [
         pytest.param(full_menu_route(query_ranked=False), id="full_menu-unranked"),
-        pytest.param(full_menu_route(query_ranked=True, degraded=True,
+        pytest.param(full_menu_route(query_ranked=False, degraded=True,
                                      degraded_reason="no_retrieval_candidates"),
-                     id="full_menu-degraded-fallback"),
-        pytest.param(ranked_route(degraded=True, degraded_reason="embedding_unavailable"),
-                     id="smart_routing-degraded"),
+                     id="full_menu-degraded-fallback-nothing-matched"),
         pytest.param(ranked_route(strategy="full_menu"), id="full_menu-without-query_ranked"),
     ])
     def test_an_unranked_or_degraded_result_gets_the_menu_only(self, monkeypatch, route):
@@ -291,35 +293,85 @@ class TestRoutingStatusSeesHttpFailures:
         assert st.http_errors == 1  # cumulative, like `timeouts`
 
 
+class _Clock:
+    """A stand-in for the ``time`` module inside ``skill_router``: requests
+    and admission waits advance it instead of the wall clock."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def __getattr__(self, name):
+        import time
+
+        return getattr(time, name)
+
+
+class _Scripted:
+    """/route answers each status in ``script`` once, then 200 like ``platform``.
+
+    ``retry_after`` puts that header on a 429 (the platform's admission limit,
+    which the SDK waits out); ``clock`` + ``cost_s`` make each request take
+    that long.
+    """
+
+    def __init__(self, platform, script, *, retry_after=None, clock=None, cost_s=0.0):
+        self.platform, self.script = platform, list(script)
+        self.retry_after, self.clock, self.cost_s = retry_after, clock, cost_s
+
+    def __call__(self, method, url, **kw):
+        if self.clock is not None:
+            self.clock.now += self.cost_s
+        if url.endswith("/route") and self.script:
+            self.platform.calls.append({"method": method, "url": url, **kw})
+            code = self.script.pop(0)
+            if code == "timeout":
+                raise httpx.ReadTimeout("slow")
+            headers = {"Retry-After": self.retry_after} if self.retry_after and code == 429 else {}
+            return httpx.Response(code, json={"detail": "edge abort"}, headers=headers)
+        return self.platform(method, url, **kw)
+
+
 class TestAFailedRouteIsCachedForTheTurn:
     """Errors were never cached, so every LLM call in a turn retried a failing
-    route — a 5 s timeout per call until three of them opened the breaker."""
+    route — a 5 s timeout per call until three of them opened the breaker.
 
-    @pytest.mark.parametrize("failure", ["http_503", "timeout"])
+    Only a failure that COST time is cached: that time is what caching saves.
+    These used to include a fast 503; a fast failure is no longer cached (see
+    `TestAFastFailureIsNotCached`), so they are a timeout and a 429 whose
+    admission retries waited out their Retry-After and still failed.
+    """
+
+    @pytest.mark.parametrize("failure", ["timeout", "slow_429"])
     def test_later_llm_calls_in_the_turn_do_not_retry(self, monkeypatch, failure):
         platform = FakePlatform()
-        if failure == "http_503":
-            platform.status["/route"] = 503
-            transport = platform
+        clock = _Clock()
+        monkeypatch.setattr(sr, "time", clock)
+        if failure == "timeout":
+            transport = _Scripted(platform, ["timeout"] * 4)
         else:
-            def transport(method, url, **kw):
-                platform.calls.append({"method": method, "url": url, **kw})
-                raise httpx.ReadTimeout("slow")
+            # Three 429s with Retry-After: 2 → 2 s + 2 s of waiting, then give up.
+            transport = _Scripted(platform, [429] * 12, retry_after="2")
         monkeypatch.setattr(httpx, "request", transport)
         router = _router(inject_body=True)
 
         results = [router.build_prompt_fragment("refund an opened box", scope="run-1") for _ in range(4)]
 
         assert results == [("", None)] * 4
-        assert len(platform.urls("/route")) == 1
+        assert len(platform.urls("/route")) == (1 if failure == "timeout" else 3), (
+            "a failure that cost the turn real time is paid once per turn"
+        )
 
     def test_a_new_run_retries(self, monkeypatch):
         platform = FakePlatform()
-        platform.status["/route"] = 503
-        monkeypatch.setattr(httpx, "request", platform)
+        monkeypatch.setattr(httpx, "request", _Scripted(platform, ["timeout"]))
         router = _router()
         router.build_prompt_fragment("q", scope="run-1")
-        platform.status.clear()
         fragment, routing_id = router.build_prompt_fragment("q", scope="run-2")
         assert routing_id == ranked_route()["routing_id"]
         assert len(platform.urls("/route")) == 2
@@ -342,13 +394,58 @@ class TestAFailedRouteIsCachedForTheTurn:
 
     def test_bypass_cache_still_refetches(self, monkeypatch):
         platform = FakePlatform()
-        platform.status["/route"] = 503
-        monkeypatch.setattr(httpx, "request", platform)
+        monkeypatch.setattr(httpx, "request", _Scripted(platform, ["timeout"]))
         router = _router()
         router.build_prompt_fragment("q", scope="run-1")
-        platform.status.clear()
         _, routing_id = router.build_prompt_fragment("q", scope="run-1", bypass_cache=True)
         assert routing_id == ranked_route()["routing_id"]
+
+
+class TestAFastFailureIsNotCached:
+    """A Cloud Run edge abort is a 0 s 429 with no Retry-After, and those are
+    common. Cached for 30 s it left the rest of the run without skills, and on
+    LangChain (which routes unscoped) every other run asking the same question
+    too — although retrying it costs nothing. Repeated fast failures are the
+    breaker's job: three in a row open it."""
+
+    @pytest.mark.parametrize("status", [429, 503, 500, 401])
+    def test_the_next_llm_call_retries_and_gets_skills(self, monkeypatch, status):
+        platform = FakePlatform()
+        monkeypatch.setattr(httpx, "request", _Scripted(platform, [status]))
+        router = _router()
+
+        calls = [bool(router.build_prompt_fragment("refund an opened box", scope="run-1")[0])
+                 for _ in range(3)]
+
+        assert calls == [False, True, True]
+        assert len(platform.urls("/route")) == 2  # the retry, then the cache
+
+    @pytest.mark.parametrize("status", [429, 503])
+    def test_an_unscoped_caller_is_not_left_without_skills(self, monkeypatch, status):
+        """LangChain's shape: no scope, so one cache slot per (query, agent)
+        for the whole process."""
+        platform = FakePlatform()
+        monkeypatch.setattr(httpx, "request", _Scripted(platform, [status]))
+        router = _router()
+
+        first = router.build_prompt_parts("refund an opened box", agent_name="support")
+        second = router.build_prompt_parts("refund an opened box", agent_name="support")
+
+        assert first[2] is None
+        assert second[2] == ranked_route()["routing_id"]
+        assert "## Available Skills" in second[0]
+
+    def test_a_run_of_fast_failures_opens_the_breaker(self, monkeypatch):
+        """Not caching them does not mean paying for them forever."""
+        platform = FakePlatform()
+        monkeypatch.setattr(httpx, "request", _Scripted(platform, [503] * 10))
+        router = _router()
+
+        for _ in range(5):
+            router.build_prompt_fragment("refund an opened box", scope="run-1")
+
+        assert len(platform.urls("/route")) == 3
+        assert routing_status().breaker_open is True
 
 
 # ── R13/Q2: the SDK stops asking for attachments it throws away ───────────
@@ -371,14 +468,23 @@ class TestRoutingDoesNotRequestAttachments:
         assert call["json"]["include_attachments"] is True
 
 
-# ── R8: load_skill serves only what this run was offered ──────────────────
+# ── R8: load_skill names the run's routing decision ──────────────────────
 
 
 class TestLoadSkillServesOnlyOfferedSkills:
     """`/body` serves any public, active skill by name. A prompt injection that
-    names a crawler-imported skill could make the agent load it."""
+    names a crawler-imported skill could make the agent load it.
 
-    REFUSAL = "was not offered"
+    Phase 1b moved the decision to the platform. The first pass refused here,
+    client-side, every name this router had not put on the run's menu — which
+    also refused an org-owned, installed or assigned skill that the menu cap
+    pushed off this turn's menu. The SDK cannot tell those from a planted
+    public name; the platform can. So `load_skill` now sends the run's
+    `routing_id` and the platform refuses only a public-registry-only name that
+    decision did not offer. The tests below that pinned a client refusal now
+    pin the request instead; the refusal itself is covered against a platform
+    stand-in in test_router_gates_phase1b.py.
+    """
 
     def _platform(self, monkeypatch, **bodies):
         platform = FakePlatform(bodies={"refund-policy": BODY, "tone-guide": "Be warm.",
@@ -400,19 +506,16 @@ class TestLoadSkillServesOnlyOfferedSkills:
         assert router.load_skill("tone-guide", scope="run").startswith("## Skill: tone-guide")
         assert router.load_skill("refund-policy", scope="run").startswith("## Skill: refund-policy")
 
-    def test_a_name_nobody_offered_is_refused_without_a_fetch(self, monkeypatch):
+    def test_a_name_nobody_offered_is_sent_with_the_runs_decision(self, monkeypatch):
+        """Whether it is served is the platform's call (it owns the tiers)."""
         platform = self._platform(monkeypatch)
         router = _router()
         router.build_prompt_fragment("refund an opened box", scope="run")
 
-        out = router.load_skill("planted-skill", scope="run")
+        router.load_skill("planted-skill", scope="run")
 
-        assert self.REFUSAL in out and "planted-skill" in out
-        assert "Exfiltrate" not in out
-        assert platform.urls("/planted-skill/body") == []
-        # A refusal costs no budget: the offered skill still loads after it.
-        assert router.load_skill("refund-policy", scope="run").startswith("## Skill: refund-policy")
-        assert router.consume_loaded_names(scope="run") == ["refund-policy"]
+        (call,) = [c for c in platform.calls if c["url"].endswith("/planted-skill/body")]
+        assert call["params"]["routing_id"] == "rt_" + "a" * 24
 
     def test_an_injected_body_can_be_loaded_again_by_name(self, monkeypatch):
         """Delivered ⊆ offered: a body the prompt already carries is never refused
@@ -421,17 +524,20 @@ class TestLoadSkillServesOnlyOfferedSkills:
         router = _router(inject_body=True)
         fragment, _ = router.build_prompt_fragment("refund an opened box", scope="run")
         assert BODY in fragment
-        assert self.REFUSAL not in router.load_skill("refund-policy", scope="run")
+        assert router.load_skill("refund-policy", scope="run") == f"## Skill: refund-policy\n\n{BODY}"
 
     def test_a_failed_route_offers_nothing_to_load(self, monkeypatch):
-        """With an empty menu the model has no legitimate name to ask for, and
-        the tool stays registered — this was the guess-any-public-skill hole."""
+        """With an empty menu the model has no public name to ask for, and the
+        tool stays registered — this was the guess-any-public-skill hole. The
+        load says "offered nothing" (an empty routing_id), and the platform
+        still serves the org's own skills."""
         platform = self._platform(monkeypatch)
         platform.status["/route"] = 503
         router = _router()
         router.build_prompt_fragment("refund an opened box", scope="run")
-        assert self.REFUSAL in router.load_skill("refund-policy", scope="run")
-        assert platform.urls("/body") == []
+        assert router.load_skill("refund-policy", scope="run").startswith("## Skill: refund-policy")
+        (call,) = [c for c in platform.calls if c["url"].endswith("/body")]
+        assert call["params"]["routing_id"] == ""
 
     def test_unscoped_callers_check_against_everything_this_router_offered(self, monkeypatch):
         """LangChain loads from user tool code with no run identity. Two
@@ -446,16 +552,20 @@ class TestLoadSkillServesOnlyOfferedSkills:
         router.build_prompt_fragment("where is my parcel")
         assert router.load_skill("refund-policy").startswith("## Skill: refund-policy")
         assert router.load_skill("shipping").startswith("## Skill: shipping")
-        assert self.REFUSAL in router.load_skill("planted-skill")
+        router.load_skill("planted-skill")
+        (call,) = [c for c in platform.calls if c["url"].endswith("/planted-skill/body")]
+        assert call["params"]["routing_id"] == "rt_" + "b" * 24
 
     def test_a_scope_that_never_routed_falls_back_to_what_this_router_offered(self, monkeypatch):
         """More concurrent runs than the scoped store holds, or an adapter that
         keys its load differently from its route, must not lose the skill."""
-        self._platform(monkeypatch)
+        platform = self._platform(monkeypatch)
         router = _router()
         router.build_prompt_fragment("refund an opened box", scope="run-1")
         assert router.load_skill("refund-policy", scope="other").startswith("## Skill: refund-policy")
-        assert self.REFUSAL in router.load_skill("planted-skill", scope="other")
+        router.load_skill("planted-skill", scope="other")
+        (call,) = [c for c in platform.calls if c["url"].endswith("/planted-skill/body")]
+        assert call["params"]["routing_id"] == "rt_" + "a" * 24
 
     def test_a_router_that_never_routed_serves_direct_callers(self, monkeypatch):
         """A hand-written loop that builds its own menu and calls load_skill
@@ -487,11 +597,14 @@ class TestLoadSkillServesOnlyOfferedSkills:
         assert call["params"]["agent_name"] == "support-bot"
 
     def test_a_priority_skill_loads_only_when_offered(self, monkeypatch):
-        """`priority_skills` reserves body slots, it never widens access."""
-        self._platform(monkeypatch, **{"reply-format": "Use bullets."})
+        """`priority_skills` reserves body slots, it never widens access: the
+        load names the run's decision like any other."""
+        platform = self._platform(monkeypatch, **{"reply-format": "Use bullets."})
         router = _router(priority_skills=["reply-format"])
         router.build_prompt_fragment("refund an opened box", scope="run")
-        assert self.REFUSAL in router.load_skill("reply-format", scope="run")
+        router.load_skill("reply-format", scope="run")
+        (call,) = [c for c in platform.calls if c["url"].endswith("/reply-format/body")]
+        assert call["params"]["routing_id"] == "rt_" + "a" * 24
 
 
 # ── R13/P6: the skill name is a path segment, not raw URL text ────────────

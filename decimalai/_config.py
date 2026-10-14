@@ -318,6 +318,19 @@ def _is_enabled() -> bool:
     return _config is not None and _config.enabled
 
 
+def _disabled_by_init() -> bool:
+    """True when the last ``init()`` said ``enabled=False``: the kill switch.
+
+    Unlike ``not _is_enabled()``, False before any ``init()``. The skill
+    loaders read it at their one door to the platform (each adapter's
+    ``_get_skill_router``): a loader an earlier ``init(langchain=True)``
+    installed patches the framework for the life of the process, so without
+    this a later ``init(enabled=False)`` stopped traces while every user
+    message still went to ``/skills/route`` and skills were still injected.
+    """
+    return _config is not None and not _config.enabled
+
+
 def _is_manifest_only() -> bool:
     """True if the SDK is in CI manifest-extraction mode.
 

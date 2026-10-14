@@ -331,6 +331,124 @@ class TestAppShapedRunners:
         assert [t.agent_name for t in _flushed(client)] == ["agent_probe"]
 
 
+class TestAgentShapedRunnersRaiseNoDeprecationWarning:
+    """ADK deprecates ``Runner(plugins=...)`` and warns whenever the argument is
+    not None. The global install used to pass ``plugins=[shared_plugin]`` on
+    every agent-shaped runner, so a user who never touched ``plugins`` got
+    ADK's DeprecationWarning on every ``Runner(agent=...)`` and
+    ``InMemoryRunner(agent=...)`` — and a suite run with
+    ``-W error::DeprecationWarning`` could not build a runner at all. The
+    plugin now goes in through an ``App``, the way ADK itself wraps a bare
+    agent."""
+
+    @staticmethod
+    def _shapes():
+        from google.adk.runners import InMemoryRunner, Runner
+        from google.adk.sessions import InMemorySessionService
+
+        return {
+            "Runner(agent=)": lambda a: Runner(
+                agent=a, app_name="probe", session_service=InMemorySessionService()),
+            "Runner(node=)": lambda a: Runner(node=a, session_service=InMemorySessionService()),
+            "Runner(node=, app_name=)": lambda a: Runner(
+                node=a, app_name="named", session_service=InMemorySessionService()),
+            "InMemoryRunner(agent)": lambda a: InMemoryRunner(a),
+            "InMemoryRunner(agent=, app_name=)": lambda a: InMemoryRunner(agent=a, app_name="probe"),
+        }
+
+    @staticmethod
+    def _plugin_warnings(record) -> List[str]:
+        return [str(w.message) for w in record
+                if issubclass(w.category, DeprecationWarning) and "plugins" in str(w.message)]
+
+    @pytest.mark.parametrize("shape", [
+        "Runner(agent=)", "Runner(node=)", "Runner(node=, app_name=)",
+        "InMemoryRunner(agent)", "InMemoryRunner(agent=, app_name=)",
+    ])
+    def test_no_plugins_deprecation_warning_and_the_plugin_is_there(self, client, shape):
+        import warnings
+
+        import decimalai.adk as adk
+
+        build = self._shapes()[shape]
+        agent = _agent("probe", [])
+        with warnings.catch_warnings(record=True) as native_record:
+            warnings.simplefilter("always")
+            native = build(agent)
+        adk.instrument(agent_name="probe")
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            runner = build(agent)
+
+        assert self._plugin_warnings(native_record) == [], "control: ADK alone does not warn"
+        assert self._plugin_warnings(record) == [], (
+            "the DecimalAI install made ADK warn about a `plugins` argument the user never passed"
+        )
+        assert len(_decimalai_plugins(runner)) == 1
+        # Everything else about the runner is what ADK alone builds.
+        assert runner.app_name == native.app_name
+        assert runner.agent is native.agent
+        assert runner.app.name == native.app.name
+
+    def test_strict_warnings_still_build_and_trace_a_runner(self, client):
+        import warnings
+
+        import decimalai.adk as adk
+        from google.adk.runners import InMemoryRunner
+
+        adk.instrument(agent_name="strict")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            runner = InMemoryRunner(agent=_agent("strict", []), app_name="strict")
+        asyncio.run(_one_turn(runner))
+        assert [t.agent_name for t in _flushed(client)] == ["strict"]
+
+    def test_the_users_own_plugins_keep_adks_warning_and_their_order(self, client):
+        """A caller who passes ``plugins=`` themselves is on ADK's deprecated
+        path by their own choice: ADK still tells them so, and their plugins
+        follow DecimalAI's in the order they gave."""
+        import warnings
+
+        import decimalai.adk as adk
+        from google.adk.plugins.base_plugin import BasePlugin
+        from google.adk.runners import InMemoryRunner
+
+        class Extra(BasePlugin):
+            def __init__(self, name):
+                super().__init__(name=name)
+
+        first, second = Extra("first"), Extra("second")
+        adk.instrument(agent_name="probe")
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            runner = InMemoryRunner(agent=_agent("probe", []), app_name="probe",
+                                    plugins=[first, second])
+
+        assert len(self._plugin_warnings(record)) == 1
+        plugins = runner.plugin_manager.plugins
+        assert len(_decimalai_plugins(runner)) == 1 and plugins[1:] == [first, second]
+
+    @pytest.mark.parametrize("kwargs, needle", [
+        ({"agent": "A"}, "app_name is required"),
+        ({"agent": "A", "node": "A", "app_name": "x"}, "Only one of app, agent, or node"),
+        ({}, "One of app, agent, or node must be provided"),
+    ], ids=["agent-without-app_name", "agent-and-node", "nothing"])
+    def test_adks_own_refusals_are_unchanged(self, client, kwargs, needle):
+        import decimalai.adk as adk
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+
+        agent = _agent("probe", [])
+        built = {k: (agent if v == "A" else v) for k, v in kwargs.items()}
+        with pytest.raises(ValueError) as native:
+            Runner(session_service=InMemorySessionService(), **built)
+        adk.instrument(agent_name="probe")
+        with pytest.raises(ValueError) as patched:
+            Runner(session_service=InMemorySessionService(), **built)
+        assert needle in str(native.value)
+        assert str(patched.value) == str(native.value)
+
+
 # ── 2. the event loop is never blocked by the router ────────
 
 

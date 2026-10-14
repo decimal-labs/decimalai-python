@@ -153,8 +153,26 @@ class TestPydanticAiLoadSkillTool:
         assert out == "## Skill: x\n\nbody"
         # scope=None because this call runs outside any agent run — there is no
         # trace to attribute the load to, and the adapter must say so rather
-        # than invent a run key.
-        fake_router.load_skill.assert_called_once_with("x", scope=None)
+        # than invent a run key. agent_name is the name the run is ROUTED
+        # under (`_run_agent_name`); this stand-in Agent has none, so None. It
+        # used to be left off entirely, so the platform resolved the body for
+        # no agent even when routing had named one (see
+        # tests/test_pydantic_ai_phase1.py::TestLoadSkillNamesTheRoutedAgent).
+        fake_router.load_skill.assert_called_once_with("x", scope=None, agent_name=None)
+
+    def test_registered_tool_names_the_bound_agent(self, fake_pydantic_ai):
+        _, Agent, pa = fake_pydantic_ai
+
+        pa.install(agent_name="support", enable_skill_loader=True)
+        agent = Agent("openai:gpt-4o")
+        tool_fn = agent.registered_tools[0]
+        fake_router = MagicMock()
+        fake_router.load_skill.return_value = "## Skill: x\n\nbody"
+        pa._skill_router_singleton = fake_router
+
+        tool_fn("x")
+
+        fake_router.load_skill.assert_called_once_with("x", scope=None, agent_name="support")
 
     def test_tool_returns_error_string_when_router_unavailable(self, fake_pydantic_ai):
         """The tool must always return a string the model can act on."""

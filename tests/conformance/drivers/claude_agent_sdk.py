@@ -265,6 +265,7 @@ DRIVER = Driver(
     name="claude-agent-sdk",
     covers=frozenset({"claude-agent-sdk", "claude-code"}),
     requires=("claude_agent_sdk",),
+    frameworks=("claude-agent-sdk",),
     entrypoint="decimalai.claude_agent_sdk.trace_stream()",
     run=run,
     run_concurrent=run_concurrent,

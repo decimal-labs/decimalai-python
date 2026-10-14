@@ -840,7 +840,10 @@ def init(
             (``langchain``/``openai_agents``/``adk``/``llamaindex``/
             ``claude_agent_sdk``/``otel``/``crewai``/``autogen``) are ignored —
             no adapter is installed, no call is made to the DecimalAI API, and
-            no skill files are written to disk.
+            no skill files are written to disk. It also stops a skill loader an
+            EARLIER ``init()`` installed: while disabled, no message is routed
+            and no skill is injected or loaded. A later ``init(enabled=True)``
+            turns it back on.
         langchain: If ``True``, instrument LangChain / LangGraph, and deliver
             skills into every chat-model call (see ``skills``).
         openai_agents: If ``True``, instrument the OpenAI Agents SDK, and

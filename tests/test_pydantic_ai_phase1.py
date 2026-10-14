@@ -67,6 +67,7 @@ class _Router:
     def __init__(self) -> None:
         self.calls: List[SimpleNamespace] = []
         self.loads: List[str] = []
+        self.load_agents: List[Optional[str]] = []
         self._lock = threading.Lock()
 
     def build_prompt_fragment(self, query=None, agent_name=None, scope=None, **_kw):
@@ -85,8 +86,9 @@ class _Router:
             "rt_" + format(n, "024x"),
         )
 
-    def load_skill(self, name, scope=None):
+    def load_skill(self, name, scope=None, agent_name=None):
         self.loads.append(name)
+        self.load_agents.append(agent_name)
         return BODY
 
     def consume_loaded_names(self, scope=None):
@@ -463,6 +465,70 @@ class TestRoutingName:
 
         assert [c.agent_name for c in router.calls] == ["agent"]
         assert [t.agent_name for t in pipeline.traces()] == ["agent"]
+
+
+class TestLoadSkillNamesTheRoutedAgent:
+    """Routing named the agent; ``load_skill`` named none. The platform then
+    looked the body up for NO agent, missed the agent's own Use rows (every
+    registry skill pulled onto one agent), and either served the public
+    registry's latest version instead of the agent's pin or, for a Use target
+    the registry hides, answered 404 for a skill the menu had just offered."""
+
+    def test_an_unnamed_agent_loads_under_the_name_it_routed_with(self, pa, router):
+        pa.instrument(agent_name="support", enable_skill_loader=True)
+        Agent(_Model(call_tool="load_skill").model()).run_sync("where is my refund?")
+
+        assert router.loads == [SKILL]
+        assert router.load_agents == [c.agent_name for c in router.calls] == ["support"]
+
+    def test_an_explicit_name_loads_under_that_name(self, pa, router):
+        pa.instrument(agent_name="support", enable_skill_loader=True)
+        Agent(_Model(call_tool="load_skill").model(), name="order-bot").run_sync("q")
+
+        assert router.load_agents == ["order-bot"]
+
+    def test_two_agents_in_one_process_each_load_as_themselves(self, pa, router):
+        pa.instrument(enable_skill_loader=True)
+        Agent(_Model(call_tool="load_skill").model(), name="a-bot").run_sync("q1")
+        Agent(_Model(call_tool="load_skill").model(), name="b-bot").run_sync("q2")
+
+        assert router.load_agents == ["a-bot", "b-bot"]
+
+    def test_the_body_request_carries_the_agent_name(self, pa, monkeypatch):
+        """End to end through the real SkillRouter: the GET /body the tool
+        makes names the agent, next to the run's routing decision."""
+        import httpx
+
+        from decimalai.skill_router import SkillRouter
+
+        calls = []
+
+        def transport(method, url, **kw):
+            calls.append((method, str(url), kw.get("params") or {}, kw.get("json") or {}))
+            if str(url).endswith("/skills/route") or str(url).endswith("/skills/menu"):
+                return httpx.Response(200, json={
+                    "strategy": "smart_routing", "query_ranked": True,
+                    "skills": [{"name": SKILL, "description": "Refund rules"}],
+                    "prompt_fragment": f"## Recommended Skills\n| {SKILL} | Refund rules |",
+                    "routing_id": "rt_" + "a" * 24,
+                })
+            return httpx.Response(200, json={
+                "name": SKILL, "version": 1, "body": "REFUND", "truncated": False,
+                "total_chars": 6, "content_hash": "ab" * 32,
+                "content_hash_matches_body": True,
+            })
+
+        monkeypatch.setattr(httpx, "request", transport)
+        monkeypatch.setattr(pa, "_skill_router_singleton",
+                            SkillRouter(api_key="dai_sk_test", base_url="http://platform.test"))
+        pa.instrument(agent_name="support-bot", enable_skill_loader=True)
+        Agent(_Model(call_tool="load_skill").model()).run_sync("refund an opened box")
+
+        (route,) = [c for c in calls if c[1].endswith("/skills/route")]
+        (body,) = [c for c in calls if c[1].endswith("/body")]
+        assert route[3]["agent_name"] == "support-bot"
+        assert body[2].get("agent_name") == "support-bot", body[2]
+        assert body[2].get("routing_id") == "rt_" + "a" * 24
 
 
 # ── 4. the router's blocking call stays off the event loop ───────────────────

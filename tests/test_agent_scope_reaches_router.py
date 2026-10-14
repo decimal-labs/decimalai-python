@@ -110,6 +110,8 @@ class TestAnthropicSendsAgentName:
     def _inject(self, monkeypatch, agent_name: Optional[str]) -> _SpyRouter:
         import decimalai.anthropic as an
 
+        from decimalai.otel import _active_agent_name
+
         spy = _SpyRouter()
         monkeypatch.setattr(an, "_get_skill_router", lambda: spy)
         monkeypatch.setattr(an, "_install_agent_name", agent_name)
@@ -118,7 +120,15 @@ class TestAnthropicSendsAgentName:
             "system": "You are a refunds agent.",
             "messages": [{"role": "user", "content": "refund my order"}],
         }
-        an._inject_skills_into_create_kwargs(kwargs)
+        # The run-scoped name outranks the install name (a run named with
+        # `agent_run` routes as that run's agent), so these install-name cases
+        # run with no run named — the process-wide ContextVar may carry one
+        # another test set and never reset.
+        token = _active_agent_name.set(None)
+        try:
+            an._inject_skills_into_create_kwargs(kwargs)
+        finally:
+            _active_agent_name.reset(token)
         return spy
 
     def test_installed_agent_name_reaches_the_router(self, monkeypatch):

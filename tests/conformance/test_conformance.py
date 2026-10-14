@@ -41,6 +41,14 @@ pytestmark = pytest.mark.conformance
 
 DRIVERS = all_drivers()
 DRIVER_NAMES = [d.name for d in DRIVERS]
+DRIVERS_BY_NAME = {d.name: d for d in DRIVERS}
+
+
+def _unavailable_reason(driver_name: str) -> str:
+    """Why a driver could not run: a missing import, or a framework below the
+    SDK's floor (``floors.py``)."""
+    why = "; ".join(DRIVERS_BY_NAME[driver_name].missing_requirements)
+    return f"{driver_name}: cannot run: {why or 'driver dependencies are not installed'}"
 
 # The platform repo is a private sibling checkout that most clones will not have.
 # Resolve it relative to this one and let the guard skip when it is absent, rather
@@ -49,6 +57,7 @@ _SIBLING = Path(__file__).resolve().parents[3]
 BACKEND_TRACE_SERVICE = (
     _SIBLING / "platform" / "backend" / "app" / "services" / "trace_service.py"
 )
+BACKEND_SKILL_SERVICE = BACKEND_TRACE_SERVICE.with_name("skill_service.py")
 
 # Contract items that are known-red today, as `driver:item`. The suite went live
 # against adapters that already had defects, so gating on "everything green"
@@ -86,7 +95,7 @@ def test_contract(
     if obs is None:
         skip_declared(
             "unavailable", f"{driver_name}:{item}",
-            f"{driver_name}: driver dependencies are not installed",
+            _unavailable_reason(driver_name),
         )
     result = contract.grade(item, obs)
     record(driver_name, result)
@@ -107,6 +116,37 @@ def test_contract(
         pytest.xfail(f"{key} known-red: {result.message}")
 
     assert result.status == contract.PASS, f"{item} {result.title}: {result.message}"
+
+
+# ── the shape axis ───────────────────────────────────────────────────────────
+
+#: Every (driver, second documented shape) pair. A driver with no second shape
+#: has no cell here, the way a driver with no rail has no delivery cell.
+SHAPE_CELLS = [(d.name, s.name) for d in DRIVERS for s in d.shapes]
+
+
+@pytest.mark.parametrize(
+    "driver_name,shape_name", SHAPE_CELLS,
+    ids=[f"{d}-{s}" for d, s in SHAPE_CELLS],
+)
+def test_entry_shape(
+    driver_name: str, shape_name: str, observations: Dict[str, Optional[Observation]]
+) -> None:
+    """A second documented way into a framework, held to the run contract.
+
+    Graded from the SAME capture as the per-driver matrix — each shape is one
+    more phase of that driver's child process — so this costs no extra process.
+    There is no baseline ledger for this axis: every cell went live green.
+    """
+    obs = observations[driver_name]
+    if obs is None:
+        skip_declared(
+            "unavailable", f"{driver_name}:{contract.SHAPE_ITEM}[{shape_name}]",
+            _unavailable_reason(driver_name),
+        )
+    result = contract.grade_shape(obs, shape_name)
+    record(driver_name, result)
+    assert result.status == contract.PASS, f"{result.item} {result.title}: {result.message}"
 
 
 # ── the delivery matrix ──────────────────────────────────────────────────────
@@ -163,7 +203,7 @@ def test_delivery_channel(
     if obs is None:
         skip_declared(
             "unavailable", f"{driver_name}:{delivery_mode}",
-            f"{driver_name}: driver dependencies are not installed",
+            _unavailable_reason(driver_name),
         )
     result = contract.grade_delivery(obs)
     record(driver_name, result)
@@ -226,6 +266,14 @@ def test_journey(
             f"{driver_name}: the file `decimalai init --framework {framework}` "
             f"writes cannot run here — missing {', '.join(missing)}. Install what "
             f"the CLI itself prints: {install_command(framework)}",
+        )
+    # The same floor gate as the driver matrix: a journey walked on a framework
+    # older than the SDK supports grades a file the SDK no longer claims runs.
+    stale = DRIVERS_BY_NAME[driver_name].below_floor
+    if stale:
+        skip_declared(
+            "unavailable", f"{driver_name}:{contract.JOURNEY_ITEM}",
+            f"{driver_name}: cannot run: {'; '.join(stale)}",
         )
     capture = journey_captures[driver_name]
     if capture is None:  # pragma: no cover - the two branches above cover it
@@ -290,6 +338,85 @@ def test_backend_validator_has_not_drifted() -> None:
         f"  actual   {actual}\n"
         "Re-read trace_service._validate_payload, update probe.validate_trace_payload "
         "to match, then record the new fingerprint in probe.BACKEND_VALIDATOR_SHA256."
+    )
+
+
+def _platform_router_shapes(source: str) -> Dict[str, set]:
+    """strategy value -> the keys of every dict literal that returns it.
+
+    The platform's router answers are dict literals carrying a constant
+    ``"strategy"``; reading them off the AST keeps this guard free of the
+    platform's imports (and of a database).
+    """
+    shapes: Dict[str, set] = {}
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Dict):
+            continue
+        pairs = {
+            k.value: v for k, v in zip(node.keys, node.values)
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        }
+        value = pairs.get("strategy")
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            shapes.setdefault(value.value, set()).update(pairs)
+    return shapes
+
+
+def _platform_constant(source: str, name: str) -> Optional[str]:
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            try:
+                return ast.literal_eval(node.value)
+            except ValueError:
+                return None
+    return None
+
+
+def test_probe_router_matches_the_platform() -> None:
+    """The probe's routing answers speak the platform's vocabulary.
+
+    The SDK decides whether to inject a skill body from ``query_ranked`` (and,
+    without it, from the strategy), and the langchain adapter builds its prompt
+    from the prefix/tail split. A probe whose answers drift from the platform's —
+    a strategy the platform never sends, a field it dropped — grades the SDK
+    against a router that does not exist, and the injected-delivery cells stop
+    meaning what they say. Skips when the platform repo is not beside this one,
+    like the validator guard above.
+    """
+    from .probe import MENU_INSTRUCTION, ROUTER_RESPONSE_KEYS, ROUTER_STRATEGIES
+
+    if not BACKEND_SKILL_SERVICE.exists():
+        pytest.skip(
+            f"platform repo not on disk at {BACKEND_SKILL_SERVICE} — the router "
+            f"shapes cannot be checked here; they are checked wherever both repos "
+            f"are present"
+        )
+    source = BACKEND_SKILL_SERVICE.read_text()
+    platform = _platform_router_shapes(source)
+    assert set(platform) == set(ROUTER_STRATEGIES), (
+        f"the platform's router answers with strategies {sorted(platform)}; the "
+        f"probe models {sorted(ROUTER_STRATEGIES)}. Teach the probe the new answer "
+        f"(probe.Probe._route_skills / _menu_payload) before trusting a delivery cell."
+    )
+    drift = {
+        strategy: sorted(keys - platform[strategy])
+        for strategy, keys in ROUTER_RESPONSE_KEYS.items()
+        if keys - platform[strategy]
+    }
+    assert not drift, (
+        f"the probe's routing answers carry keys the platform's no longer do: {drift}. "
+        f"The SDK may be reading a field production stopped sending."
+    )
+    for strategy in ROUTER_STRATEGIES:
+        assert "query_ranked" in platform[strategy], (
+            f"the platform's {strategy} answer no longer carries query_ranked — the "
+            f"field the SDK's body injection is gated on. Re-read the router and the "
+            f"SDK's _ranked_by_this_query together."
+        )
+    assert _platform_constant(source, "MENU_INSTRUCTION") == MENU_INSTRUCTION, (
+        "the platform's MENU_INSTRUCTION changed; copy it into probe.MENU_INSTRUCTION"
     )
 
 

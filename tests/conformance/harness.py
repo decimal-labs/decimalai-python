@@ -32,6 +32,18 @@ from .probe import Probe, Recorded
 #: Lanes used by the concurrency phase.
 CONCURRENCY = 8
 
+#: Lane numbers for the phases after ``skills``. Far from the concurrency and
+#: rail lanes (0..7) and from ``second_agent``'s 99, so no two phases share an
+#: agent name or a sentinel.
+UNNAMED_LANE = 77
+CONVERSATION_LANE = 80
+SHAPE_LANE_BASE = 200
+
+
+def shape_phase(name: str) -> str:
+    """The phase a ``Shape`` runs as."""
+    return f"shape:{name}"
+
 #: How long to wait for the background sender to be done after flush().
 SETTLE_SECONDS = 0.75
 
@@ -353,6 +365,39 @@ def observe(
             fanout=True,
             na_reason=_skipped("skills") or caps.na_reason("C8"),
         )
+        # Everything below runs with the rail already on, AFTER `skills`, for
+        # the reason `skills` is last among the phases above: turning the rail
+        # on is irreversible on several adapters, so nothing that must run
+        # without it may come after it.
+        #
+        # The rail on an agent the framework does not name the DecimalAI way
+        # (C18). A distinct agent name, so the name the run is routed for can
+        # only match the trace's if the adapter resolved it for THIS run — not
+        # because every phase so far used the same one.
+        phases["unnamed"] = _run_phase(
+            "unnamed", driver.run_unnamed, [ctx.derive(UNNAMED_LANE)], probe,
+            fanout=False,
+            na_reason=_skipped("unnamed") or caps.na_reason("C18"),
+        )
+        # Two turns of one conversation (C19). Same agent; the second turn's
+        # sentinel extends the first's, so each turn is told apart on the wire
+        # and a stub keyed on the longest sentinel answers each turn as itself.
+        first_turn = ctx.derive(CONVERSATION_LANE, rename=False)
+        phases["conversation"] = _run_phase(
+            "conversation", driver.run_conversation,
+            [first_turn, first_turn.derive(1, rename=False)], probe, fanout=True,
+            na_reason=_skipped("conversation") or caps.na_reason("C19"),
+        )
+        # Second documented shapes (the S1 axis), last of all: several of them
+        # are process-wide installs of their own (an init flag, a global
+        # Runner patch).
+        for index, shape in enumerate(driver.shapes):
+            name = shape_phase(shape.name)
+            phases[name] = _run_phase(
+                name, shape.run,
+                [ctx.derive(SHAPE_LANE_BASE + 10 * index + j) for j in range(shape.lanes)],
+                probe, fanout=True, na_reason=_skipped(name),
+            )
     finally:
         for k, v in prev_env.items():
             if v is None:

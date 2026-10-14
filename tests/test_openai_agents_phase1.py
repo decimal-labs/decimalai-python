@@ -181,6 +181,13 @@ def sdk(monkeypatch):
         monkeypatch.setattr(oa, name, value)
     # Introduced by the fix; absent before it, hence raising=False.
     monkeypatch.setattr(oa, "_namespace_notice_emitted", False, raising=False)
+    monkeypatch.setattr(oa, "_final_output_guard_installed", False, raising=False)
+    from agents.run_internal import turn_resolution
+
+    monkeypatch.setattr(
+        turn_resolution, "check_for_final_output_from_tools",
+        turn_resolution.check_for_final_output_from_tools,
+    )
     monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
     monkeypatch.setattr(oa, "_run_rails", OrderedDict())
     monkeypatch.setattr(oa, "_load_skill_tool_enabled", lambda: True)
@@ -496,3 +503,149 @@ class TestRoutingDoesNotBlockTheEventLoop:
         agent = agents.Agent(name="a", instructions="be terse")
         out = agent.instructions(agents.RunContextWrapper(context=None), agent)
         assert isinstance(out, str) and MENU in out
+
+
+# ── 4. tool_use_behavior: DecimalAI's tool is never the agent's answer ───────
+#
+# ``init(openai_agents=True)`` turns the skill loader on, which puts
+# ``load_skill`` on every Agent — and the menu hint tells the model to call it
+# FIRST. An agent built with ``tool_use_behavior="stop_on_first_tool"`` ends its
+# run with the first tool's output, so it answered the user with the skill
+# body. A ``ToolsToFinalOutputFunction`` was handed a tool it never declared.
+
+
+def _turn(*calls: tuple) -> ModelResponse:
+    """One model turn that calls each ``(name, arguments)`` in order."""
+    return ModelResponse(output=[
+        ResponseFunctionToolCall(
+            id=f"fc_{i}", call_id=f"call_{name}_{i}", type="function_call",
+            name=name, arguments=json.dumps(arguments),
+        )
+        for i, (name, arguments) in enumerate(calls)
+    ], usage=Usage(), response_id=None)
+
+
+ORDER = "ORDER 42: refunded"
+
+
+def _lookup_order():
+    @agents.function_tool
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        return f"ORDER {order_id}: refunded"
+
+    return lookup_order
+
+
+class TestToolUseBehaviorIgnoresTheSkillTool:
+    def _agent(self, script, behavior, *, tools=None):
+        return agents.Agent(
+            name="support", instructions="Answer with the tool result.",
+            model=_ScriptedModel(script), tools=tools if tools is not None else [_lookup_order()],
+            tool_use_behavior=behavior,
+        )
+
+    @pytest.fixture
+    def router(self, sdk):
+        router = _Router()
+        oa._skill_router_singleton = router
+        oa.instrument(enable_skill_loader=True, disk_sync=False)
+        return router
+
+    @pytest.mark.parametrize("built", ["after_instrument", "before_instrument"])
+    def test_stop_on_first_tool_answers_with_the_agents_own_tool(self, sdk, built):
+        router = _Router()
+        oa._skill_router_singleton = router
+        script = [_turn(("load_skill", {"name": SKILL})),
+                  _turn(("lookup_order", {"order_id": "42"}))]
+        agent = self._agent(script, "stop_on_first_tool") if built == "before_instrument" else None
+        oa.instrument(enable_skill_loader=True, disk_sync=False)
+        agent = agent or self._agent(script, "stop_on_first_tool")
+
+        result = Runner.run_sync(agent, "refund status for order 42?")
+
+        assert [t.name for t in agent.model.calls[0]["tools"]] == ["lookup_order", "load_skill"]
+        assert result.final_output == ORDER, (
+            "the skill body DecimalAI loaded was taken as the agent's final answer"
+        )
+        assert [load["name"] for load in router.loads] == [SKILL]
+        # The body still reached the model: it was asked again after the load.
+        assert len(agent.model.calls) == 2
+
+    def test_skill_and_own_tool_in_one_turn(self, router):
+        agent = self._agent(
+            [_turn(("load_skill", {"name": SKILL}), ("lookup_order", {"order_id": "42"}))],
+            "stop_on_first_tool",
+        )
+        assert Runner.run_sync(agent, "refund status for order 42?").final_output == ORDER
+
+    def test_a_custom_function_never_sees_the_skill_tool(self, router):
+        seen: List[List[str]] = []
+
+        def first_order_lookup(context, tool_results):
+            seen.append([r.tool.name for r in tool_results])
+            for r in tool_results:
+                if r.tool.name == "lookup_order":
+                    return agents.ToolsToFinalOutputResult(is_final_output=True, final_output=r.output)
+            return agents.ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+
+        agent = self._agent(
+            [_turn(("load_skill", {"name": SKILL})),
+             _turn(("load_skill", {"name": SKILL}), ("lookup_order", {"order_id": "42"}))],
+            first_order_lookup,
+        )
+        assert Runner.run_sync(agent, "refund status for order 42?").final_output == ORDER
+        assert seen == [["lookup_order"]], (
+            "the user's ToolsToFinalOutputFunction was handed DecimalAI's tool"
+        )
+
+    # ── the paths that already worked, unchanged ────────────────────────────
+
+    def test_run_llm_again_still_reads_the_body_then_answers(self, router):
+        agent = self._agent(
+            [_turn(("load_skill", {"name": SKILL})), _text("final answer")], "run_llm_again",
+        )
+        assert Runner.run_sync(agent, QUESTION).final_output == "final answer"
+        assert "REFUND BODY SENTINEL" in json.dumps(agent.model.calls[1]["input"], default=str)
+
+    def test_stop_at_tool_names_still_stops_at_the_named_tool(self, router):
+        agent = self._agent(
+            [_turn(("load_skill", {"name": SKILL})), _turn(("lookup_order", {"order_id": "42"}))],
+            {"stop_at_tool_names": ["lookup_order"]},
+        )
+        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
+
+    def test_stop_on_first_tool_with_only_the_agents_tool_is_unchanged(self, router):
+        agent = self._agent([_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
+        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
+        assert len(agent.model.calls) == 1
+
+    def test_the_users_own_load_skill_tool_still_stops_the_run(self, router):
+        """Only DecimalAI's tool is set aside: a tool the user wrote and named
+        ``load_skill`` is theirs, and stop_on_first_tool honours it."""
+        @agents.function_tool
+        def load_skill(name: str) -> str:
+            """The user's own loader."""
+            return f"USER LOADER: {name}"
+
+        agent = self._agent([_turn(("load_skill", {"name": "x"}))], "stop_on_first_tool",
+                            tools=[load_skill])
+        assert Runner.run_sync(agent, QUESTION).final_output == "USER LOADER: x"
+
+    def test_without_the_skill_loader_nothing_is_filtered(self, sdk):
+        oa.instrument(disk_sync=False)  # tracing only
+        agent = self._agent([_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
+        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
+
+    def test_the_guard_is_in_place_once_the_loader_is(self, router):
+        """A canary for the next floor bump: the guard wraps one function inside
+        the Agents SDK, and if that function moves, this goes red rather than
+        stop_on_first_tool agents quietly answering with skill bodies again."""
+        from agents.run_internal import turn_resolution
+
+        assert oa._final_output_guard_installed is True
+        assert getattr(turn_resolution.check_for_final_output_from_tools, oa._HOOK_MARKER, False)
+        oa._install_skill_loader()
+        oa._install_final_output_guard()
+        inner = turn_resolution.check_for_final_output_from_tools.__wrapped__
+        assert not getattr(inner, oa._HOOK_MARKER, False), "the guard wrapped itself twice"

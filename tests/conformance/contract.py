@@ -33,11 +33,16 @@ C13b        a body the model DID pull is not silently dropped
 C14         a skill's BODY reached the model, by any channel
 C15         the adapter hands its caller each run's trace: once, a copy, safely
 C16         a run inside the caller's decimalai.start_trace() ships as its child
+C17         a tool call recorded as done carries what the tool returned
+C18         the agent a run is routed for is the agent its trace is filed under
+C19         every turn of a conversation is routed, on that turn's message
 D1          …and each channel delivers ON ITS OWN (see the delivery axis below)
+S1          a second documented shape constructs, traces once, and is routed
 ==========  ==========================================================
 
-C1–C16 are the per-driver matrix: one capture per driver, in the adapter's own
-resolved configuration. D1 is a second axis over the SAME contract style — one
+C1–C19 are the per-driver matrix: one capture per driver, in the adapter's own
+resolved configuration. S1 grades extra phases of that SAME capture, one per
+(driver, second documented shape) — see ``grade_shape``. D1 is a second axis over the SAME contract style — one
 capture per (driver, body channel), with the other channel switched off — and is
 graded by :func:`grade_delivery` rather than by an entry in ``ITEMS``, because
 adding it to ``ITEMS`` would grade the adapter's default channel twice and vary
@@ -1342,6 +1347,376 @@ def c16_parent_link(obs: Observation) -> Result:
     )
 
 
+# ── tool results (C17) ───────────────────────────────────────────────────────
+#
+# A ToolCallRecord's `status` defaults to SUCCESS. So an adapter that writes the
+# model's tool request down and never attaches what the tool returned ships a
+# record that says "this call succeeded" and carries nothing — and every reader
+# downstream (the trace view, replay, SFT export, an eval of the tool step)
+# reads that as "the tool returned nothing". The ADK adapter did exactly this
+# for every tool call until the 2026-10-13 audit.
+#
+# The honest alternative exists and is graded as honest: an adapter that only
+# SEES the request (the OTel rail reads it off the model span, and the tool
+# runs where no hook of ours can see it) records it as `running` — requested,
+# not observed — and C17 does not ask it for a result it never had.
+
+#: Statuses that claim the call finished. Only SUCCESS is held to "carries what
+#: the tool returned": an ERROR record may carry the error or nothing.
+_DONE_TOOL_STATUSES = ("success",)
+
+
+def c17_tool_result(obs: Observation) -> Result:
+    """A tool call recorded as done carries what the tool returned."""
+    item, title = "C17", "tool_result"
+    problems: List[str] = []
+    done = 0
+    requested = 0
+    for phase in _ran_phases(obs):
+        tool_names = {c.tool_name for c in phase.ctxs}
+        tool_texts = [c.tool_sentinel for c in phase.ctxs]
+        for t in phase.attempted:
+            for i, call in enumerate(t.get("llm_calls") or []):
+                for j, entry in enumerate(call.get("tool_calls") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    status = str(entry.get("status") or "").lower()
+                    if status not in _DONE_TOOL_STATUSES:
+                        requested += 1
+                        continue
+                    done += 1
+                    name = entry.get("tool_name")
+                    where = f"[{phase.name}] llm_calls[{i}].tool_calls[{j}] ({name})"
+                    result = entry.get("result")
+                    if isinstance(result, str):
+                        text = result
+                    elif isinstance(result, (dict, list, tuple)):
+                        text = _flat(result)
+                    else:  # None, or a bare number / bool a tool returned
+                        text = "" if result is None else str(result)
+                    if result is None or not text.strip():
+                        problems.append(
+                            f"{where} is recorded as status={status!r} and carries "
+                            f"result={result!r}. A finished call with no result reads, "
+                            f"everywhere downstream, as a tool that returned nothing — "
+                            f"record what the tool returned, or record the call as "
+                            f"requested (status=running) if the adapter never saw it run"
+                        )
+                    elif name in tool_names and not any(s in text for s in tool_texts):
+                        problems.append(
+                            f"{where} is recorded as done, but its result is not what "
+                            f"the tool returned (the tool's output carries "
+                            f"{tool_texts[0]!r}; the record carries {text[:120]!r})"
+                        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    if not done:
+        return _pass(
+            item, title,
+            f"no tool call is recorded as done ({requested} recorded as requested "
+            f"only, which claims no result) — nothing here asserts a result the "
+            f"trace does not carry",
+        )
+    return _pass(
+        item, title,
+        f"{done} tool call(s) recorded as done, each carrying what its tool "
+        f"returned ({requested} recorded as requested only)",
+    )
+
+
+# ── routing on the wire: which agent, which turn (C18, C19) ──────────────────
+
+
+def _routing_requests(obs: Observation) -> Dict[str, Dict[str, Any]]:
+    """routing_id -> how the router was asked for it, across every phase.
+
+    Read off the probe's own log of the request that MINTED the id: the
+    ``agent_name`` the SDK sent (POST /route body, GET /menu query string —
+    ``None`` when it sent none), the query, and the phase. Whatever a trace says
+    about its routing is compared with this, never with itself.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for phase in obs.phases.values():
+        for r in phase.requests:
+            if not r.accepted:
+                continue
+            if r.method == "POST" and r.path.endswith("/skills/route"):
+                sent = r.body if isinstance(r.body, dict) else {}
+                agent = sent.get("agent_name")
+                query = sent.get("query")
+            elif r.method == "GET" and r.path.endswith("/skills/menu"):
+                agent = (r.query.get("agent_name") or [None])[0]
+                query = None
+            else:
+                continue
+            rid = (r.response or {}).get("routing_id") if isinstance(r.response, dict) else None
+            if rid:
+                out[str(rid)] = {"agent_name": agent, "query": query, "phase": phase.name}
+    return out
+
+
+def c18_routed_as_traced(obs: Observation) -> Result:
+    """The agent a run is ROUTED for is the agent its trace is FILED under.
+
+    Routing is agent-scoped on the platform: an agent's own assignments, its
+    version pins and its restricted skills are offered only to a routing call
+    that names it. A run traced as ``support`` and routed as nobody (or as the
+    variable name a framework inferred, or as whichever agent the process
+    installed first) is shown none of ``support``'s skills, while every trace
+    says the router was consulted — and nothing errors anywhere.
+
+    Graded on every phase that routed, plus one that exists for it: ``unnamed``,
+    the rail on an agent the framework does not name the DecimalAI way.
+    """
+    item, title = "C18", "routed_as_traced"
+    unnamed = obs.phases.get("unnamed")
+    if unnamed is None or not unnamed.ran:
+        reason = unnamed.na_reason if unnamed is not None else "no such phase"
+        return _fail(
+            item, title,
+            f"the unnamed phase did not run ({reason}) — the case this item exists "
+            f"for was never exercised",
+        )
+    minted = _routing_requests(obs)
+    problems: List[str] = []
+    checked = 0
+    unnamed_checked = 0
+    for phase in _ran_phases(obs):
+        for t in phase.attempted:
+            rid = t.get("routing_id")
+            if not rid:
+                continue
+            asked = minted.get(str(rid))
+            if asked is None:
+                continue  # minted nowhere on this rail: C8's provenance problem
+            checked += 1
+            if phase.name == "unnamed":
+                unnamed_checked += 1
+            filed, routed = t.get("agent_name"), asked["agent_name"]
+            if routed != filed:
+                offered = (
+                    "the org-wide skill set" if routed is None
+                    else f"the skills of agent {routed!r}"
+                )
+                problems.append(
+                    f"[{phase.name}] the trace is filed under agent {filed!r}, and its "
+                    f"routing_id {rid} was minted by a routing call that named "
+                    f"{'NO agent' if routed is None else repr(routed)} — so the run was "
+                    f"offered {offered}, not the skills of agent {filed!r}: its "
+                    f"assignments, version pins and restricted skills never reached it"
+                )
+    if not unnamed_checked:
+        problems.append(
+            "the unnamed run shipped no trace carrying a routing_id the router "
+            "minted — the rail on an agent the framework does not name was not "
+            "routed at all (or its trace never reached the wire)"
+        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"{checked} routed trace(s) across {len({p.name for p in _ran_phases(obs)})} "
+        f"phases, each filed under the agent its routing call named — the unnamed "
+        f"run's included",
+    )
+
+
+def c19_conversation_routed(obs: Observation) -> Result:
+    """Every turn of a conversation is routed — on THAT turn's message.
+
+    The router answers a turn with the skills for what the user just asked. An
+    adapter that routes only the first request of a conversation (Pydantic AI's
+    ``@agent.system_prompt`` is not rebuilt when ``message_history`` is passed)
+    gives turn two turn one's menu, files no routing decision for it, and ships
+    a trace with no routing_id — so turn two contributes nothing to skill
+    effectiveness and is served skills for a question nobody is asking anymore.
+    """
+    item, title = "C19", "conversation_routed"
+    phase = obs.phases.get("conversation")
+    if phase is None or not phase.ran:
+        reason = phase.na_reason if phase is not None else "no such phase"
+        return _fail(item, title, f"the conversation phase did not run ({reason})")
+    if len(phase.ctxs) != 2:
+        return _fail(
+            item, title,
+            f"the conversation phase was handed {len(phase.ctxs)} turn(s), not 2 — "
+            f"a harness defect, not the adapter's",
+        )
+    first, second = phase.ctxs
+    turns = (
+        (1, first, [
+            t for t in phase.attempted
+            if first.prompt_sentinel in _rendered_text(t)
+            and second.prompt_sentinel not in _rendered_text(t)
+        ]),
+        (2, second, [
+            t for t in phase.attempted if second.prompt_sentinel in _rendered_text(t)
+        ]),
+    )
+    routes = sum(
+        1 for r in phase.requests
+        if r.accepted and (
+            (r.method == "POST" and r.path.endswith("/skills/route"))
+            or (r.method == "GET" and r.path.endswith("/skills/menu"))
+        )
+    )
+    problems: List[str] = []
+    if phase.exception is not None:
+        problems.append(f"the conversation raised {phase.exception}")
+    rids: Dict[int, set] = {}
+    for number, ctx, traces in turns:
+        if not traces:
+            problems.append(
+                f"turn {number} shipped no trace carrying its own message "
+                f"({ctx.prompt_sentinel!r}) — there is nothing to grade its routing on"
+            )
+            continue
+        for t in traces:
+            rid = t.get("routing_id")
+            if not rid:
+                problems.append(
+                    f"turn {number}'s trace carries no routing_id: "
+                    + (
+                        "the second turn of the conversation was never routed — it "
+                        "was shown the first turn's menu, if any, and files no "
+                        "routing decision"
+                        if number == 2 else "the conversation's first turn was not routed"
+                    )
+                )
+                continue
+            rids.setdefault(number, set()).add(str(rid))
+            query = obs.probe.routing_queries.get(str(rid))
+            if query is None:
+                problems.append(
+                    f"turn {number}'s routing_id {rid} was minted without a query "
+                    f"(the full menu, or by no routing call on this rail) — the turn "
+                    f"was not routed on its own message"
+                )
+            elif ctx.prompt_sentinel not in query or (
+                number == 1 and second.prompt_sentinel in query
+            ):
+                problems.append(
+                    f"turn {number} reports routing_id {rid}, which the router minted "
+                    f"for the query {query[:100]!r} — not turn {number}'s own message "
+                    f"({ctx.prompt_sentinel!r})"
+                )
+    shared = rids.get(1, set()) & rids.get(2, set())
+    if shared:
+        problems.append(
+            f"both turns report routing_id(s) {sorted(shared)} — one routing "
+            f"decision counted against two turns"
+        )
+    if routes < 2:
+        problems.append(
+            f"the router was called {routes} time(s) for a two-turn conversation"
+        )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    return _pass(
+        item, title,
+        f"both turns routed on their own message: {routes} routing call(s), turn 1 "
+        f"{sorted(rids.get(1, ()))}, turn 2 {sorted(rids.get(2, ()))}",
+    )
+
+
+# ── the shape axis (S1) ──────────────────────────────────────────────────────
+#
+# C1–C19 grade each framework's main documented snippet. A framework usually
+# documents more than one way in, and the 2026-10-13 integration audit found the
+# OTHER ways broken while the main one was green: ADK's `Runner(app=App(...))`
+# raised at construction after the global install, OpenAI Agents' SandboxAgent
+# was never routed, `init(openai_agents=True)` then `instrument()` sent every run
+# twice, Anthropic's `messages.stream()` got no skills. Each driver names the
+# second shapes it knows (`drivers.Shape`), each runs as its own phase, and this
+# grades each one against the run contract. Like D1 and J1 it is an axis rather
+# than an entry in ITEMS: its cells are (driver, shape) pairs, and a driver with
+# no second shape has no cell rather than an N/A.
+
+SHAPE_ITEM = "S1"
+
+
+def grade_shape(obs: Observation, shape_name: str) -> Result:
+    """A second documented shape constructs, runs, traces once, and is routed."""
+    from .harness import shape_phase
+
+    item, title = f"{SHAPE_ITEM}[{shape_name}]", "entry_shape"
+    shape = next((s for s in obs.driver.shapes if s.name == shape_name), None)
+    if shape is None:
+        return _fail(item, title, f"{obs.driver.name} declares no shape {shape_name!r}")
+    phase = obs.phases.get(shape_phase(shape_name))
+    if phase is None or not phase.ran:
+        reason = phase.na_reason if phase is not None else "no such phase"
+        return _fail(item, title, f"the {shape_name} phase did not run ({reason})")
+
+    problems: List[str] = []
+    if phase.exception is not None:
+        problems.append(
+            f"{shape.doc} — raised {phase.exception}. A documented way to build or "
+            f"start a run that raises under DecimalAI is a crash the user's own "
+            f"code never had"
+        )
+    traces = phase.attempted
+    minted = _routing_requests(obs)
+    expected = {c.agent_name for c in phase.ctxs}
+    strays = sorted({str(t.get("agent_name")) for t in traces} - expected)
+    if strays:
+        problems.append(
+            f"{len(traces)} trace(s) on the wire, some filed under {strays}, which "
+            f"no run of this shape asked for (asked: {sorted(expected)})"
+        )
+    offered_by_probe = sorted(s["name"] for s in obs.probe.skills)
+    for ctx in phase.ctxs:
+        mine = [t for t in traces if t.get("agent_name") == ctx.agent_name]
+        if len(mine) != 1:
+            problems.append(
+                f"the run for {ctx.agent_name!r} shipped {len(mine)} trace(s); one run "
+                f"is one trace (0 = the run is invisible, more = every run is counted "
+                f"{len(mine)} times, with the skill telemetry on at most one copy)"
+            )
+        if not shape.routed:
+            continue
+        for t in mine:
+            rid = t.get("routing_id")
+            asked = minted.get(str(rid)) if rid else None
+            if not rid:
+                problems.append(
+                    f"the run for {ctx.agent_name!r} ran with the skills rail on and "
+                    f"its trace carries no routing_id — this shape was never routed"
+                )
+                continue
+            if asked is None or asked["phase"] != phase.name:
+                problems.append(
+                    f"the run for {ctx.agent_name!r} reports routing_id {rid}, which no "
+                    f"routing call of this run minted"
+                )
+            elif asked["query"] is not None and ctx.prompt_sentinel not in asked["query"]:
+                problems.append(
+                    f"the run for {ctx.agent_name!r} reports routing_id {rid}, minted "
+                    f"for another run's query ({asked['query'][:80]!r})"
+                )
+            recorded = sorted(set(t.get("skills_offered_in_prompt") or []))
+            if recorded != offered_by_probe:
+                problems.append(
+                    f"the run for {ctx.agent_name!r} records skills_offered_in_prompt="
+                    f"{recorded}, but the router offered {offered_by_probe}"
+                )
+            shown = _rendered_text(t)
+            missing = [n for n in recorded if n not in shown]
+            if missing:
+                problems.append(
+                    f"the run for {ctx.agent_name!r} claims to have offered {missing}, "
+                    f"and those names are not in what the model was shown"
+                )
+    if problems:
+        return _fail(item, title, _summarize(problems))
+    routed = " and routed (its own routing_id, the offered menu in the prompt)" if shape.routed else ""
+    return _pass(
+        item, title,
+        f"{shape.doc}: {len(phase.ctxs)} run(s), one accepted trace each under the "
+        f"agent asked for{routed}",
+    )
+
+
 # ── the delivery axis (D1) ───────────────────────────────────────────────────
 #
 # C14 asks "did a body reach the model AT ALL?". This asks the next question:
@@ -1744,16 +2119,24 @@ def grade_journey(capture: Any) -> Result:
 
 # ── registry ─────────────────────────────────────────────────────────────────
 
+#: In display order, which is by SUBJECT rather than by number: an item added
+#: later sits beside the items it reads with. C17 (what a tool call carries)
+#: follows C5 (the run's structure); C18 and C19 (routing: which agent, which
+#: turn) follow C8 (the rail). The skills ladder (C13–C14) and then the caller's
+#: side (C15–C16) still close the list.
 ITEMS: Dict[str, Callable[[Observation], Result]] = {
     "C1": c1_emits,
     "C2": c2_ingest_valid,
     "C3": c3_llm_calls,
     "C4": c4_content,
     "C5": c5_structure,
+    "C17": c17_tool_result,
     "C6": c6_identity,
     "C7": c7_manifest_stable,
     "C7b": c7b_manifest_no_fabrication,
     "C8": c8_skills_rail,
+    "C18": c18_routed_as_traced,
+    "C19": c19_conversation_routed,
     "C9": c9_isolation,
     "C10": c10_error_path,
     "C11": c11_no_side_effects,

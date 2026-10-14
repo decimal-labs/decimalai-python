@@ -50,14 +50,32 @@ existed only for them are gone.
   `load_skill`, DecimalAI's tool is exposed as `decimalai_load_skill`.
   `instrument()` is safe to call more than once, including after
   `init(openai_agents=True)`: one trace processor, one trace per run.
+  DecimalAI's `load_skill` result is never taken as the run's answer: an Agent
+  with `tool_use_behavior="stop_on_first_tool"` used to end its run with a
+  skill body, and a custom `ToolsToFinalOutputFunction` was handed DecimalAI's
+  tool. Both now see only the agent's own tools.
 - Pydantic AI: the skills menu is an instructions function routed once per run,
   so every turn of a conversation (`message_history=`) is routed and traced,
   not only the first. A second tool named `load_skill` no longer makes every
   run raise `UserError`; DecimalAI's tool is exposed as `decimalai_load_skill`
   then. Routing uses the agent name the trace is filed under, not the variable
-  name Pydantic AI infers for an unnamed `Agent`.
+  name Pydantic AI infers for an unnamed `Agent`. `load_skill` sends that same
+  agent name, so the body is the agent's pinned version, and a skill assigned
+  to the agent loads even when the public registry hides it.
 - Anthropic: `messages.stream()` and `messages.parse()` (sync and async) get
-  skills, not only `messages.create()`.
+  skills, not only `messages.create()`. A run named with
+  `decimalai.providers.agent_run(name)` is routed for that agent, the one its
+  trace is filed under; it used to route as `instrument(agent_name=...)`, or as
+  no agent, so the agent's assignments and pins were ignored.
+- Google ADK: `Runner(agent=...)`, `Runner(node=...)` and
+  `InMemoryRunner(agent=...)` no longer raise ADK's `plugins` DeprecationWarning
+  after `init(adk=True)` when you passed no plugins. The DecimalAI plugin goes
+  in through the `App` ADK wraps the agent in, so a suite run with
+  `-W error::DeprecationWarning` can build a runner again.
+- `init(enabled=False)` also stops a skill loader an earlier `init()`
+  installed: no message is routed and no skill is injected or loaded while the
+  SDK is disabled. Before, traces stopped but every user message still went to
+  the platform. `init(enabled=True)` turns it back on.
 - LangChain: skills are routed for the agent the run's trace is filed under (a
   per-call `CallbackHandler(agent_name=...)` or a named graph), not only for
   `instrument(agent_name=...)`. Unnamed runs used to route as no agent, so
@@ -72,20 +90,28 @@ existed only for them are gone.
 
 ### Changed: skill routing
 
-- A skill body is injected only when the platform ranked the result by this
-  turn's message and did not mark it degraded. The top row of an unranked or
-  fallback menu no longer lands in turns like "thanks!".
-- `load_skill` serves only skills this router offered. A name the router never
-  offered is refused with a message the model can act on, so a prompt
-  injection cannot load an arbitrary registry skill by name.
+- A skill body is injected when the platform ranked the result by this turn's
+  message (degraded retrieval included, when its rows still matched). The top
+  row of an unranked or fallback menu no longer lands in turns like "thanks!".
+  Two bodies are injected ranked or not, because there is no wrong one to
+  pick: the `priority_skills` the platform offered, and the agent's only skill
+  (a show-all menu whose `rows_total` is 1), so a reworded question in a
+  one-skill workspace still gets the body on the adapters with no `load_skill`
+  tool. That skill's body also reaches small talk.
+- `load_skill` sends the run's `routing_id`, and the platform serves a skill
+  reachable only through the public registry just when that decision offered
+  it, so a prompt injection cannot load an arbitrary registry skill by name.
+  Skills the org owns, installed or assigned load either way.
 - The in-turn `/body` fetch uses the 5 s hot-path budget and the circuit
   breaker, like `/route` and `/menu`. Disk export keeps the cold budget.
 - `routing_status()` turns unhealthy on 401, 402, 403, 429 and 5xx responses
   (new `http_errors` and `last_status_code` fields), not only on timeouts. A
   404 for an unknown skill name is not a failure.
-- A failed routing call is cached for the turn, so the other model calls of
-  that turn do not each wait out the timeout again. An open breaker is not
-  cached.
+- A slow failed routing call (a timeout, or a 429 whose `Retry-After` waits
+  ran out) is cached for the turn, so the other model calls of that turn do
+  not each wait it out again. A fast failure (an edge 429, a 5xx, a 401) is
+  not cached: the next call retries, and three in a row open the breaker. An
+  open breaker is not cached.
 - `load_skill` tells the model when the platform was unavailable instead of
   saying the skill does not exist.
 - Routing no longer asks the platform for skill attachments it discarded.

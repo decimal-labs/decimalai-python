@@ -68,7 +68,7 @@ def main(argv: list) -> int:
         return 2
     if not driver.available:
         print(
-            f"{name}: missing import(s): {', '.join(driver.missing_requirements)}",
+            f"{name}: cannot run: {'; '.join(driver.missing_requirements)}",
             file=sys.stderr,
         )
         return 3
