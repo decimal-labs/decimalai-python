@@ -1,0 +1,26 @@
+# Managed by `decimalai skills`. Commit this file. Hand edits are fine;
+# run `decimalai skills install` afterwards.
+root = ".agents/skills"
+
+[skills]
+"acme/refund-policy" = "latest"
+"acme/f1-duplicate-key" = "latest"
+"acme/f10-empty-body" = "latest"
+"acme/f11-stamp-differs" = "latest"
+"acme/f12-body-differs" = "latest"
+"acme/f13-two-trailing-newlines" = "latest"
+"acme/f14-top-level-file" = "latest"
+"acme/f15-nested-skill-md" = "latest"
+"acme/f2-unknown-key" = "latest"
+"acme/f3-namespaced-name" = "latest"
+"acme/f4-empty-description" = "latest"
+"acme/f5-compatibility-list" = "latest"
+"acme/f6a-allowed-tools-list" = "latest"
+"acme/f6b-bare-bash" = "latest"
+"acme/f7-disable-model-invocation-false" = "latest"
+"acme/f8-nested-metadata" = "latest"
+"acme/f9-license-list" = "latest"
+"acme/v1-symlinked-folder" = "latest"
+"acme/v1-symlinked-resource" = "latest"
+"acme/v3-edited-attachment" = "latest"
+"acme/v4-exec-bit" = "latest"

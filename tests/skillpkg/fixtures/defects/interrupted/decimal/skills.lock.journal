@@ -1,0 +1,36 @@
+{
+  "name": "acme-refund-policy",
+  "new_entry": {
+    "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+    "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+    "executable": [
+      "scripts/compute_refund.py"
+    ],
+    "files": {
+      "SKILL.md": "41f6dd662499895324197384620c8de7989b7e2f576dc508aabd1029c1512da0",
+      "references/fees.md": "a38a1a6c352d740addf0cf6298f1eca3185f8ae664b7ead05b46567b2a04b5be",
+      "scripts/compute_refund.py": "2f7e05045c7b41d6dc05065b7d7321fc68322e577422370a232573fc74060cda"
+    },
+    "installed_at": "2026-10-15T00:00:00Z",
+    "invocation": "model",
+    "name": "acme/refund-policy",
+    "path": ".agents/skills/acme-refund-policy",
+    "pin": "latest",
+    "render": {
+      "format": 1,
+      "hash": "86bb36b26adcf58af0d5d338781a3b84447247a21eb99981c2ab092de2973a7a",
+      "variant": "authored"
+    },
+    "skill_id": "00000000-0000-0000-0000-00005eed0000",
+    "source": {
+      "base_url": "https://api.example.test",
+      "org": null
+    },
+    "unavailable": [],
+    "version": 3,
+    "version_id": "00000000-0000-0000-0000-0000f00d0000"
+  },
+  "old_entry": null,
+  "old_present": false,
+  "txid": "20261015T000000Z-0a0b0c0d"
+}

@@ -1,0 +1,7 @@
+# Managed by `decimalai skills`. Commit this file. Hand edits are fine;
+# run `decimalai skills install` afterwards.
+root = ".agents/skills"
+
+[skills]
+"acme/refund-policy" = "4"
+"acme/returns-desk" = "latest"

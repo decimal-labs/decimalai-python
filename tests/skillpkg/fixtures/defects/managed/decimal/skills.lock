@@ -1,0 +1,563 @@
+{
+  "lock_hash": "68fbbb5386cb4f8355cbf8b84fa654df8c87c484e37406b2bda4cc9d42faa06e",
+  "root": ".agents/skills",
+  "skills": {
+    "acme-refund-policy": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [
+        "scripts/compute_refund.py"
+      ],
+      "files": {
+        "SKILL.md": "3ee3c6e6ca66d5b02857f0d5a1c01012d83a68decf64fdb59c34978df99a5bee",
+        "references/fees.md": "a38a1a6c352d740addf0cf6298f1eca3185f8ae664b7ead05b46567b2a04b5be",
+        "scripts/compute_refund.py": "2f7e05045c7b41d6dc05065b7d7321fc68322e577422370a232573fc74060cda"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/refund-policy",
+      "path": ".agents/skills/acme-refund-policy",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "86bb36b26adcf58af0d5d338781a3b84447247a21eb99981c2ab092de2973a7a",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0001",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0001"
+    },
+    "f1-duplicate-key": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "7eb400a34078ef3f9e5dde4d6461a88981668fc550119f3bef279843d298068f"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f1-duplicate-key",
+      "path": ".agents/skills/f1-duplicate-key",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0002",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0002"
+    },
+    "f10-empty-body": {
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "d860f894e7d3f21397d9af081a17d338a890230070332c598a9d9afcda741b49"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f10-empty-body",
+      "path": ".agents/skills/f10-empty-body",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000c",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000c"
+    },
+    "f11-stamp-differs": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "8757118467c33ae96daf2ded2fe51ea81209c017c85e48b649ce03d11e65ec01"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f11-stamp-differs",
+      "path": ".agents/skills/f11-stamp-differs",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000d",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000d"
+    },
+    "f12-body-differs": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "cf6aabf1cce429420cbe4da846d5c3f4bd3fd9300b28dc8abfa33651c813fdac"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f12-body-differs",
+      "path": ".agents/skills/f12-body-differs",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000e",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000e"
+    },
+    "f13-two-trailing-newlines": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "9a2fc5bb523e15f9f6a8216e7f76ebee13b0cd8fd998b563875f5e8af3137c89"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f13-two-trailing-newlines",
+      "path": ".agents/skills/f13-two-trailing-newlines",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000f",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000f"
+    },
+    "f14-top-level-file": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "be4adcbb8290ac3fd6629619762a01ee71b76831a9da07b1701c6b4b9c30ad32"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f14-top-level-file",
+      "path": ".agents/skills/f14-top-level-file",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0010",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0010"
+    },
+    "f15-nested-skill-md": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "33809a69373d0d68cac0eb87f2e3c306bbaa25f98aa237301bbde8464d7c4691",
+        "references/fees.md": "a38a1a6c352d740addf0cf6298f1eca3185f8ae664b7ead05b46567b2a04b5be"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f15-nested-skill-md",
+      "path": ".agents/skills/f15-nested-skill-md",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0011",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0011"
+    },
+    "f2-unknown-key": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "c5b349bf34b14c7c357ed9441a5781eaffa14751fa8c87416aeefb83e554847a"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f2-unknown-key",
+      "path": ".agents/skills/f2-unknown-key",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0003",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0003"
+    },
+    "f3-namespaced-name": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "f4d0d484d4b51d83d02f00383ee526e54ce1f48d285212a35e441e837170cb87"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f3-namespaced-name",
+      "path": ".agents/skills/f3-namespaced-name",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0004",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0004"
+    },
+    "f4-empty-description": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "6a088c3090daf4f5441ce3e59d3b2ffb51150f16f0c7de6c025b265a4f5df3f9"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f4-empty-description",
+      "path": ".agents/skills/f4-empty-description",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0005",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0005"
+    },
+    "f5-compatibility-list": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "9ab0a5536cea5b704edaa0f4cea44872762137fb7c6e97a913c6d73f3d0db2a3"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f5-compatibility-list",
+      "path": ".agents/skills/f5-compatibility-list",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0006",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0006"
+    },
+    "f6a-allowed-tools-list": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "69c880c39b5dee4d0e5e8e3d993aa7fd7b637a1bf606c4bfe6ed9d7d3628b9a5"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f6a-allowed-tools-list",
+      "path": ".agents/skills/f6a-allowed-tools-list",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0007",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0007"
+    },
+    "f6b-bare-bash": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "8e2b68b4bde8cd9b61f24ad23d3c124157d1a60f740d74889efd6f2ce85f4e75"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f6b-bare-bash",
+      "path": ".agents/skills/f6b-bare-bash",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0008",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0008"
+    },
+    "f7-disable-model-invocation-false": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "4b86d069014afd78b1aa8cf7f770425adb730bc8ecbec62ba87cbf64d19123ee"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f7-disable-model-invocation-false",
+      "path": ".agents/skills/f7-disable-model-invocation-false",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0009",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0009"
+    },
+    "f8-nested-metadata": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "4f99ead72820bdb86d065c84046959282016e32a0e565303835f901c14153154"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f8-nested-metadata",
+      "path": ".agents/skills/f8-nested-metadata",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000a",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000a"
+    },
+    "f9-license-list": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "55ee3e711344fd878612707ab2894659db224d28805818f87dfaa5022688ff9e"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/f9-license-list",
+      "path": ".agents/skills/f9-license-list",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed000b",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d000b"
+    },
+    "v1-symlinked-folder": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "f61c45a49ece9053f549e2b8ed5f80f3c7b47894c6a3b351e14b5bf7a356a884"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/v1-symlinked-folder",
+      "path": ".agents/skills/v1-symlinked-folder",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0012",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0012"
+    },
+    "v1-symlinked-resource": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "62c2c494bf852a11ecff454ec57d8e749ba3a56906abfa4fbb24c2a2d028914d",
+        "references/fees.md": "a38a1a6c352d740addf0cf6298f1eca3185f8ae664b7ead05b46567b2a04b5be"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/v1-symlinked-resource",
+      "path": ".agents/skills/v1-symlinked-resource",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0013",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0013"
+    },
+    "v3-edited-attachment": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [],
+      "files": {
+        "SKILL.md": "e0996540d112eba1bcc66aa3f83ec3f52db196f5ec23895466bdd3d3c96b659c",
+        "references/fees.md": "a38a1a6c352d740addf0cf6298f1eca3185f8ae664b7ead05b46567b2a04b5be"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/v3-edited-attachment",
+      "path": ".agents/skills/v3-edited-attachment",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "0672303a2caf13936d86751b03e7cdb764dc9e569c730ab903d1d285bb0622ff",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0015",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0015"
+    },
+    "v4-exec-bit": {
+      "body_sha256": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+      "executable": [
+        "scripts/compute_refund.py"
+      ],
+      "files": {
+        "SKILL.md": "fb22b3b4f6d8df0fb7ffd0eb9660bb151715a6a4fab12640935ad45fd06141ab",
+        "scripts/compute_refund.py": "2f7e05045c7b41d6dc05065b7d7321fc68322e577422370a232573fc74060cda"
+      },
+      "installed_at": "2026-10-15T00:00:00Z",
+      "invocation": "model",
+      "name": "acme/v4-exec-bit",
+      "path": ".agents/skills/v4-exec-bit",
+      "pin": "latest",
+      "render": {
+        "format": 1,
+        "hash": "86bb36b26adcf58af0d5d338781a3b84447247a21eb99981c2ab092de2973a7a",
+        "variant": "authored"
+      },
+      "skill_id": "00000000-0000-0000-0000-00005eed0014",
+      "source": {
+        "base_url": "https://api.example.test",
+        "org": null
+      },
+      "unavailable": [],
+      "version": 3,
+      "version_id": "00000000-0000-0000-0000-0000f00d0014"
+    }
+  },
+  "version": 2
+}

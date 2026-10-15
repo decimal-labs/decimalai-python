@@ -1,0 +1,18 @@
+{
+  "skills": {
+    "acme/refund-policy": {
+      "agents": [
+        "universal"
+      ],
+      "body_hash": "2804b8c5e3955a593eefef55a8fbbdcb6ff702e84ad25d158a067606d171b76e",
+      "content_hash": "b44472195ad14f26e8aed46fcfb5f5c7ed154743daac4b6e4fd845d0be40e05b",
+      "installed_at": "2026-10-15T00:00:00Z",
+      "scope": "project",
+      "skill_id": "00000000-0000-0000-0000-00005eed0000",
+      "source": "platform",
+      "version": 3
+    }
+  },
+  "updated_at": "2026-10-15T00:00:00Z",
+  "version": 1
+}
