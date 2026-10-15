@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
@@ -123,6 +123,10 @@ class TraceContext:
         # into _active_skills: delivery is not activation.
         self._skills_delivered: set[str] = set()
         self._skills_delivered_versions: List[Dict[str, str]] = []
+        # The registry identity a caller gave with an activation: skill_name ->
+        # {skill_id?, version_id?, body_sha256?}. Beside `_active_skills`, not in
+        # it, so that map keeps its name -> hash shape.
+        self._active_skill_ids: Dict[str, Dict[str, str]] = {}
 
     def log_llm_call(
         self,
@@ -269,14 +273,43 @@ class TraceContext:
         """Return the trace ID as a string, for use as a child's parent_trace_id."""
         return str(self._trace_id)
 
-    def log_skill_activation(self, *, name: str, hash: Optional[str] = None) -> None:
+    def log_skill_activation(
+        self,
+        *,
+        name: str,
+        hash: Optional[str] = None,
+        skill_id: Optional[str] = None,
+        version_id: Optional[str] = None,
+        body_sha256: Optional[str] = None,
+    ) -> None:
         """Record that a skill was activated during this trace.
 
         Args:
             name: Skill identifier (e.g. "code-review").
             hash: Optional content hash of the skill body.
+            skill_id: Optional registry id of the skill that ran.
+            version_id: Optional registry id of the version that ran.
+            body_sha256: Optional sha256 of the body that ran.
+
+        The three ids are for a framework with no DecimalAI adapter that reads
+        skill folders itself (deepagents, Microsoft Agent Framework, Strands, a
+        pydantic-ai harness). A folder ``decimalai skills`` installed carries
+        them in its ``SKILL.md`` metadata (``decimalai-skill-id``,
+        ``decimalai-version-id``, ``decimalai-body-sha256``), and
+        ``decimalai.skills.discover_skills()`` returns them on each descriptor.
+        With them the platform credits the exact version; without them the
+        activation resolves by name and hash, as before. When the folder was
+        edited after install (the descriptor's ``hash``, of the body as read, is
+        not ``"sha256:" + body_sha256``), send that ``hash`` as ``body_sha256``
+        and no ``version_id``: the edit is not that version. Each call replaces
+        what an earlier one said about ``name``.
         """
         self._active_skills[name] = hash
+        ids = _identity_fields(skill_id=skill_id, version_id=version_id, body_sha256=body_sha256)
+        if ids:
+            self._active_skill_ids[name] = ids
+        else:
+            self._active_skill_ids.pop(name, None)
 
     def set_routing_id(self, routing_id: Optional[str]) -> None:
         """Record the SkillRouter routing-decision id for this trace.
@@ -323,7 +356,15 @@ class TraceContext:
                 self._skills_delivered.add(n)
                 self._skills_offered_in_prompt.add(n)
 
-    def log_skill_loaded(self, *, name: str, hash: Optional[str] = None) -> None:
+    def log_skill_loaded(
+        self,
+        *,
+        name: str,
+        hash: Optional[str] = None,
+        skill_id: Optional[str] = None,
+        version_id: Optional[str] = None,
+        body_sha256: Optional[str] = None,
+    ) -> None:
         """Record that the agent actually READ a skill's body.
 
         Use this when the agent fetched the SKILL.md content (not just
@@ -339,6 +380,12 @@ class TraceContext:
                 without it, the activation is recorded exactly as before, with
                 a null hash. Never compute this yourself — an SDK-computed
                 digest is not a version the platform ever minted.
+            skill_id, version_id, body_sha256: Optional registry identity of
+                the skill read from disk, as for ``log_skill_activation``.
+
+        With a hash or any of the ids the load is also recorded as an
+        activation carrying them, unless the caller already declared one for
+        ``name``. The loaded list itself stays a list of names.
         """
         if isinstance(name, str) and name.strip():
             n = name.strip()
@@ -346,11 +393,16 @@ class TraceContext:
             # A loaded skill is implicitly also offered + delivered.
             self._skills_offered_in_prompt.add(n)
             self._skills_delivered.add(n)
-            # `setdefault`, not assignment: an explicit `log_skill_activation`
-            # is the caller SAYING which version influenced the output, and a
-            # rail observation must not overwrite a caller's own declaration.
-            if isinstance(hash, str) and hash:
-                self._active_skills.setdefault(n, hash)
+            # Only when nothing is recorded yet: an explicit
+            # `log_skill_activation` is the caller SAYING which version influenced
+            # the output, and a rail observation must not overwrite a caller's own
+            # declaration.
+            has_hash = isinstance(hash, str) and bool(hash)
+            ids = _identity_fields(skill_id=skill_id, version_id=version_id, body_sha256=body_sha256)
+            if (has_hash or ids) and n not in self._active_skills:
+                self._active_skills[n] = hash if has_hash else None
+                if ids:
+                    self._active_skill_ids[n] = ids
 
     def log_skill_delivery_versions(self, *, versions: List[Dict[str, str]]) -> None:
         """Retain the exact immutable identities supplied with delivered bodies."""
@@ -370,6 +422,7 @@ class TraceContext:
             entry: Dict[str, Any] = {"name": name}
             if h:
                 entry["hash"] = h
+            entry.update(self._active_skill_ids.get(name, {}))
             active_skills_list.append(entry)
 
         return RunTrace(
@@ -824,11 +877,23 @@ def log_tool_call(**kwargs: Any) -> None:
     ctx.log_tool_call(**kwargs)
 
 
-def log_skill_activation(*, name: str, hash: Optional[str] = None) -> None:
+def log_skill_activation(
+    *,
+    name: str,
+    hash: Optional[str] = None,
+    skill_id: Optional[str] = None,
+    version_id: Optional[str] = None,
+    body_sha256: Optional[str] = None,
+) -> None:
     """Record that a skill was activated on the current active trace.
 
     Convenience function — calls ``ctx.log_skill_activation()`` on the
     active trace. Raises ``DecimalConfigError`` if no trace is active.
+
+    ``skill_id``, ``version_id`` and ``body_sha256`` say which registry skill
+    and version ran, for a framework with no DecimalAI adapter that reads a
+    skill folder ``decimalai skills`` installed; see
+    ``TraceContext.log_skill_activation``.
     """
     ctx = _get_current_trace()
     if ctx is None:
@@ -837,7 +902,9 @@ def log_skill_activation(*, name: str, hash: Optional[str] = None) -> None:
         raise DecimalConfigError(
             "No active trace. Use @decimalai.trace() or decimalai.start_trace() first."
         )
-    ctx.log_skill_activation(name=name, hash=hash)
+    ctx.log_skill_activation(
+        name=name, hash=hash, skill_id=skill_id, version_id=version_id, body_sha256=body_sha256,
+    )
 
 
 def set_routing_id(routing_id: Optional[str]) -> None:
@@ -898,7 +965,14 @@ def log_skill_delivered(*, names: List[str]) -> None:
     ctx.log_skill_delivered(names=names)
 
 
-def log_skill_loaded(*, name: str, hash: Optional[str] = None) -> None:
+def log_skill_loaded(
+    *,
+    name: str,
+    hash: Optional[str] = None,
+    skill_id: Optional[str] = None,
+    version_id: Optional[str] = None,
+    body_sha256: Optional[str] = None,
+) -> None:
     """Record that the active trace's agent read a skill's body.
 
     Convenience function — calls ``ctx.log_skill_loaded()`` on the
@@ -910,6 +984,9 @@ def log_skill_loaded(*, name: str, hash: Optional[str] = None) -> None:
     ``hash`` is the body's ``content_hash`` as the platform returned it, and is
     what lets the activation resolve to a skill VERSION rather than just a name.
     Omitting it is the pre-2026-08-29 behaviour and stays fully supported.
+    ``skill_id``, ``version_id`` and ``body_sha256`` are the identity of a skill
+    read from a folder ``decimalai skills`` installed; see
+    ``TraceContext.log_skill_activation``.
     """
     ctx = _get_current_trace()
     if ctx is None:
@@ -918,7 +995,28 @@ def log_skill_loaded(*, name: str, hash: Optional[str] = None) -> None:
         raise DecimalConfigError(
             "No active trace. Use @decimalai.trace() or decimalai.start_trace() first."
         )
-    ctx.log_skill_loaded(name=name, hash=hash)
+    ctx.log_skill_loaded(
+        name=name, hash=hash, skill_id=skill_id, version_id=version_id, body_sha256=body_sha256,
+    )
+
+
+def _identity_fields(**values: Any) -> Dict[str, str]:
+    """The registry identity values worth sending: non-empty strings (a UUID as its
+    string). The platform reads nothing else, so anything else is left out, and said."""
+    out: Dict[str, str] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if isinstance(value, UUID):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+        else:
+            logger.warning(
+                "decimalai: %s must be a non-empty string; got %r, which is not sent.",
+                key, value,
+            )
+    return out
 
 
 def _infer_provider(model: Optional[str]) -> Optional[str]:

@@ -153,6 +153,43 @@ def _scrub_surrogates(value: Any) -> Any:
     return value
 
 
+def _skill_index() -> Any:
+    """The working directory's index of installed skills, or None. Never raises."""
+    try:
+        from .skillpkg.identity import current_index
+
+        return current_index()
+    except Exception:  # noqa: BLE001 - identity enrichment must never cost a trace
+        logger.debug("Could not read the project's skills lock; skill names are sent "
+                     "as reported", exc_info=True)
+        return None
+
+
+def _with_skill_identity(payload: Dict[str, Any], index: Any) -> Dict[str, Any]:
+    """``payload`` with the skills a native loader reported given their registry identity.
+
+    A skill installed by ``decimalai skills`` is reported by its folder's name
+    (``acme-refund-policy``), by Claude Code's plugin skill name
+    (``decimalai-skills:acme-refund-policy``) or by its path, none of which the platform
+    knows; ``decimalai.skillpkg.identity.translate_payload`` turns those into the registry
+    name, skill id and version id the lock recorded. It is called here, on the traces the
+    SDK built (``ingest_trace``, ``ingest_traces_batch``), and nowhere else: a payload the
+    caller built (``ingest_raw_trace``) is sent as given.
+
+    Never raises: on any failure the payload goes as it was.
+    """
+    if not index:
+        return payload
+    try:
+        from .skillpkg.identity import translate_payload
+
+        return translate_payload(payload, index=index)
+    except Exception:  # noqa: BLE001 - identity enrichment must never cost a trace
+        logger.debug("Skill identity translation failed; skill names are sent as "
+                     "reported", exc_info=True)
+        return payload
+
+
 class DecimalRateLimitError(Exception):
     """Raised when the Decimal platform returns 429 after all retries are exhausted."""
 
@@ -531,11 +568,16 @@ class DecimalAIClient:
 
         No-op when the SDK is in manifest_only mode (returns
         ``{"status": "skipped", ...}`` — see :class:`IngestionSkipped`).
+
+        Skills reported by an installed folder's name, plugin skill name or path
+        are sent with the registry identity the project's lock recorded (see
+        ``_with_skill_identity``).
         """
         if not self._should_send_traces("ingest_trace"):
             skipped: IngestionSkipped = {"status": "skipped", "reason": "manifest_only_mode"}
             return skipped
-        payload = _scrub_surrogates(trace.model_dump(mode="json"))
+        payload = _with_skill_identity(
+            _scrub_surrogates(trace.model_dump(mode="json")), _skill_index())
         try:
             from .evidence import observe_trace
             observe_trace(self, trace)
@@ -551,7 +593,8 @@ class DecimalAIClient:
     def ingest_traces_batch(self, traces: List[RunTrace]) -> IngestionResult:
         """Send a batch of traces to the platform.
 
-        No-op when the SDK is in manifest_only mode.
+        No-op when the SDK is in manifest_only mode. Skill names are translated
+        as in :meth:`ingest_trace`.
         """
         if not self._should_send_traces("ingest_traces_batch"):
             skipped: IngestionSkipped = {
@@ -560,7 +603,11 @@ class DecimalAIClient:
                 "skipped_count": len(traces),
             }
             return skipped
-        payload = [_scrub_surrogates(t.model_dump(mode="json")) for t in traces]
+        index = _skill_index()
+        payload = [
+            _with_skill_identity(_scrub_surrogates(t.model_dump(mode="json")), index)
+            for t in traces
+        ]
         try:
             from .evidence import observe_trace
             for trace in traces:
@@ -583,6 +630,7 @@ class DecimalAIClient:
 
         No Pydantic validation — the backend validates the payload.
         Useful for custom pipelines, batch imports, and non-Python sources.
+        The payload is sent as given: its skill names are not translated.
         """
         if not self._should_send_traces("ingest_raw_trace"):
             skipped: IngestionSkipped = {"status": "skipped", "reason": "manifest_only_mode"}
