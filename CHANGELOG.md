@@ -6,6 +6,39 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI Agents: a model turn that calls a tool records the call.** The
+  `llm_call` of a turn whose output is a function call (a `load_skill` call, or
+  any tool) carried `output: null`, no `tool_calls` and `finish_reason: "stop"`,
+  so the trace hid what the model decided. Each call is now on `tool_calls`
+  (tool name and argument dict) with `finish_reason: "tool_calls"`, and on
+  `output.tool_calls` in the chat-completions shape with its call id. When the
+  tool's span ends, the same entry gets its `status`, `result` and
+  `latency_ms`, and takes the span's id, so a reader that joins tool calls with
+  tool spans by id counts one call, not two. A handoff (`transfer_to_<agent>`)
+  is closed by its handoff span the same way, with a result naming the target
+  agent. A call never seen to run stays `running`. Both the Responses path and
+  the chat-completions / LiteLLM path.
+- **OpenAI Agents: tool span previews keep 2000 characters instead of 200**,
+  which is what the platform stores, so a loaded skill body shows its first
+  paragraphs.
+- **Evals see the tool calls a trace recorded.** `trace_to_trace_data` read a
+  tool call's name only from `name` or `function.name`, and its arguments only
+  from a dict `function.arguments`. Every adapter records `ToolCallRecord`
+  (`tool_name` + `args`), so each recorded call reached an eval as
+  `ToolCallView(name="", args={})`. The reader now accepts `tool_name`, `name`
+  and `function.name`, takes arguments from `args`, `arguments` or
+  `function.arguments`, and parses a JSON-string `arguments` into a dict.
+- **`decimalai init <agent>` no longer presents the attached skills as
+  everything the agent uses.** The header listed `GET /agents/{name}/skills`
+  as "Skills this agent will use", but an agent is also offered every skill its
+  workspace owns unless that skill is set to "Only agents it's assigned to", so
+  a skill created a moment ago was missing, and an agent with no attachments was
+  told it would "run as a plain model call". The header now says "Skills
+  attached to this agent" and states the workspace-wide offer, and the summary
+  line counts "skills attached".
+
 ## [0.14.0] — 2026-10-14
 
 ### Breaking: every framework extra floors the framework's latest release

@@ -314,7 +314,9 @@ def _scaffold_agent_file(
             click.echo("")
             raise SystemExit(1)
 
-    # 3. Fetch its skills, so the file can name what it will use.
+    # 3. Fetch the skills attached to it, so the file can name them. These are
+    #    subscription rows; the skills the workspace owns are offered to the
+    #    agent without one, and the header says so (`_skill_comment_lines`).
     try:
         quoted = urllib.parse.quote(agent_name, safe="")
         resp = _get_past_admission_aborts(client._http, f"/api/v1/agents/{quoted}/skills")
@@ -428,7 +430,7 @@ def _scaffold_agent_file(
         )
     click.echo("")
     click.echo(f"  ✓ Wrote {out_path} — {agent_name}, {framework}, "
-               f"{n} skill{'' if n == 1 else 's'}{prompt_note}")
+               f"{n} skill{'' if n == 1 else 's'} attached{prompt_note}")
     if prompt_unreadable:
         click.echo("")
         click.echo("  ! Could not read this agent's system prompt just now — the "

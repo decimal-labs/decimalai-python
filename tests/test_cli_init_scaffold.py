@@ -99,6 +99,17 @@ def kwarg(call: ast.Call, name: str):
     return None
 
 
+def _header_text(source: str) -> str:
+    """The file's leading `#` block as one line of prose, so a sentence that
+    wraps across comment lines can be asserted on as a sentence."""
+    words = []
+    for line in source.splitlines():
+        if not line.startswith("#"):
+            break
+        words.extend(line.lstrip("#").split())
+    return " ".join(words)
+
+
 def string_literals(tree: ast.Module) -> list:
     return [n.value for n in ast.walk(tree)
             if isinstance(n, ast.Constant) and isinstance(n.value, str)]
@@ -491,6 +502,30 @@ class TestSkillsAreNamed:
         source = render_agent_file(AGENT, "langchain", [])
         assert "No skills are attached" in source
 
+    # The list comes from GET /agents/{name}/skills, which returns subscription
+    # rows only. An agent is ALSO offered, with no row at all, every skill its
+    # workspace owns unless that skill is set to "Only agents it's assigned
+    # to" -- so a skill created a moment ago was missing from a header that
+    # called the list "Skills this agent will use", and an agent with no rows
+    # was told it "will run as a plain model call".
+
+    @pytest.mark.parametrize("skills", [SKILLS, []], ids=["attached", "none-attached"])
+    def test_the_workspace_skills_offered_without_a_row_are_mentioned(self, skills):
+        header = _header_text(render_agent_file(AGENT, "langchain", skills))
+        assert "also offered the skills this workspace owns" in header \
+            or "still offered the skills this workspace owns" in header
+        assert "including one created a moment ago" in header
+        assert "Only agents it's assigned to" in header
+
+    def test_the_list_is_not_called_what_the_agent_will_use(self):
+        header = _header_text(render_agent_file(AGENT, "langchain", SKILLS))
+        assert "Skills this agent will use" not in header
+        assert "Skills attached to this agent (3):" in header
+
+    def test_no_attached_skills_is_not_a_plain_model_call(self):
+        header = _header_text(render_agent_file(AGENT, "langchain", []))
+        assert "plain model call" not in header
+
     def test_a_multiline_description_cannot_break_out_of_the_comment(self):
         """The header is `#` comments, so a newline is the ONLY escape — which
         is why every description is flattened before it goes in."""
@@ -834,8 +869,8 @@ class TestCliWritesTheFile:
         assert "3 skills" in result.output
 
     @pytest.mark.parametrize("prompt, expected", [
-        (_prompt_payload(), "3 skills, system prompt"),
-        (_prompt_payload(None), "3 skills, no system prompt"),
+        (_prompt_payload(), "3 skills attached, system prompt"),
+        (_prompt_payload(None), "3 skills attached, no system prompt"),
     ])
     def test_whether_the_prompt_was_picked_up_is_reported(
         self, prompt, expected, tmp_path, monkeypatch
@@ -1015,6 +1050,19 @@ class TestAgentResolution:
         compile(source, "agent.py", "exec")
         assert "No skills are attached" in source
         assert "0 skills" in result.output
+
+    def test_the_summary_counts_attached_skills_not_offered_ones(
+        self, tmp_path, monkeypatch
+    ):
+        """"0 skills" read as "this agent has none", while every skill the
+        workspace owns is still offered to it. The count is of attachments."""
+        monkeypatch.chdir(tmp_path)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x"],
+                          client=_client(skills=[]))
+        assert result.exit_code == 0, result.output
+        assert "0 skills attached" in result.output
+        header = _header_text((tmp_path / "agent.py").read_text())
+        assert "still offered the skills this workspace owns" in header
 
 
 class TestErrorTriage:

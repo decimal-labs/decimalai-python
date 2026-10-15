@@ -314,20 +314,33 @@ def _py(value: str) -> str:
 
 
 def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
-    """The `# Skills …` block: what this agent will actually use.
+    """The `# Skills …` block: what is attached to this agent, and what else
+    it is offered.
 
-    A zero-skill agent gets a sentence saying so rather than an empty list.
-    A silently empty section is how someone concludes the scaffold is broken
-    when the truth is that they have not attached anything yet.
+    `skills` is `GET /api/v1/agents/{name}/skills`: subscription rows, the ones
+    made for this agent and the workspace-wide ones. It is NOT everything the
+    agent is offered. Every skill the workspace owns reaches every agent with
+    no row at all, unless its "Offered to" setting is "Only agents it's
+    assigned to" — so a skill created a moment ago is offered and is not in
+    this list. The one endpoint that answers with the whole offered set,
+    `GET /api/v1/skills/menu`, records a routing decision on every call, and a
+    scaffold is not a run: calling it here would count an offer of every skill
+    that no run ever made. So the list stays what it is, labelled as such, and
+    the rest is said in a sentence.
+
+    A zero-row agent gets that sentence rather than an empty list. A silently
+    empty section is how someone concludes the scaffold is broken.
     """
     if not skills:
         return [
-            "# No skills are attached to this agent yet, so it will run as a plain",
-            "# model call. Attach some in the dashboard — no need to regenerate this",
-            "# file, it loads whatever is attached at run time.",
+            "# No skills are attached to this agent itself. It is still offered the",
+            "# skills this workspace owns: by default every one of them, including",
+            "# one created a moment ago, unless its \"Offered to\" setting is \"Only",
+            "# agents it's assigned to\". The file loads its skills at run time, so",
+            "# attaching more in the dashboard needs no regenerating.",
         ]
 
-    lines = [f"# Skills this agent will use ({len(skills)}):"]
+    lines = [f"# Skills attached to this agent ({len(skills)}):"]
     for s in skills:
         name = _clean(s.get("skill_name") or s.get("name") or "(unnamed)", limit=60)
         desc = _clean(s.get("description"), limit=70)
@@ -336,6 +349,13 @@ def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
         # claiming a deliberate choice that was never made.
         suffix = "  [workspace-wide]" if s.get("scope") == "workspace" else ""
         lines.append(f"#   - {name}" + (f" — {desc}" if desc else "") + suffix)
+    lines += [
+        "#",
+        "# It is also offered the skills this workspace owns: by default every one",
+        "# of them, including one created a moment ago, unless its \"Offered to\"",
+        "# setting is \"Only agents it's assigned to\". Only attached skills are",
+        "# listed above.",
+    ]
     return lines
 
 
