@@ -6,6 +6,243 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-15
+
+### Added: registry skills on disk, managed like packages
+
+A project lists the registry skills it wants in `.decimal/skills.toml`. Each one
+is installed as a real folder, `.agents/skills/<install-name>/`, holding the
+registry's own bytes, and `.decimal/skills.lock` (lock version 2) records every
+file and hash it wrote. Commit the manifest and the lock; CI and Docker get the
+same bytes back with `install --frozen`. `.agents/.claude-plugin/plugin.json`
+makes `.agents` a Claude Code plugin named `decimalai-skills`.
+
+- `decimalai skills add <ref>[@N|@latest]` resolves a registry name, url_slug,
+  install name or skill id, records it in the manifest (`latest`, or pinned to
+  version N), installs it and locks it. Adding it again with another version
+  changes the version. `--no-install` only records it.
+- `decimalai skills install` makes the folders match the manifest and the lock:
+  new entries are installed, entries the manifest dropped are removed, and
+  missing folders are fetched at their locked version. It never moves a version
+  (that is `update`), and when every folder matches the lock it makes no
+  network call.
+- `decimalai skills install --frozen` is for CI and Docker. Nothing is
+  resolved, and the manifest and the lock are never written; a missing folder
+  is fetched by its exact lock entry and every byte is checked against it.
+  `--offline` fails instead of fetching. The API key is sent only to the
+  configured platform URL, never to a URL read from a committed lock.
+- `decimalai skills update [<name>[@N|@latest]]` moves every `latest` entry to
+  the newest version and leaves pinned entries alone. Each changed folder is
+  replaced whole, so files a new version dropped disappear. If one skill cannot
+  be updated, none is. `--dry-run` changes nothing; `--json` prints the plan.
+- `decimalai skills remove <name>` deletes the folder and its manifest and lock
+  entries. Nothing changes on the registry: Use links and forks stay.
+- `decimalai skills status` shows each installed folder against the lock
+  (clean, modified, missing, unmanaged), the manifest against the lock, an
+  interrupted run, and a version 1 lock that needs `migrate`. `--remote` also
+  asks the registry for newer versions, descriptions changed upstream and
+  revoked versions. When `./skills` exists and a key is set, a second section
+  compares the skills you wrote with the platform, as `status` did before.
+  `--check` exits 1 on any drift, for CI.
+- `decimalai skills verify [PATH] [--strict]` checks folders the way the native
+  skill loaders read them, and writes nothing. In folders the lock lists every
+  rule is an error. In other folders, and in `PATH`, the format rules every
+  loader needs are errors and the SDK's own rules are warnings (`--strict`
+  makes them errors).
+- `decimalai skills migrate` converts a project with a version 1 lock (what
+  0.14 and older wrote) or an npx lock: it writes the manifest and a version 2
+  lock and installs every skill again from the registry. Old folders inside
+  `.agents/skills` move to `.decimal/migrated-v1/`, old folders anywhere else
+  stay and are listed, nothing is deleted, and a second run does nothing.
+- A skill whose safety review is `caution` or `unreviewed` is asked about on a
+  terminal and refused without one unless `--yes`. Blocked skills are always
+  refused, and withheld ones unless your org owns or uses them. Skills your org
+  owns skip the question.
+- Without an API key, `add`, `install` and `update` work anonymously, for
+  public skills only. A platform too old for these commands is refused with an
+  error naming the missing route (exit 7); there is no silent fallback.
+- The commands above take `--directory` (the project; by default the nearest
+  folder with `.decimal/`, up to the repository root), and `status`, `verify`
+  and `update` take `--json`. The exit codes are stable and listed in
+  `decimalai skills --help`:
+
+  | code | meaning |
+  |---|---|
+  | 0 | ok |
+  | 1 | `status --check` or `verify` found problems; a journal conflict; another run holds the project |
+  | 2 | usage error |
+  | 3 | the lock or the manifest is missing or unreadable, or the lock is a version 1 or npx lock |
+  | 4 | the lock is out of date with `.decimal/skills.toml` |
+  | 5 | local edits, an unmanaged folder or a symlink block the operation (`--force` backs the folder up to `.decimal/backup/` and replaces it; symlinks are refused even then) |
+  | 6 | integrity: served bytes differ from the declared or locked hashes, or `lock_hash` does not recompute |
+  | 7 | unavailable: not found, ambiguous, withheld, blocked, version unsafe, no access, name taken, render gone or invalid |
+  | 8 | network failure, or `--offline` needed a fetch |
+
+- The same engine in Python: `from decimalai import skillpkg`, then
+  `skillpkg.add()`, `install(frozen=True)`, `update()`, `remove()`, `status()`,
+  `verify()` and `migrate()`. Each returns a `Result` of `changes`, `problems`
+  and `exit_code`. Importing it loads no agent framework.
+- **`decimalai.skills_dir()`** returns the project's managed root, absolute and
+  symlink-resolved, for a framework's own skill loader;
+  `skills_dir(relative_to=Path.cwd())` gives a relative path for loaders that
+  want one. It raises when the project has no version 2 lock, naming
+  `decimalai skills migrate` for a version 1 lock. The SDK's test suite runs
+  eight native loaders on a project laid out as `install` writes it: Claude
+  Code (through the Claude Agent SDK's `plugins=`), Google ADK's
+  `SkillToolset`, the OpenAI Agents sandbox `Skills` capability, deepagents,
+  Microsoft Agent Framework, Strands, pydantic-ai-harness and CrewAI. Claude
+  Code also loads it with
+  `claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"`.
+- `log_skill_activation()` and `log_skill_loaded()` take `skill_id`,
+  `version_id` and `body_sha256`, for a framework with no DecimalAI adapter
+  that reads installed folders itself. Each installed `SKILL.md` carries them
+  under `metadata` (`decimalai-skill-id`, `decimalai-version-id`,
+  `decimalai-body-sha256`), and `discover_skills()` returns them on each
+  descriptor.
+
+### Changed: traces name the registry skill that ran
+
+- A native loader reports an installed skill by its folder name, by its plugin
+  name (`decimalai-skills:<install-name>`) or by its path, none of which the
+  platform knows. Before a trace is sent, the SDK looks the name up in the
+  project's version 2 lock and adds the registry name, skill id, version id and
+  body hash. An entry that already carries ids, or whose hash names another
+  body, is sent as reported. A folder edited locally is sent with the hash of
+  the body on disk, `modified: true` and no version id, so the edit is not
+  credited to the registry version. This covers the traces the SDK builds;
+  `ingest_raw_trace()` sends its payload as given. A failed lookup never costs
+  a trace.
+- Installing a skill to disk no longer counts as serving it. `skills add`,
+  `install`, `update`, `migrate`, `pull` and `SkillRouter.export()` fetch the
+  registry's bundle, which the platform records as a fetch, separately, and
+  the skill's served count does not move. In 0.14, `skills export` read the body through
+  the delivery route and was counted as served; 0.14 clients still are.
+
+### Breaking: no adapter writes skills to disk
+
+- `instrument()` on LangChain and OpenAI Agents no longer copies platform skills
+  into the working directory, and an existing `.agents/skills` folder no
+  longer counts as permission to do so. Registry skills reach disk only when a
+  `decimalai skills` command (or `skillpkg`) runs. If you asked for skills on
+  disk (`disk_sync=True`, or `skill_authority="harness"`), a WARNING says so
+  once per process and names `decimalai skills add` and `install`.
+- `disk_sync` now only decides whether the adapter reads local SKILL.md files
+  and uploads the ones you wrote. That upload, `decimalai skills sync`,
+  `sync_to_platform()` and the authored section of `status` skip folders that
+  carry the registry's stamp (`metadata.decimalai-skill-id`: installed, pulled
+  or exported ones), so a registry skill is never copied into your org.
+
+### Deprecated: the 0.14 disk verbs, which now run the package manager
+
+The deprecated verbs below still work in 0.15, warn once per process and name
+their replacement. Unless noted, each stops working in 0.16.
+
+- `decimalai skills export <ref>` is `skills add <ref>`. `--agent` is ignored
+  with a warning (there is one root), `--scope global` exits 2 and names
+  `decimalai skills pull <ref> --out ~/.claude/skills`, and `--out` is taken as
+  the project directory.
+- `decimalai skills install <ref>` (with a reference) is `skills add <ref>` and
+  **no longer forks** the skill into your workspace. For an editable copy use
+  `router.fork()` or the dashboard. `install` with no reference is the new
+  command above.
+- `SkillRouter.install()` and `install_skill()` add the skill like `skills add`
+  and **no longer fork**: the result's `fork` and `install` are None.
+- `SkillRouter.pull_missing()` runs `skills install` when the project has
+  `.decimal/skills.toml`. Without one it writes nothing and warns once with the
+  command to run. It never copies every org skill to disk again.
+- `SkillRouter.export_to_disk(skills=[...])` adds each named skill (deprecated,
+  no removal version set). `export_to_disk()` with no `skills` adds every skill
+  `list_skills()` returns, each listed in the manifest by name; that form stops
+  working in 0.16.
+- `disk_export.export_skill_to_disk()` and `export_skills_to_disk()` render
+  SKILL.md locally in the registry's format and write folders no lock vouches
+  for. They need the skill's registry ids: a 0.14-shaped `{name, description,
+  body_markdown}` dict raises `ValueError`. They never create a lock, only keep
+  an existing version 1 lock up to date, and never touch a version 2 lock.
+- Not deprecated, but running the new engine: `SkillRouter.export(name)` is
+  `skills add` (no fork, nothing read through the delivery route) and returns
+  its old keys plus `lock_entry` and `result`; `SkillRouter.status()` reports
+  the package manager's state for `project_root` and reaches the network only
+  with `remote=True`; `SkillRouter.update_skills()` is `skills update`.
+- **`update_skills(force=True)` means force.** A folder edited by hand stops
+  the update (none is applied) unless `force=True`, which backs it up to
+  `.decimal/backup/<txid>/` and replaces it. In 0.14 `force=True` re-wrote every
+  skill whether or not it had changed upstream.
+- Outside the version 1 fallback below, `agents=` on these methods is ignored
+  with a one-time warning. `scope="global"` on `export()`, `install()`,
+  `export_to_disk()` and `update_skills()` raises `ValueError` naming
+  `decimalai skills pull <name> --out ~/.claude/skills`.
+- In a project whose lock is still version 1, the old verbs keep working the
+  0.14 way (folders where 0.14 put them, the version 1 lock updated) and warn
+  once to run `decimalai skills migrate`. 0.16 removes this fallback.
+- `decimalai skills status DIR` stays: it prints the authored section for DIR.
+
+### Changed: `decimalai skills pull`
+
+- It writes the registry's exact files to `<out>/<install-name>/`: SKILL.md
+  with the registry's frontmatter and stamp, the bundled files, and
+  `eval.yaml` when the skill has one. `--stdout` prints the served SKILL.md,
+  frontmatter included. It is still a loose copy that nothing updates; `skills
+  add` is the managed way.
+- A folder that already holds different files is left alone with exit 5
+  unless `--force`, which leaves files that are not part of the skill in
+  place. 0.14 overwrote it silently. A folder inside a project's managed
+  `.agents/skills` is refused with exit 5, with or without `--force`.
+- Exit codes: 7 when the skill is not found, not public or withheld, 8 when
+  the platform cannot be reached (after one retry on a timeout), 6 when a
+  served file would land outside the folder or does not match its hash. 0.14
+  exited 1 for every failure.
+
+### Upgrading from 0.14
+
+- A project with a `.decimal/skills.lock` that 0.14 or older wrote: run
+  `decimalai skills migrate` once and commit `.decimal/skills.toml` and
+  `.decimal/skills.lock`.
+- **Do not run decimalai 0.14 or older in a project 0.15 manages** where it
+  writes skills: `skills export`, `skills install <ref>`,
+  `SkillRouter.export*()` / `install()` / `pull_missing()`, or an adapter with
+  disk sync on (0.14's adapters write into `.agents/skills` when it exists).
+  The old writer merges its own entries into `.decimal/skills.lock`;
+  `install --frozen` then exits 3, `status` warns about the entries, and
+  `skills install` drops them and leaves their folders unmanaged. Upgrade
+  every checkout, CI image and agent host that touches the project together.
+
+### Changed: reading SKILL.md and finding the project
+
+- Frontmatter is read with PyYAML: quoted descriptions with escapes are
+  decoded, list values are read and then joined into strings for callers, a
+  value YAML would retype (`yes`, `404`, `1.10`, dates) keeps its written text,
+  and invalid YAML falls back to the simple reader with a warning. A name may
+  start with a digit (`2slides-ppt-generator` was skipped). Category, skill
+  type, skill scope and invocation are read from `metadata` (`decimalai-*`
+  keys) first, then the top level; `skills scan` reads the category the same
+  way.
+- Descriptors from `discover_skills()` carry `managed`, `registry_name`,
+  `skill_id`, `version_id` and `body_sha256`. Discovery includes the managed
+  root, searches the working directory before the project root (a monorepo
+  package keeps its own skills), and lists a skill once.
+- The project directory (for discovery, install identity and every
+  `decimalai skills` command) is the nearest `.decimal/` with a manifest or
+  lock, then any `.decimal/`, then the repository root. The search never goes
+  above the repository, and never reaches the home directory from a folder
+  under it, so run from such a folder outside a repository, the SDK no longer
+  reads or uploads the personal skills in your home directory.
+- `decimalai skills status` writes nothing. Without a sync baseline
+  (`.decimal/install.json`, which `skills sync` creates) it asks the platform
+  nothing and says to sync once; 0.14 created an install identity on the spot.
+- `.decimal/.gitignore` is kept listing `install.json` and the engine's working
+  files (`staging/`, `backup/`, `migrated-v1/`, the journal and the process
+  lock); missing lines are appended and existing ones kept.
+- `decimalai skills benchmark` sends a category only when it is text; a list
+  made the platform refuse the request.
+
+### Dependencies
+
+- New core dependencies: `PyYAML>=6.0` (SKILL.md frontmatter) and `tomli>=2` on
+  Python 3.10 (`.decimal/skills.toml`; 3.11+ uses `tomllib`).
+- `skillevaluation>=0.8.0` (was `>=0.4.0`), for `skillevaluation.skillfmt`, the
+  on-disk format module the registry renders with.
+
 ### Fixed
 
 - **OpenAI Agents: a model turn that calls a tool records the call.** The

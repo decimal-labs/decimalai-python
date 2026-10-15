@@ -21,7 +21,7 @@ pip install decimalai
 uv pip install decimalai
 ```
 
-Requires **Python 3.10+** (`pip` won't install current releases on older Pythons). The `[adk]`, `[pydantic-ai]` and `[all]` extras need **Python 3.11+**: the google-adk and pydantic-ai-slim releases they install require it. On Python 3.10 pip does not refuse them; it installs an older decimalai instead (see [below](#when-pip-installs-an-older-decimalai)).
+Requires **Python 3.10+** (`pip` won't install current releases on older Pythons). The `[adk]`, `[pydantic-ai]` and `[all]` extras need **Python 3.11+**: the google-adk and pydantic-ai-slim releases they install require it. On Python 3.10 pip does not refuse them; it installs an older decimalai instead (see [below](https://github.com/decimal-labs/decimalai-python#when-pip-installs-an-older-decimalai)).
 
 `[langchain]` installs on Python 3.10 with one limit there. asyncio on 3.10 cannot hand a run's config to an async LangGraph node, so a model that the node calls without passing `config` on, as `create_agent`'s model node does, runs outside the run. Under `ainvoke` / `astream` those model calls route without the agent the trace is filed under, so that agent's skills and pins are not offered, and the trace records neither the calls nor their routing decisions. The SDK logs a warning the first time it happens. Sync `.invoke()` runs, nodes that pass `config` to the model, and every run on Python 3.11+ are unaffected; `instrument(agent_name=...)` at least routes the calls as the right agent.
 
@@ -83,9 +83,9 @@ Everything above comes from a **seeded reference agent — illustrative, run it 
 
 These commands work without a DecimalAI key:
 
-- `decimalai skills pull <slug>` — fetch any published SKILL.md to disk, no account.
+- `decimalai skills pull <slug>` — copy any published skill's folder (SKILL.md and its bundled files) to disk, no account. `decimalai skills add <slug>` installs a public skill into a project instead, locked and updatable.
 - `decimalai starter support --project ./support-agent` — download a frozen, runnable Support project. Its Python standard-library runtime uses your OpenAI key locally and uploads no traces; `python3 agent.py --check-setup` verifies the files and `--checks` makes two task and two judge calls. The [public builder](https://app.decimal.ai/skills/packs/support/build) downloads the same project without installing the SDK.
-- The [`agentversion`](https://pypi.org/project/agentversion/) manifest flow ([below](#open-standard-agentversion)) — diff and gate agent manifests fully locally.
+- The [`agentversion`](https://pypi.org/project/agentversion/) manifest flow ([below](https://github.com/decimal-labs/decimalai-python#open-standard-agentversion)) — diff and gate agent manifests fully locally.
 
 There's a second demo for the registry side:
 
@@ -220,14 +220,14 @@ import decimalai
 decimalai.init(api_key="dai_sk_...")
 
 from decimalai.openai_agents import instrument
-instrument()  # Scans .claude/skills/, .agents/skills/, etc. → syncs to dashboard
+instrument()  # Scans .claude/skills/, .agents/skills/, etc. → syncs the ones you wrote to the dashboard
 ```
 
 Supports 32 agent runtimes: Claude Code, Cursor, Copilot, Windsurf, Continue, and more.
 
-### Registry Search & Install
+### Registry Search, Use & Fork
 
-Find community skills and install them in one call:
+Find community skills, and link the ones you want into your workspace:
 
 ```python
 from decimalai.skill_router import SkillRouter
@@ -236,26 +236,41 @@ router = SkillRouter(api_key="dai_sk_...")
 # Search the public registry
 results = router.search("code review security")
 
-# Install a skill — a LINK into your workspace, tracking the author's updates
+# Link a skill into your workspace (no copy): your agents are offered it, and it tracks the author's updates
 router.use("pdf")
-
-# Write the files to disk, for runtimes that load SKILL.md themselves
-router.export("pdf", agents=["claude-code", "cursor"])
 
 # Take an editable copy, only if you intend to change it
 router.fork("pdf")
 ```
 
-### Status & Update
+### Skills on Disk
+
+For a runtime that loads SKILL.md folders itself, install registry skills into the project, like packages:
+
+```bash
+decimalai skills add pdf            # record it in .decimal/skills.toml, write .agents/skills/<name>/, lock its bytes
+decimalai skills install --frozen   # CI and Docker: exactly what .decimal/skills.lock records, or a refusal
+decimalai skills update             # move `latest` entries to the newest version
+decimalai skills status             # installed folders against the lock, and ./skills against the platform
+decimalai skills verify             # what a native skill loader would reject
+decimalai skills remove pdf
+```
+
+Commit `.decimal/skills.toml` and `.decimal/skills.lock`. A folder you edited by hand is never replaced without `--force`, which backs it up first. Without an API key, `add`, `install` and `update` work anonymously for public skills. Each of these commands exits with a code listed in `decimalai skills --help`, and the same engine is `from decimalai import skillpkg` in Python; `router.status()` and `router.update_skills()` run `skills status` and `skills update` for the project.
+
+Point the framework's own skill loader at the installed skills with `decimalai.skills_dir()`:
 
 ```python
-# Check sync status between local files and platform
-status = router.status()
-# → {"synced": [...], "modified_locally": [...], "untracked": [...]}
+import decimalai
+from claude_agent_sdk import ClaudeAgentOptions
 
-# Pull upstream updates
-router.update_skills()
+# .agents is a Claude Code plugin, decimalai-skills, holding the installed skills
+options = ClaudeAgentOptions(plugins=[{"type": "local", "path": str(decimalai.skills_dir().parent)}])
 ```
+
+From the Claude Code CLI: `claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"`. Other native loaders (Google ADK, the OpenAI Agents sandbox, deepagents, Microsoft Agent Framework, Strands, pydantic-ai-harness, CrewAI) take `decimalai.skills_dir()`, or `decimalai.skills_dir(relative_to=...)` where they want a path relative to a working directory.
+
+No adapter writes skills to disk on its own. Upgrading from 0.14: run `decimalai skills migrate` once in a project whose `.decimal/skills.lock` 0.14 wrote. `decimalai skills export`, `decimalai skills install <name>`, `SkillRouter.install()`, `SkillRouter.pull_missing()` and the `disk_export` writers are deprecated wrappers of these commands (`install` no longer forks) and stop working in 0.16; see the [changelog](https://github.com/decimal-labs/decimalai-python/blob/main/CHANGELOG.md).
 
 ### Skill Delivery at Runtime (`enable_skill_loader`)
 
@@ -291,7 +306,7 @@ With the loader on, the router adds a ranked **menu** of relevant skills to the 
 
 - **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the menu alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole menu is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `adk`, `crewai` — none of them register a `load_skill` tool) and **off** for `openai_agents` and `pydantic_ai`, which fetch on demand rather than double-deliver (turn the `load_skill` tool off and injection takes over there too). An explicit `True`/`False` always wins.
 - **`load_skill` tool** — on adapters that own their tool loop, a `load_skill` tool registers automatically whenever the loader is enabled, so the model can fetch an offered skill's body mid-turn. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the menu cap left off this turn's menu), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself; a load from a router that has never routed (a hand-built menu, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. If another tool in the run is already called `load_skill` (an OpenAI `SandboxAgent`'s native skills, or your own tool on Pydantic AI), DecimalAI's is exposed as `decimalai_load_skill` instead and the menu names it. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `instrument()` parameter on these adapters.
-- **Export to disk** — for runtimes that natively load skills from files (Claude Code, Cursor, ...), write them out with `router.export(...)` or `decimalai skills export` and let the runtime deliver them. Export takes no copy and needs no fork; you can export a skill you only linked.
+- **Native loading from disk** — for runtimes that load SKILL.md folders themselves (Claude Code, Google ADK, ...), install skills with `decimalai skills add` and point the runtime at `decimalai.skills_dir()` (see [Skills on Disk](https://github.com/decimal-labs/decimalai-python#skills-on-disk)), and let the runtime deliver them. No copy is taken and no fork is needed; you can install a skill you only linked.
 
 Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop the adapter controls):
 
@@ -299,12 +314,12 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 |---|---|---|---|
 | `decimalai.openai_agents` | ✅ | ✅ | tool auto-registers with the loader |
 | `decimalai.pydantic_ai` | ✅ | ✅ | routed once per run on the run's message, every turn of a conversation included; bodies arrive via `load_skill` unless the tool is off |
-| `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns); on Python 3.10, async `create_agent` runs route their model calls without the run (warns once; see [Installation](#installation)) |
+| `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns); on Python 3.10, async `create_agent` runs route their model calls without the run (warns once; see [Installation](https://github.com/decimal-labs/decimalai-python#installation)) |
 | `decimalai.adk` | ✅ | ❌ injection-only | bodies appended to `system_instruction`; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ❌ injection-only | patches `messages.create()`, `.stream()` and `.parse()` (sync and async; not `client.beta`) — no loop to route a tool result back |
-| `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself from `.claude/skills/` |
-| generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; use disk install |
+| `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
+| generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
 
 Honest-measurement note: menu-only (loader on, no body injection, no `load_skill` tool) means the model sees that a skill *exists* but never its content. Usage from that channel counts as **offered**, not **activated** — don't expect activation stats from prompt-injection-only setups.
 
@@ -314,7 +329,7 @@ Every published skill is reachable without installing anything:
 
 - **Web copy-paste** — open any skill's scorecard page on [app.decimal.ai/skills](https://app.decimal.ai/skills), hit **Copy SKILL.md**, and paste it into your repo.
 - **Raw URLs** — `https://app.decimal.ai/s/<slug>/SKILL.md` serves the raw markdown (version-pinned: `/s/<slug>@<version>/SKILL.md`); `https://app.decimal.ai/s/<slug>.json` serves machine-readable metadata (lift summary, benchmark models, trust/safety bands); `https://app.decimal.ai/llms.txt` indexes the registry for agents.
-- **CLI pull (no account)** — `decimalai skills pull <slug>` writes just the file to disk; no fork, no signup. (`decimalai skills install <slug>` forks + syncs if you do have a key.)
+- **CLI pull (no account)** — `decimalai skills pull <slug>` copies the skill's folder (SKILL.md and its bundled files) to disk; no fork, no signup, and nothing updates it later. `decimalai skills add <slug>` installs it into a project instead, locked and updatable (public skills need no key).
 - **MCP server** — search and read skills from any MCP client (`pip install decimalai-mcp`).
 
 See the full [SDK Skills Reference](https://docs.decimal.ai/sdk/python) for all methods.
