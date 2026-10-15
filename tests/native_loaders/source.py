@@ -2,13 +2,17 @@
 
 Two projects are graded on every run:
 
-* the **graded project** — what the eight loaders must read cleanly. Today that is
-  the oracle (``oracle.py``), an independent rendering of the on-disk contract.
-  When ``decimalai skills add`` and ``decimalai skills install --frozen`` exist,
-  ``graded_project`` writes the folder with them instead (as subprocesses against
-  the hermetic registry in ``tests/conformance/probe.py``), and the oracle becomes
+* the **graded project**: what the eight loaders must read cleanly. It is written by
+  the real CLI (``producer.py``): ``decimalai skills add`` for each of the three
+  skills, then ``decimalai skills install --frozen`` into a checkout of the manifest
+  and the lock alone, as subprocesses of this interpreter's ``decimalai`` script,
+  against the hermetic registry in ``tests/conformance/probe.py``. The commands run
+  once per process; every graded project is a copy of that output (bytes and modes).
+  The oracle (``oracle.py``), an independent rendering of the on-disk contract, is
   the byte-for-byte reference that output is compared with.
-* the **negative control** — a frozen copy of what SDK 0.13.9's exporter writes for
+  ``DECIMAL_NATIVE_LOADER_PRODUCER=oracle`` grades the oracle's own folder instead,
+  which tells a producer regression from a loader one.
+* the **negative control**: a frozen copy of what SDK 0.13.9's exporter writes for
   the same three skills (``fixtures/v0139_project``). The contract must FAIL on it,
   in the cells ``ledger.NEGATIVE_CONTROL_PREDICTED`` names, for as long as this
   suite exists. If a contract item is weakened, that test turns red.
@@ -18,10 +22,11 @@ The fixture is stored with its two dot-directories renamed (``agents/``,
 ``.decimal/`` at every depth; ``negative_control_project`` restores the names when
 it copies the fixture out, and checks nothing was lost on the way into git.
 
-``skills_dir`` stands in for ``decimalai.skills_dir()`` until the SDK exports it.
-Every loader module starts from it, exactly as each documented loader snippet
-starts from ``decimalai.skills_dir()``; switching to the real one is a change to
-this file only.
+``skills_dir`` stands in for ``decimalai.skills_dir()`` in the loader modules: the
+real one refuses a version 1 lock, and the negative control is one, so a loader there
+would never get as far as reading the folders it is graded on. On the graded project
+the two agree (``test_producer.py``). Every loader module starts from it, exactly as
+each documented loader snippet starts from ``decimalai.skills_dir()``.
 """
 
 from __future__ import annotations
@@ -38,15 +43,31 @@ NEGATIVE_CONTROL = HERE / "fixtures" / "v0139_project"
 #: Stored name -> the name 0.13.9 wrote (see the module docstring).
 _RENAMED = {"agents": ".agents", "decimal": ".decimal"}
 
-#: What ``graded_project`` writes today. "oracle" until the producer exists.
-PRODUCER = "oracle"
+#: What may write the graded project: the real CLI (``producer.py``), or the oracle.
+PRODUCERS = ("cli", "oracle")
+PRODUCER_ENV = "DECIMAL_NATIVE_LOADER_PRODUCER"
+
+
+def _producer() -> str:
+    chosen = (os.environ.get(PRODUCER_ENV) or "cli").strip()
+    if chosen not in PRODUCERS:
+        raise ValueError(f"{PRODUCER_ENV}={chosen!r}: one of {', '.join(PRODUCERS)}")
+    return chosen
+
+
+#: What ``graded_project`` writes on this run.
+PRODUCER = _producer()
 
 
 def graded_project(dest: Path) -> Path:
     """Write the project the eight loaders must read cleanly into ``dest``."""
     dest = Path(dest).resolve()
-    oracle.write(dest)
-    return dest
+    if PRODUCER == "oracle":
+        oracle.write(dest)
+        return dest
+    from . import producer
+
+    return producer.produce_copy(dest)
 
 
 def negative_control_files() -> list:

@@ -40,13 +40,21 @@ def test_every_noise_allowance_still_occurs(graded, loader):
 
 
 def test_the_graded_project_comes_from_the_declared_producer(graded):
-    """The suite says what wrote the folder it graded; today that is the oracle."""
-    from . import oracle, source
+    """The suite says what wrote the folder it graded: the real CLI (``producer.py``)
+    unless ``DECIMAL_NATIVE_LOADER_PRODUCER=oracle``; either way, the oracle's bytes."""
+    from . import oracle, producer, source
 
-    assert source.PRODUCER == "oracle"
-    written = {p.relative_to(graded.project).as_posix(): p.read_bytes()
-               for p in graded.project.rglob("*") if p.is_file()}
-    assert written == oracle.build().files, "the graded project is not the oracle's bytes"
+    assert source.PRODUCER in source.PRODUCERS
+    if source.PRODUCER == "oracle":
+        written = {p.relative_to(graded.project).as_posix(): p.read_bytes()
+                   for p in graded.project.rglob("*") if p.is_file()}
+        assert written == oracle.build().files, "the graded project is not the oracle's bytes"
+        return
+    made = producer.production_of(graded.project)
+    assert made is not None, "the graded project was not written by the producer"
+    assert producer.tree(graded.project) == made.after_frozen, (
+        "the graded project is not what `decimalai skills install --frozen` wrote")
+    assert producer.differences_from_oracle(graded.project, made.base_url) == []
 
 
 def test_no_skill_folder_holds_a_second_skill_md(graded):

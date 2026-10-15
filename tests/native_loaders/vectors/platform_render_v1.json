@@ -1,0 +1,895 @@
+{
+  "app_origin": "https://app.decimal.ai",
+  "cases": [
+    {
+      "attachments": [
+        {
+          "content": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "references/fees.md"
+        },
+        {
+          "content": "#!/usr/bin/env python3\n\"\"\"compute_refund.py <amount> <days>\"\"\"\nimport sys\namount, days = float(sys.argv[1]), int(sys.argv[2])\nprint('full' if days <= 30 else 'credit' if days <= 60 else 'none')\n",
+          "executable": true,
+          "execution_language": "python",
+          "path": "scripts/compute_refund.py"
+        }
+      ],
+      "bundle": {
+        "body_sha256": "ec047ae0956b8e3f1662c6a6a2dc69d01ecd41394b0c1c60202ef88661579473",
+        "description_sha256": "1968b23f8751b94b975174a6a96767f07fc600b7babc87ef973834f2ea7276d2",
+        "files": [
+          {
+            "content": "---\nname: acme-refund-policy\ndescription: \"Apply Acme refund rules when a customer asks for a refund, a return or store credit.\"\nlicense: \"Apache-2.0\"\ncompatibility: \"Requires python3\"\nallowed-tools: \"Read Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/compute_refund.py *) Write\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000101\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000111\"\n  decimalai-version: \"1\"\n  decimalai-body-sha256: \"ec047ae0956b8e3f1662c6a6a2dc69d01ecd41394b0c1c60202ef88661579473\"\n  decimalai-name: \"acme/refund-policy\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"model\"\n  decimalai-category: \"support\"\n---\n# Acme refund policy\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "fcebb2ec027f6b7afe59de02bdd0a87f29a4ccd47ebc7a79ada1a1ffae9edfb5",
+            "size": 875
+          },
+          {
+            "content": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "references/fees.md",
+            "sha256": "0d8aa99276c4b9c973205d1107a5e3bd04555487e02daa2595d555a23ae00db6",
+            "size": 87
+          },
+          {
+            "content": "#!/usr/bin/env python3\n\"\"\"compute_refund.py <amount> <days>\"\"\"\nimport sys\namount, days = float(sys.argv[1]), int(sys.argv[2])\nprint('full' if days <= 30 else 'credit' if days <= 60 else 'none')\n",
+            "encoding": "utf-8",
+            "mode": "0755",
+            "path": "scripts/compute_refund.py",
+            "sha256": "49f94ba066e4572bdd433f0b6ea0c947ff5a8fae7b257c0e38d9ab0d930a42a6",
+            "size": 194
+          }
+        ],
+        "install_name": "acme-refund-policy",
+        "invocation": "model",
+        "policy_notes": [
+          "allowed-tools: rewrote 'Bash' to 1 scoped entry for the bundled scripts"
+        ],
+        "render": {
+          "format": 1,
+          "hash": "6cd764b46fc646547e766236c76c993325ccb4e93bf32247296007fd0fc3cf00",
+          "variant": "authored"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000101",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000111"
+      },
+      "caller_org": "7e570000-0000-4000-8000-0000000000a1",
+      "fields": {
+        "allowed_tools": [
+          "Read",
+          "Bash",
+          "Write"
+        ],
+        "body": "\n# Acme refund policy\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+        "category": "support",
+        "compatibility": "Requires python3",
+        "description": "Apply Acme refund rules when a customer asks for a refund, a return or store credit.",
+        "invocation_mode": "model",
+        "license": "Apache-2.0",
+        "license_spdx": null,
+        "registry_name": "acme/refund-policy",
+        "skill_id": "7e570000-0000-4000-8000-000000000101",
+        "skill_scope": null,
+        "skill_type": null,
+        "source": null,
+        "version": 1,
+        "version_id": "7e570000-0000-4000-8000-000000000111"
+      },
+      "id": "authored-platform-skill-with-scripts",
+      "install_name": "acme-refund-policy",
+      "render_hash": "6cd764b46fc646547e766236c76c993325ccb4e93bf32247296007fd0fc3cf00",
+      "render_version": 1,
+      "rows": {
+        "attachments": [
+          {
+            "content_text": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+            "execution_language": null,
+            "file_path": "references/fees.md",
+            "id": "7e570000-0000-4000-8000-000000000121",
+            "is_executable": false,
+            "version": 1
+          },
+          {
+            "content_text": "#!/usr/bin/env python3\n\"\"\"compute_refund.py <amount> <days>\"\"\"\nimport sys\namount, days = float(sys.argv[1]), int(sys.argv[2])\nprint('full' if days <= 30 else 'credit' if days <= 60 else 'none')\n",
+            "execution_language": "python",
+            "file_path": "scripts/compute_refund.py",
+            "id": "7e570000-0000-4000-8000-000000000122",
+            "is_executable": true,
+            "version": 1
+          }
+        ],
+        "latest": 1,
+        "skill": {
+          "allowed_tools": [
+            "Read",
+            "Bash",
+            "Write"
+          ],
+          "category": "support",
+          "compatibility": "Requires python3",
+          "description": "Apply Acme refund rules when a customer asks for a refund, a return or store credit.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000101",
+          "invocation_mode": "model",
+          "license": "Apache-2.0",
+          "license_spdx": null,
+          "name": "acme/refund-policy",
+          "org_id": "7e570000-0000-4000-8000-0000000000a1",
+          "skill_scope": null,
+          "skill_type": null,
+          "source_repo": null,
+          "source_type": "platform",
+          "url_slug": null,
+          "visibility": "org"
+        },
+        "versions": [
+          {
+            "body": "\n# Acme refund policy\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Apply Acme refund rules.",
+            "id": "7e570000-0000-4000-8000-000000000111",
+            "safety_ok": true,
+            "version_number": 1
+          }
+        ]
+      },
+      "variant": "authored"
+    },
+    {
+      "attachments": [
+        {
+          "content": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "references/fees.md"
+        }
+      ],
+      "bundle": {
+        "body_sha256": "fbb336d3e5c0f3c477450010fbbbbe590f44adb6b33750db70a404c766e14674",
+        "description_sha256": "cdf280bfc79837a96466a256afff5e771fb61bd117f9f7ac55d56668fe0def97",
+        "files": [
+          {
+            "content": "---\nname: acme-returns-desk\ndescription: \"Run the Acme returns desk.\"\nlicense: \"MIT\"\nallowed-tools: \"Read\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000201\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000212\"\n  decimalai-version: \"2\"\n  decimalai-body-sha256: \"fbb336d3e5c0f3c477450010fbbbbe590f44adb6b33750db70a404c766e14674\"\n  decimalai-name: \"acme/returns-desk\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"any\"\n  decimalai-category: \"support\"\n  decimalai-skill-scope: \"private\"\n  decimalai-skill-type: \"preference\"\n  decimalai-source: \"https://app.decimal.ai/s/acme-returns-desk@2/SKILL.md\"\n---\n# Returns desk v2\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "3c8ce76dbca12c46cc4cbe32d678d0114324d0d0e3fc61f8fed736ae2023f686",
+            "size": 849
+          },
+          {
+            "content": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "references/fees.md",
+            "sha256": "0d8aa99276c4b9c973205d1107a5e3bd04555487e02daa2595d555a23ae00db6",
+            "size": 87
+          }
+        ],
+        "install_name": "acme-returns-desk",
+        "invocation": "model",
+        "policy_notes": [
+          "allowed-tools: dropped 'Write' (not authored by your organization)",
+          "allowed-tools: dropped 'Bash(git log *)' (not authored by your organization)",
+          "allowed-tools: dropped 'mcp__x__y' (not authored by your organization)"
+        ],
+        "render": {
+          "format": 1,
+          "hash": "a99e829d3bb065524e0fb95990afb1ba9f53eabee9d7515e18dfd97671971ab4",
+          "variant": "foreign"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000201",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000212"
+      },
+      "caller_org": "7e570000-0000-4000-8000-0000000000a2",
+      "fields": {
+        "allowed_tools": [
+          "Read",
+          "Write",
+          "Bash(git log *)",
+          "mcp__x__y"
+        ],
+        "body": "\n# Returns desk v2\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+        "category": "support",
+        "compatibility": null,
+        "description": "Run the Acme returns desk.",
+        "invocation_mode": "any",
+        "license": "MIT",
+        "license_spdx": null,
+        "registry_name": "acme/returns-desk",
+        "skill_id": "7e570000-0000-4000-8000-000000000201",
+        "skill_scope": "private",
+        "skill_type": "preference",
+        "source": "https://app.decimal.ai/s/acme-returns-desk@2/SKILL.md",
+        "version": 2,
+        "version_id": "7e570000-0000-4000-8000-000000000212"
+      },
+      "id": "public-platform-skill-for-another-org",
+      "install_name": "acme-returns-desk",
+      "render_hash": "a99e829d3bb065524e0fb95990afb1ba9f53eabee9d7515e18dfd97671971ab4",
+      "render_version": 2,
+      "rows": {
+        "attachments": [
+          {
+            "content_text": "# Restocking fees\n\n| category | fee |\n|---|---|\n| electronics | 15% |\n| apparel | 0% |\n",
+            "execution_language": null,
+            "file_path": "references/fees.md",
+            "id": "7e570000-0000-4000-8000-000000000221",
+            "is_executable": false,
+            "version": null
+          }
+        ],
+        "latest": 2,
+        "skill": {
+          "allowed_tools": [
+            "Read",
+            "Write",
+            "Bash(git log *)",
+            "mcp__x__y"
+          ],
+          "category": "support",
+          "compatibility": null,
+          "description": "Run the Acme returns desk.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000201",
+          "invocation_mode": "any",
+          "license": "MIT",
+          "license_spdx": null,
+          "name": "acme/returns-desk",
+          "org_id": "7e570000-0000-4000-8000-0000000000a1",
+          "skill_scope": "private",
+          "skill_type": "preference",
+          "source_repo": null,
+          "source_type": "platform",
+          "url_slug": "acme-returns-desk",
+          "visibility": "public"
+        },
+        "versions": [
+          {
+            "body": "\n# Returns desk v1\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Returns desk.",
+            "id": "7e570000-0000-4000-8000-000000000211",
+            "safety_ok": true,
+            "version_number": 1
+          },
+          {
+            "body": "\n# Returns desk v2\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Returns desk, second cut.",
+            "id": "7e570000-0000-4000-8000-000000000212",
+            "safety_ok": true,
+            "version_number": 2
+          }
+        ]
+      },
+      "variant": "foreign"
+    },
+    {
+      "attachments": [
+        {
+          "content": null,
+          "executable": false,
+          "execution_language": null,
+          "path": "assets/logo.png"
+        },
+        {
+          "content": "# Guide pinned to v2\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "references/guide.md"
+        },
+        {
+          "content": "---\nname: inner\n---\nInner.\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "templates/SKILL.md"
+        }
+      ],
+      "bundle": {
+        "body_sha256": "a3b1882fbef43f38d74b7f540031547fc2a67144cf0ca054168903e4bfdd24c7",
+        "description_sha256": "64b98530102cd8ba71ebb6a9b5e36688f61f0e207ec70eb63733668d9bed2ede",
+        "files": [
+          {
+            "content": "---\nname: example-owner-pdf-tools\ndescription: \"Fill, merge and split PDF forms.\"\nlicense: \"MIT\"\nallowed-tools: \"Read Grep\"\ndisable-model-invocation: true\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000301\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000312\"\n  decimalai-version: \"2\"\n  decimalai-body-sha256: \"a3b1882fbef43f38d74b7f540031547fc2a67144cf0ca054168903e4bfdd24c7\"\n  decimalai-name: \"example-owner/pdf-tools\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"user\"\n  decimalai-category: \"documents\"\n  decimalai-source: \"https://app.decimal.ai/s/example-owner-pdf-tools@2/SKILL.md\"\n---\n# PDF tools, rewritten\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "081b5bff610c0082ac6b3cca7e98780b1ebf67000021c75799d201ddab376268",
+            "size": 845
+          },
+          {
+            "content": "# Guide pinned to v2\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "references/guide.md",
+            "sha256": "499e9b7589622432353a847196b48c34bcf613ecb204f5b3f5133c7e87df7125",
+            "size": 21
+          }
+        ],
+        "install_name": "example-owner-pdf-tools",
+        "invocation": "user",
+        "policy_notes": [
+          "allowed-tools: rewrote 'Grep(*)' to 'Grep' (a wildcard scope is the bare tool)",
+          "allowed-tools: dropped 'Bash' (not authored by your organization)"
+        ],
+        "render": {
+          "format": 1,
+          "hash": "c4719e2771f02e3f7d9e642115c8594e2ad21a53209ce346123bcd72d8a918d0",
+          "variant": "foreign"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000301",
+        "unavailable": [
+          {
+            "path": "assets/logo.png",
+            "reason": "binary attachments are not stored"
+          },
+          {
+            "path": "templates/SKILL.md",
+            "reason": "a file or folder named SKILL.md inside a skill would load as a second skill, so it is never written"
+          }
+        ],
+        "version_id": "7e570000-0000-4000-8000-000000000312"
+      },
+      "caller_org": null,
+      "fields": {
+        "allowed_tools": [
+          "Read,",
+          "Grep(*),",
+          "Bash,"
+        ],
+        "body": "\n# PDF tools, rewritten\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+        "category": "documents",
+        "compatibility": null,
+        "description": "Fill, merge and split PDF forms.",
+        "invocation_mode": "user",
+        "license": "MIT License",
+        "license_spdx": "MIT",
+        "registry_name": "example-owner/pdf-tools",
+        "skill_id": "7e570000-0000-4000-8000-000000000301",
+        "skill_scope": null,
+        "skill_type": null,
+        "source": "https://app.decimal.ai/s/example-owner-pdf-tools@2/SKILL.md",
+        "version": 2,
+        "version_id": "7e570000-0000-4000-8000-000000000312"
+      },
+      "id": "public-import-stale-live-description",
+      "install_name": "example-owner-pdf-tools",
+      "render_hash": "c4719e2771f02e3f7d9e642115c8594e2ad21a53209ce346123bcd72d8a918d0",
+      "render_version": 2,
+      "rows": {
+        "attachments": [
+          {
+            "content_text": "# Shared guide\n",
+            "execution_language": null,
+            "file_path": "references/guide.md",
+            "id": "7e570000-0000-4000-8000-000000000321",
+            "is_executable": false,
+            "version": null
+          },
+          {
+            "content_text": "# Guide pinned to v2\n",
+            "execution_language": null,
+            "file_path": "references/guide.md",
+            "id": "7e570000-0000-4000-8000-000000000322",
+            "is_executable": false,
+            "version": 2
+          },
+          {
+            "content_text": "# Only in v1\n",
+            "execution_language": null,
+            "file_path": "references/old.md",
+            "id": "7e570000-0000-4000-8000-000000000323",
+            "is_executable": false,
+            "version": 1
+          },
+          {
+            "content_text": "---\nname: inner\n---\nInner.\n",
+            "execution_language": null,
+            "file_path": "templates/SKILL.md",
+            "id": "7e570000-0000-4000-8000-000000000324",
+            "is_executable": false,
+            "version": 2
+          },
+          {
+            "content_text": null,
+            "execution_language": null,
+            "file_path": "assets/logo.png",
+            "id": "7e570000-0000-4000-8000-000000000325",
+            "is_executable": false,
+            "version": 2
+          }
+        ],
+        "latest": 2,
+        "skill": {
+          "allowed_tools": [
+            "Read,",
+            "Grep(*),",
+            "Bash,"
+          ],
+          "category": "documents",
+          "compatibility": null,
+          "description": "Fill PDF forms.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000301",
+          "invocation_mode": "user",
+          "license": "MIT License",
+          "license_spdx": "MIT",
+          "name": "example-owner/pdf-tools",
+          "org_id": "7e570000-0000-4000-8000-0000000000a3",
+          "skill_scope": null,
+          "skill_type": null,
+          "source_repo": "example-owner/skills",
+          "source_type": "github_import",
+          "url_slug": "example-owner-pdf-tools",
+          "visibility": "public"
+        },
+        "versions": [
+          {
+            "body": "\n# PDF tools\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Fill PDF forms.",
+            "id": "7e570000-0000-4000-8000-000000000311",
+            "safety_ok": true,
+            "version_number": 1
+          },
+          {
+            "body": "\n# PDF tools, rewritten\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Fill, merge and split PDF forms.",
+            "frontmatter_json": {
+              "_decimal_import": {
+                "sync_generation": 2
+              },
+              "category": "zzz",
+              "name": "pdf-tools"
+            },
+            "id": "7e570000-0000-4000-8000-000000000312",
+            "safety_ok": true,
+            "version_number": 2
+          }
+        ]
+      },
+      "variant": "foreign"
+    },
+    {
+      "attachments": [
+        {
+          "content": "# Shared guide\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "references/guide.md"
+        },
+        {
+          "content": "# Only in v1\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "references/old.md"
+        }
+      ],
+      "bundle": {
+        "body_sha256": "12fec51f7c968f11f85c77af2892b7bc79f68f283a8555195ed94d3bddb7292d",
+        "description_sha256": "0506baf0455f1e4fb1f6965836519707143940f092b85a5da12db11cbf8c07ef",
+        "files": [
+          {
+            "content": "---\nname: example-owner-pdf-tools\ndescription: \"Fill PDF forms, version one.\"\nlicense: \"MIT\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000401\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000411\"\n  decimalai-version: \"1\"\n  decimalai-body-sha256: \"12fec51f7c968f11f85c77af2892b7bc79f68f283a8555195ed94d3bddb7292d\"\n  decimalai-name: \"example-owner/pdf-tools\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"model\"\n  decimalai-category: \"documents\"\n  decimalai-source: \"https://app.decimal.ai/s/example-owner-pdf-tools@1/SKILL.md\"\n---\n# PDF tools\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "24d1ecadfc69d42680839ba789ab73a950cf052e6d4cb9d91bf4f4b283a160ba",
+            "size": 773
+          },
+          {
+            "content": "# Shared guide\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "references/guide.md",
+            "sha256": "1c4bd2ac70ebae38a02b5a7d89a8c9d04cba73d4929737bb6483b02a59b97e5a",
+            "size": 15
+          },
+          {
+            "content": "# Only in v1\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "references/old.md",
+            "sha256": "3dedffdf8197b82ab321b304a22427ea645b6b15b605abd3338d59fd9daf3476",
+            "size": 13
+          }
+        ],
+        "install_name": "example-owner-pdf-tools",
+        "invocation": "model",
+        "policy_notes": [],
+        "render": {
+          "format": 1,
+          "hash": "fe152378b437e4326f981d4e3f8d6b3d870abda9011e747729dbf1a9bce4a7d2",
+          "variant": "foreign"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000401",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000411"
+      },
+      "caller_org": "7e570000-0000-4000-8000-0000000000a2",
+      "fields": {
+        "allowed_tools": null,
+        "body": "\n# PDF tools\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+        "category": "documents",
+        "compatibility": null,
+        "description": "Fill PDF forms, version one.",
+        "invocation_mode": "model",
+        "license": null,
+        "license_spdx": "MIT",
+        "registry_name": "example-owner/pdf-tools",
+        "skill_id": "7e570000-0000-4000-8000-000000000401",
+        "skill_scope": null,
+        "skill_type": null,
+        "source": "https://app.decimal.ai/s/example-owner-pdf-tools@1/SKILL.md",
+        "version": 1,
+        "version_id": "7e570000-0000-4000-8000-000000000411"
+      },
+      "id": "public-import-older-version",
+      "install_name": "example-owner-pdf-tools",
+      "render_hash": "fe152378b437e4326f981d4e3f8d6b3d870abda9011e747729dbf1a9bce4a7d2",
+      "render_version": 1,
+      "rows": {
+        "attachments": [
+          {
+            "content_text": "# Shared guide\n",
+            "execution_language": null,
+            "file_path": "references/guide.md",
+            "id": "7e570000-0000-4000-8000-000000000421",
+            "is_executable": false,
+            "version": null
+          },
+          {
+            "content_text": "# Guide pinned to v2\n",
+            "execution_language": null,
+            "file_path": "references/guide.md",
+            "id": "7e570000-0000-4000-8000-000000000422",
+            "is_executable": false,
+            "version": 2
+          },
+          {
+            "content_text": "# Only in v1\n",
+            "execution_language": null,
+            "file_path": "references/old.md",
+            "id": "7e570000-0000-4000-8000-000000000423",
+            "is_executable": false,
+            "version": 1
+          }
+        ],
+        "latest": 2,
+        "skill": {
+          "allowed_tools": null,
+          "category": "documents",
+          "compatibility": null,
+          "description": "Fill PDF forms.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000401",
+          "invocation_mode": "model",
+          "license": null,
+          "license_spdx": "MIT",
+          "name": "example-owner/pdf-tools",
+          "org_id": "7e570000-0000-4000-8000-0000000000a3",
+          "skill_scope": null,
+          "skill_type": null,
+          "source_repo": "example-owner/skills",
+          "source_type": "github_import",
+          "url_slug": "example-owner-pdf-tools",
+          "visibility": "public"
+        },
+        "versions": [
+          {
+            "body": "\n# PDF tools\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Fill PDF forms, version one.",
+            "id": "7e570000-0000-4000-8000-000000000411",
+            "safety_ok": true,
+            "version_number": 1
+          },
+          {
+            "body": "\n# PDF tools, rewritten\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Fill, merge and split PDF forms.",
+            "id": "7e570000-0000-4000-8000-000000000412",
+            "safety_ok": true,
+            "version_number": 2
+          }
+        ]
+      },
+      "variant": "foreign"
+    },
+    {
+      "attachments": [],
+      "bundle": {
+        "body_sha256": "2b219aef7ce336a886a6d2076643076e16c3bab3820395897995afd98200143c",
+        "description_sha256": "f86b530c77f3259470752d3db8300dea38d72f44d2b516efb2cac5e43c6343cb",
+        "files": [
+          {
+            "content": "---\nname: example-owner-d1c2b1\ndescription: \"\u7b2c\u4e00\u884c \u7b2c\u4e8c\u884c\\u2028\u7ed3\u675f\"\ncompatibility: \"Python 3.10+\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000501\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000511\"\n  decimalai-version: \"1\"\n  decimalai-body-sha256: \"2b219aef7ce336a886a6d2076643076e16c3bab3820395897995afd98200143c\"\n  decimalai-name: \"example-owner/\u4e2d\u6587\u6807\u9898\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"model\"\n  decimalai-source: \"https://app.decimal.ai/s/example-owner-zhong-wen@1/SKILL.md\"\n---\n# \u6807\u9898\n\n\u6b63\u6587\u3002\nSecond line.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "4f77665c06a1884fa1eef21a7cbb4b4f78d4614edae97e263874896ddf4be186",
+            "size": 581
+          }
+        ],
+        "install_name": "example-owner-d1c2b1",
+        "invocation": "model",
+        "policy_notes": [
+          "body: wrote CR and CRLF line endings as LF"
+        ],
+        "render": {
+          "format": 1,
+          "hash": "a7a329f80078e62a2ecb577cd3d403256dcba740069b0ca7fd0fac72dba9472a",
+          "variant": "foreign"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000501",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000511"
+      },
+      "caller_org": null,
+      "fields": {
+        "allowed_tools": null,
+        "body": "# \u6807\u9898\r\n\r\n\u6b63\u6587\u3002\r\nSecond line.\r\n",
+        "category": null,
+        "compatibility": "Python 3.10+",
+        "description": "\u7b2c\u4e00\u884c\n  \u7b2c\u4e8c\u884c\u2028\u7ed3\u675f",
+        "invocation_mode": "model",
+        "license": null,
+        "license_spdx": null,
+        "registry_name": "example-owner/\u4e2d\u6587\u6807\u9898",
+        "skill_id": "7e570000-0000-4000-8000-000000000501",
+        "skill_scope": null,
+        "skill_type": null,
+        "source": "https://app.decimal.ai/s/example-owner-zhong-wen@1/SKILL.md",
+        "version": 1,
+        "version_id": "7e570000-0000-4000-8000-000000000511"
+      },
+      "id": "non-latin-name-crlf-body",
+      "install_name": "example-owner-d1c2b1",
+      "render_hash": "a7a329f80078e62a2ecb577cd3d403256dcba740069b0ca7fd0fac72dba9472a",
+      "render_version": 1,
+      "rows": {
+        "attachments": [],
+        "latest": 1,
+        "skill": {
+          "allowed_tools": null,
+          "category": null,
+          "compatibility": "Python 3.10+",
+          "description": "\u7b2c\u4e00\u884c\n  \u7b2c\u4e8c\u884c\u2028\u7ed3\u675f",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000501",
+          "invocation_mode": "model",
+          "license": null,
+          "license_spdx": null,
+          "name": "example-owner/\u4e2d\u6587\u6807\u9898",
+          "org_id": "7e570000-0000-4000-8000-0000000000a3",
+          "skill_scope": null,
+          "skill_type": null,
+          "source_repo": null,
+          "source_type": "github_import",
+          "url_slug": "example-owner-zhong-wen",
+          "visibility": "public"
+        },
+        "versions": [
+          {
+            "body": "# \u6807\u9898\r\n\r\n\u6b63\u6587\u3002\r\nSecond line.\r\n",
+            "description": "\u7b2c\u4e00\u884c\n  \u7b2c\u4e8c\u884c\u2028\u7ed3\u675f",
+            "id": "7e570000-0000-4000-8000-000000000511",
+            "safety_ok": null,
+            "version_number": 1
+          }
+        ]
+      },
+      "variant": "foreign"
+    },
+    {
+      "attachments": [
+        {
+          "content": "<h1>Not found</h1>\n",
+          "executable": false,
+          "execution_language": null,
+          "path": "templates/page.html"
+        }
+      ],
+      "bundle": {
+        "body_sha256": "6fa0b91a7450935fb02a07689f7527269ee7cd5397c146189e72873e22a857b5",
+        "description_sha256": "c6d93c8def57aceff7c4d0256548a6590151f8f0c81868da172e60a7e18fe29b",
+        "files": [
+          {
+            "content": "---\nname: 404-8abd64\ndescription: \"Handle 404 pages.\"\nallowed-tools: \"Read\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000601\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000611\"\n  decimalai-version: \"3\"\n  decimalai-body-sha256: \"6fa0b91a7450935fb02a07689f7527269ee7cd5397c146189e72873e22a857b5\"\n  decimalai-name: \"404\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"model\"\n  decimalai-skill-scope: \"public\"\n  decimalai-skill-type: \"capability\"\n---\n# 404\n\nBody.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "bf72bbaddacfafe83a7e6964ef601e98b2dcd8842522922737a35b98e481d36d",
+            "size": 495
+          },
+          {
+            "content": "<h1>Not found</h1>\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "templates/page.html",
+            "sha256": "d22047afb6d676fbf3a81f1a8d3673b11533db87faf637f3cb2462c598ebe1a5",
+            "size": 19
+          }
+        ],
+        "install_name": "404-8abd64",
+        "invocation": "model",
+        "policy_notes": [
+          "allowed-tools: dropped 'Bash' (no bundled script to scope it to)"
+        ],
+        "render": {
+          "format": 1,
+          "hash": "c1ab43fd67ddc61d1eb80c1e8ad020b7e1efcb82e09e70cac49baa42c61835e0",
+          "variant": "authored"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000601",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000611"
+      },
+      "caller_org": "7e570000-0000-4000-8000-0000000000a1",
+      "fields": {
+        "allowed_tools": [
+          "Bash",
+          "Read"
+        ],
+        "body": "# 404\n\nBody.",
+        "category": null,
+        "compatibility": null,
+        "description": "Handle 404 pages.",
+        "invocation_mode": "model",
+        "license": null,
+        "license_spdx": null,
+        "registry_name": "404",
+        "skill_id": "7e570000-0000-4000-8000-000000000601",
+        "skill_scope": "public",
+        "skill_type": "capability",
+        "source": null,
+        "version": 3,
+        "version_id": "7e570000-0000-4000-8000-000000000611"
+      },
+      "id": "yaml-ambiguous-name-authored",
+      "install_name": "404-8abd64",
+      "render_hash": "c1ab43fd67ddc61d1eb80c1e8ad020b7e1efcb82e09e70cac49baa42c61835e0",
+      "render_version": 3,
+      "rows": {
+        "attachments": [
+          {
+            "content_text": "<h1>Not found</h1>\n",
+            "execution_language": null,
+            "file_path": "templates/page.html",
+            "id": "7e570000-0000-4000-8000-000000000621",
+            "is_executable": false,
+            "version": null
+          }
+        ],
+        "latest": 3,
+        "skill": {
+          "allowed_tools": [
+            "Bash",
+            "Read"
+          ],
+          "category": null,
+          "compatibility": null,
+          "description": "Handle 404 pages.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000601",
+          "invocation_mode": "model",
+          "license": null,
+          "license_spdx": null,
+          "name": "404",
+          "org_id": "7e570000-0000-4000-8000-0000000000a1",
+          "skill_scope": "public",
+          "skill_type": "capability",
+          "source_repo": null,
+          "source_type": "platform",
+          "url_slug": null,
+          "visibility": "org"
+        },
+        "versions": [
+          {
+            "body": "# 404\n\nBody.",
+            "description": "Handle 404 pages.",
+            "id": "7e570000-0000-4000-8000-000000000611",
+            "safety_ok": true,
+            "version_number": 3
+          }
+        ]
+      },
+      "variant": "authored"
+    },
+    {
+      "attachments": [],
+      "bundle": {
+        "body_sha256": "9d144921b4bdd923dd699edea854152e7967e225e4d0d1933ee93393f7fe6052",
+        "description_sha256": "55e78a11023f821749df826a861e951d1057b7a293cc234251688cbc2da8fbcf",
+        "files": [
+          {
+            "content": "---\nname: some-github-owner-an-extremely-long-imported-skill-name-t-4d73b0\ndescription: \"Imported skill.\"\nallowed-tools: \"Read Grep Glob\"\nmetadata:\n  decimalai-skill-id: \"7e570000-0000-4000-8000-000000000701\"\n  decimalai-version-id: \"7e570000-0000-4000-8000-000000000711\"\n  decimalai-version: \"1\"\n  decimalai-body-sha256: \"9d144921b4bdd923dd699edea854152e7967e225e4d0d1933ee93393f7fe6052\"\n  decimalai-name: \"some-github-owner/an-extremely-long-imported-skill-name-that-exceeds-the-limit\"\n  decimalai-format: \"1\"\n  decimalai-invocation: \"model\"\n---\n# Long name\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n",
+            "encoding": "utf-8",
+            "mode": "0644",
+            "path": "SKILL.md",
+            "sha256": "e60e2ab4ae7425122e8d0a1e88b790311c056cc753b248815d4c6cc2752beb2c",
+            "size": 757
+          }
+        ],
+        "install_name": "some-github-owner-an-extremely-long-imported-skill-name-t-4d73b0",
+        "invocation": "model",
+        "policy_notes": [],
+        "render": {
+          "format": 1,
+          "hash": "ea3ea29ab3b4c39405a5273361b9d58e4c6f11f37c0d04c2de56afbc8f870c6c",
+          "variant": "foreign"
+        },
+        "skill_id": "7e570000-0000-4000-8000-000000000701",
+        "unavailable": [],
+        "version_id": "7e570000-0000-4000-8000-000000000711"
+      },
+      "caller_org": "7e570000-0000-4000-8000-0000000000a2",
+      "fields": {
+        "allowed_tools": [
+          "Read",
+          "Grep",
+          "Glob"
+        ],
+        "body": "\n# Long name\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+        "category": null,
+        "compatibility": null,
+        "description": "Imported skill.",
+        "invocation_mode": "model",
+        "license": null,
+        "license_spdx": null,
+        "registry_name": "some-github-owner/an-extremely-long-imported-skill-name-that-exceeds-the-limit",
+        "skill_id": "7e570000-0000-4000-8000-000000000701",
+        "skill_scope": null,
+        "skill_type": null,
+        "source": null,
+        "version": 1,
+        "version_id": "7e570000-0000-4000-8000-000000000711"
+      },
+      "id": "long-namespaced-import-name",
+      "install_name": "some-github-owner-an-extremely-long-imported-skill-name-t-4d73b0",
+      "render_hash": "ea3ea29ab3b4c39405a5273361b9d58e4c6f11f37c0d04c2de56afbc8f870c6c",
+      "render_version": 1,
+      "rows": {
+        "attachments": [],
+        "latest": 1,
+        "skill": {
+          "allowed_tools": [
+            "Read",
+            "Grep",
+            "Glob"
+          ],
+          "category": null,
+          "compatibility": null,
+          "description": "Imported skill.",
+          "forked_from_skill_id": null,
+          "id": "7e570000-0000-4000-8000-000000000701",
+          "invocation_mode": "model",
+          "license": null,
+          "license_spdx": null,
+          "name": "some-github-owner/an-extremely-long-imported-skill-name-that-exceeds-the-limit",
+          "org_id": "7e570000-0000-4000-8000-0000000000a3",
+          "skill_scope": null,
+          "skill_type": null,
+          "source_repo": null,
+          "source_type": "github_import",
+          "url_slug": null,
+          "visibility": "public"
+        },
+        "versions": [
+          {
+            "body": "\n# Long name\n\nSentinel: PLATFORM-SENTINEL-3c1e\n\n- Within 30 days: full refund.\n- 31-60 days: store credit.\n\nFor fees read references/fees.md. To compute a refund, run scripts/compute_refund.py <amount> <days>.\n\n",
+            "description": "Imported skill.",
+            "id": "7e570000-0000-4000-8000-000000000711",
+            "safety_ok": true,
+            "version_number": 1
+          }
+        ]
+      },
+      "variant": "foreign"
+    }
+  ],
+  "description": "Platform render vectors: database rows (skill, versions, attachments) and a caller in; the RenderFields and attachment set the platform gathers from them, and the exact bundle it serves, out. Generated by the platform's render-vector test; this copy differs from it only in this description. The source URL origin is https://app.decimal.ai; caller_org null is an anonymous fetch.",
+  "format": 1,
+  "vectors_version": 1
+}

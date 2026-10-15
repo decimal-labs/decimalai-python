@@ -16,8 +16,9 @@ with no keys.
 | `strands-agents` | openai2 | `AgentSkills(skills=str(decimalai.skills_dir()), strict=True)` |
 | `crewai` | openai2 | `Agent(..., skills=[decimalai.skills_dir()])` |
 
-`decimalai.skills_dir()` is stood in for by `source.skills_dir()` until the SDK
-exports it; switching is a one-file change.
+The loader modules start from `source.skills_dir()`, a stand-in for
+`decimalai.skills_dir()`: the real one refuses a version 1 lock, and the negative
+control below is one. On the graded project the two agree (`test_producer.py`).
 
 ## Why it is not a conformance column
 
@@ -70,19 +71,29 @@ DECIMAL_TEST_ENV=openai3 .venv/bin/python -m pytest tests/native_loaders -q -rsx
 DECIMAL_TEST_ENV=openai2 .venv-openai2/bin/python -m pytest tests/native_loaders -q -rsx
 ```
 
-About 7-10 s per environment for both projects, four children at a time
-(`DECIMAL_NATIVE_LOADER_JOBS`; per-child timeout `DECIMAL_NATIVE_LOADER_TIMEOUT`,
-default 120 s, after which the cells ERROR, naming the loader; never a skip).
+About 15 s (openai3) and 22 s (openai2) per environment: the loaders on both
+projects, four children at a time (`DECIMAL_NATIVE_LOADER_JOBS`; per-child timeout
+`DECIMAL_NATIVE_LOADER_TIMEOUT`, default 120 s, after which the cells ERROR, naming
+the loader; never a skip), and about 40 runs of the `decimalai` CLI for the producer
+checks.
 
 ## What is graded
 
 Two projects per run (`conftest.py`):
 
-- **the graded project**, which every loader must read cleanly. Today it is the
-  oracle (`oracle.py`): an independent, deliberately plain rendering of the
-  on-disk contract, format 1. When `decimalai skills add` and
-  `decimalai skills install --frozen` exist, `source.graded_project` writes the
-  folder with them instead, and the oracle becomes the byte-for-byte reference.
+- **the graded project**, which every loader must read cleanly, written by the
+  real CLI (`producer.py`): `decimalai skills add` for each skill, then
+  `decimalai skills install --frozen` into a checkout of the manifest and the lock
+  alone, as subprocesses of this interpreter's `decimalai` console script importing
+  this checkout, against the install routes of `tests/conformance/probe.py`. The
+  probe renders the three skills from registry rows with `skillevaluation.skillfmt`,
+  the renderer the platform serves with. The commands run once per process; each
+  graded project is a copy of their output. The oracle (`oracle.py`, an
+  independent, deliberately plain rendering of the on-disk contract, format 1) is
+  the byte-for-byte reference it must equal (`producer.differences_from_oracle`:
+  every file and mode, the lock apart from `installed_at` and the registry URL).
+  `DECIMAL_NATIVE_LOADER_PRODUCER=oracle` grades the oracle's folder instead, to
+  tell a producer regression from a loader one.
 - **the negative control** (`fixtures/v0139_project`): what SDK 0.13.9's own
   `disk_export.py` writes for the same three skills, frozen. It is graded against
   the same expectation and must fail, in the cells `ledger.NEGATIVE_CONTROL_PREDICTED`
@@ -118,6 +129,27 @@ directory or `Location:` line from the loader's own output, never a path the tes
 already knows. Where a loader dropped the target, the steps after it have nothing to
 act on, and N3-N5 say so.
 
+## The producer (`test_producer.py`, `test_verify_matches_loaders.py`)
+
+Graded once per run, in both environments:
+
+| item | asserts |
+|---|---|
+| P1 | the commands ran through this interpreter's `decimalai` script, which imports this checkout; `install --frozen` resolved nothing and rebuilt exactly what `add` wrote (lock and manifest untouched); the result equals the oracle's bytes and modes |
+| P2 | `skills verify` passes on it; every defect of `ledger_matrix.json` is rejected with the rule it breaks; a defect any loader mishandles (any cell but `OK`) is an error even in an unmanaged folder (`verify PATH`); where verify is stricter than every loader, `STRICTER_THAN_THE_LOADERS` says why and cleans itself |
+| P3 | a second `install` and `install --frozen` write nothing and make no request (run against a closed port); `update` leaves no stale file and keeps an exact pin; a local edit makes `install --frozen` and `update` exit 5 and keeps the edit; `install --frozen --force` restores the locked bytes and keeps the edit in a backup |
+
+No command runs in this repository: the producer refuses a project inside it, gives
+each command `HOME` set to the directory holding its project (so project discovery
+stops there), and checks this repository's own `.decimal/` and `.agents/` are
+unchanged around every production.
+
+`vectors/platform_render_v1.json` is the platform's own render vectors (rows in, the
+bundle it served out), vendored byte for byte; `test_vectors_match_platform.py`
+compares it with the platform checkout when that sibling is present, re-renders
+every vector with this environment's `skillfmt`, and installs every one through the
+CLI from the probe, which serves the platform's bytes verbatim.
+
 ## The ledger (`ledger.py`)
 
 | kind | today | rule |
@@ -140,9 +172,10 @@ uppercase, over-long and double-hyphen names, folder and name disagreeing, symli
 folders and resources, an unknown key, a second `SKILL.md` inside a folder) in
 `ledger_matrix.json`, with the versions they were measured at. A changed cell
 exits 1 and is a finding; re-record with `--update-ledger`. `decimalai skills
-verify` must reject every defect that any column does not mark `OK`. Per commit, a
-one-cell run in each environment proves the command works and fails on a flipped
-cell.
+verify` rejects every defect, and makes one that any column does not mark `OK` an
+error even outside a managed project (`test_verify_matches_loaders.py`, which reads
+this file). Per commit, a one-cell run in each environment proves the command works
+and fails on a flipped cell.
 
 ## Hazards each child handles (`runner.child_env` and the loader modules)
 

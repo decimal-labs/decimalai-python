@@ -216,6 +216,11 @@ ENVIRONMENT_SKIPS: Dict[str, str] = {
         "until its native-loader page exists there is no table to compare; the "
         "in-repo guards beside it do not skip"
     ),
+    "test_the_vendored_vectors_equal_the_platforms": (
+        "the platform repo is a private sibling checkout most clones (and CI) lack; the "
+        "vendored copy is compared byte for byte wherever both are present, and every "
+        "vector is re-rendered and installed from the copy on every run regardless"
+    ),
     "test_the_tokenizer_agrees_with_skillfmt": (
         "skillevaluation.skillfmt arrives in skillevaluation 0.8.0; an environment with "
         "an older skillevaluation has nothing to compare the contract's tokenizer with, "

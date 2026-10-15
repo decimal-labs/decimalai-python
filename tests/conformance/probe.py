@@ -24,6 +24,13 @@ Keeping the port honest: ``BACKEND_VALIDATOR_SHA256`` fingerprints the backend
 functions this file mirrors. ``test_conformance.py`` re-derives it whenever the
 platform repo is present on disk and fails when it drifts, so a backend rule
 change cannot silently make this probe more permissive than production.
+
+It also answers the install routes ``decimalai skills`` writes project folders
+from (resolve and bundle, with an API key and anonymously), from fixture rows
+(:class:`InstallRow`) rendered by ``skillevaluation.skillfmt``, the renderer the
+platform serves with, or from the bundle the platform itself rendered for a row
+(a render vector), served verbatim. ``tests/native_loaders`` installs through
+them with the real CLI.
 """
 
 from __future__ import annotations
@@ -278,6 +285,136 @@ def validate_trace_payload(
     return errors
 
 
+# ── The install routes (`decimalai skills add` / `install`) ──────────────────
+
+#: ``POST resolve`` and ``GET bundles/{version_id}`` under each prefix: with an API key
+#: (org-scoped), and the anonymous twins (public skills only). Shapes, status codes and
+#: per-item error codes follow the platform's install handlers.
+INSTALL_PREFIX = "/api/v1/install/"
+REGISTRY_INSTALL_PREFIX = "/api/v1/registry/install/"
+INSTALL_MAX_ITEMS = 100
+INSTALL_MAX_ANONYMOUS_ITEMS = 20
+INSTALL_MAX_FORMATS = 8
+
+
+@dataclass
+class InstallRow:
+    """One version of one skill, as the install routes serve it.
+
+    ``fields`` are the skill and version columns the platform's renderer gathers
+    (``skillfmt.RenderFields``, as a dict); ``attachments`` the version's final
+    attachment set (``skillfmt.Attachment`` dicts). The folder is rendered through
+    ``skillfmt.render_bundle`` for whatever install name and variant a caller is due.
+
+    ``served``, when set, is the bundle the PLATFORM rendered for this row (a render
+    vector, :meth:`from_vector`). It is served verbatim, and only for its own install
+    name, variant and format: the probe never re-renders what the platform produced.
+    """
+
+    fields: Dict[str, Any]
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
+    org_id: str = ""
+    public: bool = False
+    #: Imported from GitHub, or a fork: never the authored variant, even for its org.
+    imported: bool = False
+    url_slug: Optional[str] = None
+    served: Optional[Dict[str, Any]] = None
+
+    @property
+    def skill_id(self) -> str:
+        return str(self.fields["skill_id"])
+
+    @property
+    def version_id(self) -> str:
+        return str(self.fields["version_id"])
+
+    @property
+    def version(self) -> int:
+        return int(self.fields["version"])
+
+    @property
+    def name(self) -> str:
+        return str(self.fields["registry_name"])
+
+    def visible_to(self, org: Optional[str]) -> bool:
+        return self.public or (org is not None and org == self.org_id)
+
+    def variant_for(self, org: Optional[str]) -> str:
+        authored = org is not None and org == self.org_id and not self.imported
+        return "authored" if authored else "foreign"
+
+    @classmethod
+    def from_vector(cls, case: Dict[str, Any]) -> "InstallRow":
+        """A platform render vector: its database rows in, the bundle it served out.
+
+        The vector names its caller; the row's access and variant come from the skill
+        row (owner, visibility, import or fork), and must give that caller the variant
+        the platform rendered, or the vector is not one this probe can serve.
+        """
+        skill = case["rows"]["skill"]
+        row = cls(
+            fields=dict(case["fields"]),
+            attachments=[dict(a) for a in case["attachments"]],
+            org_id=str(skill["org_id"]),
+            public=skill.get("visibility") == "public",
+            imported=(skill.get("source_type") == "github_import"
+                      or skill.get("forked_from_skill_id") is not None),
+            url_slug=skill.get("url_slug"),
+            served=dict(case["bundle"]),
+        )
+        caller = case.get("caller_org")
+        if not row.visible_to(caller) or row.variant_for(caller) != case["variant"]:
+            raise ValueError(
+                f"render vector {case.get('id')!r}: its skill row gives caller {caller!r} "
+                f"the {row.variant_for(caller)!r} variant (visible: {row.visible_to(caller)}), "
+                f"but the platform rendered {case['variant']!r}")
+        return row
+
+
+class _InstallRefusal(Exception):
+    """One refusal: a per-item error in resolve, a structured ``detail`` in bundle."""
+
+    def __init__(self, status: int, code: str, message: str, **extra: Any) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.extra = extra
+
+    def detail(self) -> Dict[str, Any]:
+        return {"code": self.code, "message": self.message, **self.extra}
+
+    def response(self) -> Tuple[int, Any, List[str]]:
+        return self.status, {"detail": self.detail(), "code": f"HTTP_{self.status}"}, []
+
+
+def _framework_error(status: int) -> Tuple[int, Any, List[str]]:
+    """What the platform answers for a path or method no route matches."""
+    phrase = {401: "Invalid or missing API key", 404: "Not Found", 405: "Method Not Allowed"}
+    return status, {"detail": phrase.get(status, "Error"), "code": f"HTTP_{status}"}, []
+
+
+def _install_validation_error(field_name: str, message: str) -> Tuple[int, Any, List[str]]:
+    return 422, {"detail": "Request validation failed", "code": "validation_error",
+                 "details": {"errors": [{"field": field_name, "message": message}]}}, []
+
+
+def _install_format(formats: Sequence[int]) -> int:
+    """The highest format both the client reads and the renderer writes."""
+    from skillevaluation import skillfmt
+
+    if len(formats) > INSTALL_MAX_FORMATS:
+        raise _InstallRefusal(422, "too_many_formats",
+                              f"at most {INSTALL_MAX_FORMATS} formats per request",
+                              max_formats=INSTALL_MAX_FORMATS)
+    common = set(formats) & set(skillfmt.SUPPORTED_FORMATS)
+    if not common:
+        raise _InstallRefusal(422, "format_unsupported",
+                              "none of the requested formats is rendered here",
+                              supported=sorted(skillfmt.SUPPORTED_FORMATS))
+    return max(common)
+
+
 # ── Recording ────────────────────────────────────────────────────────────────
 
 
@@ -325,6 +462,11 @@ class Probe:
         # empty for every driver run, which is why the adapter matrix sees no
         # change. agent_name -> the row below.
         self.agents: Dict[str, Dict[str, Any]] = {}
+        # The registry the install routes serve (`add_install_row`), and the API
+        # keys they accept: key -> the organization it belongs to. Empty for every
+        # conformance run.
+        self.install_rows: List["InstallRow"] = []
+        self.install_keys: Dict[str, str] = {}
         self._lock = threading.RLock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -361,9 +503,16 @@ class Probe:
             def _handle(self, method: str) -> None:
                 parsed = urlparse(self.path)
                 body = self._read_body()
-                status, payload, errors = probe.route(
-                    method, parsed.path, parse_qs(parsed.query), body
-                )
+                query = parse_qs(parsed.query)
+                if parsed.path.startswith((INSTALL_PREFIX, REGISTRY_INSTALL_PREFIX)):
+                    # The install routes read the caller's key; `route` keeps its
+                    # signature, which subclasses in the suite override.
+                    status, payload, errors = probe.install_route(
+                        method, parsed.path, query, body,
+                        {k.lower(): v for k, v in self.headers.items()},
+                    )
+                else:
+                    status, payload, errors = probe.route(method, parsed.path, query, body)
                 probe._record(
                     method, parsed.path, parse_qs(parsed.query), body, status,
                     payload, errors,
@@ -451,6 +600,9 @@ class Probe:
         self, method: str, path: str, query: Dict[str, List[str]], body: Any
     ) -> Tuple[int, Any, List[str]]:
         """Dispatch one request. Returns ``(status, response_json, errors)``."""
+        if path.startswith((INSTALL_PREFIX, REGISTRY_INSTALL_PREFIX)):
+            return self.install_route(method, path, query, body, {})  # no key: anonymous
+
         if method == "GET" and path == "/api/v1/auth/verify":
             return 200, {
                 "status": "ok",
@@ -978,3 +1130,239 @@ class Probe:
         with self._lock:
             row = self.manifests.get(str(manifest_id))
         return row["agent_name"] if row else None
+
+    # ── the install routes ───────────────────────────────────
+
+    def add_install_row(self, row: InstallRow) -> InstallRow:
+        """Put one skill version in the registry the install routes serve."""
+        with self._lock:
+            if any(r.version_id == row.version_id for r in self.install_rows):
+                raise ValueError(f"version {row.version_id} is already served")
+            self.install_rows.append(row)
+        return row
+
+    def install_route(
+        self, method: str, path: str, query: Dict[str, List[str]], body: Any,
+        headers: Dict[str, str],
+    ) -> Tuple[int, Any, List[str]]:
+        """One request to the install routes; ``headers`` (lowercased) carry the API key."""
+        anonymous = path.startswith(REGISTRY_INSTALL_PREFIX)
+        rest = path[len(REGISTRY_INSTALL_PREFIX if anonymous else INSTALL_PREFIX):]
+        if rest != "resolve" and not rest.startswith("bundles/"):
+            return _framework_error(404)
+        if method != ("POST" if rest == "resolve" else "GET"):
+            return _framework_error(405)
+        org: Optional[str] = None
+        if not anonymous:
+            scheme, _, key = (headers.get("authorization") or "").partition(" ")
+            with self._lock:
+                org = self.install_keys.get(key.strip()) if scheme.lower() == "bearer" else None
+            if org is None:
+                return _framework_error(401)
+        try:
+            if rest == "resolve":
+                return self._install_resolve(body, org, anonymous)
+            return self._install_bundle(unquote(rest[len("bundles/"):]), query, org)
+        except _InstallRefusal as exc:
+            return exc.response()
+
+    def _install_resolve(
+        self, body: Any, org: Optional[str], anonymous: bool,
+    ) -> Tuple[int, Any, List[str]]:
+        from skillevaluation import skillfmt
+
+        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+            return _install_validation_error("items", "a list of items is required")
+        items = body["items"]
+        cap = INSTALL_MAX_ANONYMOUS_ITEMS if anonymous else INSTALL_MAX_ITEMS
+        if len(items) > cap:
+            raise _InstallRefusal(422, "too_many_items",
+                                  f"at most {cap} items per request, got {len(items)}",
+                                  max_items=cap)
+        formats = body.get("formats", [skillfmt.FORMAT])
+        if (not isinstance(formats, list)
+                or any(not isinstance(f, int) or isinstance(f, bool) for f in formats)):
+            return _install_validation_error("formats", "a list of format numbers")
+        fmt = _install_format(formats)
+        taken = body.get("taken") or {}
+        if not isinstance(taken, dict):
+            return _install_validation_error("taken", "a map of install name to skill id")
+        taken = dict(taken)
+        return 200, {"items": [self._install_resolve_item(item, org, taken, fmt)
+                               for item in items]}, []
+
+    def _install_resolve_item(
+        self, item: Any, org: Optional[str], taken: Dict[str, Optional[str]], fmt: int,
+    ) -> Dict[str, Any]:
+        from skillevaluation import skillfmt
+
+        if not isinstance(item, dict):
+            return {"ok": False, "error": {"code": "not_found",
+                                           "message": "an item must be an object"}}
+        label = item.get("ref") if item.get("ref") is not None else item.get("skill_id")
+        try:
+            versions = self._install_find(item.get("ref"), item.get("skill_id"), org)
+            row = self._install_version(versions, item)
+            try:
+                install_name = skillfmt.choose_install_name(row.name, row.skill_id, taken)
+            except skillfmt.InstallNameCollision as exc:
+                raise _InstallRefusal(409, "install_name_collision", str(exc),
+                                      install_name=exc.install_name)
+            bundle = self._install_render(row, install_name, row.variant_for(org), fmt)
+        except _InstallRefusal as exc:
+            return {"ref": label, "ok": False, "error": exc.detail()}
+        taken[install_name] = row.skill_id
+        newest = max(versions, key=lambda r: r.version)
+        base, alt = skillfmt.install_name_forms(row.name, row.skill_id)
+        return {
+            "ref": label,
+            "ok": True,
+            "skill_id": row.skill_id,
+            "org_id": org,
+            "registry_name": row.name,
+            "url_slug": row.url_slug,
+            "install_name": install_name,
+            "install_name_base": base,
+            "install_name_disambiguated": alt,
+            "version_id": row.version_id,
+            "version": row.version,
+            "latest": {"version_id": newest.version_id, "version": newest.version},
+            "render": dict(bundle["render"]),
+            "body_sha256": bundle["body_sha256"],
+            "description_sha256": bundle["description_sha256"],
+            "invocation": bundle["invocation"],
+            "relationship": "owned" if org is not None and org == row.org_id else "public",
+            "files": [{"path": f["path"], "sha256": f["sha256"], "mode": f["mode"]}
+                      for f in bundle["files"]],
+            "unavailable": [dict(u) for u in bundle["unavailable"]],
+            "policy_notes": list(bundle["policy_notes"]),
+            "safety": {"band": "clean", "withheld": False},
+        }
+
+    def _install_find(self, ref: Any, skill_id: Any, org: Optional[str]) -> List[InstallRow]:
+        """Every version of the one skill ``ref`` (or ``skill_id``) names, for ``org``.
+
+        The platform's order: a skill id, an exact url_slug, a registry name (the
+        caller's own, then a public one), then an install name.
+        """
+        from skillevaluation import skillfmt
+
+        with self._lock:
+            visible = [r for r in self.install_rows if r.visible_to(org)]
+        by_skill: Dict[str, List[InstallRow]] = {}
+        for r in visible:
+            by_skill.setdefault(r.skill_id, []).append(r)
+
+        def one(skills: List[str], what: str) -> Optional[List[InstallRow]]:
+            unique = sorted(set(skills))
+            if len(unique) > 1:
+                raise _InstallRefusal(409, "ambiguous", f"{len(unique)} skills match {what}")
+            return by_skill[unique[0]] if unique else None
+
+        if skill_id is not None:
+            if skill_id in by_skill:
+                return by_skill[skill_id]
+            raise _InstallRefusal(404, "not_found", f"no skill with id {skill_id}")
+        if not isinstance(ref, str) or not ref:
+            raise _InstallRefusal(404, "not_found", "an item needs a ref or a skill_id")
+        if ref in by_skill:
+            return by_skill[ref]
+        for skills, what in (
+            ([r.skill_id for r in visible if r.url_slug == ref], f"the url_slug {ref}"),
+            ([r.skill_id for r in visible if r.name == ref and org is not None
+              and r.org_id == org], f"the name {ref}"),
+            ([r.skill_id for r in visible if r.name == ref and r.public], f"the name {ref}"),
+            ([r.skill_id for r in visible
+              if skillfmt.install_name_for(r.name, r.skill_id) == ref], f"the install name {ref}"),
+        ):
+            found = one(skills, what)
+            if found is not None:
+                return found
+        raise _InstallRefusal(404, "not_found", f"no skill matches {ref}")
+
+    @staticmethod
+    def _install_version(versions: List[InstallRow], item: Dict[str, Any]) -> InstallRow:
+        version_id = item.get("version_id")
+        spec = item.get("version", "latest")
+        if version_id is not None:
+            match = [r for r in versions if r.version_id == version_id]
+        elif spec == "latest":
+            match = [max(versions, key=lambda r: r.version)]
+        elif isinstance(spec, int) and not isinstance(spec, bool):
+            match = [r for r in versions if r.version == spec]
+        else:
+            raise _InstallRefusal(404, "not_found",
+                                  f"version must be 'latest' or a number, not {spec!r}")
+        if not match:
+            raise _InstallRefusal(404, "not_found",
+                                  f"{versions[0].name} has no version {version_id or spec}")
+        return match[0]
+
+    @staticmethod
+    def _install_render(row: InstallRow, install_name: str, variant: str,
+                        fmt: int) -> Dict[str, Any]:
+        """The bundle (``skillfmt.Bundle.to_dict()`` shape) for one rendering of ``row``."""
+        from skillevaluation import skillfmt
+
+        if row.served is not None:
+            served = row.served
+            key = (served["install_name"], served["render"]["variant"], served["render"]["format"])
+            if key != (install_name, variant, fmt):
+                raise _InstallRefusal(
+                    409, "render_gone",
+                    f"this probe holds the platform's own rendering of version {row.version_id} "
+                    f"only: {key}, not {(install_name, variant, fmt)}")
+            return json.loads(json.dumps(served))
+        try:
+            bundle = skillfmt.render_bundle(
+                skillfmt.RenderFields.from_dict(row.fields), row.attachments,
+                install_name=install_name, variant=variant, format=fmt)
+        except skillfmt.RenderError as exc:
+            raise _InstallRefusal(422, exc.code, str(exc))
+        return bundle.to_dict()
+
+    def _install_bundle(
+        self, version_id: str, query: Dict[str, List[str]], org: Optional[str],
+    ) -> Tuple[int, Any, List[str]]:
+        from skillevaluation import skillfmt
+
+        def one(name: str) -> Optional[str]:
+            values = query.get(name)
+            return values[-1] if values else None
+
+        with self._lock:
+            row = next((r for r in self.install_rows if r.version_id == version_id), None)
+        if row is None:
+            raise _InstallRefusal(404, "not_found", f"no version {version_id}")
+        if not row.visible_to(org):
+            raise _InstallRefusal(404, "no_access", f"no version {version_id}")
+        install_name = one("install_name")
+        if not install_name:
+            return _install_validation_error("install_name", "field required")
+        if not skillfmt.is_valid_install_name(install_name):
+            raise _InstallRefusal(422, "invalid_install_name",
+                                  f"{install_name!r} is not an install name")
+        formats = query.get("formats") or [str(skillfmt.FORMAT)]
+        if any(not (f.isascii() and f.isdigit()) for f in formats):
+            raise _InstallRefusal(422, "invalid_formats", "formats takes format numbers")
+        fmt = _install_format([int(f) for f in formats])
+        exact = one("format")
+        if exact is not None:
+            if not (exact.isascii() and exact.isdigit()) or int(exact) not in {int(f) for f in formats}:
+                raise _InstallRefusal(422, "format_unsupported",
+                                      f"format {exact!r} was not among the requested formats",
+                                      supported=sorted(skillfmt.SUPPORTED_FORMATS))
+            fmt = int(exact)
+        natural = row.variant_for(org)
+        variant = one("variant") or natural
+        if variant not in skillfmt.VARIANTS:
+            return _install_validation_error("variant", f"one of {skillfmt.VARIANTS}")
+        if variant == "authored" and natural != "authored":
+            raise _InstallRefusal(403, "not_author",
+                                  "the authored variant is served only to its authors")
+        bundle = self._install_render(row, install_name, variant, fmt)
+        render_hash = one("render_hash")
+        if render_hash and render_hash != bundle["render"]["hash"]:
+            raise _InstallRefusal(409, "render_gone",
+                                  f"render {render_hash[:12]} no longer exists")
+        return 200, bundle, []
