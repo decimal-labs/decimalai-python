@@ -26,7 +26,8 @@ platform's own semantics, and per-skill URLs still carried raw names.
    only a name that resolves solely through the public registry and that
    decision did not offer. A run whose routing call failed sends an empty
    ``routing_id`` (it was offered nothing). Calls outside a run (a direct
-   ``get_skill_body``, disk export) send none and behave as before.
+   ``get_skill_body``) send none and behave as before; a disk export makes no
+   body request at all (it is ``decimalai skills add``).
 
 3. **Per-skill paths.** Versions, publish, attachments, fork, use and the rest
    still interpolated the raw name; a ``#`` or ``?`` ended the path.
@@ -412,13 +413,23 @@ class TestFetchesOutsideARunAreUnchanged:
         router.get_skill_body_record("tone-guide")
         assert "routing_id" not in _params(platform.body_calls("tone-guide")[0])
 
-    def test_disk_export_names_no_decision(self, monkeypatch):
+    def test_disk_export_makes_no_body_call_even_after_a_routed_run(self, monkeypatch, tmp_path):
+        """No `/body` request, so no routing decision to name: the export is the
+        package manager's, through its own resolve and bundle routes."""
+        from tests.fakes.fake_registry import FakeRegistry
+        from tests.test_router_skillpkg_shims import engine_on
+
         platform = _install(monkeypatch, FakePlatform())
+        registry = FakeRegistry(keys={"dai_sk_test": "org-test"})
+        engine_on(registry, monkeypatch)
+        registry.add_skill("planted/skill", body="Use the box.\n")
         router = _router()
         router.build_prompt_fragment("refund an opened box", scope="run")
-        assert router._resolved_export_source("planted/skill") is not None
-        (call,) = platform.body_calls("planted/skill")
-        assert "routing_id" not in _params(call)
+
+        router.export("planted/skill", project_root=str(tmp_path))
+
+        assert platform.body_calls() == []
+        assert registry.calls("body") == []
 
     def test_a_direct_caller_can_name_a_decision(self, monkeypatch):
         platform = _install(monkeypatch, FakePlatform())
@@ -498,18 +509,19 @@ class TestPerSkillPathsAreEncoded:
         assert detail[1] == "/api/v1/registry/skills/reg%231/use"
         assert detail[2] == "/api/v1/registry/skills/reg%231"
 
-    def test_registry_attachment_paths_encode_the_ids(self, monkeypatch):
+    def test_export_reads_no_attachment_route(self, monkeypatch, tmp_path):
+        """The attachments arrive in the bundle, hashed; the per-id attachment routes
+        (owned, then public registry) the export once walked are not called."""
+        from tests.fakes.fake_registry import FakeRegistry
+        from tests.test_router_skillpkg_shims import engine_on
+
         platform = _install(monkeypatch, FakePlatform())
+        registry = FakeRegistry(keys={"dai_sk_test": "org-test"})
+        engine_on(registry, monkeypatch)
+        registry.add_skill("pdf", files=({"path": "scripts/a.py", "content": "x\n"},))
 
-        def answer(method, url, **kwargs):
-            platform.calls.append({"method": method, "url": url, **kwargs})
-            if "/api/v1/skills/" in url:  # owned listing fails: not our skill
-                return httpx.Response(404, json={"detail": "Skill not found"})
-            if url.endswith("/attachments"):
-                return httpx.Response(200, json={"attachments": [{"id": "att?2", "file_path": "a.py"}]})
-            return httpx.Response(200, json={"id": "att?2", "file_path": "a.py", "content_text": "x"})
+        summary = _router().export("pdf", project_root=str(tmp_path))
 
-        monkeypatch.setattr(httpx, "request", answer)
-        _router()._attachments_for_export("id#1")
-        assert "/api/v1/registry/skills/id%231/attachments" in _paths(platform)
-        assert "/api/v1/registry/skills/id%231/attachments/att%3F2" in _paths(platform)
+        assert summary["attachments_written"] == 1
+        assert _paths(platform) == []
+        assert [c.route for c in registry.calls()] == ["resolve", "bundle"]

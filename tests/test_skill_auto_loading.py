@@ -632,12 +632,12 @@ class TestAutoLoadE2E:
         assert acc.active_skills == {}
 
 
-class TestPullMissingTargetsDiskRuntimes:
-    """install(agent_name=<trace name>) must not hand a non-runtime name
-    to pull_missing — 'acme-support-agent' is a trace label, not a disk
-    runtime, and pre-fix every such install ERROR-logged 'Unknown agent'.
-    Only real AGENT_PATHS keys pass through; everything else falls back to
-    'universal'."""
+class TestInstrumentPullsNothing:
+    """install()/instrument() used to hand the agent name to a background
+    `pull_missing`, which mirrored every org skill into that runtime's folder (and a
+    trace label such as 'acme-support-agent' was not even a runtime). There is no
+    background pull now, whatever the agent is called: registry skills reach disk only
+    when `decimalai skills` runs."""
 
     def _synchronous_sender(self):
         sender = MagicMock()
@@ -685,30 +685,17 @@ class TestPullMissingTargetsDiskRuntimes:
                 install(agent_name=agent_name, disk_sync=True)
         return router
 
-    def test_openai_agents_trace_name_falls_back_to_universal(self):
-        router = self._run_openai_install("acme-support-agent")
-        router.pull_missing.assert_called_once()
-        assert router.pull_missing.call_args.kwargs["agents"] == ["universal"]
+    @pytest.mark.parametrize("agent_name", ["acme-support-agent", "claude-code", None])
+    def test_openai_agents_never_pulls(self, agent_name):
+        router = self._run_openai_install(agent_name)
+        router.pull_missing.assert_not_called()
+        router.export_to_disk.assert_not_called()
 
-    def test_openai_agents_runtime_key_passes_through(self):
-        router = self._run_openai_install("claude-code")
-        router.pull_missing.assert_called_once()
-        assert router.pull_missing.call_args.kwargs["agents"] == ["claude-code"]
-
-    def test_langchain_trace_name_falls_back_to_universal(self):
-        router = self._run_langchain_install("acme-support-agent")
-        router.pull_missing.assert_called_once()
-        assert router.pull_missing.call_args.kwargs["agents"] == ["universal"]
-
-    def test_langchain_runtime_key_passes_through(self):
-        router = self._run_langchain_install("claude-code")
-        router.pull_missing.assert_called_once()
-        assert router.pull_missing.call_args.kwargs["agents"] == ["claude-code"]
-
-    def test_openai_agents_none_agent_name_uses_universal(self):
-        router = self._run_openai_install(None)
-        router.pull_missing.assert_called_once()
-        assert router.pull_missing.call_args.kwargs["agents"] == ["universal"]
+    @pytest.mark.parametrize("agent_name", ["acme-support-agent", "claude-code", None])
+    def test_langchain_never_pulls(self, agent_name):
+        router = self._run_langchain_install(agent_name)
+        router.pull_missing.assert_not_called()
+        router.export_to_disk.assert_not_called()
 
 
 if __name__ == "__main__":

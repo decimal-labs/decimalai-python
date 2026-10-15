@@ -7,8 +7,9 @@ stamp ``POST /skills/sync`` and ``POST /skills/installs/report`` with it. The
 backend then knows which install reconciled which version and can flag local /
 remote drift.
 
-The id is per-checkout, NOT per-user, so it must not be committed: creating it
-also drops a ``.decimal/.gitignore`` that excludes ``install.json``.
+The id is per-checkout, NOT per-user, so it must not be committed: writing it
+also keeps ``.decimal/.gitignore`` listing ``install.json`` and the rest of what
+the skills engine keeps under ``.decimal/`` (the engine's own writer does it).
 """
 
 from __future__ import annotations
@@ -20,28 +21,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# Colocated with disk_export.LOCKFILE_NAME (".decimal/skills.lock") so all
-# project-local SDK state lives under one dotdir users gitignore once.
+# The directory `decimalai skills` keeps its manifest and lock in, so all
+# project-local SDK state lives under one dotdir.
 STATE_DIR = ".decimal"
 INSTALL_FILE = "install.json"
 
 
 def find_project_root(start: Optional[str] = None) -> str:
-    """Best-effort project root for install identity.
+    """The project directory for install identity: the one ``decimalai skills`` uses.
 
-    Prefers an existing ``.decimal/`` marker (so a run from a subdirectory
-    shares the repo's install_id with one at the root), then the nearest
-    ``.git`` ancestor, else ``start`` / the current working directory.
+    The search walks up from ``start`` (default: the working directory) and stops at
+    the repository, the first directory with a ``.git`` entry, and below the home
+    directory (home is the project only when ``start`` is home). Within that range it
+    prefers a ``.decimal/skills.toml`` or ``.decimal/skills.lock``, then any
+    ``.decimal/``, so a run from a subdirectory shares the repo's install_id; then the
+    repository root; else ``start``. A ``.decimal/`` above the repository, or in the
+    home directory, belongs to something else. See
+    :meth:`decimalai.skillpkg.project.Project.find`.
     """
-    base = Path(start or os.getcwd()).resolve()
-    candidates = [base, *base.parents]
-    for d in candidates:
-        if (d / STATE_DIR).is_dir():
-            return str(d)
-    for d in candidates:
-        if (d / ".git").exists():
-            return str(d)
-    return str(base)
+    from .skillpkg.project import find_project  # standard library only
+
+    return str(find_project(start or None).directory)
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -52,13 +52,21 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def _ensure_gitignore(state_dir: Path) -> None:
-    """Keep install.json out of version control (per-checkout identity)."""
-    gi = state_dir / ".gitignore"
-    if gi.exists():
-        return
+    """Keep install.json (a per-checkout identity) and the engine's working files out of
+    version control.
+
+    Appends whichever lines of :data:`decimalai.skillpkg.project.GITIGNORE_LINES`
+    ``.decimal/.gitignore`` lacks, every time, and leaves every line already there; a
+    second call changes nothing. The skills engine's writer does it, so there is one
+    writer of the file. Identity bookkeeping never fails the call it serves, so a file
+    that cannot be written (a symlink, a read-only checkout) is left as it is.
+    """
     try:
-        gi.write_text(f"{INSTALL_FILE}\n", encoding="utf-8")
-    except OSError:
+        from .skillpkg import ops
+        from .skillpkg.project import Project
+
+        ops._ensure_gitignore(Project.at(Path(state_dir).parent))
+    except Exception:  # noqa: BLE001 - see the docstring
         pass
 
 
@@ -128,6 +136,7 @@ def get_install_identity(
             if rewrite and create:
                 try:
                     _atomic_write_json(path, data)
+                    _ensure_gitignore(state_dir)
                 except OSError:
                     pass
             return data

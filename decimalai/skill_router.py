@@ -27,7 +27,6 @@ import warnings
 from collections import OrderedDict
 from contextvars import ContextVar
 from copy import deepcopy
-from pathlib import Path
 from threading import Lock
 from threading import local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
@@ -1192,43 +1191,26 @@ def _detect_disk_runtime() -> Optional[str]:
 def should_auto_pull_to_disk(
     target_agent: str, explicitly_requested: bool = False
 ) -> tuple[bool, str]:
-    """Whether instrument() may mirror platform skills into the working directory.
+    """Whether the user asked for platform skills on disk. Kept for compatibility.
 
-    ``disk_sync`` answers "is disk a channel for skills at all", and it governs
-    reading local SKILL.md files and uploading them — neither of which creates
-    anything. Writing is different in kind: pulling platform skills down creates
-    ``.agents/skills/`` (or ``.claude/skills/``) inside whatever directory the
-    user happened to run from. A single documented one-liner, in a plain Python
-    script, was leaving a tree of files in the user's repo — and with no
-    disk-loading runtime in the process, nothing ever read them back. Litter, in
-    exchange for nothing.
+    Nothing in the SDK writes skills to disk on its own any more: ``instrument()`` has
+    no background pull, and registry skills reach disk only when a command runs
+    (``decimalai skills add`` / ``install``, or ``decimalai.skillpkg``). So nothing
+    calls this for a write; it answers the old question for code that still asks.
 
-    The distinction that matters is **explicit versus derived**. ``disk_sync``
-    is a tri-state: passed as ``True`` it is the user asking for exactly this,
-    and it is honoured without further argument. Left as ``None`` it is derived
-    from ``skill_authority``, and the derived default lands on ``True`` whenever
-    the router's skill loader is off — which is most first runs. Nobody chose
-    that, and it is the branch that was writing to people's repos.
+    Two things count as asking:
 
-    The rule is that we may keep a directory the user already has up to date, but
-    we may not create one they never asked for. Three things count as asking:
+    * ``disk_sync=True`` passed explicitly (``explicitly_requested``);
+    * ``skill_authority="harness"`` set explicitly in ``decimalai.init()``.
 
-    * ``disk_sync=True`` passed explicitly to ``install()``;
-    * ``skill_authority="harness"`` was set explicitly — an unambiguous "disk is
-      my channel", which must work on the first run in a fresh checkout, before
-      any directory exists to detect;
-    * the target directory already exists — the user works in a checkout that
-      uses it, so leaving it stale is the surprise, not updating it.
+    A skills directory that already exists is **not** consent. It used to be, and that
+    is how an agent run in any checkout with ``.agents/skills`` (which ``decimalai
+    skills`` itself creates) wrote every org skill into it. Being inside a disk-loading
+    runtime is not consent either. ``target_agent`` is accepted and unused. Nothing is
+    logged: someone who asked for skills on disk is told once, by ``instrument()``, that
+    nothing is written (:func:`_note_disk_sync_writes_nothing`).
 
-    Detecting a disk-loading runtime is deliberately **not** on that list, though
-    it is the tempting third entry. Being inside Claude Code says the editor
-    would read these files if they existed; it does not say the user wants a
-    Python script they ran in that terminal to create them. Running a script is
-    not a request to sync skills. It earns a one-time hint instead — enough to
-    find the feature, not enough to write to the repo uninvited.
-
-    Returns the decision and a short reason, so the skip is explainable in logs
-    rather than looking like the pull silently failed.
+    Returns the decision and a short reason.
     """
     if explicitly_requested:
         return True, "disk_sync=True was passed explicitly"
@@ -1241,48 +1223,10 @@ def should_auto_pull_to_disk(
     except Exception:
         pass
 
-    try:
-        from .disk_export import AGENT_PATHS
-
-        project_dir = AGENT_PATHS.get(target_agent, {}).get("project")
-        if project_dir and Path(project_dir).is_dir():
-            return True, f"{project_dir} already exists"
-    except Exception:
-        pass
-
-    runtime = _detect_disk_runtime()
-    if runtime:
-        _hint_disk_mirror_available(runtime, target_agent)
     return False, (
-        "no existing skills directory and skill_authority is not 'harness' — "
-        "the router already delivers skills to the model, so writing them to "
-        "disk would leave files in the user's repo that nothing reads"
-    )
-
-
-_disk_mirror_hinted = False
-
-
-def _hint_disk_mirror_available(runtime: str, target_agent: str) -> None:
-    """Tell a harness user once that disk mirroring exists and is off.
-
-    Only fires where the offer is meaningful: a runtime that reads skills from
-    disk is present, but no directory exists yet, so we declined to make one.
-    Once per process — an agent instrumented in a loop must not narrate this on
-    every call.
-    """
-    global _disk_mirror_hinted
-    if _disk_mirror_hinted or os.environ.get("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING"):
-        return
-    _disk_mirror_hinted = True
-    logger.info(
-        "%s reads skills from disk, but DecimalAI is not mirroring them there: "
-        "no skills directory exists yet and creating one unasked would put files "
-        "in your repo. Skills still reach the model through the router. To mirror "
-        "them for %s as well, set skill_authority='harness' in decimalai.init() "
-        "(or create the directory yourself). "
-        "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING=1 silences this.",
-        runtime, runtime,
+        "nobody asked for skills on disk, and a skills directory that exists is not "
+        "asking — the router already delivers skills to the model; "
+        "`decimalai skills add <name>` installs one for a native loader"
     )
 
 
@@ -1303,13 +1247,13 @@ def _warn_if_disk_runtime_detected(framework: str) -> None:
     _disk_runtime_warned = True
     logger.warning(
         "SkillRouter loader (decimalai.%s) enabled inside %s, which "
-        "auto-discovers SKILL.md files from disk. Both will inject skills "
-        "into the system prompt, producing duplicates. With "
-        "skill_authority='router' (or 'auto' + this loader) the SDK already "
-        "stops mirroring skills to disk (disk_sync=False); to fully avoid the "
-        "duplicate, also remove the local SKILL.md files %s loads so the "
-        "Router is the only source. Otherwise skip enable_skill_loader=True "
-        "here and let %s do the loading. Set "
+        "loads SKILL.md files from disk itself: a skill that is both routed and "
+        "on disk reaches the prompt twice. The SDK no longer writes skills to disk "
+        "on its own; registry skills get there only through `decimalai skills add` "
+        "and `decimalai skills install`. To avoid the duplicate, either keep the "
+        "router as the only source (do not also install the routed skills, and "
+        "remove local copies %s loads), or skip enable_skill_loader=True here and "
+        "let %s load the skills you install with `decimalai skills add`. Set "
         "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING=1 to silence intentionally.",
         framework, runtime, runtime, runtime,
     )
@@ -1321,6 +1265,200 @@ def _warn_if_disk_runtime_detected(framework: str) -> None:
 # also guards re-firing.
 if os.environ.get("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING"):
     _disk_runtime_warned = True
+
+
+# ── The disk verbs are the package manager's ───────────────
+# SkillRouter's disk methods (export, export_to_disk, install, update_skills,
+# status, pull_missing) predate `decimalai.skillpkg`. Each one is now a thin
+# wrapper over that engine, which the `decimalai skills` commands run too, so
+# there is one way a registry skill reaches disk: a manifest entry, a folder
+# under `.agents/skills` and a version 2 lock entry pinning its bytes. The
+# wrappers keep their signatures and the keys they returned. Arguments that only
+# meant something to the old writer are ignored with a warning (`agents`, which
+# picked folders) or refused (`scope="global"`, which wrote outside the project).
+
+#: Shims and notices that fired already in this process, by key.
+_warned_once: set = set()
+
+#: Change actions that wrote a folder.
+_FOLDER_WRITES = ("add", "update", "fetch", "restore")
+
+
+def _warn_deprecated(key: str, message: str) -> None:
+    """``DeprecationWarning`` for the shim ``key``, once per process."""
+    if key in _warned_once:
+        return
+    _warned_once.add(key)
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+
+
+def _log_once(key: str, message: str, *args: Any) -> None:
+    """A WARNING the user should see, once per process."""
+    if key in _warned_once:
+        return
+    _warned_once.add(key)
+    logger.warning(message, *args)
+
+
+def _note_disk_sync_writes_nothing(disk_sync: Optional[bool]) -> None:
+    """Tell someone who asked for skills on disk, once per process, that none are written.
+
+    ``disk_sync`` is the value ``instrument()`` was called with. Asking is
+    ``disk_sync=True``, or ``skill_authority="harness"`` with ``disk_sync`` left unset.
+    Until 0.15 either one mirrored every platform skill into the working directory;
+    now registry skills reach disk only when a ``decimalai skills`` command runs, and
+    someone relying on the old behaviour would otherwise just stop getting updates.
+    """
+    if disk_sync is True:
+        how = "disk_sync=True"
+    elif disk_sync is None:
+        try:
+            from ._config import _get_config
+
+            if (_get_config().skill_authority or "").strip().lower() != "harness":
+                return
+        except Exception:
+            return
+        how = "skill_authority='harness'"
+    else:
+        return
+    _log_once(
+        "disk-sync-writes-nothing",
+        "You asked for skills on disk (%s), but the SDK no longer writes skills to disk: "
+        "platform skills are not mirrored into the working directory any more. Install "
+        "the ones an agent loads natively with `decimalai skills add <name>`; "
+        "`decimalai skills install` puts them back on a fresh clone or in CI. Local "
+        "SKILL.md files you wrote are still read and synced.",
+        how,
+    )
+
+
+def _check_scope(scope: Optional[str], name: Any) -> None:
+    """Refuse a scope other than the project."""
+    if scope not in (None, "project"):
+        import shlex
+
+        raise ValueError(
+            f"scope={scope!r} is not supported any more: skills install into the "
+            "project's `.agents/skills`, managed by `decimalai skills`. For a personal "
+            f"copy run `decimalai skills pull {shlex.quote(str(name or '<name>'))} "
+            "--out ~/.claude/skills`"
+        )
+
+
+def _check_disk_args(agents: Optional[List[str]], scope: Optional[str], name: Any) -> None:
+    """Refuse a scope other than the project; say once that ``agents`` is ignored."""
+    _check_scope(scope, name)
+    if agents and any(a != "universal" for a in agents):
+        _log_once(
+            "agents",
+            "agents=%s is ignored: skills install into one root, .agents/skills "
+            "(decimalai.skills_dir()). Claude Code loads it with "
+            "`claude --plugin-dir \"$(git rev-parse --show-toplevel)/.agents\"`; "
+            "point other runtimes' skill loaders at "
+            "decimalai.skills_dir().",
+            list(agents),
+        )
+
+
+def _disk_project(project_root: Optional[str]) -> Any:
+    """The project the engine will use for ``project_root`` (found from the working
+    directory when it is None), for reading back what it wrote."""
+    from .skillpkg.project import Project
+
+    return Project.find() if project_root is None else Project.at(project_root)
+
+
+def _v1_project(project_root: Optional[str]) -> Any:
+    """The project, when its ``.decimal/skills.lock`` is a version 1 lock (one 0.14 or
+    older wrote, with or without a ``version`` key); else None."""
+    from .disk_export import _lock_kind
+
+    try:
+        project = _disk_project(project_root)
+    except Exception:
+        return None
+    if _lock_kind(str(project.directory)) != "v1":
+        return None
+    _log_once(
+        "v1-lock",
+        "%s uses a version 1 skills lock; run `decimalai skills migrate` to move to the "
+        "package manager (0.16 removes this fallback). Until then SkillRouter's disk "
+        "methods write the registry's folders and update that lock as 0.14 did.",
+        project.directory,
+    )
+    return project
+
+
+def _v1_failure(name: str, exc: BaseException) -> "SkillRouterError":
+    from .skillpkg.errors import Result, SkillpkgError
+
+    result = Result.from_error(exc) if isinstance(exc, SkillpkgError) else None
+    return SkillRouterError(f"could not add {name!r}: {exc}", result=result)
+
+
+def _locked_entries(project: Any) -> Dict[str, Any]:
+    """The project's version 2 lock entries; none when there is no readable lock."""
+    try:
+        from .skillpkg import lock as _lock
+
+        return dict(_lock.load(project, missing_ok=True, repair=True).skills)
+    except Exception:
+        return {}
+
+
+def _refusal(result: Any) -> str:
+    """Why an engine call failed: its errors, each naming the skill and the fix."""
+    from .skillpkg.errors import SkillpkgError
+
+    errors = [str(p) for p in result.problems if isinstance(p, SkillpkgError)]
+    return "; ".join(errors) or f"exit code {int(result.exit_code)}"
+
+
+def _written(result: Any, project: Any, locked: Dict[str, Any]) -> Dict[str, Any]:
+    """The summary keys ``export_to_disk`` always returned, for one engine result."""
+    paths: List[str] = []
+    attachments = 0
+    for change in result.changes:
+        if getattr(change, "action", None) not in _FOLDER_WRITES:
+            continue
+        paths.append(str(project.skills_root / change.install_name / "SKILL.md"))
+        files = (locked.get(change.install_name) or {}).get("files") or {}
+        attachments += max(len(files) - 1, 0)
+    return {"skills_written": len(paths), "attachments_written": attachments, "paths": paths}
+
+
+#: The keys an adapter's sync-up sends for one skill: what ``POST /skills/sync``
+#: reads, plus the taxonomy labels ``skills.sync_to_platform`` sends. Never the
+#: descriptor's local path, its hashes or the registry's stamp.
+SYNC_FIELDS = ("name", "display_name", "description", "category", "trigger_phrases",
+               "skill_type", "skill_scope", "invocation", "local_updated_at")
+
+
+def _sync_up_items(skills: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """``(items, managed)``: the ``POST /skills/sync`` items for the skills you wrote.
+
+    ``skills`` are descriptors from ``discover_skills()`` (or dicts a caller passed).
+    A folder ``decimalai skills`` installed (a ``managed`` descriptor, which carries
+    the registry's stamp) is never sent: it is a registry skill, and syncing it would
+    create a private copy of it in your org. Its name is returned in ``managed``. An
+    item without a body is skipped, since the platform refuses the whole batch for one.
+    """
+    items: List[Dict[str, Any]] = []
+    managed: List[str] = []
+    for skill in skills or ():
+        if not isinstance(skill, dict) or not isinstance(skill.get("name"), str):
+            continue
+        if skill.get("managed"):
+            managed.append(skill.get("registry_name") or skill["name"])
+            continue
+        body = skill.get("body_markdown") or skill.get("body")
+        if not isinstance(body, str) or not body.strip():
+            continue
+        item = {key: skill[key] for key in SYNC_FIELDS if skill.get(key) is not None}
+        item["body_markdown"] = body
+        items.append(item)
+    return items, managed
 
 
 class SkillRouterError(Exception):
@@ -1338,6 +1476,7 @@ class SkillRouterError(Exception):
         status_code: Optional[int] = None,
         detail: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
+        result: Optional[Any] = None,
     ):
         self.status_code = status_code
         #: Parsed JSON error body (the FastAPI ``detail`` value) when the server
@@ -1350,6 +1489,9 @@ class SkillRouterError(Exception):
         #: existing fork's name in ``X-Installed-As`` (install idempotency).
         #: ``None`` for transport errors.
         self.headers = headers
+        #: The engine's ``Result`` when a disk method failed (``export``,
+        #: ``install``, ``export_to_disk``): every refusal, with its exit code.
+        self.result = result
         super().__init__(message)
 
 
@@ -3545,141 +3687,65 @@ class SkillRouter:
             _skill_path(skill_id, f"/attachments/{_path_part(attachment_id)}"),
         )
 
-    # ── Disk Export ─────────────────────────────────────────
+    # ── Disk: the package manager's verbs ──────────────────
+    #
+    # Every disk method is a wrapper over `decimalai.skillpkg`; see the notes above
+    # `SkillRouterError`. None of them reads `/body`, forks or writes a skills
+    # folder by itself.
 
-    def _resolved_export_source(self, name: str) -> Optional[Dict[str, Any]]:
-        """The skill as the RESOLVER sees it, or None if this backend can't say.
+    def _engine(self) -> Dict[str, Any]:
+        """The registry and key the engine uses: this router's."""
+        return {"api_key": self.api_key, "base_url": self.base_url, "channel": "sdk"}
 
-        ``GET /skills/{name}/body`` runs the Use/Fork resolver, so it answers
-        for a **linked** skill — a Use pointer at a public skill owned by the
-        publisher's org — as well as one you own. Every other read path here is
-        scoped to skills your org owns, which is why :meth:`install` forks
-        before it writes files.
+    def _registry_client(self) -> Any:
+        from .skillpkg.client import RegistryClient
 
-        Returns None when the response lacks the export fields, which means an
-        older backend — the caller then falls back to the org-scoped path and
-        behaves exactly as before.
-        """
-        try:
-            # Cold: export runs from the CLI, not inside a turn. The 5 s budget
-            # would fail it on a slow platform, and its failures would open the
-            # breaker that the same process's agents route through.
-            resp = self._request("GET", _skill_body_path(name), hot=False)
-        except Exception:
-            return None
-        if not isinstance(resp, dict):
-            return None
-        body = (resp.get("body") or "").strip()
-        # `skill_id` and `description` landed together; either missing means
-        # this backend predates the change and cannot build a file on its own.
-        if not body or not resp.get("skill_id") or resp.get("description") is None:
-            return None
-        if resp.get("truncated"):
-            # The route truncates for prompt injection. A truncated body is
-            # fine in a menu and is not a file — fall back rather than write a
-            # SKILL.md that silently ends mid-sentence.
-            return None
-        return {
-            "id": resp["skill_id"],
-            "name": resp.get("name") or name,
-            "description": resp.get("description") or "",
-            "body_markdown": resp.get("body") or "",
-        }
+        return RegistryClient.from_env(**self._engine())
 
-    def _fetch_skill_for_export(self, name: str) -> Dict[str, Any]:
-        """Fetch one skill with a RESOLVED body + attachments for disk export.
+    def _add_for_export(
+        self, name: str, *, project_root: Optional[str], agents: Optional[List[str]],
+        yes: bool, force: bool,
+    ) -> Dict[str, Any]:
+        """``skillpkg.add(name)``, summarised the way :meth:`export` always returned it.
 
-        Tries the resolver-backed body route first so a **linked** skill can be
-        exported without forking it (see :meth:`_resolved_export_source`), then
-        falls back to the org-scoped path this has always used.
-
-        ``GET /api/v1/skills/{name}`` historically serialized no
-        ``body_markdown`` at all, so ``export_to_disk`` wrote SKILL.md files
-        with an EMPTY body — install looked successful but delivered
-        nothing. Body resolution order on that path:
-
-        1. ``body_markdown`` on the skill response itself (newer backends).
-        2. The current version via ``GET /skills/{name}/versions/{n}``
-           (``latest_version.version_number``, else newest from
-           ``list_versions``) — that endpoint has always returned the body.
+        In a project whose lock is a version 1 lock the engine is not used (it refuses
+        that lock until ``decimalai skills migrate``, which never runs implicitly): the
+        registry's folder is written where 0.14 put it, one per agent directory, and the
+        version 1 lock is updated.
 
         Raises:
-            SkillRouterError: the body could not be resolved. Failing loudly
-                is the contract — an empty SKILL.md must never be written.
+            SkillRouterError: the engine refused; ``.result`` has every refusal.
         """
-        skill = self._resolved_export_source(name)
-        if skill is None:
-            skill = self.get_skill(name)
-        if not (skill.get("body_markdown") or "").strip():
-            version_number = (skill.get("latest_version") or {}).get("version_number")
-            if version_number is None:
-                versions = self.list_versions(name)
-                version_number = (versions[0] or {}).get("version_number") if versions else None
-            body = ""
-            if version_number is not None:
-                body = self.get_version(name, version_number).get("body_markdown") or ""
-            if not body.strip():
-                raise SkillRouterError(
-                    f"Could not resolve a body for skill '{name}': the skill "
-                    "response carries no body_markdown and no version body was "
-                    "found — refusing to write an empty SKILL.md."
-                )
-            skill["body_markdown"] = body
+        from .skillpkg import ops
 
-        skill_id = skill.get("id", "")
-        if skill_id:
-            skill["attachments"] = self._attachments_for_export(skill_id)
-        return skill
+        v1 = _v1_project(project_root)
+        if v1 is not None:
+            from .disk_export import _v1_add
 
-    def _attachments_for_export(self, skill_id: str) -> List[Dict[str, Any]]:
-        """Attachment bodies for a skill you own OR one you only link to.
-
-        ``/api/v1/skills/{id}/attachments`` is scoped to skills your org owns,
-        so it cannot see a linked skill. The public registry serves the same
-        files — ``/api/v1/registry/skills/{id}/attachments`` to list and
-        ``.../{attachment_id}`` for one WITH content — and a Use target is by
-        definition public, so that path is always available for exactly the
-        skills the org-scoped one refuses.
-
-        Best-effort throughout, as before: a skill whose scripts cannot be
-        fetched still exports its SKILL.md rather than failing the whole run.
-        """
-        def _pull(lister, getter) -> Optional[List[Dict[str, Any]]]:
             try:
-                atts = lister()
-            except Exception:
-                return None
-            out: List[Dict[str, Any]] = []
-            for att in atts or []:
-                try:
-                    out.append(getter(att["id"]))
-                except Exception:
-                    logger.debug("Failed to fetch attachment %s", att.get("file_path"))
-            return out
-
-        owned = _pull(
-            lambda: self.list_attachments(skill_id),
-            lambda aid: self.get_attachment(skill_id, aid),
-        )
-        if owned:
-            return owned
-
-        # Empty is a legitimate answer for an owned skill with no attachments,
-        # so only a FAILED listing (None) falls through to the public route —
-        # otherwise every attachment-less owned skill would pay a second
-        # round-trip to be told the same thing.
-        if owned == []:
-            return []
-
-        public = _pull(
-            lambda: self._request(
-                "GET", _registry_skill_path(skill_id, "/attachments"),
-            ).get("attachments", []),
-            lambda aid: self._request(
-                "GET", _registry_skill_path(skill_id, f"/attachments/{_path_part(aid)}"),
-            ),
-        )
-        return public or []
+                with self._registry_client() as client:
+                    return _v1_add(client, str(v1.directory), name, agents=agents, force=force)
+            except Exception as exc:  # noqa: BLE001 - every refusal is the caller's to see
+                raise _v1_failure(name, exc) from exc
+        if agents and any(a != "universal" for a in agents):
+            _check_disk_args(agents, None, name)
+        result = ops.add(name, yes=yes, force=force, directory=project_root, **self._engine())
+        if not result.ok:
+            raise SkillRouterError(f"could not add {name!r}: {_refusal(result)}", result=result)
+        project = _disk_project(project_root)
+        locked = _locked_entries(project)
+        summary = _written(result, project, locked)
+        change = next((c for c in result.changes if getattr(c, "install_name", None)), None)
+        install_name = getattr(change, "install_name", None)
+        summary.update({
+            "written_paths": list(summary["paths"]),
+            "skill_name": getattr(change, "skill", None) or name,
+            "skill_dirname": install_name,
+            "errors": [],
+            "lock_entry": locked.get(install_name) if install_name else None,
+            "result": result,
+        })
+        return summary
 
     def export_to_disk(
         self,
@@ -3688,90 +3754,72 @@ class SkillRouter:
         agents: Optional[List[str]] = None,
         scope: str = "project",
         project_root: Optional[str] = None,
+        yes: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
-        """Export skills from the platform to disk for agent runtimes.
+        """Add skills to the project: ``decimalai skills add`` for each. Deprecated.
 
-        Fetches skill bodies + attachments from the platform and writes
-        SKILL.md files + scripts to the correct directories for each
-        specified agent runtime.
+        .. deprecated:: 0.15
+            Use ``decimalai skills add <name>`` or :func:`decimalai.skillpkg.add` per
+            skill. With ``skills=None`` this stops working in 0.16.
+
+        Each name becomes a manifest entry in ``.decimal/skills.toml``, a folder under
+        ``.agents/skills`` and a lock entry, exactly as :meth:`export` does. With
+        ``skills=None`` every skill of your org (:meth:`list_skills`) is listed in the
+        manifest by name; nothing is mirrored implicitly any more.
 
         Args:
-            skills: List of skill names to export. If None, exports ALL
-                    skills in the user's org.
-            agents: Agent runtimes to write for (e.g., ['claude-code', 'cursor']).
-                    Defaults to ['universal'].
-            scope: 'project' (writes to .agents/skills/ etc.) or
-                   'global' (writes to ~/.claude/skills/ etc.).
-            project_root: Project root directory (for scope='project').
+            skills: skill names; None (or empty) means every skill of your org.
+            agents: ignored, with a one-time warning: there is one root.
+            scope: ``"project"``; ``"global"`` is refused (see :meth:`export`).
+            project_root: the project (default: found from the working directory).
+            yes, force: as for :meth:`export`.
 
         Returns:
-            Summary with skills_written, attachments_written, paths, and
-            errors (per-skill fetch/body-resolution failures — empty on
-            full success).
+            ``skills_written``, ``attachments_written``, ``paths``, ``errors`` (one
+            ``{skill, error}`` per refused skill) and ``results`` (the engine's
+            ``Result`` per name).
 
         Raises:
-            SkillRouterError: every explicitly-requested skill failed to
-                fetch or resolve a body (an empty SKILL.md is never
-                written silently).
-
-        Example::
-
-            router = SkillRouter(api_key="dai_sk_...")
-
-            # Export all org skills for Claude Code and Cursor
-            router.export_to_disk(agents=["claude-code", "cursor"])
-
-            # Export specific skills globally
-            router.export_to_disk(
-                skills=["code-review", "pdf"],
-                agents=["claude-code"],
-                scope="global",
-            )
+            SkillRouterError: every explicitly requested skill was refused.
         """
-        from .disk_export import export_skills_to_disk
-
-        # Resolve the target names, then fetch each skill with a RESOLVED
-        # body (see _fetch_skill_for_export — never export an empty body).
         if skills:
-            names = list(skills)
+            _warn_deprecated(
+                "export_to_disk",
+                "SkillRouter.export_to_disk() is deprecated: add each skill with "
+                "`decimalai skills add <name>` (decimalai.skillpkg.add()).")
         else:
-            names = [s["name"] for s in self.list_skills()]
+            _warn_deprecated(
+                "export_to_disk(skills=None)",
+                "SkillRouter.export_to_disk() without skills is deprecated and stops "
+                "working in 0.16: list the skills the project uses with "
+                "`decimalai skills add <name>` (decimalai.skillpkg.add()).")
+        _check_scope(scope, (skills or [None])[0])
+        names = list(skills) if skills else [s["name"] for s in self.list_skills()]
 
-        skill_data_list = []
-        errors: List[Dict[str, str]] = []
+        summary: Dict[str, Any] = {"skills_written": 0, "attachments_written": 0,
+                                   "paths": [], "errors": [], "results": {}}
         for name in names:
             try:
-                skill_data_list.append(self._fetch_skill_for_export(name))
-            except Exception as e:
-                logger.warning("Failed to fetch skill '%s' for export: %s", name, e)
-                errors.append({"skill": name, "error": str(e)})
+                one = self._add_for_export(name, project_root=project_root, agents=agents,
+                                           yes=yes, force=force)
+            except SkillRouterError as e:
+                logger.warning("export_to_disk: %s", e)
+                summary["errors"].append({"skill": name, "error": str(e)})
+                summary["results"][name] = e.result
+                continue
+            summary["skills_written"] += one["skills_written"]
+            summary["attachments_written"] += one["attachments_written"]
+            summary["paths"].extend(one["paths"])
+            summary["results"][name] = one["result"]
 
-        # Explicitly-requested skills that ALL failed → raise, don't return a
-        # zero-count summary a caller could mistake for "nothing to do".
-        if skills and errors and not skill_data_list:
+        if skills and summary["errors"] and len(summary["errors"]) == len(names):
             raise SkillRouterError(
                 "export_to_disk failed for every requested skill: "
-                + "; ".join(f"{e['skill']}: {e['error']}" for e in errors)
+                + "; ".join(f"{e['skill']}: {e['error']}" for e in summary["errors"])
             )
-
-        if not skill_data_list:
+        if not names:
             logger.info("No skills to export")
-            return {
-                "skills_written": 0,
-                "attachments_written": 0,
-                "paths": [],
-                "errors": errors,
-            }
-
-        summary = export_skills_to_disk(
-            skill_data_list,
-            agents=agents,
-            scope=scope,
-            project_root=project_root,
-        )
-        # Per-skill fetch failures surface in the summary — partial success
-        # must not read as total success.
-        summary["errors"] = errors
         return summary
 
     # ── Registry lifecycle: publish / unpublish / merge upstream ───
@@ -3981,38 +4029,62 @@ class SkillRouter:
         agents: Optional[List[str]] = None,
         scope: str = "project",
         project_root: Optional[str] = None,
+        yes: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
-        """Write one skill to disk. **No copy is taken.**
+        """Install one registry skill into the project: ``decimalai skills add <name>``.
 
-        The file half of adoption, on its own. `install()` below does this too
-        but forks first, so asking for a file used to mean also taking an
-        editable copy you never wanted. Nothing about writing a SKILL.md
-        requires owning the skill — the writer wants a name, a description and
-        a body — so this is the verb for "I want the files", and Install (the
-        link) and Fork (the copy) are the verbs for "I want the skill".
+        The same engine as the command (:func:`decimalai.skillpkg.add`): the skill is
+        recorded in ``.decimal/skills.toml``, its folder is written to
+        ``.agents/skills/<install-name>/`` with the registry's own bytes, and
+        ``.decimal/skills.lock`` pins exactly those bytes. **No copy is taken** (no
+        fork), and nothing is read through ``/body``. Re-running it is safe: a skill
+        already installed as asked is left alone.
 
-        Works for anything the resolver grants you: a skill you own, or one you
-        have linked with :meth:`use`. See :meth:`_resolved_export_source`.
+        Works for anything the registry lets your key install: a skill you own, one
+        you have linked with :meth:`use`, or a public skill. A skill whose safety
+        review is ``caution`` or ``unreviewed`` needs ``yes=True`` when there is no
+        terminal to ask on.
+
+        **A project 0.14 wrote** (its ``.decimal/skills.lock`` is a version 1 lock) is
+        not migrated implicitly: there the registry's folder is written where 0.14 put
+        it (one per ``agents`` directory), the version 1 lock is updated, and a warning
+        says once to run ``decimalai skills migrate``. A folder that is the skill's own
+        unedited copy is refreshed; any other folder in the way needs ``force``.
 
         Args:
-            name: Skill name.
-            agents: Agent runtimes to write for (e.g. ``['claude-code']``).
-            scope: ``'project'`` or ``'global'``.
-            project_root: Project root directory.
+            name: a registry name, url_slug, install name or skill id, optionally
+                with ``@N`` or ``@latest``.
+            agents: ignored, with a one-time warning: there is one root, which Claude
+                Code loads with ``claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"``
+                (an absolute path: a relative one fails silently from a subdirectory) and
+                other runtimes read
+                through :func:`decimalai.skills_dir`.
+            scope: ``"project"``. ``"global"`` raises ``ValueError`` naming
+                ``decimalai skills pull <name> --out ~/.claude/skills``.
+            project_root: the project (default: found from the working directory).
+            yes: accept a ``caution`` or ``unreviewed`` skill without asking.
+            force: replace an unmanaged folder of that name (backed up first).
 
         Returns:
-            The disk-write summary — ``skills_written``, ``attachments_written``,
-            ``paths``, ``errors``.
+            ``skills_written`` (1 when a folder was written, 0 when it was already
+            installed), ``attachments_written``, ``paths`` and ``written_paths`` (the
+            SKILL.md written), ``skill_name`` (the registry name), ``skill_dirname``
+            (the install name), ``errors``, ``lock_entry`` (the skill's lock entry)
+            and ``result`` (the engine's ``Result``).
+
+        Raises:
+            SkillRouterError: the engine refused (not found, no access, blocked, a
+                local edit in the way...); ``.result`` holds every refusal.
 
         Example::
 
             router = SkillRouter(api_key="dai_sk_...")
-            router.use("pdf")                        # link it
-            router.export("pdf", agents=["claude-code"])   # and put it on disk
+            router.export("acme/refund-policy")   # .agents/skills/acme-refund-policy/
         """
-        return self.export_to_disk(
-            skills=[name], agents=agents, scope=scope, project_root=project_root,
-        )
+        _check_scope(scope, name)
+        return self._add_for_export(name, project_root=project_root, agents=agents, yes=yes,
+                                    force=force)
 
     def install(
         self,
@@ -4021,96 +4093,44 @@ class SkillRouter:
         agents: Optional[List[str]] = None,
         scope: str = "project",
         project_root: Optional[str] = None,
+        yes: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
-        """Fork a registry skill into your workspace AND write it to disk.
+        """Add a registry skill to the project. Deprecated alias of :meth:`export`.
 
-        .. deprecated::
-            The two halves are separate verbs now, because bundling them meant
-            asking for a file also took an editable copy. Use :meth:`export` for
-            the files, :meth:`use` to link the skill, :meth:`fork` to copy it.
-            This keeps working and keeps forking, so nothing breaks — it is just
-            no longer the shape to reach for.
+        .. deprecated:: 0.15
+            Use ``decimalai skills add <name>`` (or :meth:`export`). This stops working
+            in 0.16.
 
-        The ergonomic on-ramp for file-loading runtimes: it does
-        :meth:`fork` (the workspace copy) and then writes ``SKILL.md`` +
-        attachments into each agent runtime's skills directory so Claude
-        Code / Cursor / etc. load it. SDK-only runtimes that consume skills
-        through the Router don't need this — :meth:`fork` is enough.
-
-        Args:
-            name: Registry skill name to install.
-            agents: Agent runtimes to write for (e.g. ['claude-code']).
-            scope: 'project' or 'global'.
-            project_root: Project root directory.
+        It **no longer forks**. It used to take an editable copy of the skill into your
+        workspace and then write it to disk; now it only installs the skill, as
+        :meth:`export` does. For an editable copy use :meth:`fork` or the dashboard;
+        to link a skill without copying it, :meth:`use`.
 
         Returns:
-            Dict with ``fork`` (the fork response), ``export`` (disk-write
-            summary), and ``skill_name``. The legacy ``install`` key mirrors
-            ``fork`` for back-compat.
-
-        Idempotency: a fork 409 ("already forked in this org") is NOT an
-        error — the backend names the existing fork in ``X-Installed-As``,
-        and install proceeds to the disk export under that name, so
-        re-running install always converges to files-on-disk.
-
-        Example::
-
-            router = SkillRouter(api_key="dai_sk_...")
-            router.install("pdf", agents=["claude-code", "cursor"])
+            ``export`` (what :meth:`export` returns), ``skill_name``, and ``fork`` and
+            ``install`` (both None: no copy is taken).
         """
-        from .disk_export import SkillExportFileExistsError
+        _warn_deprecated(
+            "install",
+            "SkillRouter.install() is deprecated and stops working in 0.16, and it no "
+            "longer forks: it adds the skill like `decimalai skills add <name>` "
+            "(decimalai.skillpkg.add()). For an editable copy use router.fork() or the "
+            "dashboard.")
+        return self._install_without_fork(name, agents=agents, scope=scope,
+                                          project_root=project_root, yes=yes, force=force)
 
-        already_forked = False
-        try:
-            fork_result = self.fork(name)
-            installed_name = fork_result.get("skill", {}).get("name", name)
-        except (RuntimeError, SkillRouterError) as e:
-            # fork() wraps the transport error in RuntimeError (`from e`);
-            # the /install alias fallback can surface it un-wrapped.
-            cause = e if isinstance(e, SkillRouterError) else e.__cause__
-            if not (isinstance(cause, SkillRouterError) and cause.status_code == 409):
-                raise
-            already_forked = True
-            installed_name = (cause.headers or {}).get("x-installed-as") or name
-            logger.info(
-                "install(%r): already in your org as %r — refreshing files on disk",
-                name, installed_name,
-            )
-            fork_result = {
-                "status": "already_installed",
-                "installed_as": installed_name,
-                "skill": {"name": installed_name},
-            }
-
-        try:
-            export_result = self.export_to_disk(
-                skills=[installed_name],
-                agents=agents,
-                scope=scope,
-                project_root=project_root,
-            )
-        except SkillExportFileExistsError:
-            if not already_forked:
-                raise
-            # Re-install with the files already on disk IS the converged
-            # state — don't fail the idempotent path over it.
-            logger.info(
-                "install(%r): files for %r already on disk — nothing to write",
-                name, installed_name,
-            )
-            export_result = {
-                "skills_written": 0,
-                "attachments_written": 0,
-                "paths": [],
-                "errors": [],
-                "already_on_disk": True,
-            }
-        return {
-            "fork": fork_result,
-            "install": fork_result,  # legacy alias key
-            "export": export_result,
-            "skill_name": installed_name,
-        }
+    def _install_without_fork(self, name: str, **kwargs: Any) -> Dict[str, Any]:
+        _log_once(
+            "install-no-fork",
+            "SkillRouter.install() no longer forks: it adds the skill to the project, like "
+            "`decimalai skills add`, and takes no copy into your workspace. For an "
+            "editable copy call router.fork(%r); the result's `fork` is None.",
+            name,
+        )
+        export = self.export(name, **kwargs)
+        return {"fork": None, "install": None, "export": export,
+                "skill_name": export["skill_name"]}
 
     def install_skill(
         self,
@@ -4119,21 +4139,21 @@ class SkillRouter:
         agents: Optional[List[str]] = None,
         scope: str = "project",
         project_root: Optional[str] = None,
+        yes: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
-        """Deprecated alias for :meth:`install` (fork + write to disk).
+        """Deprecated alias of :meth:`install`, which is a deprecated alias of :meth:`export`.
 
-        Renamed in the fork/install/router terminology cleanup: ``fork()``
-        is the workspace copy, ``install()`` is fork + disk. Use those.
+        It no longer forks. Use ``decimalai skills add <name>``, or :meth:`fork` for an
+        editable copy.
         """
-        warnings.warn(
-            "SkillRouter.install_skill() is deprecated; use install() "
-            "(fork + write to disk) or fork() (workspace copy only).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.install(
-            name, agents=agents, scope=scope, project_root=project_root,
-        )
+        _warn_deprecated(
+            "install_skill",
+            "SkillRouter.install_skill() is deprecated and stops working in 0.16, and it "
+            "no longer forks: use `decimalai skills add <name>` "
+            "(decimalai.skillpkg.add()), or router.fork() for an editable copy.")
+        return self._install_without_fork(name, agents=agents, scope=scope,
+                                          project_root=project_root, yes=yes, force=force)
 
     def use(
         self,
@@ -4287,102 +4307,77 @@ class SkillRouter:
         self,
         *,
         project_root: Optional[str] = None,
+        remote: bool = False,
     ) -> Dict[str, Any]:
-        """Compare local skill state vs platform state.
+        """What the project has installed: ``decimalai skills status``.
 
-        Reads the lockfile and compares content hashes against what
-        the platform has. Reports which skills are:
-        - synced: local and platform match
-        - modified_locally: local hash differs from platform
-        - missing_locally: on platform but not installed on disk
-        - untracked: on disk but not yet synced to platform
-
-        Args:
-            project_root: Project root directory.
+        The same engine as the command (:func:`decimalai.skillpkg.status`), for the
+        project at ``project_root`` (default: found from the working directory). Read
+        only; with ``remote=True`` the registry is asked which skills are outdated or
+        revoked, and no other call reaches the network.
 
         Returns:
-            Status report dict.
+            The keys this method always returned, now about the package manager's state:
+
+            - ``synced``: installed folders that match the lock;
+            - ``modified_locally``: installed folders edited by hand;
+            - ``missing_locally``: skills the manifest or lock lists with no folder;
+            - ``untracked``: skills on disk the package manager does not manage — folders
+              in ``.agents/skills`` the lock does not list, and the skills you wrote in
+              the project's other skill folders;
+            - ``total_on_disk``: folders under ``.agents/skills``;
+            - ``total_on_platform``: the registry skills the project installs (manifest
+              and lock);
+
+            plus ``problems`` (each finding as text) and ``result`` (the engine's
+            ``Result``, whose ``changes`` are one ``SkillStatus`` per skill).
 
         Example::
 
-            router = SkillRouter(api_key="dai_sk_...")
-            status = router.status()
+            status = SkillRouter(api_key="dai_sk_...").status()
             for name in status["modified_locally"]:
-                print(f"  {name}: local changes not synced")
+                print(f"  {name}: edited by hand")
         """
-        from .disk_export import _read_lockfile
+        from .skillpkg import ops
         from .skills import discover_skills
 
-        root = project_root or os.getcwd()
+        result = ops.status(remote=remote, directory=project_root, **self._engine())
+        rows = [c for c in result.changes if isinstance(c, ops.SkillStatus)]
 
-        # Read lockfile
-        lockdata = _read_lockfile(root)
-        locked_skills = lockdata.get("skills", {})
+        def named(*states: str) -> List[str]:
+            return sorted({str(r.install_name or r.skill) for r in rows if r.state in states})
 
-        # Discover skills on disk
-        discovered = discover_skills() or []
-        disk_names = {s["name"] for s in discovered}
-        disk_hashes = {}
-        for s in discovered:
-            h = s.get("hash", "")
-            # Normalize: strip sha256: prefix if present
-            if h.startswith("sha256:"):
-                h = h[7:]
-            disk_hashes[s["name"]] = h[:12] if h else ""
-
-        # Fetch platform skills
+        project = _disk_project(project_root)
         try:
-            platform_skills = self.list_skills()
-            platform_names = {s["name"] for s in platform_skills}
-            # The backend serializes content_hash
-            # ONLY under the nested ``latest_version`` object (never as a
-            # top-level key), and it is the FULL 64-char SHA-256 while the disk
-            # hash above is truncated to 12 chars. Read the nested key and
-            # compare by prefix — exactly as pull_missing() does
-            # (skill_router.py:1774). The old code read a non-existent top-level
-            # key (always "") and compared full-vs-12-char with ==, so every
-            # synced skill was mislabelled "modified_locally".
-            platform_hashes = {
-                s["name"]: (s.get("latest_version") or {}).get("content_hash", "")
-                for s in platform_skills
-            }
+            authored = [s["name"] for s in discover_skills(project_root=str(project.directory))
+                        if not s.get("managed")]
         except Exception:
-            logger.warning("Could not fetch platform skills for status check")
-            platform_names = set()
-            platform_hashes = {}
-
-        # Classify
-        synced = []
-        modified_locally = []
-        missing_locally = []
-        untracked = []
-
-        for name in platform_names:
-            if name in disk_hashes:
-                disk_h = disk_hashes[name]
-                plat_h = platform_hashes.get(name, "")
-                # Drift only when both hashes are known and the disk prefix is
-                # NOT a prefix of the platform hash. If either side is unknown we
-                # can't prove drift, so treat as synced (mirrors pull_missing).
-                if disk_h and plat_h and not plat_h.startswith(disk_h):
-                    modified_locally.append(name)
-                else:
-                    synced.append(name)
-            else:
-                missing_locally.append(name)
-
-        for name in disk_names:
-            if name not in platform_names:
-                untracked.append(name)
-
+            authored = []
         return {
-            "synced": sorted(synced),
-            "modified_locally": sorted(modified_locally),
-            "missing_locally": sorted(missing_locally),
-            "untracked": sorted(untracked),
-            "total_on_disk": len(disk_names),
-            "total_on_platform": len(platform_names),
+            "synced": named("clean"),
+            "modified_locally": named("modified"),
+            "missing_locally": named("missing", "not_installed"),
+            "untracked": sorted(set(named("unmanaged", "unmanaged_stamped")) | set(authored)),
+            "total_on_disk": len([r for r in rows if r.state not in ("missing", "not_installed")]),
+            "total_on_platform": len([r for r in rows if r.state not in ("unmanaged",
+                                                                         "unmanaged_stamped",
+                                                                         "illegal")]),
+            "problems": [str(p) for p in result.problems],
+            "result": result,
         }
+
+    def _v1_refresh(self, project: Any, **kwargs: Any) -> Dict[str, Any]:
+        """The version 1 lock's folders, refreshed (see ``disk_export._v1_refresh``); a
+        failure to reach the registry is every listed skill's failure."""
+        from .disk_export import _v1_refresh, _v1_skills
+
+        try:
+            with self._registry_client() as client:
+                return _v1_refresh(client, str(project.directory), **kwargs)
+        except Exception as exc:  # noqa: BLE001 - reported in the result, as 0.14 did
+            keys = sorted(_v1_skills(str(project.directory)))
+            return {"pulled": [], "updated": [], "skipped": [],
+                    "failures": [(key, str(exc)) for key in keys] or [("", str(exc))]}
 
     def update_skills(
         self,
@@ -4391,99 +4386,67 @@ class SkillRouter:
         scope: str = "project",
         project_root: Optional[str] = None,
         force: bool = False,
+        yes: bool = False,
     ) -> Dict[str, Any]:
-        """Pull upstream changes from the platform and update local files.
+        """Move installed skills to their newest version: ``decimalai skills update``.
 
-        Compares local content hashes against the platform. If the
-        platform version is newer (different hash), re-exports the
-        skill to disk. Local changes are overwritten.
+        The same engine as the command (:func:`decimalai.skillpkg.update`): every
+        ``latest`` entry of ``.decimal/skills.toml`` moves to the current version, exact
+        pins stay, and each changed folder is replaced whole. A folder edited by hand
+        stops the update unless ``force=True``, which backs it up to
+        ``.decimal/backup/<txid>/`` first and then replaces it. If any skill cannot be
+        updated, none is.
+
+        In a project whose lock is a version 1 lock (0.14 and earlier) the folders that
+        lock lists are refreshed to the registry's current version where 0.14 put them,
+        and the lock is updated; a folder edited by hand is left alone (and counted in
+        ``failed``) unless ``force``. Run ``decimalai skills migrate`` to leave this path.
 
         Args:
-            agents: Agent runtimes to update for. Uses lockfile agents
-                    if not specified.
-            scope: 'project' or 'global'.
-            project_root: Project root directory.
-            force: If True, re-export ALL skills regardless of hash match.
+            agents: ignored, with a one-time warning: there is one root.
+            scope: ``"project"``; ``"global"`` is refused (see :meth:`export`).
+            project_root: the project (default: found from the working directory).
+            force: replace folders edited by hand (after backing them up).
+            yes: accept a new version whose safety review is ``caution`` or
+                ``unreviewed`` without asking.
 
         Returns:
-            Update summary with updated, skipped, and failed counts.
-
-        Example::
-
-            router = SkillRouter(api_key="dai_sk_...")
-            result = router.update_skills()
-            print(f"Updated {result['updated']} skills")
+            ``updated`` and ``updated_skills`` (the folders written), ``skipped`` (the
+            skills already current), ``failed``, ``error`` when the update was refused,
+            and ``result`` (the engine's ``Result``).
         """
-        from .disk_export import _read_lockfile
+        from .skillpkg import ops
 
-        root = project_root or os.getcwd()
-        lockdata = _read_lockfile(root)
-        locked = lockdata.get("skills", {})
-
-        # Get platform hashes
-        try:
-            hash_result = self._request("GET", "/api/v1/skills/hashes")
-        except Exception as e:
-            logger.error("Failed to fetch platform hashes: %s", e)
-            return {"updated": 0, "skipped": 0, "failed": 0, "error": str(e)}
-
-        platform_hashes = hash_result.get("hashes", {})
-
-        # Determine which skills need updating
-        to_update = []
-        skipped = 0
-
-        for name, info in platform_hashes.items():
-            platform_hash = info.get("hash", "")
-            local_entry = locked.get(name, {})
-            # `body_hash` (full sha256 of body_markdown — the same axis the
-            # platform serves) is the comparable value; `content_hash` now
-            # pins the written FILE (frontmatter+body) so it never matches a
-            # platform body hash. Legacy lockfiles stored sha256(body)[:12]
-            # as content_hash — the prefix check keeps those in-sync entries
-            # from re-exporting on every update.
-            local_hash = local_entry.get("body_hash") or local_entry.get("content_hash") or ""
-
-            up_to_date = bool(
-                platform_hash and local_hash
-                and (platform_hash == local_hash or platform_hash.startswith(local_hash))
-            )
-            if force or not up_to_date:
-                to_update.append(name)
-            else:
-                skipped += 1
-
-        if not to_update:
-            logger.info("All skills are up to date")
-            return {"updated": 0, "skipped": skipped, "failed": 0}
-
-        # Resolve agents from lockfile if not specified
-        if not agents and locked:
-            first_entry = next(iter(locked.values()), {})
-            agents = first_entry.get("agents", ["universal"])
-
-        # Fetch and re-export outdated skills
-        try:
-            result = self.export_to_disk(
-                skills=to_update,
-                agents=agents,
-                scope=scope,
-                project_root=root,
-            )
-            return {
-                "updated": result.get("skills_written", 0),
-                "skipped": skipped,
-                "failed": 0,
-                "updated_skills": to_update,
-            }
-        except Exception as e:
-            logger.error("Failed to update skills: %s", e)
-            return {
-                "updated": 0,
-                "skipped": skipped,
-                "failed": len(to_update),
-                "error": str(e),
-            }
+        _check_scope(scope, None)
+        v1 = _v1_project(project_root)
+        if v1 is not None:
+            done = self._v1_refresh(v1, agents=agents, force=force, replace_existing=True,
+                                    purpose="update")
+            out = {"updated": len(done["updated"]) + len(done["pulled"]),
+                   "skipped": len(done["skipped"]), "failed": len(done["failures"]),
+                   "updated_skills": done["updated"] + done["pulled"], "result": None}
+            if done["failures"]:
+                out["error"] = "; ".join(f"{key}: {why}" for key, why in done["failures"])
+                logger.warning("update_skills: %s", out["error"])
+            return out
+        _check_disk_args(agents, None, None)
+        result = ops.update(force=force, yes=yes, directory=project_root, **self._engine())
+        updated = [c.install_name for c in result.changes
+                   if getattr(c, "action", None) in _FOLDER_WRITES]
+        locked = _locked_entries(_disk_project(project_root))
+        out: Dict[str, Any] = {
+            "updated": len(updated),
+            # The engine reports only what it changed; the rest of the lock stayed.
+            "skipped": len([name for name in locked if name not in updated]),
+            "failed": 0,
+            "updated_skills": updated,
+            "result": result,
+        }
+        if not result.ok:
+            out["failed"] = 1
+            out["error"] = _refusal(result)
+            logger.warning("update_skills: %s", out["error"])
+        return out
 
     # ── Bidirectional Sync ─────────────────────────────────
 
@@ -4496,126 +4459,82 @@ class SkillRouter:
         project_root: Optional[str] = None,
         disk_wins: bool = False,
     ) -> Dict[str, Any]:
-        """Pull skills from platform that are missing locally or out-of-date.
+        """Install what ``.decimal/skills.toml`` lists: ``decimalai skills install``. Deprecated.
 
-        Compares the set of platform skills against local SKILL.md files
-        and writes any missing/outdated skills to disk.
+        .. deprecated:: 0.15
+            Run ``decimalai skills install`` (or :func:`decimalai.skillpkg.install`).
+            This stops working in 0.16.
 
-        By default, platform content wins on conflicts (the platform version
-        overwrites the local version when hashes differ). Set ``disk_wins=True``
-        to keep local edits and only pull truly missing skills.
+        It no longer copies every org skill to disk. In a project with a manifest it
+        runs the engine's install, which fetches only what the manifest lists and the
+        folders lack, and never moves a pin. Without a manifest it writes nothing and
+        warns once with the command to run. There ``local_skill_names``, ``agents``,
+        ``scope`` and ``disk_wins`` are ignored: the lock says what is on disk, and a
+        folder edited by hand is never replaced here.
 
-        Args:
-            local_skill_names: Skill names already on disk (to avoid re-scan).
-                If None, will discover from disk.
-            agents: Target agent runtimes for export (e.g. ["claude-code"]).
-                Defaults to ["universal"].
-            scope: 'project' or 'global'.
-            project_root: Project root directory.
-            disk_wins: If True, only pull skills that are completely missing
-                on disk (don't overwrite local edits). If False (default),
-                platform version wins — local files are updated to match
-                the platform.
+        In a project whose lock is a version 1 lock (0.14 and earlier) it puts back the
+        folders that lock lists (in the lock's, or ``agents``', directories), at the
+        registry's current version, and updates the lock; a folder edited by hand is
+        left alone, and with ``disk_wins=True`` no folder that exists is replaced. It
+        never adds a skill the lock does not list.
 
         Returns:
-            Summary dict with pulled, updated, skipped counts.
-
-        Example::
-
-            router = SkillRouter(api_key="dai_sk_...")
-
-            # Pull all platform skills to disk (platform wins on conflict)
-            result = router.pull_missing(agents=["claude-code"])
-            print(f"Pulled {result['pulled']} new, updated {result['updated']}")
+            ``pulled`` and ``pulled_skills`` (folders fetched), ``updated`` and
+            ``updated_skills``, ``skipped``, ``error`` when the install was refused,
+            and ``result``; just the three counts when there is no manifest.
         """
-        from .skills import discover_skills
+        from .skillpkg import ops
 
-        root = project_root or os.getcwd()
-        target_agents = agents or ["universal"]
-
-        # Get platform skill hashes
-        try:
-            hash_result = self._request("GET", "/api/v1/skills/hashes")
-            platform_hashes = hash_result.get("hashes", {})
-        except Exception as e:
-            logger.warning("pull_missing: failed to fetch platform hashes: %s", e)
-            return {"pulled": 0, "updated": 0, "skipped": 0, "error": str(e)}
-
-        if not platform_hashes:
+        _warn_deprecated(
+            "pull_missing",
+            "SkillRouter.pull_missing() is deprecated and stops working in 0.16: run "
+            "`decimalai skills install` (decimalai.skillpkg.install()), which installs "
+            "the skills .decimal/skills.toml lists.")
+        v1 = _v1_project(project_root)
+        if v1 is not None:
+            done = self._v1_refresh(v1, agents=agents, force=False,
+                                    replace_existing=not disk_wins, purpose="install")
+            out = {"pulled": len(done["pulled"]), "updated": len(done["updated"]),
+                   "skipped": len(done["skipped"]), "pulled_skills": done["pulled"],
+                   "updated_skills": done["updated"], "result": None}
+            if done["failures"]:
+                out["error"] = "; ".join(f"{key}: {why}" for key, why in done["failures"])
+                logger.warning("pull_missing: %s", out["error"])
+            return out
+        project = _disk_project(project_root)
+        if not project.manifest_path.is_file():
+            _log_once(
+                "pull_missing:no-manifest",
+                "pull_missing() wrote nothing: %s has no .decimal/skills.toml, and it no "
+                "longer copies every org skill to disk. Add the skills this project "
+                "uses with `decimalai skills add <name>`; then `decimalai skills install` "
+                "(or pull_missing()) installs them.",
+                project.directory,
+            )
             return {"pulled": 0, "updated": 0, "skipped": 0}
 
-        # Get local disk state
-        if local_skill_names is None:
-            discovered = discover_skills() or []
-            local_skill_names = {s["name"] for s in discovered}
-            # Build local hash map for conflict detection
-            local_hashes: Dict[str, str] = {}
-            for s in discovered:
-                h = s.get("hash", "")
-                # Normalize: strip sha256: prefix if present
-                if h.startswith("sha256:"):
-                    h = h[7:]
-                local_hashes[s["name"]] = h[:12] if h else ""
-        else:
-            local_hashes = {}
+        result = ops.install(directory=project_root, **self._engine())
 
-        # Classify skills
-        to_pull: List[str] = []  # Missing from disk entirely
-        to_update: List[str] = []  # On disk but hash differs
-        skipped = 0
+        def actions(*names: str) -> List[str]:
+            return [c.install_name for c in result.changes
+                    if getattr(c, "action", None) in names]
 
-        for name, info in platform_hashes.items():
-            platform_hash = info.get("hash", "")
-
-            if name not in local_skill_names:
-                # Missing locally — always pull
-                to_pull.append(name)
-            elif not disk_wins:
-                # Conflict check: platform wins by default
-                local_h = local_hashes.get(name, "")
-                if local_h and platform_hash and not platform_hash.startswith(local_h):
-                    to_update.append(name)
-                else:
-                    skipped += 1
-            else:
-                skipped += 1
-
-        all_to_write = to_pull + to_update
-        if not all_to_write:
-            return {"pulled": 0, "updated": 0, "skipped": skipped}
-
-        # Fetch full content and write to disk
-        try:
-            result = self.export_to_disk(
-                skills=all_to_write,
-                agents=target_agents,
-                scope=scope,
-                project_root=root,
-            )
-            written = result.get("skills_written", 0)
-            logger.info(
-                "pull_missing: wrote %d skills (%d new, %d updated)",
-                written, len(to_pull), len(to_update),
-            )
-            return {
-                "pulled": len(to_pull),
-                "updated": len(to_update),
-                "skipped": skipped,
-                "pulled_skills": to_pull,
-                "updated_skills": to_update,
-            }
-        except Exception as e:
-            # warning, not error: pull_missing runs as a best-effort background
-            # sync, so a failed export must not take the caller down — the
-            # result dict already carries the error for callers that need to
-            # act on it.
-            logger.warning("pull_missing: export failed: %s", e)
-            return {
-                "pulled": 0,
-                "updated": 0,
-                "skipped": skipped,
-                "error": str(e),
-            }
+        pulled, updated = actions("add", "fetch"), actions("update", "restore")
+        locked = _locked_entries(project)
+        out: Dict[str, Any] = {
+            "pulled": len(pulled),
+            "updated": len(updated),
+            # The engine reports only what it changed; the rest of the lock stayed.
+            "skipped": len([name for name in locked if name not in pulled + updated]),
+            "pulled_skills": pulled,
+            "updated_skills": updated,
+            "result": result,
+        }
+        if not result.ok:
+            # warning, not error: callers ran this as a best-effort sync.
+            out["error"] = _refusal(result)
+            logger.warning("pull_missing: %s", out["error"])
+        return out
 
     # ── Registry Search ────────────────────────────────────
 

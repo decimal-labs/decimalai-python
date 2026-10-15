@@ -964,8 +964,10 @@ def init(
             when no skill-capable framework flag is set, and when ``enabled``
             is ``False``. With the loader on, the default ``skill_authority``
             ("auto") treats the router as the skills channel, so the LangChain
-            and OpenAI Agents adapters stop syncing local SKILL.md files to and
-            from the platform; pass ``skill_authority="harness"`` to keep both.
+            and OpenAI Agents adapters stop reading local SKILL.md files and
+            syncing them to the platform; pass ``skill_authority="harness"`` to
+            keep that. No adapter writes skills to disk either way: registry
+            skills get there through ``decimalai skills add``.
 
     Re-initializing with a different key, base URL, ``inject_skill_body`` or
     ``load_skill_tool`` drops every adapter's cached ``SkillRouter``, so the
@@ -2236,6 +2238,12 @@ def __getattr__(name: str):
         # string-matching a message or importing a private module.
         from ._client import AgentNotFoundError
         return AgentNotFoundError
+    if name == "skills_dir":
+        # The managed skills root that `decimalai skills install` writes, for a
+        # framework's native skill loader. Lazy because its module is the package
+        # manager's, which `import decimalai` has no other reason to load.
+        from .skillpkg.project import skills_dir
+        return skills_dir
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -2243,6 +2251,7 @@ __all__ = [
     "AgentConfig",
     "AgentNotFoundError",
     "SkillRouter",
+    "skills_dir",
     "__version__",
     "init",
     "load_agent",

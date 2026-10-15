@@ -826,24 +826,22 @@ def _check_targets(ctx: _Project, plan: _Plan, *, force: bool) -> None:
 def _gate(run: _Run, resolved: "Resolved", *, yes: bool, new_version: bool = True) -> None:
     """The trust gate for one resolved skill. Raises its refusal.
 
-    Blocked and withheld are checked every time; the question is asked only for a
-    version the project has not accepted before (``new_version``).
+    The verdict is :func:`~decimalai.skillpkg.client.trust_verdict`, which the
+    migration shares. Blocked and withheld are checked every time; the question is
+    asked only for a version the project has not accepted before (``new_version``),
+    and never for a skill the caller's organization owns.
     """
+    from . import client
+
     name = resolved.registry_name
-    band = resolved.safety.band
-    if band == "blocked":
+    refusal, reason = client.trust_verdict(resolved)
+    if refusal == "blocked":
         raise SkillBlockedError(f"version {resolved.version} failed its safety review and is "
                                 "blocked", skill=name)
-    if resolved.relationship == "owned":
+    if refusal == "withheld":
+        raise SkillWithheldError("the registry withholds it from installs", skill=name)
+    if reason is None or resolved.relationship == "owned":
         return
-    if resolved.safety.withheld:
-        if resolved.relationship != "used":
-            raise SkillWithheldError("the registry withholds it from installs", skill=name)
-        reason = "withheld pending review"
-    elif band == "clean":
-        return
-    else:
-        reason = band
     if yes or not new_version:
         return
     interactive = run.interactive if run.interactive is not None else _stdin_is_tty()

@@ -1,6 +1,6 @@
 """Consistency between what we SHIP and what we SAY about it.
 
-Three drifts this file locks down, each of which was live in the tree:
+Four drifts this file locks down, the first three of which were live in the tree:
 
   1. `SkillExportFileExistsError` told users to run `decimal registry
      install --force`. There is no `decimal` binary (pyproject declares
@@ -12,6 +12,9 @@ Three drifts this file locks down, each of which was live in the tree:
   3. The CI langchain-compat matrix pinned a langchain-core floor
      (0.3.84) that `pip install -e ".[dev]"` can no longer resolve,
      because the pyproject extra floors it at 1.3.0.
+  4. The deprecated disk verbs (SkillRouter.export_to_disk/install/pull_missing,
+     disk_export.export_*) tell the user what to run instead. Every command and
+     function those messages name must exist, or the replacement is a dead end.
 
 These are cheap string/AST assertions on purpose: they cost nothing to run
 and they catch the class of bug where the code moves and the prose doesn't.
@@ -121,3 +124,31 @@ def test_ci_langchain_matrix_tests_the_declared_floor():
         "can no longer resolve."
     )
     assert "latest" in matrix, f"CI matrix should also test `latest`; got {matrix}"
+
+
+# ── 4. The disk shims name commands and functions that exist ─────────
+
+#: The `decimalai skills` verbs of the package manager.
+SKILLS_VERBS = {"add", "install", "update", "remove", "status", "verify", "migrate", "pull"}
+
+
+def _shim_sources() -> str:
+    return "".join((REPO_ROOT / "decimalai" / name).read_text(encoding="utf-8")
+                   for name in ("skill_router.py", "disk_export.py"))
+
+
+def test_disk_shims_name_real_skills_verbs():
+    named = set(re.findall(r"`decimalai skills ([a-z-]+)", _shim_sources()))
+    assert {"add", "install", "update", "pull"} <= named, named
+    assert named <= SKILLS_VERBS, named - SKILLS_VERBS
+
+
+def test_disk_shims_name_real_python_functions():
+    import decimalai
+    from decimalai import skillpkg
+
+    src = _shim_sources()
+    for name in set(re.findall(r"decimalai\.skillpkg\.(\w+)\(", src)):
+        assert callable(getattr(skillpkg, name)), name
+    for name in set(re.findall(r"decimalai\.(\w+)\(\)", src)) - {"skillpkg"}:
+        assert callable(getattr(decimalai, name)), name

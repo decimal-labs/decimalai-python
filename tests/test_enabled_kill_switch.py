@@ -3,27 +3,26 @@
 The regression this locks down: ``init(enabled=False, langchain=True)`` used to
 skip only the client, then fall through to the framework auto-install block
 anyway. ``decimalai.langchain.instrument()`` is not a passive no-op — it calls
-the DecimalAI API (``GET /api/v1/skills/hashes``, then the per-skill body
-routes) and writes SKILL.md files into the caller's working tree. So a user who
-explicitly turned the SDK off still got network traffic and new files on disk.
+the DecimalAI API (it uploads the skills you wrote, ``POST /api/v1/skills/sync``,
+and until 0.15 it also pulled every org skill: ``GET /api/v1/skills/hashes``, then
+the per-skill body routes, then SKILL.md files in the caller's working tree). So a
+user who explicitly turned the SDK off still got network traffic and new files.
 
 Both tests drive the REAL adapter against a fake httpx transport in a temp cwd,
 so they observe the two effects a user actually cares about:
 
-* ``test_disabled_*`` — nothing attempted, nothing written (fails without the
-  gate: the old code records ``GET .../skills/hashes`` and writes a SKILL.md).
+* ``test_disabled_*`` — nothing attempted, nothing written.
 * ``test_enabled_*`` — the control. It proves the gate is conditional, not a
-  blanket off-switch: with ``enabled=True`` the same call still syncs and still
-  writes.
+  blanket off-switch: with ``enabled=True`` the same call still runs the adapter,
+  which still syncs the skill the project wrote.
 
-The control asks for disk mirroring explicitly (``skill_authority="harness"``).
-It did not have to when this file was written, because writing to the caller's
-working tree was the unconditional default — the very default that turned out to
-be the bug in ``tests/test_disk_mirror_consent.py``: instrumenting an agent
-created ``.agents/skills/`` in whatever directory the user ran from, and with no
-disk-loading runtime in the process nothing read those files back. Consent is
-now required, so the control states it. What this file tests is unchanged:
-``enabled`` gates the adapter, and nothing else about it moved.
+The control asks for disk sync explicitly (``skill_authority="harness"``), and it
+now also pins what changed in 0.15: even asked, and even with the fake platform
+serving a skill the project does not have, no adapter writes a skill to disk.
+Registry skills reach disk only when ``decimalai skills`` runs; an explicit
+``SkillRouter.pull_missing()`` in a project with a manifest runs ``skills install``
+(``tests/test_router_skillpkg_shims.py``). What this file tests about ``enabled``
+is unchanged.
 """
 from __future__ import annotations
 
@@ -34,8 +33,9 @@ import httpx
 import pytest
 
 
-# The fake platform serves one skill that is NOT on local disk, so the pull
-# path classifies it as "missing" and exports it — i.e. a real file write.
+# The fake platform serves one skill that is NOT on local disk. A background
+# pull (0.14 and earlier) classified it as "missing" and exported it, a real file
+# write; the control asserts that no such write happens any more.
 _SKILL_NAME = "kill-switch-demo-skill"
 _SKILL_BODY = {
     "skill_id": "skl_kill_switch_demo",
@@ -149,27 +149,39 @@ def test_disabled_langchain_makes_no_http_call_and_writes_no_files(
     assert cfg._client is None
 
 
-def test_enabled_langchain_still_syncs_and_writes(platform, fresh_sdk):
-    """The control: enabled=True behaviour is unchanged by the gate."""
+def test_enabled_langchain_still_syncs_and_writes_no_skill(platform, fresh_sdk):
+    """The control: enabled=True still runs the adapter, which uploads the skill the
+    project wrote — and, asked for disk sync or not, writes no skill to disk."""
     import decimalai
+
+    mine = fresh_sdk / ".claude" / "skills" / "my-own"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text(
+        "---\nname: my-own\ndescription: Mine.\n---\n# Mine\n\nDo it my way.\n",
+        encoding="utf-8",
+    )
+    before = _files_under(fresh_sdk)
 
     decimalai.init(
         api_key="dai_sk_test",
         base_url="http://localhost:9",
         enabled=True,
         langchain=True,
-        # Opt in to disk mirroring: writing is no longer implicit, so without
-        # this the control would prove nothing about `enabled`.
+        # Ask for disk sync explicitly: without it the loader turns sync off, and
+        # the control would prove nothing about `enabled`.
         skill_authority="harness",
     )
+    decimalai.flush()
 
-    assert any("/skills/hashes" in c for c in platform.calls), (
-        "enabled=True no longer pulls skills from the platform: "
-        + repr(platform.calls)
+    assert any("/skills/sync" in c for c in platform.calls), (
+        "enabled=True no longer syncs the project's own skills: " + repr(platform.calls)
     )
-    written = _files_under(fresh_sdk)
-    assert any(p.endswith("SKILL.md") for p in written), (
-        "enabled=True no longer writes skills to disk: " + repr(written)
+    assert not any("/skills/hashes" in c for c in platform.calls), (
+        "instrument() pulled platform skills again: " + repr(platform.calls)
+    )
+    written = [p for p in _files_under(fresh_sdk) if p not in before]
+    assert not any(p.endswith("SKILL.md") for p in written), (
+        "instrument() wrote a skill to disk: " + repr(written)
     )
 
 

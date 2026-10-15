@@ -656,12 +656,13 @@ class TestSafety:
     @pytest.mark.parametrize("withheld", [False, True])
     @pytest.mark.parametrize("relationship", ["owned", "used", "public", None])
     def test_the_verdict_is_the_trust_gates(self, band, withheld, relationship):
-        # The trust gate of `add` and `install` decides the same refusals; where it would
-        # ask (and refuse without a terminal), the migration warns instead.
+        # The trust gate of `add` and `install` and the migration share one verdict,
+        # `client.trust_verdict`; where the gate would ask (and refuse without a
+        # terminal), the migration warns instead.
         from types import SimpleNamespace
 
         from decimalai.skillpkg import ops
-        from decimalai.skillpkg.client import RenderKey, Resolved, Safety
+        from decimalai.skillpkg.client import RenderKey, Resolved, Safety, trust_verdict
 
         resolved = Resolved(
             ref="acme/x", skill_id="sid", registry_name="acme/x", install_name="acme-x",
@@ -670,7 +671,7 @@ class TestSafety:
             relationship=relationship, safety=Safety(band, withheld))
         run = SimpleNamespace(interactive=False, confirm=None)
 
-        refusal, warning = migration._trust(resolved)
+        refusal, warning = trust_verdict(resolved)
 
         try:
             ops._gate(run, resolved, yes=True)

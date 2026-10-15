@@ -23,7 +23,6 @@ import pytest
 
 from decimalai import skill_router as sr
 from decimalai.skill_router import (
-    _COLD_PATH_TIMEOUT,
     SkillRouter,
     _HotPathBreakers,
     _hot_path_read_budget,
@@ -219,14 +218,24 @@ class TestInTurnBodyFetchIsAHotPath:
         assert st.healthy is False
         assert st.timeouts == 1
 
-    def test_disk_export_keeps_the_cold_budget(self, monkeypatch):
-        """Export is a CLI action, not a turn — a slow platform must not fail it
-        at 5 s, and its failures must not open the breaker agents depend on."""
+    def test_disk_export_makes_no_body_call(self, monkeypatch, tmp_path):
+        """Export is `decimalai skills add`: the engine's own client and routes, so no
+        `/body` request, no hot-path budget, and nothing that could open the breaker
+        agents depend on."""
+        from tests.fakes.fake_registry import FakeRegistry
+        from tests.test_router_skillpkg_shims import engine_on
+
         platform = FakePlatform()
         monkeypatch.setattr(httpx, "request", platform)
-        assert _router()._resolved_export_source("refund-policy") is not None
-        (timeout,) = self._timeouts(platform, "/body")
-        assert timeout == _COLD_PATH_TIMEOUT
+        registry = FakeRegistry(keys={"dai_sk_test": "org-test"})
+        engine_on(registry, monkeypatch)
+        registry.add_skill("refund-policy", body=BODY)
+
+        summary = _router().export("refund-policy", project_root=str(tmp_path))
+
+        assert summary["skills_written"] == 1
+        assert platform.calls == [] and registry.calls("body") == []
+        assert routing_status().healthy is not False
 
 
 # ── R4: routing_status() sees HTTP failures; a failure is cached ──────────
@@ -628,8 +637,20 @@ class TestSkillNameIsUrlEncoded:
         (call,) = platform.calls
         assert call["url"] == BASE + path
 
-    def test_export_encodes_the_name_too(self, monkeypatch):
+    def test_export_sends_the_name_as_data_not_as_a_path(self, monkeypatch, tmp_path):
+        """Export reads no per-skill path at all: the name travels in the resolve
+        request's JSON body, exactly as given."""
+        from tests.fakes.fake_registry import FakeRegistry
+        from tests.test_router_skillpkg_shims import engine_on
+
         platform = FakePlatform(bodies={"weird#name": BODY})
         monkeypatch.setattr(httpx, "request", platform)
-        assert _router()._resolved_export_source("weird#name") is not None
-        assert platform.calls[0]["url"] == BASE + "/api/v1/skills/weird%23name/body"
+        registry = FakeRegistry(keys={"dai_sk_test": "org-test"})
+        engine_on(registry, monkeypatch)
+
+        with pytest.raises(sr.SkillRouterError):
+            _router().export("weird#name", project_root=str(tmp_path))
+
+        (resolve,) = registry.calls("resolve")
+        assert [item.get("ref") for item in resolve.json["items"]] == ["weird#name"]
+        assert platform.calls == []

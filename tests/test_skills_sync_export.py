@@ -1,10 +1,12 @@
-"""Tests for Skills Sync & Export features (Phases 0-4).
+"""Tests for Skills Sync & Export features.
 
 Covers:
-- disk_export module: AGENT_PATHS registry, SKILL.md reconstruction, lockfile, export
-- SkillRouter lifecycle: export_to_disk, fork, install, status, update_skills, search
-- sync_skills integration in install() for openai_agents and langchain
-- sync-on-install verification
+- disk_export module: AGENT_PATHS registry, SKILL.md reconstruction, the version 1
+  lockfile, and the deprecated writers (format 1, unmanaged folders)
+- SkillRouter lifecycle: export_to_disk, fork, install, status, update_skills and
+  pull_missing as wrappers over the package manager (decimalai.skillpkg), and search
+- sync_skills integration in instrument() for openai_agents and langchain, which no
+  longer pull anything to disk
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ from decimalai.disk_export import (
     export_skill_to_disk,
     export_skills_to_disk,
 )
-from decimalai.skill_router import SkillRouter
+from decimalai.skill_router import SkillRouter, SkillRouterError
+from decimalai.skillpkg import ops
 from decimalai.skills import (
     discover_skills,
     parse_skill_md,
@@ -40,6 +43,36 @@ from decimalai.skills import (
 
 
 # ── Fixtures ──────────────────────────────────────────────────
+
+from tests.fakes.fake_registry import FakeRegistry  # noqa: E402
+from tests.test_router_skillpkg_shims import (  # noqa: E402
+    _fresh_once_state,
+    engine_on,
+    no_router_http,
+)
+
+__all__ = ["_fresh_once_state"]  # autouse: every shim warns once per test
+
+
+def _seed_v1_lock(project_root: str) -> None:
+    """A version 1 lock, as an older SDK left it: the only kind of project the
+    deprecated writers still record their folders in."""
+    _write_lockfile(project_root, {"version": 1, "skills": {}})
+
+
+def _ids(n: int) -> dict:
+    """Registry ids for a skill dict: the deprecated writers stamp them."""
+    return {"id": f"00000000-0000-4000-8000-{n:012x}",
+            "latest_version_id": f"00000000-0000-4000-9000-{n:012x}"}
+
+
+@pytest.fixture
+def registry(monkeypatch):
+    """A registry the engine talks to, and a router whose own requests fail."""
+    reg = FakeRegistry(keys={"test": "org-test"})
+    engine_on(reg, monkeypatch)
+    no_router_http(monkeypatch)
+    return reg
 
 
 @pytest.fixture
@@ -63,7 +96,7 @@ def project_root(tmp_path, monkeypatch):
 def sample_skill():
     """A sample skill dict as returned by the platform API."""
     return {
-        "id": "sk-test-001",
+        **_ids(1),
         "name": "code-review",
         "description": "Reviews code for bugs and security",
         "body_markdown": "# Code Review\n\nWhen reviewing code:\n1. Check for SQL injection\n2. Check for XSS\n3. Validate input sanitization",
@@ -184,17 +217,21 @@ class TestReconstructSkillMd:
             "test", "desc", "# Body",
             compatibility=["python3", "node18+"],
         )
-        assert "compatibility:" in result
-        assert "  - python3" in result
-        assert "  - node18+" in result
+        # One string, never a YAML list (loaders refuse or drop a list there).
+        assert 'compatibility: "python3; node18+"' in result
+        assert "  - " not in result
 
     def test_with_allowed_tools(self):
         result = _reconstruct_skill_md(
             "test", "desc", "# Body",
             allowed_tools=["bash", "python"],
         )
-        assert "allowed-tools:" in result
-        assert "  - bash" in result
+        assert "allowed-tools: bash python" in result
+        assert "  - " not in result
+
+    def test_a_string_is_not_split_into_characters(self):
+        result = _reconstruct_skill_md("test", "desc", "# Body", allowed_tools="Read Grep")
+        assert "allowed-tools: Read Grep" in result
 
     def test_with_taxonomy_labels(self):
         result = _reconstruct_skill_md(
@@ -332,7 +369,8 @@ class TestExportSkillToDisk:
         with open(skill_md_path) as f:
             content = f.read()
         assert "name: code-review" in content
-        assert "license: MIT" in content
+        assert 'license: "MIT"' in content
+        assert 'decimalai-format: "1"' in content
         assert "# Code Review" in content
 
     def test_multi_agent_export(self, project_root, sample_skill):
@@ -405,9 +443,10 @@ class TestExportSkillsToDisk:
     """Tests for batch export + lockfile update."""
 
     def test_batch_export_with_lockfile(self, project_root):
+        _seed_v1_lock(project_root)
         skills = [
             {
-                "id": "sk-1",
+                **_ids(11),
                 "name": "pdf",
                 "description": "PDF skills",
                 "body_markdown": "# PDF\nConvert PDFs.",
@@ -415,7 +454,7 @@ class TestExportSkillsToDisk:
                 "source": "registry",
             },
             {
-                "id": "sk-2",
+                **_ids(12),
                 "name": "testing",
                 "description": "Testing skills",
                 "body_markdown": "# Testing\nWrite tests.",
@@ -441,16 +480,28 @@ class TestExportSkillsToDisk:
         assert lockdata["skills"]["pdf"]["source"] == "registry"
         assert lockdata["skills"]["testing"]["version"] == 1
 
-    def test_lockfile_not_updated_for_global_scope(self, project_root):
-        skills = [{"name": "global-skill", "description": "X", "body_markdown": "# X\nDo X.", "version": 1}]
-        export_skills_to_disk(
-            skills, agents=["universal"], scope="global", project_root=project_root,
-        )
-        lockdata = _read_lockfile(project_root)
-        assert lockdata["skills"] == {}
+    def test_global_scope_is_refused_and_writes_nothing(self, project_root):
+        skills = [{**_ids(13), "name": "global-skill", "description": "X",
+                   "body_markdown": "# X\nDo X.", "version": 1}]
+        with pytest.raises(ValueError) as ei:
+            export_skills_to_disk(
+                skills, agents=["universal"], scope="global", project_root=project_root,
+            )
+        assert "skills pull" in str(ei.value)
+        assert not os.path.exists(os.path.join(project_root, ".decimal", "skills.lock"))
+
+    def test_a_project_without_a_lock_gets_none(self, project_root):
+        """A fresh project never starts with legacy state."""
+        skills = [{**_ids(17), "name": "fresh", "description": "X",
+                   "body_markdown": "# X\nDo X.", "version": 1}]
+        result = export_skills_to_disk(skills, agents=["claude-code"], project_root=project_root)
+        assert result["lockfile"] is None
+        assert not os.path.exists(os.path.join(project_root, ".decimal", "skills.lock"))
 
     def test_skip_lockfile_if_disabled(self, project_root):
-        skills = [{"name": "no-lock", "description": "X", "body_markdown": "# X\nDo X.", "version": 1}]
+        _seed_v1_lock(project_root)
+        skills = [{**_ids(14), "name": "no-lock", "description": "X",
+                   "body_markdown": "# X\nDo X.", "version": 1}]
         export_skills_to_disk(
             skills, agents=["claude-code"], scope="project",
             project_root=project_root, update_lockfile=False,
@@ -463,7 +514,9 @@ class TestExportSkillsToDisk:
         exact SKILL.md written to disk (frontmatter+body); body_hash carries
         the platform's body-only axis. The old sha256(body)[:12] pinned a
         string that was never on disk."""
-        skills = [{"name": "determin", "description": "X", "body_markdown": "# X\nDo X.", "version": 1}]
+        _seed_v1_lock(project_root)
+        skills = [{**_ids(15), "name": "determin", "description": "X",
+                   "body_markdown": "# X\nDo X.", "version": 1}]
         export_skills_to_disk(
             skills, agents=["claude-code"], scope="project", project_root=project_root,
         )
@@ -481,9 +534,10 @@ class TestExportSkillsToDisk:
         the install→export pipeline is broken for a major fraction of
         users — they install a skill, it doesn't appear in the agent.
         """
+        _seed_v1_lock(project_root)
         top_five = ["claude-code", "cursor", "windsurf", "github-copilot", "codex"]
         skills = [{
-            "id": "sk-multi",
+            **_ids(16),
             "name": "code-review",
             "description": "Reviews code",
             "body_markdown": "# Code Review\nLook for bugs.",
@@ -532,62 +586,37 @@ class TestExportSkillsToDisk:
 
 
 class TestSkillRouterExportToDisk:
-    """Tests for SkillRouter.export_to_disk()."""
+    """SkillRouter.export_to_disk() is `decimalai skills add`, once per skill."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
-    def test_export_calls_api_and_writes(self, project_root):
+    def test_export_adds_and_writes_into_the_one_root(self, project_root, registry):
+        registry.add_skill("pdf")
+        result = self._router().export_to_disk(
+            skills=["pdf"], agents=["claude-code"], scope="project", project_root=project_root,
+        )
+        assert result["skills_written"] == 1
+        assert os.path.exists(os.path.join(project_root, ".agents/skills/pdf/SKILL.md"))
+        assert not os.path.exists(os.path.join(project_root, ".claude"))
+
+    def test_export_all_skills_when_none_specified(self, project_root, registry):
         router = self._router()
-        skill_data = {
-            "id": "sk-1", "name": "pdf", "description": "PDF",
-            "body_markdown": "# PDF\nConvert.", "version": 1,
-        }
-        with patch.object(router, "get_skill", return_value=skill_data):
-            with patch.object(router, "list_attachments", return_value=[]):
-                result = router.export_to_disk(
-                    skills=["pdf"],
-                    agents=["claude-code"],
-                    scope="project",
-                    project_root=project_root,
-                )
-                assert result["skills_written"] == 1
-                assert os.path.exists(os.path.join(project_root, ".claude/skills/pdf/SKILL.md"))
+        registry.add_skill("a", org="org-test", public=False)
+        registry.add_skill("b", org="org-test", public=False)
+        with patch.object(router, "list_skills", return_value=[{"name": "a"}, {"name": "b"}]):
+            result = router.export_to_disk(project_root=project_root)
+        assert result["skills_written"] == 2
 
-    def test_export_all_skills_when_none_specified(self, project_root):
-        router = self._router()
-        all_skills = [
-            {"name": "a", "id": "1"}, {"name": "b", "id": "2"},
-        ]
-        full_a = {"name": "a", "id": "1", "description": "A", "body_markdown": "# A\nDo A.", "version": 1}
-        full_b = {"name": "b", "id": "2", "description": "B", "body_markdown": "# B\nDo B.", "version": 1}
-
-        with patch.object(router, "list_skills", return_value=all_skills):
-            with patch.object(router, "get_skill", side_effect=[full_a, full_b]):
-                with patch.object(router, "list_attachments", return_value=[]):
-                    result = router.export_to_disk(
-                        agents=["claude-code"],
-                        scope="project",
-                        project_root=project_root,
-                    )
-                    assert result["skills_written"] == 2
-
-    def test_export_raises_when_all_requested_skills_fail(self, project_root):
-        """Explicitly-requested skills that ALL fail
-        must raise, not return a zero-count summary a caller could mistake
-        for "nothing to do"."""
-        from decimalai.skill_router import SkillRouterError
-
-        router = self._router()
-        with patch.object(router, "get_skill", side_effect=Exception("Network error")):
-            with pytest.raises(SkillRouterError) as ei:
-                router.export_to_disk(
-                    skills=["pdf"],
-                    agents=["claude-code"],
-                    project_root=project_root,
-                )
+    def test_export_raises_when_all_requested_skills_fail(self, project_root, registry):
+        """Explicitly-requested skills that ALL fail must raise, not return a
+        zero-count summary a caller could mistake for "nothing to do"."""
+        registry.add_skill("pdf")
+        registry.fault("resolve", "connect")
+        with pytest.raises(SkillRouterError) as ei:
+            self._router().export_to_disk(skills=["pdf"], project_root=project_root)
         assert "pdf" in str(ei.value)
-        assert "Network error" in str(ei.value)
+        assert "could not reach the registry" in str(ei.value)
 
 
 class TestSkillRouterInstall:
@@ -596,41 +625,14 @@ class TestSkillRouterInstall:
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
-    def test_install_makes_correct_api_calls(self, project_root):
-        router = self._router()
-
-        search_resp = {"items": [{"id": "cat-1", "name": "pdf"}]}
-        fork_resp = {"status": "installed", "skill": {"id": "fork-1", "name": "pdf"}}
-        get_resp = {
-            "id": "fork-1", "name": "pdf", "description": "PDF",
-            "body_markdown": "# PDF\nConvert.", "version": 1,
-        }
-        seen = []
-
-        def mock_request(method, path, **kwargs):
-            seen.append((method, path))
-            if "registry/skills" in path and method == "GET":
-                return search_resp
-            elif path.endswith("/fork") or path.endswith("/install"):
-                return fork_resp
-            elif "/skills/pdf" in path and method == "GET":
-                return get_resp
-            elif "/attachments" in path:
-                return []
-            return {}
-
-        with patch.object(router, "_request", side_effect=mock_request):
-            result = router.install(
-                "pdf",
-                agents=["claude-code"],
-                project_root=project_root,
-            )
-
-        # Canonical fork route is hit (not the legacy /install).
-        assert any(m == "POST" and p.endswith("/fork") for m, p in seen), \
-            f"install() should POST the /fork route; saw {seen}"
+    def test_install_adds_and_makes_no_fork_call(self, project_root, registry):
+        registry.add_skill("pdf")
+        result = self._router().install("pdf", agents=["claude-code"],
+                                        project_root=project_root)
+        # The router's own requests fail in this fixture: a fork would have raised.
         assert result["skill_name"] == "pdf"
-        assert "fork" in result and "export" in result
+        assert result["fork"] is None
+        assert result["export"]["skills_written"] == 1
 
     def test_fork_is_db_only_no_disk_write(self):
         """fork() forks via the API and must NOT write SKILL.md to disk."""
@@ -652,16 +654,21 @@ class TestSkillRouterInstall:
         mock_export.assert_not_called()
         assert out["skill"]["name"] == "pdf"
 
-    def test_install_skill_alias_warns_and_delegates(self):
-        """install_skill is a deprecated alias for install()."""
+    def test_install_skill_alias_warns_and_delegates(self, project_root, monkeypatch):
+        """install_skill is a deprecated alias: it warns and adds the skill."""
         import warnings as _w
+
+        from decimalai.skillpkg.errors import Result
+
+        calls = []
+        monkeypatch.setattr(ops, "add", lambda *a, **kw: calls.append((a, kw)) or Result(
+            [ops.Change("add", "pdf", "pdf", version=1)]))
         router = self._router()
-        with patch.object(router, "install", return_value={"skill_name": "pdf"}) as mock_inst:
-            with _w.catch_warnings(record=True) as caught:
-                _w.simplefilter("always")
-                out = router.install_skill("pdf", agents=["claude-code"])
-        mock_inst.assert_called_once()
-        assert out == {"skill_name": "pdf"}
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            out = router.install_skill("pdf", agents=["claude-code"], project_root=project_root)
+        assert [a for a, _ in calls] == [("pdf",)]
+        assert out["skill_name"] == "pdf"
         assert any(issubclass(w.category, DeprecationWarning) for w in caught), \
             "install_skill() should emit DeprecationWarning"
 
@@ -697,116 +704,77 @@ class TestSkillRouterInstall:
 
 
 class TestSkillRouterStatus:
-    """Tests for SkillRouter.status()."""
+    """SkillRouter.status() is `decimalai skills status` for the project it is given."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
-    # A realistic full 64-char SHA-256 (the backend stores the full digest under
-    # latest_version.content_hash; the SDK truncates the disk hash to 12 chars).
-    _FULL_HASH = "abc123def456abc123def456abc123def456abc123def456abc123def4561234"
-
-    def test_status_returns_correct_structure(self, project_root):
+    def _installed(self, project_root, registry):
+        registry.add_skill("code-review")
         router = self._router()
+        router.export("code-review", project_root=project_root)
+        return router
 
-        # Realistic shapes: the backend serializes content_hash ONLY under the
-        # nested ``latest_version`` object, as the FULL digest. Same content on
-        # both sides must classify as SYNCED (regression guard: a full-digest
-        # vs truncated-digest mismatch used to report a false DRIFT).
-        platform_skills = [
-            {"name": "code-review", "latest_version": {"content_hash": self._FULL_HASH}}
-        ]
-        disk_skills = [
-            {"name": "code-review", "hash": f"sha256:{self._FULL_HASH}", "source_path": "/x"}
-        ]
-
-        with patch.object(router, "list_skills", return_value=platform_skills):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                result = router.status(project_root=project_root)
-
-        assert "synced" in result
-        assert "modified_locally" in result
-        assert "missing_locally" in result
-        assert "untracked" in result
-        assert "total_on_disk" in result
-        assert "total_on_platform" in result
-        # The bug this guards: identical content used to land in modified_locally.
+    def test_status_returns_correct_structure(self, project_root, registry):
+        result = self._installed(project_root, registry).status(project_root=project_root)
+        for key in ("synced", "modified_locally", "missing_locally", "untracked",
+                    "total_on_disk", "total_on_platform", "problems", "result"):
+            assert key in result, key
         assert result["synced"] == ["code-review"]
         assert result["modified_locally"] == []
 
-    def test_status_detects_modified_locally(self, project_root):
-        router = self._router()
-
-        platform_hash = self._FULL_HASH
-        local_hash = "fedcba987654fedcba987654fedcba987654fedcba987654fedcba9876549999"
-
-        platform_skills = [
-            {"name": "code-review", "latest_version": {"content_hash": platform_hash}}
-        ]
-        disk_skills = [
-            {"name": "code-review", "hash": f"sha256:{local_hash}", "source_path": "/x"}
-        ]
-
-        with patch.object(router, "list_skills", return_value=platform_skills):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                result = router.status(project_root=project_root)
-
+    def test_status_detects_modified_locally(self, project_root, registry):
+        router = self._installed(project_root, registry)
+        path = os.path.join(project_root, ".agents/skills/code-review/SKILL.md")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\nA local edit.\n")
+        result = router.status(project_root=project_root)
         assert result["modified_locally"] == ["code-review"]
         assert result["synced"] == []
 
-    def test_status_detects_untracked(self, project_root):
-        router = self._router()
+    def test_status_detects_untracked(self, project_root, registry):
+        router = self._installed(project_root, registry)
+        for folder in (".agents/skills/local-only", ".claude/skills/also-mine"):
+            d = os.path.join(project_root, folder)
+            os.makedirs(d)
+            name = os.path.basename(folder)
+            with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
+                f.write(f"---\nname: {name}\ndescription: Mine\n---\n# Mine\nDo my thing.\n")
+        result = router.status(project_root=project_root)
+        assert {"local-only", "also-mine"} <= set(result["untracked"])
+        assert "code-review" not in result["untracked"]
 
-        platform_skills = []  # Nothing on platform
-        disk_skills = [{"name": "local-only", "hash": "sha256:x", "source_path": "/x"}]
-
-        with patch.object(router, "list_skills", return_value=platform_skills):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                result = router.status(project_root=project_root)
-
-        assert "local-only" in result["untracked"]
-
-    def test_status_detects_missing_locally(self, project_root):
-        router = self._router()
-
-        platform_skills = [{"name": "remote-only", "content_hash": "abc"}]
-        disk_skills = []  # Nothing on disk
-
-        with patch.object(router, "list_skills", return_value=platform_skills):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                result = router.status(project_root=project_root)
-
-        assert "remote-only" in result["missing_locally"]
+    def test_status_detects_missing_locally(self, project_root, registry):
+        router = self._installed(project_root, registry)
+        shutil.rmtree(os.path.join(project_root, ".agents/skills/code-review"))
+        result = router.status(project_root=project_root)
+        assert result["missing_locally"] == ["code-review"]
 
 
 class TestSkillRouterUpdateSkills:
-    """Tests for SkillRouter.update_skills()."""
+    """SkillRouter.update_skills() is `decimalai skills update`."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
-    def test_update_skips_when_synced(self, project_root):
+    def test_update_skips_when_synced(self, project_root, registry):
+        registry.add_skill("code-review")
         router = self._router()
+        router.export("code-review", project_root=project_root)
+        result = router.update_skills(project_root=project_root)
+        assert result["updated"] == 0
+        assert result["skipped"] > 0
 
-        lockdata = {
-            "version": 1,
-            "skills": {
-                "code-review": {
-                    "content_hash": "abc123",
-                    "version": 1,
-                    "source": "platform",
-                    "agents": ["claude-code"],
-                    "scope": "project",
-                },
-            },
-        }
-        _write_lockfile(project_root, lockdata)
-
-        # The API returns {name: {hash: ...}} per update_skills implementation
-        with patch.object(router, "_request", return_value={"hashes": {"code-review": {"hash": "abc123"}}}):
-            result = router.update_skills(project_root=project_root)
-            assert result["updated"] == 0
-            assert result["skipped"] > 0
+    def test_update_moves_a_latest_entry_to_the_new_version(self, project_root, registry):
+        skill = registry.add_skill("code-review")
+        router = self._router()
+        router.export("code-review", project_root=project_root)
+        registry.add_version(skill, "# Code review\n\nVersion two.\n")
+        result = router.update_skills(project_root=project_root)
+        assert result["updated_skills"] == ["code-review"]
+        with open(os.path.join(project_root, ".agents/skills/code-review/SKILL.md"),
+                  encoding="utf-8") as f:
+            assert "Version two." in f.read()
 
 
 class TestSkillRouterSearch:
@@ -1029,6 +997,7 @@ class TestRoundTrip:
     def test_version_tracking_via_hash(self, project_root):
         """Editing a skill changes its content hash (auto-versioning)."""
         v1 = {
+            **_ids(21),
             "name": "code-review",
             "description": "Reviews code",
             "body_markdown": "# V1\nCheck for bugs.",
@@ -1047,11 +1016,13 @@ class TestRoundTrip:
         hash_v2 = s2[0]["hash"]
         assert hash_v1 != hash_v2, "Hash should change when body changes"
 
-    def test_labels_roundtrip_export_discover_sync(self, project_root, monkeypatch):
-        """skill-type + skill-scope + invocation survive pull/install → disk →
-        discover → sync without being dropped at any hop."""
+    def test_labels_roundtrip_export_discover_and_the_folder_is_never_synced(
+            self, project_root, monkeypatch):
+        """skill-type + skill-scope + invocation survive export -> disk -> discover. The
+        exported folder carries the registry's stamp, so syncing never uploads it: it is
+        a registry skill, and uploading it would copy it into your org."""
         skill = {
-            "id": "sk-labeled",
+            **_ids(22),
             "name": "house-style",
             "description": "House style conventions",
             "body_markdown": "# House Style\nFollow the house citation format.",
@@ -1065,17 +1036,16 @@ class TestRoundTrip:
             [skill], agents=["claude-code"], scope="project", project_root=project_root,
         )
 
-        # Exported frontmatter carries both taxonomy axes + both invocation
-        # spellings.
+        # Format 1 keeps the labels in the stamp, and Claude Code's spelling of
+        # user-only invocation at the top level.
         skill_md_path = os.path.join(project_root, ".claude/skills/house-style/SKILL.md")
         with open(skill_md_path) as f:
             content = f.read()
-        assert "skill-type: preference" in content
-        assert "skill-scope: private" in content
-        assert "invocation: user" in content
+        assert 'decimalai-skill-type: "preference"' in content
+        assert 'decimalai-skill-scope: "private"' in content
+        assert 'decimalai-invocation: "user"' in content
         assert "disable-model-invocation: true" in content
 
-        # Discovery parses them back into the descriptor.
         discovered = discover_skills(
             [os.path.join(project_root, ".claude/skills")], include_global=False,
         )
@@ -1083,8 +1053,8 @@ class TestRoundTrip:
         assert discovered[0]["skill_type"] == "preference"
         assert discovered[0]["skill_scope"] == "private"
         assert discovered[0]["invocation"] == "user"
+        assert discovered[0]["managed"] is True
 
-        # Sync threads them into the platform payload.
         captured = {}
 
         class FakeRouter:
@@ -1100,11 +1070,7 @@ class TestRoundTrip:
             "dai_sk_test",
             search_paths=[os.path.join(project_root, ".claude/skills")],
         )
-        (payload,) = captured["skills"]
-        assert payload["skill_type"] == "preference"
-        assert payload["skill_scope"] == "private"
-        assert payload["invocation"] == "user"
-        assert payload["category"] == "writing"
+        assert "skills" not in captured
 
     def test_legacy_ondisk_skill_type_syncs_as_new_taxonomy(self, project_root, monkeypatch):
         """A legacy on-disk `skill-type: convention` (pre-split spelling) is
@@ -1169,10 +1135,10 @@ class TestRoundTrip:
         assert "invocation: user" in reexported
         assert "disable-model-invocation: true" in reexported
 
-    def test_unlabeled_skill_roundtrips_without_new_frontmatter(self, project_root):
-        """Absent labels stay absent through export → discover: no defaults
-        stamped, no new frontmatter lines on re-export."""
+    def test_unlabeled_skill_roundtrips_without_new_labels(self, project_root):
+        """Absent labels stay absent through export -> discover: no defaults stamped."""
         skill = {
+            **_ids(23),
             "name": "plain-skill",
             "description": "No labels",
             "body_markdown": "# Plain\nNothing fancy here.",
@@ -1184,9 +1150,9 @@ class TestRoundTrip:
         skill_md_path = os.path.join(project_root, ".claude/skills/plain-skill/SKILL.md")
         with open(skill_md_path) as f:
             content = f.read()
-        assert "skill-type:" not in content
-        assert "skill-scope:" not in content
-        assert "invocation:" not in content
+        assert "skill-type" not in content
+        assert "skill-scope" not in content
+        assert "decimalai-category" not in content
         assert "disable-model-invocation" not in content
 
         discovered = discover_skills(
@@ -1194,7 +1160,7 @@ class TestRoundTrip:
         )
         assert discovered[0]["skill_type"] is None
         assert discovered[0]["skill_scope"] is None
-        assert discovered[0]["invocation"] is None
+        assert discovered[0]["invocation"] == "model"   # the format records it
 
     def test_multi_agent_symmetry(self, project_root, sample_skill):
         """Same skill exported to multiple agents has identical content."""
@@ -1222,229 +1188,87 @@ class TestRoundTrip:
 
 
 class TestPullMissing:
-    """Tests for SkillRouter.pull_missing() — bidirectional sync."""
+    """SkillRouter.pull_missing() is `decimalai skills install`, or nothing."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
-    def test_pull_missing_fetches_and_writes(self, project_root):
-        """Skills on platform but not on disk are pulled and written."""
-        router = self._router()
+    def _listed(self, project_root, registry, *names):
+        for name in names:
+            registry.add_skill(name)
+            assert ops.add(name, no_install=True, directory=project_root).ok
 
-        # Platform has "code-review" but disk has nothing
-        hash_response = {
-            "hashes": {
-                "code-review": {"hash": "abc123", "version": 2},
-            }
-        }
-        export_skill = {
-            "name": "code-review", "description": "Reviews code",
-            "body_markdown": "# Code Review\nCheck for SQL injection.",
-            "version": 2,
-        }
-
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch.object(router, "export_to_disk", return_value={"skills_written": 1}) as mock_export:
-                result = router.pull_missing(
-                    local_skill_names=set(),  # Nothing on disk
-                    agents=["claude-code"],
-                    project_root=project_root,
-                )
-
+    def test_pull_missing_installs_what_the_manifest_lists(self, project_root, registry):
+        self._listed(project_root, registry, "code-review")
+        result = self._router().pull_missing(project_root=project_root)
         assert result["pulled"] == 1
-        assert result["updated"] == 0
-        assert "code-review" in result["pulled_skills"]
-        mock_export.assert_called_once()
+        assert result["pulled_skills"] == ["code-review"]
+        assert os.path.exists(os.path.join(project_root, ".agents/skills/code-review/SKILL.md"))
 
-    def test_pull_missing_skips_existing_when_disk_wins(self, project_root):
-        """When disk_wins=True, existing skills are not overwritten."""
+    def test_a_second_pull_fetches_nothing(self, project_root, registry):
+        self._listed(project_root, registry, "code-review")
         router = self._router()
+        router.pull_missing(project_root=project_root)
+        before = len(registry.calls())
+        result = router.pull_missing(project_root=project_root)
+        assert result["pulled"] == 0 and result["skipped"] == 1
+        assert len(registry.calls()) == before
 
-        hash_response = {
-            "hashes": {
-                "code-review": {"hash": "platform_hash_123", "version": 3},
-            }
-        }
-        disk_skills = [{"name": "code-review", "hash": "sha256:local_hash_456", "source_path": "/x"}]
-
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                result = router.pull_missing(
-                    agents=["claude-code"],
-                    disk_wins=True,
-                    project_root=project_root,
-                )
-
-        assert result["pulled"] == 0
-        assert result["updated"] == 0
-        assert result["skipped"] == 1
-
-    def test_pull_missing_updates_when_platform_wins(self, project_root):
-        """When disk_wins=False (default), platform version overwrites local."""
+    def test_a_folder_edited_by_hand_is_never_replaced(self, project_root, registry):
+        self._listed(project_root, registry, "code-review")
         router = self._router()
+        router.pull_missing(project_root=project_root)
+        path = os.path.join(project_root, ".agents/skills/code-review/SKILL.md")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\nMy edit.\n")
+        router.pull_missing(project_root=project_root, disk_wins=False)
+        with open(path, encoding="utf-8") as f:
+            assert "My edit." in f.read()
 
-        hash_response = {
-            "hashes": {
-                "code-review": {"hash": "platform_hash_new", "version": 3},
-            }
-        }
+    def test_without_a_manifest_nothing_is_pulled(self, project_root, registry):
+        registry.add_skill("code-review")
+        result = self._router().pull_missing(local_skill_names=set(), agents=["claude-code"],
+                                             project_root=project_root)
+        assert result == {"pulled": 0, "updated": 0, "skipped": 0}
+        assert not os.path.exists(os.path.join(project_root, ".agents"))
+        assert registry.calls() == []
 
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch.object(router, "export_to_disk", return_value={"skills_written": 1}) as mock_export:
-                result = router.pull_missing(
-                    local_skill_names={"code-review"},  # Exists on disk
-                    agents=["claude-code"],
-                    disk_wins=False,
-                    project_root=project_root,
-                )
-
-        # With no local hashes provided, it finds it in local_skill_names
-        # and since disk_wins=False and no local hash to compare, skips
-        # (can't determine conflict without hashes)
-        # This tests the case where local_skill_names is provided but not local_hashes
-        assert result["skipped"] == 1
-
-    def test_pull_missing_discovers_disk_and_compares(self, project_root):
-        """Full flow: discovers disk skills, compares to platform, pulls missing."""
-        router = self._router()
-
-        hash_response = {
-            "hashes": {
-                "on-platform": {"hash": "abc", "version": 1},
-                "on-both": {"hash": "same_hash", "version": 1},
-            }
-        }
-        disk_skills = [
-            {"name": "on-both", "hash": "sha256:same_hash_longform", "source_path": "/x"},
-            {"name": "on-disk-only", "hash": "sha256:zzz", "source_path": "/y"},
-        ]
-
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch("decimalai.skills.discover_skills", return_value=disk_skills):
-                with patch.object(router, "export_to_disk", return_value={"skills_written": 1}) as mock_export:
-                    result = router.pull_missing(
-                        agents=["claude-code"],
-                        project_root=project_root,
-                    )
-
-        # "on-platform" is missing locally → pulled
-        assert result["pulled"] == 1
-        assert "on-platform" in result["pulled_skills"]
-
-    def test_pull_missing_handles_network_error(self, project_root):
-        """Network failures return gracefully, don't crash."""
-        router = self._router()
-
-        with patch.object(router, "_request", side_effect=Exception("Timeout")):
-            result = router.pull_missing(
-                local_skill_names=set(),
-                agents=["claude-code"],
-                project_root=project_root,
-            )
-
-        assert result["pulled"] == 0
-        assert "error" in result
-
-    def test_pull_missing_handles_empty_platform(self, project_root):
-        """No skills on platform → nothing to pull."""
-        router = self._router()
-
-        with patch.object(router, "_request", return_value={"hashes": {}}):
-            result = router.pull_missing(
-                local_skill_names=set(),
-                agents=["claude-code"],
-                project_root=project_root,
-            )
-
-        assert result["pulled"] == 0
-        assert result["updated"] == 0
-        assert result["skipped"] == 0
-
-    def test_pull_missing_defaults_to_universal_agent(self, project_root):
-        """When no agents specified, defaults to universal."""
-        router = self._router()
-
-        hash_response = {"hashes": {"new-skill": {"hash": "abc", "version": 1}}}
-
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch.object(router, "export_to_disk", return_value={"skills_written": 1}) as mock_export:
-                router.pull_missing(
-                    local_skill_names=set(),
-                    project_root=project_root,
-                )
-
-        call_args = mock_export.call_args
-        assert call_args[1]["agents"] == ["universal"]
-
-    def test_pull_missing_export_failure_logs_warning_not_error(self, project_root, caplog):
-        """Defense in depth: a failed export is a WARNING (pull_missing is
-        best-effort background sync) — never an ERROR-level record. The
-        result dict still carries the error for callers that need it."""
+    def test_a_network_failure_is_a_warning_with_the_error(self, project_root, registry, caplog):
+        """Defense in depth: callers ran this as a best-effort sync, so a failure is a
+        WARNING and the result carries the error — never an ERROR-level record."""
         import logging
 
-        router = self._router()
-        hash_response = {"hashes": {"new-skill": {"hash": "abc", "version": 1}}}
-
-        with patch.object(router, "_request", return_value=hash_response):
-            with patch.object(
-                router, "export_to_disk",
-                side_effect=ValueError("Unknown agent 'not-a-runtime'"),
-            ):
-                with caplog.at_level(logging.DEBUG, logger="decimalai.skill_router"):
-                    result = router.pull_missing(
-                        local_skill_names=set(),
-                        agents=["not-a-runtime"],
-                        project_root=project_root,
-                    )
+        self._listed(project_root, registry, "code-review")
+        registry.fault("resolve", "connect")
+        with caplog.at_level(logging.DEBUG, logger="decimalai.skill_router"):
+            result = self._router().pull_missing(project_root=project_root)
 
         assert result["pulled"] == 0
-        assert "Unknown agent" in result["error"]
+        assert "could not reach the registry" in result["error"]
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
-        assert any(
-            r.levelno == logging.WARNING and "pull_missing" in r.getMessage()
-            for r in caplog.records
-        )
+        assert any(r.levelno == logging.WARNING and "pull_missing" in r.getMessage()
+                   for r in caplog.records)
 
 
-class TestBidirectionalSyncOnInstall:
-    """Tests verifying that install() includes bidirectional sync logic.
+class TestNoPullOnInstall:
+    """instrument() no longer pulls platform skills to disk: no background pull, no
+    disk writer, on either adapter. (Structural: these read the source; the behaviour
+    is pinned in tests/test_router_skillpkg_shims.py.)"""
 
-    Structural tests: verify the source code contains pull_missing_background
-    since actually calling install() requires full SDK init.
-    """
-
-    def test_openai_agents_install_has_pull_code(self):
-        """Verify openai_agents.install() contains pull_missing logic."""
+    @pytest.mark.parametrize("module", ["openai_agents", "langchain"])
+    def test_instrument_has_no_pull_leg(self, module):
+        import importlib
         import inspect
-        from decimalai import openai_agents
-        source = inspect.getsource(openai_agents.instrument)
-        assert "_pull_missing_background" in source, "install() must include pull_missing"
-        assert "pull_missing" in source, "install() must call router.pull_missing()"
-        assert "disk_wins=False" in source, "platform wins by default"
 
-    def test_langchain_install_has_pull_code(self):
-        """Verify langchain.install() contains pull_missing logic."""
+        source = inspect.getsource(importlib.import_module(f"decimalai.{module}").instrument)
+        for gone in ("_pull_missing_background", "pull_missing", "export_to_disk",
+                     "should_auto_pull_to_disk", "disk_wins"):
+            assert gone not in source, gone
+
+    @pytest.mark.parametrize("module", ["openai_agents", "langchain"])
+    def test_sync_up_skips_managed_folders(self, module):
+        import importlib
         import inspect
-        from decimalai import langchain
-        source = inspect.getsource(langchain.instrument)
-        assert "_pull_missing_background" in source, "install() must include pull_missing"
-        assert "pull_missing" in source, "install() must call router.pull_missing()"
-        assert "disk_wins=False" in source, "platform wins by default"
 
-    def test_pull_is_non_blocking(self):
-        """Verify pull_missing is wrapped in try/except and runs in background."""
-        import inspect
-        from decimalai import openai_agents
-        source = inspect.getsource(openai_agents.instrument)
-        assert "_sender.submit(_pull_missing_background)" in source, "pull must use background thread"
-        assert 'Background skill pull failed' in source, "pull must be non-fatal"
-
-    def test_pull_respects_agent_name(self):
-        """Verify pull passes agent_name to pull_missing for correct directory
-        targeting — but only when it's a real disk runtime: trace names
-        like 'acme-support-agent' must fall back to 'universal'."""
-        import inspect
-        from decimalai import openai_agents
-        source = inspect.getsource(openai_agents.instrument)
-        assert 'target_agent = agent_name if agent_name in AGENT_PATHS else "universal"' in source
-
+        source = inspect.getsource(importlib.import_module(f"decimalai.{module}").instrument)
+        assert "_sync_up_items" in source

@@ -1,175 +1,95 @@
-"""Exporting a skill to disk no longer requires owning a copy of it.
+"""Exporting a skill to disk never requires owning a copy of it.
 
-`install()` forks and then writes files, so wanting a skill on disk forced you
-to take a copy. The disk writer never cared who owned the skill -- it wants a
-name, a description and a body. It was the FETCH that forced the fork:
-`GET /skills/{name}` is scoped to your org, and a linked skill (a Use pointer at
-a public skill owned by the publisher's org) is not in your org.
-
-`GET /skills/{name}/body` runs the Use/Fork resolver instead, so it answers for
-both. It now carries `skill_id` and `description` too, which is what makes it
-sufficient on its own.
-
-Attachments have the same split: `/api/v1/skills/{id}/attachments` is org-scoped
-and 404s for a linked skill, while the public registry serves the same files --
-and a Use target is public by definition, so that route covers exactly the cases
-the org-scoped one refuses.
+`export()` once had to fork a linked skill (a Use pointer at a public skill another
+org owns) because the routes it read were scoped to your org. Then it read `/body`,
+which runs the resolver. Now it reads neither: it is `decimalai skills add`, whose
+resolve and bundle routes answer for whatever the key may install, and whose bundle
+carries the attachments with their hashes, checked before anything is written.
 """
 from __future__ import annotations
 
 import os
-from unittest.mock import patch
 
-from decimalai.skill_router import SkillRouter
+import pytest
 
-BODY = "# Migration review\n\nCheck for ACCESS EXCLUSIVE locks."
+from decimalai.skill_router import SkillRouterError
+from decimalai.skillpkg.errors import ExitCode
+from tests.fakes.fake_registry import OTHER_ORG, OWNER_ORG, FakeRegistry
+from tests.test_router_skillpkg_shims import _fresh_once_state, engine_on, no_router_http, router
+
+__all__ = ["_fresh_once_state"]
+
+BODY = "# Migration review\n\nCheck for ACCESS EXCLUSIVE locks.\n"
+FILES = ({"path": "scripts/check.py", "content": "print('lock check')\n", "executable": True},)
 
 
-def _router():
-    return SkillRouter(api_key="dai_sk_test", base_url="http://localhost:8000")
-
-
-def _skill_md(root: str, dirname: str) -> str:
-    path = os.path.join(root, ".agents", "skills", dirname, "SKILL.md")
+def _skill_md(root, dirname: str) -> str:
+    path = os.path.join(str(root), ".agents", "skills", dirname, "SKILL.md")
     assert os.path.exists(path), f"expected {path} to exist"
     with open(path, encoding="utf-8") as f:
         return f.read()
 
 
-def _body_response(**over):
-    base = {
-        "name": "sql-review", "version": 3, "body": BODY,
-        "truncated": False, "total_chars": len(BODY),
-        "skill_id": "sk-linked", "description": "Reviews SQL migrations",
-    }
-    base.update(over)
-    return base
+@pytest.fixture
+def registry(monkeypatch):
+    reg = FakeRegistry()
+    engine_on(reg, monkeypatch)
+    return reg
 
 
-def test_a_linked_skill_exports_without_touching_the_org_scoped_route(tmp_path):
-    """The regression this file exists for. No fork, and no GET /skills/{name}:
-    for a linked skill that route 404s, which is what used to force the copy."""
-    router = _router()
-    calls = []
+def test_a_linked_skill_exports_without_a_copy_or_a_body_call(tmp_path, registry, monkeypatch):
+    made = no_router_http(monkeypatch)
+    skill = registry.add_skill("sql-review", org=OTHER_ORG, body=BODY, files=FILES)
+    registry.use(skill, OWNER_ORG)
 
-    def fake_request(method, path, **kwargs):
-        calls.append(path)
-        if path == "/api/v1/skills/sql-review/body":
-            return _body_response()
-        if path == "/api/v1/skills/sk-linked/attachments":
-            raise RuntimeError("404 — org-scoped, cannot see a linked skill")
-        if path == "/api/v1/registry/skills/sk-linked/attachments":
-            return {"attachments": []}
-        raise AssertionError(f"unexpected request: {method} {path}")
+    summary = router().export("sql-review", project_root=str(tmp_path))
 
-    with patch.object(router, "_request", side_effect=fake_request):
-        summary = router.export_to_disk(skills=["sql-review"], project_root=str(tmp_path))
-
-    assert summary["skills_written"] == 1
-    assert summary["errors"] == []
-    assert BODY in _skill_md(str(tmp_path), "sql-review")
-    assert "/api/v1/skills/sql-review" not in calls, "fell back to the org-scoped route"
-    assert not any("/fork" in p or "/install" in p for p in calls), "forked to export"
+    assert summary["skills_written"] == 1 and summary["errors"] == []
+    assert BODY.strip() in _skill_md(tmp_path, "sql-review")
+    assert made == [], "forked, or read /body, to export"
+    assert registry.calls("body") == []
 
 
-def test_attachments_come_from_the_public_registry_when_the_org_route_refuses(tmp_path):
-    router = _router()
+def test_attachments_come_in_the_bundle_with_their_mode(tmp_path, registry, monkeypatch):
+    no_router_http(monkeypatch)
+    registry.add_skill("sql-review", org=OTHER_ORG, body=BODY, files=FILES)
 
-    def fake_request(method, path, **kwargs):
-        if path == "/api/v1/skills/sql-review/body":
-            return _body_response()
-        if path == "/api/v1/skills/sk-linked/attachments":
-            raise RuntimeError("404")
-        if path == "/api/v1/registry/skills/sk-linked/attachments":
-            return {"attachments": [{"id": "a1", "file_path": "scripts/check.py"}]}
-        if path == "/api/v1/registry/skills/sk-linked/attachments/a1":
-            return {
-                "id": "a1", "file_path": "scripts/check.py",
-                "content_text": "print('lock check')",
-            }
-        raise AssertionError(f"unexpected request: {method} {path}")
+    summary = router().export("sql-review", project_root=str(tmp_path))
 
-    with patch.object(router, "_request", side_effect=fake_request):
-        summary = router.export_to_disk(skills=["sql-review"], project_root=str(tmp_path))
-
+    written = tmp_path / ".agents" / "skills" / "sql-review" / "scripts" / "check.py"
     assert summary["attachments_written"] == 1
-    written = os.path.join(
-        str(tmp_path), ".agents", "skills", "sql-review", "scripts", "check.py",
-    )
-    assert os.path.exists(written)
+    assert written.read_text(encoding="utf-8") == "print('lock check')\n"
+    if os.name == "posix":
+        assert os.stat(written).st_mode & 0o777 == 0o755
+    assert [c.route for c in registry.calls()] == ["resolve", "bundle"]
 
 
-def test_an_owned_skill_with_no_attachments_does_not_ask_the_registry(tmp_path):
-    """An empty list is a real answer. Only a FAILED listing falls through, or
-    every attachment-less skill pays a second round-trip to hear the same
-    thing."""
-    router = _router()
-    calls = []
+def test_an_older_registry_is_refused_never_a_fallback_to_body(tmp_path, monkeypatch):
+    no_router_http(monkeypatch)
+    old = FakeRegistry(old=True)
+    engine_on(old, monkeypatch)
+    old.add_skill("sql-review", body=BODY)
 
-    def fake_request(method, path, **kwargs):
-        calls.append(path)
-        if path == "/api/v1/skills/sql-review/body":
-            return _body_response(skill_id="sk-owned")
-        if path == "/api/v1/skills/sk-owned/attachments":
-            return {"attachments": []}
-        raise AssertionError(f"unexpected request: {method} {path}")
+    with pytest.raises(SkillRouterError) as ei:
+        router().export("sql-review", project_root=str(tmp_path))
 
-    with patch.object(router, "_request", side_effect=fake_request):
-        router.export_to_disk(skills=["sql-review"], project_root=str(tmp_path))
-
-    assert not any(p.startswith("/api/v1/registry/") for p in calls)
+    assert ei.value.result.exit_code == ExitCode.UNAVAILABLE
+    assert old.calls("body") == []
+    assert not (tmp_path / ".agents").exists()
 
 
-# ── falling back, so an older backend behaves exactly as before ──────
+def test_bytes_that_differ_from_the_declared_hashes_are_never_written(
+        tmp_path, registry, monkeypatch):
+    """Where `/body` once served a truncated body that could end up in a file, every
+    byte is now checked against the resolve answer before the folder moves in."""
+    no_router_http(monkeypatch)
+    registry.add_skill("sql-review", body=BODY)
 
+    def cut(bundle):
+        bundle["files"][0]["content"] = bundle["files"][0]["content"][:40]
 
-def test_an_older_backend_without_the_export_fields_falls_back(tmp_path):
-    router = _router()
-    calls = []
-
-    def fake_request(method, path, **kwargs):
-        calls.append(path)
-        if path == "/api/v1/skills/sql-review/body":
-            # Pre-change shape: no skill_id, no description.
-            return {"name": "sql-review", "version": 3, "body": BODY}
-        if path == "/api/v1/skills/sql-review":
-            return {
-                "id": "sk-owned", "name": "sql-review", "description": "d",
-                "body_markdown": BODY, "latest_version": {"version_number": 3},
-            }
-        if path == "/api/v1/skills/sk-owned/attachments":
-            return {"attachments": []}
-        raise AssertionError(f"unexpected request: {method} {path}")
-
-    with patch.object(router, "_request", side_effect=fake_request):
-        summary = router.export_to_disk(skills=["sql-review"], project_root=str(tmp_path))
-
-    assert summary["skills_written"] == 1
-    assert "/api/v1/skills/sql-review" in calls, "should have fallen back"
-    assert BODY in _skill_md(str(tmp_path), "sql-review")
-
-
-def test_a_truncated_body_is_never_written_to_disk(tmp_path):
-    """That route truncates for prompt injection. Fine in a menu, not a file --
-    a SKILL.md that ends mid-sentence is worse than a fallback round-trip."""
-    router = _router()
-    calls = []
-    full = BODY + "\n\nAnd the rest of the guidance that got cut."
-
-    def fake_request(method, path, **kwargs):
-        calls.append(path)
-        if path == "/api/v1/skills/sql-review/body":
-            return _body_response(body=BODY, truncated=True, total_chars=len(full))
-        if path == "/api/v1/skills/sql-review":
-            return {
-                "id": "sk-owned", "name": "sql-review", "description": "d",
-                "body_markdown": full, "latest_version": {"version_number": 3},
-            }
-        if path == "/api/v1/skills/sk-owned/attachments":
-            return {"attachments": []}
-        raise AssertionError(f"unexpected request: {method} {path}")
-
-    with patch.object(router, "_request", side_effect=fake_request):
-        router.export_to_disk(skills=["sql-review"], project_root=str(tmp_path))
-
-    assert "the rest of the guidance" in _skill_md(str(tmp_path), "sql-review")
+    registry.tamper = cut
+    with pytest.raises(SkillRouterError) as ei:
+        router().export("sql-review", project_root=str(tmp_path))
+    assert ei.value.result.exit_code == ExitCode.INTEGRITY
+    assert not (tmp_path / ".agents" / "skills" / "sql-review").exists()

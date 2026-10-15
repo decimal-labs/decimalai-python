@@ -85,7 +85,7 @@ from typing import (
 from . import fs
 from . import lock as _lock
 from . import manifest as _manifest
-from .client import Bundle, RegistryClient, Resolved, ResolveRequest
+from .client import Bundle, RegistryClient, Resolved, ResolveRequest, trust_verdict
 from .errors import (
     BundleContractError,
     ExitCode,
@@ -859,7 +859,7 @@ def _settle(items: List[_Item], current: "_lock.Lock") -> None:
         r = item.resolved
         sid = r.skill_id
         locked = current.by_skill_id(sid)
-        refusal, caution = _trust(r)
+        refusal, caution = trust_verdict(r)
         if locked is not None:
             item.outcome, item.lock_name = ALREADY, locked[0]  # nothing is installed
         elif refusal == "blocked":
@@ -878,27 +878,6 @@ def _settle(items: List[_Item], current: "_lock.Lock") -> None:
         else:
             item.outcome, item.caution = INSTALLED, caution
             first[sid] = item
-
-
-def _trust(resolved: Resolved) -> Tuple[Optional[str], Optional[str]]:
-    """The trust gate's verdict on a resolved skill, without its question: ``(refusal, caution)``.
-
-    The same evaluation the gate of ``add`` and ``install`` makes. ``refusal`` is
-    ``"blocked"`` (refused for everyone, owners included) or ``"withheld"`` (refused unless
-    the caller's organization owns or uses the skill), else None. ``caution`` names what the
-    gate would ask about (``caution``, ``unreviewed``, any other band but ``clean``, or
-    ``withheld pending review`` for an owned or used skill); the migration warns with it
-    instead of asking, for owned skills too. Pure: it reads only the resolve answer.
-    """
-    band, withheld, relationship = resolved.safety.band, resolved.safety.withheld, \
-        resolved.relationship
-    if band == "blocked":
-        return "blocked", None
-    if withheld:
-        if relationship not in ("owned", "used"):
-            return "withheld", None
-        return None, "withheld pending review"
-    return None, None if band == "clean" else band
 
 
 def _seed_manifest(client: RegistryClient, manifest: "_manifest.Manifest", items: List[_Item],

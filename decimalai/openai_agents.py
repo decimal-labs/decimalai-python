@@ -1620,12 +1620,13 @@ def instrument(
         )
 
     # Router authority (skill_authority): when None, derive disk_sync from config
-    # — router-authoritative installs (loader active) default to NOT mirroring
-    # skills to disk, so a native skill-loading runtime can't also load them and
-    # double-inject. An explicit disk_sync=... always wins.
-    # Captured before the derivation below overwrites it: `disk_sync=True`
-    # passed by hand is a request, the derived default is only a guess.
-    _disk_sync_explicit = disk_sync is True
+    # — router-authoritative installs (loader active) default to NOT reading
+    # local skills, so the router is the one source of skills in the prompt.
+    # An explicit disk_sync=... always wins.
+    # Asking for skills on disk (disk_sync=True, or the harness authority) used to
+    # mirror every platform skill here; it writes nothing now, so say so once.
+    from .skill_router import _note_disk_sync_writes_nothing
+    _note_disk_sync_writes_nothing(disk_sync)
     if disk_sync is None:
         try:
             from ._config import _get_config
@@ -1648,97 +1649,62 @@ def instrument(
         except Exception:
             logger.debug("Skill auto-discovery failed", exc_info=True)
 
-    # Sync discovered skills to platform for observability + pull platform-
-    # only skills back to disk for IDE/runtime use. Both paths are gated on
-    # disk_sync=True. When False, the SDK treats the platform as the sole
-    # source of truth (useful for pure-Python stacks that don't use a
-    # disk-loading runtime, or to suppress duplicate injection when the
-    # SkillRouter loader is the active injector).
-    if disk_sync:
+    # Sync the skills you wrote up to the platform for observability, gated on
+    # disk_sync=True. When False, the SDK treats the platform as the sole source
+    # of truth (useful for pure-Python stacks that don't use a disk-loading
+    # runtime, or to suppress duplicate injection when the SkillRouter loader is
+    # the active injector). Nothing here writes disk: the background pull that
+    # mirrored every org skill into the working directory is gone, and registry
+    # skills reach disk only when a `decimalai skills` command runs. Folders that
+    # command installed are never uploaded (that would copy a registry skill into
+    # your org).
+    if disk_sync and resolved_skills:
         try:
             from ._config import _get_config, _sender
 
             config = _get_config()
-            local_names = {s["name"] for s in resolved_skills} if resolved_skills else set()
 
-            if resolved_skills:
-                def _sync_skills_background():
-                    try:
-                        from .skill_router import SkillRouter
-
-                        router = SkillRouter(
-                            api_key=config.api_key,
-                            base_url=config.base_url,
-                        )
-                        try:
-                            from ._install import get_install_identity
-                            _ident = get_install_identity()
-                        except Exception:
-                            _ident = {}
-                        from .skills import _with_local_timestamps
-                        result = router.sync_skills(
-                            _with_local_timestamps(resolved_skills),
-                            # Don't blind-clobber a teammate's newer dashboard
-                            # edit on agent boot; record this checkout's baseline.
-                            conflict_policy="newer_wins",
-                            install_id=_ident.get("install_id"),
-                            install_label=_ident.get("install_label"),
-                        )
-                        synced = result.get("synced", 0)
-                        created = result.get("created", 0)
-                        logger.info(
-                            "Skills synced to platform: %d synced, %d created",
-                            synced,
-                            created,
-                        )
-                    except Exception:
-                        logger.debug("Background skill sync failed", exc_info=True)
-
-                _sender.submit(_sync_skills_background)
-
-            # Bidirectional sync: pull platform-only skills to disk.
-            def _pull_missing_background():
+            def _sync_skills_background():
                 try:
-                    from .disk_export import AGENT_PATHS
-                    from .skill_router import SkillRouter
+                    from .skill_router import SkillRouter, _sync_up_items
+                    from .skills import _with_local_timestamps
 
+                    items, managed = _sync_up_items(_with_local_timestamps(resolved_skills))
+                    if managed:
+                        logger.debug(
+                            "Not syncing %d skill(s) `decimalai skills` installed: %s",
+                            len(managed), ", ".join(managed),
+                        )
+                    if not items:
+                        return
                     router = SkillRouter(
                         api_key=config.api_key,
                         base_url=config.base_url,
                     )
-                    # A trace's agent_name is a free-form label, not a disk
-                    # runtime key — only honor names that are real runtimes,
-                    # else export_to_disk raises "Unknown agent" on every
-                    # install whose agent has a custom name.
-                    target_agent = agent_name if agent_name in AGENT_PATHS else "universal"
-                    # Reading and uploading local skills is free; WRITING them
-                    # creates a directory in the user's repo. Only mirror when
-                    # something will actually read the files back.
-                    from .skill_router import should_auto_pull_to_disk
-                    allowed, why = should_auto_pull_to_disk(
-                        target_agent, explicitly_requested=_disk_sync_explicit
+                    try:
+                        from ._install import get_install_identity
+                        _ident = get_install_identity()
+                    except Exception:
+                        _ident = {}
+                    result = router.sync_skills(
+                        items,
+                        # Don't blind-clobber a teammate's newer dashboard
+                        # edit on agent boot; record this checkout's baseline.
+                        conflict_policy="newer_wins",
+                        install_id=_ident.get("install_id"),
+                        install_label=_ident.get("install_label"),
                     )
-                    if not allowed:
-                        logger.debug("Skipping skill pull to disk: %s", why)
-                        return
-                    logger.debug("Pulling skills to disk: %s", why)
-                    result = router.pull_missing(
-                        local_skill_names=local_names,
-                        agents=[target_agent],
-                        disk_wins=False,  # platform wins by default
+                    synced = result.get("synced", 0)
+                    created = result.get("created", 0)
+                    logger.info(
+                        "Skills synced to platform: %d synced, %d created",
+                        synced,
+                        created,
                     )
-                    pulled = result.get("pulled", 0)
-                    updated = result.get("updated", 0)
-                    if pulled or updated:
-                        logger.info(
-                            "Pulled %d new skills from platform, updated %d",
-                            pulled,
-                            updated,
-                        )
                 except Exception:
-                    logger.debug("Background skill pull failed (non-fatal)", exc_info=True)
+                    logger.debug("Background skill sync failed", exc_info=True)
 
-            _sender.submit(_pull_missing_background)
+            _sender.submit(_sync_skills_background)
         except Exception:
             logger.debug("Skill sync setup failed (non-fatal)", exc_info=True)
 

@@ -4,7 +4,7 @@ A project is the directory that holds ``.decimal/``::
 
     <project>/
       .agents/
-        .claude-plugin/plugin.json      the Claude Code plugin root (``--plugin-dir .agents``)
+        .claude-plugin/plugin.json      the Claude Code plugin root (``--plugin-dir <abs>/.agents``)
         skills/<install-name>/          one real directory per skill, never a symlink
       .decimal/
         skills.toml                     the manifest: what the project wants      (commit)

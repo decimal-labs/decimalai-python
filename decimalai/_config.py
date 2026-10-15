@@ -200,10 +200,13 @@ class DecimalConfig:
     )
     # Which channel is authoritative for delivering skills to the model:
     #   "harness" — a native skill-loading runtime (Claude Code/Cursor) loads
-    #               skills from disk; the SDK keeps mirroring them there
-    #               (disk_sync on). Today's behavior.
-    #   "router"  — the SDK router is the single injection channel; the SDK stops
-    #               writing skills to disk (disk_sync off) so it never duplicates.
+    #               skills from disk; the adapters read the project's SKILL.md
+    #               files and sync the ones you wrote (disk_sync on). The SDK
+    #               writes no skill to disk: registry skills get there through
+    #               `decimalai skills add` / `decimalai skills install`.
+    #   "router"  — the SDK router is the single injection channel; the adapters
+    #               do not read local skills (disk_sync off), so the router is
+    #               the one source and nothing is injected twice.
     #   "auto"    — router when an adapter's skill loader is active, else harness.
     # Only affects an adapter once its router loader is enabled — a no-op otherwise.
     # Set via init(skill_authority=...) or DECIMALAI_SKILL_AUTHORITY.
@@ -246,12 +249,13 @@ class DecimalConfig:
         return sdk_headers(self.api_key)
 
     def resolve_disk_sync(self, loader_active: bool) -> bool:
-        """Whether an adapter should mirror platform skills to disk (disk_sync).
+        """Whether an adapter reads the project's SKILL.md files and syncs the ones you
+        wrote to the platform (disk_sync). It never writes skills to disk either way:
+        registry skills get there only through ``decimalai skills add`` / ``install``.
 
-        Router authority => False (the router is the sole injector; writing to
-        disk only creates duplicates for a native skill-loading runtime).
-        Harness authority => True (today's behavior). "auto" resolves to router
-        only when the adapter's router skill loader is active.
+        Router authority => False (the router is the sole injector, so local skills
+        are not read). Harness authority => True. "auto" resolves to router only when
+        the adapter's router skill loader is active.
         """
         authority = (self.skill_authority or "auto").lower()
         if authority == "router":

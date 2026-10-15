@@ -108,6 +108,7 @@ __all__ = [
     "Safety",
     "Unavailable",
     "VersionRef",
+    "trust_verdict",
 ]
 
 DEFAULT_BASE_URL = "https://api.decimal.ai"
@@ -302,6 +303,27 @@ class Resolved:
     @property
     def executable(self) -> Tuple[str, ...]:
         return tuple(sorted(f.path for f in self.files if f.executable))
+
+
+def trust_verdict(resolved: Resolved) -> Tuple[Optional[str], Optional[str]]:
+    """The trust gate's verdict on a resolved skill, without its question: ``(refusal, caution)``.
+
+    ``refusal`` is ``"blocked"`` (refused for everyone, owners included) or ``"withheld"``
+    (refused unless the caller's organization owns or uses the skill), else None.
+    ``caution`` names what there is to ask about: ``caution``, ``unreviewed`` or any other
+    band but ``clean``, or ``withheld pending review`` for an owned or used skill; None
+    when there is nothing. The gate of ``add`` and ``install`` asks about it (except for
+    a skill the caller's organization owns); the migration warns with it instead. Pure:
+    it reads only the resolve answer.
+    """
+    band, withheld = resolved.safety.band, resolved.safety.withheld
+    if band == "blocked":
+        return "blocked", None
+    if withheld:
+        if resolved.relationship not in ("owned", "used"):
+            return "withheld", None
+        return None, "withheld pending review"
+    return None, None if band == "clean" else band
 
 
 @dataclass(frozen=True)

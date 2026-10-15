@@ -63,75 +63,91 @@ def test_refuses_rather_than_sanitizing():
         _safe_skill_dirname("../../.ssh/authorized_keys")
 
 
-# ── the split between the on-disk directory and the declared name ─────────
+# ── the folder, the frontmatter name and the registry name ─────────
 
-def test_export_uses_url_slug_for_the_directory_and_name_for_frontmatter(tmp_path):
-    """A server-supplied skill name must never escape its own directory.
+SKILL_ID = "00000000-0000-4000-8000-000000000001"
+VERSION_ID = "00000000-0000-4000-8000-000000000002"
 
-    INVARIANT: the on-disk directory comes from `url_slug` and the declared
-    identity comes from `name`. A registry name may be `owner/skill` — that is
-    the skill's IDENTITY and belongs in the SKILL.md frontmatter, but it is not
-    a single path component, so it can never be used as a directory name.
-    `url_slug` is the slash-free identifier the platform serves alongside the
-    name, and it is the only field the export path may turn into a directory.
-    """
+
+@pytest.fixture(autouse=True)
+def _fresh_once_state(monkeypatch):
+    import decimalai.disk_export as disk_export
+
+    monkeypatch.setattr(disk_export, "_warned_once", set())
+
+
+def _export(tmp_path, **skill):
     from decimalai.disk_export import export_skill_to_disk
 
-    result = export_skill_to_disk(
-        {
-            "name": "acme/example-tool",
-            "url_slug": "acme-example-tool",
-            "description": "Query the example data store.",
-            "body_markdown": "# Example Tool\n\nQuery things.",
-        },
-        agents=["claude-code"],
-        project_root=str(tmp_path),
-    )
+    skill = {"id": SKILL_ID, "version_id": VERSION_ID, "description": "d",
+             "body_markdown": "# Example Tool\n\nQuery things.", **skill}
+    return export_skill_to_disk(skill, agents=["claude-code"], project_root=str(tmp_path))
+
+
+def _frontmatter(path):
+    from skillevaluation import skillfmt
+
+    with open(path, encoding="utf-8") as f:
+        return skillfmt.parse_skill_md_text(f.read())[0]
+
+
+def test_a_namespaced_skill_gets_its_install_name_and_keeps_its_identity(tmp_path):
+    """A registry name may be `owner/skill` — that is the skill's IDENTITY, but not a
+    single path component. The folder, and the `name:` it declares (loaders require the
+    two to match), is the install name every door uses; the registry name is kept in
+    the stamp, `metadata.decimalai-name`."""
+    result = _export(tmp_path, name="acme/example-tool", url_slug="acme-example-tool")
 
     assert result["skill_dirname"] == "acme-example-tool"
     assert result["skill_name"] == "acme/example-tool"
-
     written = result["written_paths"][0]
-    # The directory is the slug — one level, where agents actually look.
     assert "acme-example-tool" in written
     assert "acme/example-tool" not in written
+    fm = _frontmatter(written)
+    assert fm["name"] == "acme-example-tool"
+    assert fm["metadata"]["decimalai-name"] == "acme/example-tool"
 
-    # …and the file still DECLARES the real, namespaced identity.
-    content = open(written, encoding="utf-8").read()
-    assert "name: acme/example-tool" in content
+
+def test_the_install_name_does_not_depend_on_url_slug(tmp_path):
+    """Older backends don't send url_slug; the folder is the same either way."""
+    with_slug = _export(tmp_path / "a", name="acme/example-tool", url_slug="acme-example-tool")
+    without = _export(tmp_path / "b", name="acme/example-tool")
+    assert with_slug["skill_dirname"] == without["skill_dirname"] == "acme-example-tool"
 
 
-def test_export_falls_back_to_name_when_url_slug_is_absent(tmp_path):
-    """Older backends don't send url_slug; behaviour must be unchanged there."""
-    from decimalai.disk_export import export_skill_to_disk
-
-    result = export_skill_to_disk(
-        {
-            "name": "commit-conventions",
-            "description": "d",
-            "body_markdown": "# body",
-        },
-        agents=["claude-code"],
-        project_root=str(tmp_path),
-    )
+def test_a_plain_name_is_its_own_folder(tmp_path):
+    result = _export(tmp_path, name="commit-conventions")
     assert result["skill_dirname"] == "commit-conventions"
     assert result["skill_name"] == "commit-conventions"
 
 
-def test_a_traversing_url_slug_is_still_refused(tmp_path):
-    """The guard must still fire — url_slug is server-supplied too."""
-    import pytest as _pytest
+@pytest.mark.parametrize("field,value", [
+    ("url_slug", "../../../etc/evil"),
+    ("url_slug", "/etc/evil"),
+    ("name", "../evil"),
+    ("name", "acme/../../evil"),
+    ("name", "/abs/evil"),
+    ("name", "back\\slash"),
+])
+def test_a_traversing_name_or_url_slug_is_still_refused(tmp_path, field, value):
+    """The guard still fires: both values are server-supplied, and a hostile one is
+    refused, never quietly sanitized into a safe-looking folder."""
+    from decimalai.disk_export import SkillExportUnsafePathError
 
+    skill = {"name": "innocent", field: value}
+    with pytest.raises(SkillExportUnsafePathError):
+        _export(tmp_path, **skill)
+    assert not (tmp_path / ".claude").exists()
+
+
+@pytest.mark.parametrize("path", ["../escape.md", "/etc/passwd", "scripts/../../x.py"])
+def test_a_traversing_attachment_path_is_refused(tmp_path, path):
     from decimalai.disk_export import SkillExportUnsafePathError, export_skill_to_disk
 
-    with _pytest.raises(SkillExportUnsafePathError):
+    with pytest.raises(SkillExportUnsafePathError):
         export_skill_to_disk(
-            {
-                "name": "innocent",
-                "url_slug": "../../../etc/evil",
-                "description": "d",
-                "body_markdown": "# b",
-            },
-            agents=["claude-code"],
+            {"id": SKILL_ID, "version_id": VERSION_ID, "name": "pdf", "description": "d",
+             "body_markdown": "b"},
             project_root=str(tmp_path),
-        )
+            attachments=[{"file_path": path, "content_text": "x"}])
+    assert not (tmp_path / ".agents").exists()

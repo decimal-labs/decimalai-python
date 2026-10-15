@@ -6,9 +6,12 @@ whatever directory the user ran from. With no disk-loading runtime in the
 process nothing ever read those files back, so the user got a tree of SKILL.md
 files in their repo, often inside a git checkout, in exchange for nothing.
 
-`disk_sync` did not distinguish reading from writing. Discovering local skills
-and uploading them creates nothing and is fine on by default; pulling skills
-down creates a directory. This pins that split.
+The adapters no longer write disk at all (`tests/test_router_skillpkg_shims.py`
+pins that). `should_auto_pull_to_disk` stays for code that still asks the old
+question, and its answer changed in one place: a skills directory that already
+exists is no longer consent. `decimalai skills` creates `.agents/skills` itself,
+so "the folder exists" would read every managed project as a request to mirror
+every org skill into it.
 """
 
 from __future__ import annotations
@@ -19,11 +22,7 @@ from decimalai.skill_router import should_auto_pull_to_disk
 
 
 @pytest.fixture(autouse=True)
-def _reset_hint_state(monkeypatch):
-    """The hint is once-per-process; tests need it armed each time."""
-    import decimalai.skill_router as sr
-
-    monkeypatch.setattr(sr, "_disk_mirror_hinted", False)
+def _no_disk_runtime(monkeypatch):
     for var in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CURSOR_AGENT",
                 "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING"):
         monkeypatch.delenv(var, raising=False)
@@ -49,7 +48,7 @@ def test_declines_to_create_a_directory_nobody_asked_for(in_empty_dir, monkeypat
     _set_authority(monkeypatch, "auto")
     allowed, why = should_auto_pull_to_disk("universal")
     assert not allowed
-    assert "nothing reads" in why
+    assert "nobody asked" in why and "decimalai skills add" in why
 
 
 def test_a_detected_harness_is_not_consent_to_write(in_empty_dir, monkeypatch):
@@ -66,24 +65,19 @@ def test_a_detected_harness_is_not_consent_to_write(in_empty_dir, monkeypatch):
     assert not allowed
 
 
-def test_a_detected_harness_gets_told_the_feature_exists(in_empty_dir, monkeypatch, caplog):
+def test_asking_logs_nothing(in_empty_dir, monkeypatch, caplog):
+    """It only answers the question. The notice for someone who asked for skills on
+    disk comes from instrument(), once (see tests/test_router_skillpkg_shims.py); the
+    old hint offered disk mirroring, which no longer exists."""
+    import decimalai.skill_router as sr
+
+    # Armed as the old once-per-process hint would be on a first call.
+    monkeypatch.setattr(sr, "_disk_mirror_hinted", False, raising=False)
     _set_authority(monkeypatch, "auto")
     monkeypatch.setenv("CLAUDECODE", "1")
     with caplog.at_level("INFO", logger="decimalai.skill_router"):
         should_auto_pull_to_disk("universal")
-        should_auto_pull_to_disk("universal")  # once per process, not per call
-
-    hints = [r for r in caplog.records if "reads skills from disk" in r.message]
-    assert len(hints) == 1
-    assert "skill_authority='harness'" in hints[0].getMessage()
-
-
-def test_no_hint_when_no_harness_is_present(in_empty_dir, monkeypatch, caplog):
-    """A plain script gets silence, not advice about an editor it isn't using."""
-    _set_authority(monkeypatch, "auto")
-    with caplog.at_level("INFO", logger="decimalai.skill_router"):
-        should_auto_pull_to_disk("universal")
-    assert not [r for r in caplog.records if "reads skills from disk" in r.message]
+    assert caplog.records == []
 
 
 def test_explicit_disk_sync_true_is_honoured(in_empty_dir, monkeypatch):
@@ -113,21 +107,18 @@ def test_explicit_harness_authority_still_mirrors(in_empty_dir, monkeypatch):
     assert "harness" in why
 
 
-def test_an_existing_directory_keeps_getting_updated(in_empty_dir, monkeypatch):
-    """Presence of the directory is the user's consent; stale is the surprise."""
+@pytest.mark.parametrize("agent,folder", [
+    ("universal", ".agents/skills"),
+    ("claude-code", ".claude/skills"),
+    ("cursor", ".agents/skills"),
+])
+def test_an_existing_directory_is_not_consent(in_empty_dir, monkeypatch, agent, folder):
+    """It used to be: the folder's existence meant "keep it up to date". That turned
+    every checkout with `.agents/skills` (which `decimalai skills install` creates)
+    into a target for a mirror of every org skill."""
     _set_authority(monkeypatch, "auto")
-    (in_empty_dir / ".agents" / "skills").mkdir(parents=True)
-    allowed, why = should_auto_pull_to_disk("universal")
-    assert allowed
-    assert ".agents/skills" in why
-
-
-def test_consent_is_read_per_agent_not_globally(in_empty_dir, monkeypatch):
-    """A Cursor checkout must not authorize writing Claude Code's directory."""
-    _set_authority(monkeypatch, "auto")
-    (in_empty_dir / ".agents" / "skills").mkdir(parents=True)
-    assert should_auto_pull_to_disk("universal")[0]
-    assert not should_auto_pull_to_disk("claude-code")[0]
+    (in_empty_dir / folder).mkdir(parents=True)
+    assert not should_auto_pull_to_disk(agent)[0]
 
 
 def test_an_unknown_agent_name_never_writes(in_empty_dir, monkeypatch):
@@ -145,3 +136,37 @@ def test_an_uninitialised_config_does_not_authorize_writing(in_empty_dir, monkey
 
     monkeypatch.setattr(cfg, "_get_config", _boom)
     assert not should_auto_pull_to_disk("universal")[0]
+
+
+# ── the duplicate-injection warning describes what the SDK does now ───
+
+
+def test_the_duplicate_warning_fires_once_inside_a_disk_runtime(monkeypatch, caplog):
+    import decimalai.skill_router as sr
+
+    monkeypatch.setattr(sr, "_disk_runtime_warned", False)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with caplog.at_level("WARNING", logger="decimalai.skill_router"):
+        sr._warn_if_disk_runtime_detected("langchain")
+        sr._warn_if_disk_runtime_detected("langchain")
+
+    (record,) = [r for r in caplog.records if "decimalai.langchain" in r.getMessage()]
+    message = record.getMessage()
+    assert record.levelname == "WARNING"
+    assert "claude-code" in message
+    # 0.15: nothing is mirrored; registry skills reach disk only through the commands.
+    assert "no longer writes skills to disk" in message
+    assert "`decimalai skills add`" in message and "`decimalai skills install`" in message
+    assert "mirroring" not in message and "disk_sync" not in message
+    assert "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING=1" in message
+
+
+def test_the_duplicate_warning_needs_a_disk_runtime(monkeypatch, caplog):
+    """The trigger is unchanged: no disk-loading runtime, no warning."""
+    import decimalai.skill_router as sr
+
+    monkeypatch.setattr(sr, "_disk_runtime_warned", False)
+    with caplog.at_level("WARNING", logger="decimalai.skill_router"):
+        sr._warn_if_disk_runtime_detected("langchain")
+    assert [r for r in caplog.records if "decimalai.langchain" in r.getMessage()] == []
+    assert sr._disk_runtime_warned is False

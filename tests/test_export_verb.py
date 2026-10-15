@@ -1,86 +1,69 @@
-"""`export()` writes the files and takes no copy.
+"""`export()` installs the files and takes no copy; `install()` is now the same verb.
 
-`install()` does a fork and then a disk write, so asking for a file also took an
-editable copy of the skill. Nothing about writing a SKILL.md needs ownership —
-the writer wants a name, a description and a body. So the file half is its own
-verb now, and Install (link) / Fork (copy) are the verbs for acquiring the skill
-itself.
-
-`install()` is unchanged and still forks. Deprecating a shape is not the same as
-breaking it.
+`install()` used to fork and then write to disk, so asking for a file also took an
+editable copy of the skill. `export()` split the file half out; now both are
+`decimalai skills add` underneath, and `install()` is a deprecated alias that no longer
+forks (a fork is `fork()`, a link is `use()`).
 """
 from __future__ import annotations
 
 import os
-from unittest.mock import patch
 
-from decimalai.skill_router import SkillRouter
+import pytest
 
-BODY = "# Review\n\nCheck the locks."
+from tests.fakes.fake_registry import FakeRegistry
+from tests.test_router_skillpkg_shims import _fresh_once_state, engine_on, no_router_http, router
 
-
-def _router():
-    return SkillRouter(api_key="dai_sk_test", base_url="http://localhost:8000")
+__all__ = ["_fresh_once_state"]  # the autouse fixture, imported for this module too
 
 
-def _stub(calls):
-    def fake_request(method, path, **kwargs):
-        calls.append((method, path))
-        if path == "/api/v1/skills/pdf/body":
-            return {
-                "name": "pdf", "version": 1, "body": BODY, "truncated": False,
-                "total_chars": len(BODY), "skill_id": "sk1", "description": "d",
-            }
-        if path == "/api/v1/skills/sk1/attachments":
-            return {"attachments": []}
-        if path.endswith("/fork"):
-            return {"status": "installed", "skill": {"id": "sk1", "name": "pdf"}}
-        if path == "/api/v1/registry/skills":
-            return {"items": [{"id": "sk1", "name": "pdf"}]}
-        raise AssertionError(f"unexpected request: {method} {path}")
-    return fake_request
+@pytest.fixture
+def registry(monkeypatch):
+    reg = FakeRegistry()
+    engine_on(reg, monkeypatch)
+    reg.add_skill("pdf", body="# Review\n\nCheck the locks.\n")
+    return reg
 
 
-def test_export_writes_the_file_and_forks_nothing(tmp_path):
-    router, calls = _router(), []
-    with patch.object(router, "_request", side_effect=_stub(calls)):
-        summary = router.export("pdf", project_root=str(tmp_path))
+def _read(root) -> bytes:
+    with open(os.path.join(str(root), ".agents", "skills", "pdf", "SKILL.md"), "rb") as f:
+        return f.read()
+
+
+def test_export_writes_the_file_and_forks_nothing(tmp_path, registry, monkeypatch):
+    made = no_router_http(monkeypatch)
+    summary = router().export("pdf", project_root=str(tmp_path))
 
     assert summary["skills_written"] == 1
-    path = os.path.join(str(tmp_path), ".agents", "skills", "pdf", "SKILL.md")
-    assert os.path.exists(path)
-    with open(path, encoding="utf-8") as f:
-        assert BODY in f.read()
-
-    assert not any(p.endswith(("/fork", "/install")) for _, p in calls), (
-        "export took a copy — that is the whole thing it exists not to do"
-    )
+    assert b"Check the locks." in _read(tmp_path)
+    assert made == [], "export took a copy, or read /body"
 
 
-def test_install_still_forks(tmp_path):
-    """The deprecated shape keeps its behaviour. A deprecation that silently
-    changes what a published method DOES is worse than no deprecation."""
-    router, calls = _router(), []
-    with patch.object(router, "_request", side_effect=_stub(calls)):
-        router.install("pdf", project_root=str(tmp_path))
+def test_install_no_longer_forks(tmp_path, registry, monkeypatch):
+    """The deprecated shape keeps its signature and its keys; the fork side effect is
+    gone (it inflated install counts and handed out copies nobody asked for)."""
+    made = no_router_http(monkeypatch)
+    out = router().install("pdf", project_root=str(tmp_path))
+    assert made == []
+    assert out["fork"] is None and out["skill_name"] == "pdf"
 
-    assert any(p.endswith("/fork") for _, p in calls), "install stopped forking"
 
-
-def test_export_and_install_write_the_same_bytes(tmp_path):
-    """The only difference is the copy, not the file."""
+def test_export_and_install_write_the_same_bytes(tmp_path, registry, monkeypatch):
+    no_router_http(monkeypatch)
     a, b = tmp_path / "via-export", tmp_path / "via-install"
-    a.mkdir(); b.mkdir()
-
-    router = _router()
-    with patch.object(router, "_request", side_effect=_stub([])):
-        router.export("pdf", project_root=str(a))
-    with patch.object(router, "_request", side_effect=_stub([])):
-        router.install("pdf", project_root=str(b))
-
-    def _read(root):
-        with open(os.path.join(str(root), ".agents", "skills", "pdf", "SKILL.md"),
-                  encoding="utf-8") as f:
-            return f.read()
-
+    a.mkdir()
+    b.mkdir()
+    router().export("pdf", project_root=str(a))
+    router().install("pdf", project_root=str(b))
     assert _read(a) == _read(b)
+
+
+def test_running_it_again_is_a_no_op(tmp_path, registry, monkeypatch):
+    no_router_http(monkeypatch)
+    r = router()
+    r.export("pdf", project_root=str(tmp_path))
+    before = _read(tmp_path)
+    again = r.export("pdf", project_root=str(tmp_path))
+    assert again["skills_written"] == 0 and again["errors"] == []
+    assert again["skill_dirname"] == "pdf"
+    assert _read(tmp_path) == before
