@@ -22,6 +22,7 @@ module the platform uses.
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import time
 
@@ -32,6 +33,8 @@ import decimalai.skill_router as sr
 from decimalai.skill_router import _COLD_PATH_TIMEOUT, _HotPathBreakers, _hot_path_read_budget, routing_status
 from decimalai.skillpkg.client import (
     DEFAULT_TIMEOUT,
+    FORMATS,
+    MAX_ANONYMOUS_RESOLVE_ITEMS,
     MAX_RESOLVE_ITEMS,
     Bundle,
     RegistryClient,
@@ -143,6 +146,7 @@ class TestResolveRequests:
             "taken": {"my-own-skill": None},
             "channel": "cli",
             "purpose": "add",
+            "formats": [1],
         }
         assert all(isinstance(r, Resolved) for r in out)
         assert [r.version for r in out] == [1, 3, 2]
@@ -261,6 +265,57 @@ class TestResolveRequests:
         assert out[-1].install_name == skillfmt.install_name_disambiguated("acme-policy", skills[-1].skill_id)
         assert len({r.install_name for r in out}) == len(out)
 
+    def test_anonymous_resolves_go_in_batches_of_20_and_carry_earlier_names(
+            self, registry, sleeps):
+        # The 1st and the 21st skill share a base install name.
+        skills = [registry.add_skill("acme/policy")]
+        skills += [registry.add_skill(f"team/skill-{i}")
+                   for i in range(MAX_ANONYMOUS_RESOLVE_ITEMS - 1)]
+        skills.append(registry.add_skill("acme-policy", url_slug="acme-policy-2"))
+        skills += [registry.add_skill(f"more/skill-{i}") for i in range(20)]
+        out = make_client(registry, sleeps, key=None).resolve(
+            [ResolveRequest(skill_id=s.skill_id) for s in skills], purpose="install")
+
+        calls = registry.calls("resolve")
+        assert MAX_ANONYMOUS_RESOLVE_ITEMS == 20
+        assert [len(c.json["items"]) for c in calls] == [20, 20, 1]
+        assert all(c.path == ANON_RESOLVE for c in calls)
+        assert calls[1].json["taken"] == {r.install_name: r.skill_id for r in out[:20]}
+        assert [r.skill_id for r in out] == [s.skill_id for s in skills]
+        assert len({r.install_name for r in out}) == len(out)
+
+    def test_a_lower_cap_the_registry_names_is_followed(self, registry, sleeps):
+        skills = [registry.add_skill(f"team/skill-{i}") for i in range(12)]
+        registry.fault("resolve", respond(422, {"detail": {
+            "code": "too_many_items", "message": "at most 5 items", "max_items": 5}}))
+        out = make_client(registry, sleeps).resolve(
+            [ResolveRequest(skill_id=s.skill_id) for s in skills], purpose="install")
+        assert [len(c.json["items"]) for c in registry.calls("resolve")] == [12, 5, 5, 2]
+        assert [r.skill_id for r in out] == [s.skill_id for s in skills]
+
+    def test_a_cap_refusal_without_a_smaller_cap_is_not_retried(self, registry, sleeps):
+        registry.add_skill("team/a")
+        registry.fault("resolve", respond(422, {"detail": {
+            "code": "too_many_items", "message": "no", "max_items": 50}}))
+        with pytest.raises(UnavailableError) as excinfo:
+            make_client(registry, sleeps).resolve(["team/a"], purpose="install")
+        assert excinfo.value.details["registry_code"] == "too_many_items"
+        assert len(registry.calls("resolve")) == 1
+
+    @pytest.mark.parametrize("key,cap", [(None, 20), (OWNER_KEY, 100)])
+    def test_the_fake_enforces_the_caps(self, registry, key, cap):
+        path = ANON_RESOLVE if key is None else AUTH_RESOLVE
+        headers = {} if key is None else {"Authorization": f"Bearer {key}"}
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            over = http.post(path, headers=headers,
+                             json={"items": [{"ref": "x"}] * (cap + 1), "formats": [1]})
+            at = http.post(path, headers=headers,
+                           json={"items": [{"ref": "x"}] * cap, "formats": [1]})
+        assert over.status_code == 422
+        assert over.json()["detail"]["code"] == "too_many_items"
+        assert over.json()["detail"]["max_items"] == cap
+        assert at.status_code == 200
+
     def test_resolve_one_returns_the_item_or_raises_its_error(self, registry, sleeps):
         refund(registry)
         client = make_client(registry, sleeps)
@@ -285,7 +340,7 @@ class TestBundleRequests:
         assert (call.method, call.path) == ("GET", AUTH_BUNDLES + r.version_id)
         assert call.query == {
             "install_name": "acme-refund-policy", "render_hash": r.render.hash, "format": "1",
-            "variant": "foreign", "channel": "cli", "purpose": "add",
+            "variant": "foreign", "formats": "1", "channel": "cli", "purpose": "add",
         }
         assert call.headers["authorization"] == f"Bearer {OWNER_KEY}"
         assert call.json is None
@@ -296,8 +351,8 @@ class TestBundleRequests:
         make_client(registry, sleeps).fetch_bundle(
             skill.newest.version_id, install_name="acme-refund-policy", purpose="frozen")
         (call,) = registry.calls("bundle")
-        assert call.query == {"install_name": "acme-refund-policy", "channel": "cli",
-                              "purpose": "frozen"}
+        assert call.query == {"install_name": "acme-refund-policy", "formats": "1",
+                              "channel": "cli", "purpose": "frozen"}
 
     def test_the_anonymous_bundle_uses_the_registry_twin(self, registry, sleeps):
         skill = refund(registry)
@@ -329,8 +384,8 @@ class TestBundleRequests:
         (call,) = registry.calls("bundle")
         assert call.query == {
             "install_name": r.install_name, "render_hash": r.render.hash,
-            "format": str(r.render.format), "variant": "authored", "channel": "cli",
-            "purpose": "add",
+            "format": str(r.render.format), "variant": "authored", "formats": "1",
+            "channel": "cli", "purpose": "add",
         }
         assert bundle.file_hashes == r.file_hashes
         assert bundle.executable == ("scripts/compute_refund.py",)
@@ -342,7 +397,7 @@ class TestBundleRequests:
         (call,) = registry.calls("registry_bundle")
         assert call.path == REGISTRY_SKILLS + "acme-refund-policy/bundle"
         assert "authorization" not in call.headers
-        assert call.query == {"version": "1", "channel": "cli", "purpose": "pull"}
+        assert call.query == {"version": "1", "formats": "1", "channel": "cli", "purpose": "pull"}
         assert bundle.install_name == "acme-refund-policy"
         assert bundle.render.variant == "foreign"
 
@@ -460,8 +515,8 @@ class TestRefsAreUrlEncoded:
                 "../../admin?x=1", install_name="acme-refund-policy", purpose="frozen")
         (call,) = registry.calls()
         assert call.raw_path == AUTH_BUNDLES + "..%2F..%2Fadmin%3Fx%3D1"
-        assert call.query == {"install_name": "acme-refund-policy", "channel": "cli",
-                              "purpose": "frozen"}
+        assert call.query == {"install_name": "acme-refund-policy", "formats": "1",
+                              "channel": "cli", "purpose": "frozen"}
 
     def test_refs_in_a_resolve_body_travel_verbatim(self, registry, sleeps):
         registry.add_skill("weird#name")
@@ -1062,11 +1117,32 @@ class TestBundleRefusals:
                 purpose="frozen")
         assert excinfo.value.exit_code == 7
 
-    def test_an_install_name_the_skill_cannot_have_is_exit_7(self, registry, sleeps):
+    def test_any_valid_install_name_is_served(self, registry, sleeps):
+        # A locked folder keeps its name after an upstream rename; the name only sets the
+        # `name:` line of the client's own folder.
         skill = refund(registry)
+        bundle = make_client(registry, sleeps).fetch_bundle(
+            skill.newest.version_id, install_name="refunds-kept-name", purpose="frozen")
+        assert bundle.install_name == "refunds-kept-name"
+        fm, _ = skillfmt.parse_skill_md_text(bundle.skill_md.decode("utf-8"))
+        assert fm["name"] == "refunds-kept-name"
+
+    def test_the_registry_refuses_a_name_no_loader_accepts(self, registry):
+        skill = refund(registry)
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            resp = http.get(AUTH_BUNDLES + skill.newest.version_id,
+                            params={"install_name": "Not A Name"},
+                            headers={"Authorization": f"Bearer {OWNER_KEY}"})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "invalid_install_name"
+
+    def test_an_install_name_refusal_is_exit_7(self, registry, sleeps):
+        skill = refund(registry)
+        registry.fault("bundle", respond(422, {"detail": {
+            "code": "invalid_install_name", "message": "not an install name"}}))
         with pytest.raises(UnavailableError) as excinfo:
             make_client(registry, sleeps).fetch_bundle(
-                skill.newest.version_id, install_name="something-else", purpose="frozen")
+                skill.newest.version_id, install_name="acme-refund-policy", purpose="frozen")
         assert excinfo.value.exit_code == 7
         assert excinfo.value.details["registry_code"] == "invalid_install_name"
 
@@ -1074,6 +1150,180 @@ class TestBundleRefusals:
         refund(registry, band="blocked")
         with pytest.raises(LockedVersionRevokedError):
             make_client(registry, sleeps).fetch_registry_bundle("acme-refund-policy", purpose="pull")
+
+
+# ── format negotiation ───────────────────────────────────────────────────────────
+
+
+class TestFormatNegotiation:
+    """The client says which formats it reads; it never receives another one."""
+
+    def test_the_formats_this_client_reads_are_one_constant(self):
+        assert FORMATS == (1,)
+        assert set(FORMATS) == set(skillfmt.SUPPORTED_FORMATS)
+
+    def test_resolve_and_bundle_send_the_formats(self, registry, sleeps):
+        refund(registry)
+        client = make_client(registry, sleeps)
+        r = client.resolve_one("acme/refund-policy", purpose="add")
+        client.fetch_resolved(r, purpose="add")
+        assert registry.calls("resolve")[0].json["formats"] == [1]
+        assert registry.calls("bundle")[0].query["formats"] == "1"
+
+    def test_a_per_item_format_unsupported_names_the_upgrade(self, registry, sleeps):
+        refund(registry)
+        registry.fault("resolve", respond(200, {"items": [{"ref": "acme/refund-policy", "ok": False,
+            "error": {"code": "format_unsupported",
+                      "message": "this version renders in format 2 only"}}]}))
+        (err,) = make_client(registry, sleeps).resolve(["acme/refund-policy"], purpose="add")
+        assert isinstance(err, RenderInvalidError)
+        assert err.exit_code == ExitCode.UNAVAILABLE
+        assert err.details["registry_code"] == "format_unsupported"
+        assert err.details["formats"] == [1]
+        assert "pip install -U decimalai" in err.fix
+        assert "format 2 only" in err.message
+
+    def test_a_bundle_refused_for_its_format_names_the_upgrade(self, registry, sleeps):
+        skill = refund(registry)
+        registry.fault("bundle", respond(422, {"detail": {
+            "code": "format_unsupported", "message": "no format this client reads"}}))
+        with pytest.raises(RenderInvalidError) as excinfo:
+            make_client(registry, sleeps).fetch_bundle(
+                skill.newest.version_id, install_name="acme-refund-policy", purpose="frozen",
+                skill="acme/refund-policy")
+        assert excinfo.value.exit_code == ExitCode.UNAVAILABLE
+        assert excinfo.value.details["registry_code"] == "format_unsupported"
+        assert "pip install -U decimalai" in excinfo.value.fix
+
+    def test_no_shared_format_refuses_the_whole_resolve_as_exit_7(
+            self, registry, sleeps, monkeypatch):
+        refund(registry)
+        monkeypatch.setattr("decimalai.skillpkg.client.FORMATS", (7,))
+        with pytest.raises(RenderInvalidError) as excinfo:
+            make_client(registry, sleeps).resolve(["acme/refund-policy", "other"],
+                                                  purpose="add")
+        err = excinfo.value
+        assert err.exit_code == ExitCode.UNAVAILABLE == 7
+        assert err.details["registry_code"] == "format_unsupported"
+        assert err.details["supported"] == [1]
+        assert "pip install -U decimalai" in err.fix
+        assert registry.calls("resolve")[0].json["formats"] == [7]
+
+    def test_the_fake_answers_one_request_level_refusal_and_never_echoes(self, registry):
+        refund(registry)
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            resp = http.post(ANON_RESOLVE, json={"items": [{"ref": "acme/refund-policy"}],
+                                                 "formats": [7, 9]})
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "format_unsupported" and detail["supported"] == [1]
+        assert "7" not in json.dumps(resp.json()) and "9" not in detail["message"]
+
+    @pytest.mark.parametrize("route", ["resolve", "bundle"])
+    def test_more_than_8_formats_is_refused(self, registry, route):
+        skill = refund(registry)
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            if route == "resolve":
+                resp = http.post(ANON_RESOLVE, json={"items": [{"ref": "acme/refund-policy"}],
+                                                     "formats": [1] * 9})
+            else:
+                resp = http.get(ANON_BUNDLES + skill.newest.version_id,
+                                params={"install_name": "acme-refund-policy",
+                                        "formats": ["1"] * 9})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "too_many_formats"
+
+    @pytest.mark.parametrize("value", ["1x", "\u0661", "-1", "", " 1"])
+    def test_bundle_formats_must_be_ascii_digits(self, registry, value):
+        skill = refund(registry)
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            resp = http.get(ANON_BUNDLES + skill.newest.version_id,
+                            params={"install_name": "acme-refund-policy", "formats": [value]})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "invalid_formats"
+
+    @pytest.mark.parametrize("render_hash", ["not-a-hash", "A" * 64, "0" * 63])
+    def test_a_malformed_render_hash_is_render_gone(self, registry, sleeps, render_hash):
+        skill = refund(registry)
+        with pytest.raises(RenderGoneError) as excinfo:
+            make_client(registry, sleeps).fetch_bundle(
+                skill.newest.version_id, install_name="acme-refund-policy",
+                render_hash=render_hash, purpose="frozen")
+        assert excinfo.value.exit_code == 7
+        assert registry.calls("bundle")[0].query["render_hash"] == render_hash
+
+    def test_the_fake_bundle_route_refuses_formats_without_one_it_renders(self, registry):
+        skill = refund(registry)
+        with httpx.Client(base_url=BASE_URL, transport=registry.transport()) as http:
+            resp = http.get(AUTH_BUNDLES + skill.newest.version_id,
+                            params={"install_name": "acme-refund-policy", "formats": [7, 8]},
+                            headers={"Authorization": f"Bearer {OWNER_KEY}"})
+            ok = http.get(AUTH_BUNDLES + skill.newest.version_id,
+                          params={"install_name": "acme-refund-policy", "formats": [7, 1]},
+                          headers={"Authorization": f"Bearer {OWNER_KEY}"})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "format_unsupported"
+        assert ok.status_code == 200 and ok.json()["render"]["format"] == 1
+
+
+class TestBadRef:
+    """A reference the registry cannot even read is the caller's mistake: exit 2."""
+
+    @pytest.mark.parametrize("bad,why", [
+        ("bad\x00ref", "control character at position 4"),
+        ("tab\tref", "control character at position 4"),
+        ("lone\udc80surrogate", "unpaired surrogate at position 5"),
+        ("x" * 513, "513 characters"),
+    ])
+    def test_a_bad_ref_is_a_usage_error_naming_its_position(self, registry, sleeps, bad, why):
+        refund(registry)
+        out = make_client(registry, sleeps).resolve(["acme/refund-policy", bad],
+                                                    purpose="add")
+        assert isinstance(out[0], Resolved)
+        err = out[1]
+        assert isinstance(err, UsageError)
+        assert err.exit_code == ExitCode.USAGE == 2
+        assert err.details["registry_code"] == "bad_ref"
+        assert "reference #2" in err.fix and why in err.fix
+        assert str(err).isprintable(), "the message never prints the raw characters"
+        assert registry.calls("resolve")[0].json["items"][1]["ref"] == bad
+
+    def test_a_lone_surrogate_reaches_the_registry_instead_of_crashing(self, registry, sleeps):
+        (err,) = make_client(registry, sleeps).resolve(["a\udc80b"], purpose="add")
+        assert isinstance(err, UsageError)
+        (call,) = registry.calls("resolve")
+        assert call.json["items"][0]["ref"] == "a\udc80b"
+
+    def test_resolve_one_raises_it(self, registry, sleeps):
+        with pytest.raises(UsageError) as excinfo:
+            make_client(registry, sleeps).resolve_one("bad\x01", purpose="add")
+        assert "reference #1" in excinfo.value.fix
+
+    def test_the_position_counts_across_batches(self, registry, sleeps):
+        refs = [f"team/skill-{i}" for i in range(22)] + ["bad\x00"]
+        for ref in refs[:-1]:
+            registry.add_skill(ref)
+        out = make_client(registry, sleeps, key=None).resolve(refs, purpose="install")
+        assert "reference #23" in out[-1].fix
+
+
+class TestOrgId:
+    def test_the_resolve_answer_names_the_callers_organization(self, registry, sleeps):
+        refund(registry)
+        r = make_client(registry, sleeps).resolve_one("acme/refund-policy", purpose="add")
+        assert r.org_id == OWNER_ORG
+
+    def test_anonymous_has_no_organization(self, registry, sleeps):
+        refund(registry)
+        r = make_client(registry, sleeps, key=None).resolve_one("acme/refund-policy",
+                                                                purpose="add")
+        assert r.org_id is None
+
+    def test_an_answer_without_one_is_none(self, registry, sleeps):
+        refund(registry)
+        registry.tamper_resolve = lambda data: data["items"][0].pop("org_id")
+        r = make_client(registry, sleeps).resolve_one("acme/refund-policy", purpose="add")
+        assert r.org_id is None
 
 
 # ── construction ─────────────────────────────────────────────────────────────────

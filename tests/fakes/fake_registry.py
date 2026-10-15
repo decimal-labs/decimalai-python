@@ -47,6 +47,24 @@ Simplifications, each one deliberate:
 - Ref resolution follows the documented order: a UUID is a skill id, then an exact
   url_slug, then a name (owned, then a Use target, then public; two public skills with the
   name are ``ambiguous``), then an install name.
+
+Rules of the platform's contract it holds to:
+
+- **Caps.** Resolve takes at most 100 items with an API key and 20 anonymously; more is
+  one 422 ``too_many_items`` with ``max_items``. ``formats`` takes at most 8 entries
+  (422 ``too_many_formats``).
+- **Formats are negotiated.** Resolve (a ``formats`` list in the body) and bundle (a
+  repeated ``formats`` query parameter, ASCII digits only, else 422 ``invalid_formats``)
+  name the formats the client reads, ``[1]`` when left out. The answer is in the highest
+  of them that ``skillfmt`` renders; with none, the whole request is one 422
+  ``format_unsupported`` with ``supported`` (the client's list is never echoed).
+- **References it cannot read** (a control character, an unpaired surrogate, more than
+  512 characters) are refused per item with ``bad_ref``. A ``render_hash`` that is not
+  64 lowercase hex names no rendering: 409 ``render_gone``.
+- **Any valid install name is served.** The bundle route renders under whatever install
+  name passes ``skillfmt``'s name rule, not only the skill's two current forms: a locked
+  folder keeps its name after the skill is renamed. Resolve still chooses names from the
+  current forms and ``taken``.
 """
 from __future__ import annotations
 
@@ -58,6 +76,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass, field
@@ -76,6 +95,9 @@ OTHER_ORG = "org-other"
 OTHER_KEY = "dai_sk_other"
 
 MAX_RESOLVE_ITEMS = 100
+MAX_ANONYMOUS_RESOLVE_ITEMS = 20
+MAX_FORMATS = 8
+MAX_REF_LENGTH = 512
 
 AUTH_RESOLVE = "/api/v1/install/resolve"
 AUTH_BUNDLES = "/api/v1/install/bundles/"
@@ -447,6 +469,8 @@ class FakeRegistry:
 
         method = request.method.upper()
         query = self.requests[-1].query
+        formats = urllib.parse.parse_qs(request.url.query.decode("ascii"),
+                                        keep_blank_values=True).get("formats")
         if path in (AUTH_RESOLVE, ANON_RESOLVE):
             if method != "POST":
                 return _framework(405, accepted=["POST"])
@@ -455,7 +479,7 @@ class FakeRegistry:
                 org = self._org(request)
                 if org is None:
                     return _unauthorized()
-            return self._resolve(body, org)
+            return self._resolve(body, org, anonymous=path == ANON_RESOLVE)
         if path.startswith(AUTH_BUNDLES) or path.startswith(ANON_BUNDLES):
             if method != "GET":
                 return _framework(405, accepted=["GET"])
@@ -466,12 +490,13 @@ class FakeRegistry:
                 if org is None:
                     return _unauthorized()
             version_id = path[len(AUTH_BUNDLES if authenticated else ANON_BUNDLES):]
-            return self._bundle(version_id, query, org, anonymous=not authenticated)
+            return self._bundle(version_id, query, org, anonymous=not authenticated,
+                                formats=formats)
         match = _REGISTRY_BUNDLE_RE.match(path)
         if match:
             if method != "GET":
                 return _framework(405, accepted=["GET"])
-            return self._registry_bundle(match.group("ref"), query)
+            return self._registry_bundle(match.group("ref"), query, formats=formats)
         match = _BODY_RE.match(path)
         if match and method == "GET":
             return self._body(match.group("name"))
@@ -561,27 +586,42 @@ class FakeRegistry:
 
     # ── resolve ───────────────────────────────────────────────────────
 
-    def _resolve(self, body: Any, org: Optional[str]) -> httpx.Response:
+    def _resolve(self, body: Any, org: Optional[str], *, anonymous: bool = False) -> httpx.Response:
         if not isinstance(body, dict) or not isinstance(body.get("items"), list):
             return _validation_error("items", "a list of items is required")
         items = body["items"]
-        if len(items) > MAX_RESOLVE_ITEMS:
+        cap = MAX_ANONYMOUS_RESOLVE_ITEMS if anonymous else MAX_RESOLVE_ITEMS
+        if len(items) > cap:
             return _refusal(422, "too_many_items",
-                            f"at most {MAX_RESOLVE_ITEMS} items per request, got {len(items)}")
+                            f"at most {cap} items per request, got {len(items)}", max_items=cap)
         taken = body.get("taken") or {}
         if not isinstance(taken, dict):
             return _validation_error("taken", "a map of install name to skill id or null")
         taken = dict(taken)
-        data = {"items": [self._resolve_item(item, org, taken) for item in items]}
+        formats = body.get("formats", [skillfmt.FORMAT])
+        if (not isinstance(formats, list)
+                or any(not isinstance(f, int) or isinstance(f, bool) for f in formats)):
+            return _validation_error("formats", "a list of format numbers")
+        fmt = _choose_format(formats)
+        if isinstance(fmt, httpx.Response):
+            return fmt
+        data = {"items": [self._resolve_item(item, org, taken, fmt) for item in items]}
         if self.tamper_resolve is not None:
             self.tamper_resolve(data)
         return _json(200, data, cache="private, no-store" if org else None)
 
-    def _resolve_item(self, item: Any, org: Optional[str], taken: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    def _resolve_item(self, item: Any, org: Optional[str], taken: Dict[str, Optional[str]],
+                      fmt: int = skillfmt.FORMAT) -> Dict[str, Any]:
         if not isinstance(item, dict):
             return {"ok": False, "error": {"code": "not_found", "message": "an item must be an object"}}
         ref, skill_id = item.get("ref"), item.get("skill_id")
         label = ref if ref is not None else skill_id
+        if isinstance(ref, str) and _unreadable_ref(ref):
+            # Never echoed: it may not print, or not even encode.
+            return {"ok": False, "error": {
+                "code": "bad_ref",
+                "message": f"the reference holds a control character or an unpaired surrogate, "
+                           f"or is longer than {MAX_REF_LENGTH} characters"}}
         try:
             skill = self._find(ref, skill_id, org)
             refusal = self._refusal_for(skill, None)
@@ -596,7 +636,7 @@ class FakeRegistry:
             render_hash, fields = self.snapshot(skill, version)
             try:
                 bundle = skillfmt.render_bundle(fields, version.files, install_name=install_name,
-                                                variant=variant)
+                                                variant=variant, format=fmt)
             except skillfmt.RenderError as exc:
                 raise _ItemError(exc.code, str(exc))
         except _ItemError as exc:
@@ -617,11 +657,12 @@ class FakeRegistry:
             "version_id": version.version_id,
             "version": version.number,
             "latest": {"version_id": pointer.version_id, "version": pointer.number},
-            "render": {"format": skillfmt.FORMAT, "hash": render_hash, "variant": variant},
+            "render": {"format": fmt, "hash": render_hash, "variant": variant},
             "body_sha256": bundle.body_sha256,
             "description_sha256": bundle.description_sha256,
             "invocation": bundle.invocation,
             "relationship": self._relationship(skill, org),
+            "org_id": org,
             "files": [{"path": f.path, "sha256": f.sha256, "mode": f.mode} for f in bundle.files],
             "unavailable": [{"path": u.path, "reason": u.reason} for u in bundle.unavailable],
             "policy_notes": notes + list(bundle.policy_notes),
@@ -711,6 +752,7 @@ class FakeRegistry:
 
     def _bundle(
         self, version_id: str, query: Mapping[str, str], org: Optional[str], *, anonymous: bool,
+        formats: Optional[Sequence[str]] = None,
     ) -> httpx.Response:
         found = self._by_version_id(version_id)
         if found is None:
@@ -725,15 +767,13 @@ class FakeRegistry:
         install_name = query.get("install_name")
         if not install_name:
             return _validation_error("install_name", "field required")
-        if install_name not in skillfmt.install_name_forms(skill.name, skill.skill_id):
+        if not skillfmt.is_valid_install_name(install_name):
             return _refusal(422, "invalid_install_name",
-                            f"{install_name} is not an install name of {skill.name}")
-        try:
-            fmt = int(query.get("format") or skillfmt.FORMAT)
-        except ValueError:
-            return _validation_error("format", "an integer is required")
-        if fmt not in skillfmt.SUPPORTED_FORMATS:
-            return _refusal(422, "unsupported_format", f"format {fmt} is not supported")
+                            f"{install_name!r} is not an install name: lowercase letters, "
+                            "digits and single hyphens, at most 64 characters")
+        fmt = _bundle_format(query.get("format"), formats)
+        if isinstance(fmt, httpx.Response):
+            return fmt
         natural = self._variant(skill, org)
         variant = query.get("variant") or natural
         if variant not in skillfmt.VARIANTS:
@@ -742,7 +782,9 @@ class FakeRegistry:
             return _refusal(403, "not_author", "the authored variant is served only to its authors")
         render_hash = query.get("render_hash")
         if render_hash:
-            fields = self._renders.get(version.version_id, {}).get(render_hash)
+            fields = None
+            if re.fullmatch(r"[0-9a-f]{64}", render_hash):   # anything else names no rendering
+                fields = self._renders.get(version.version_id, {}).get(render_hash)
             if fields is None:
                 return _refusal(409, "render_gone", f"render {render_hash[:12]} no longer exists")
         else:
@@ -758,7 +800,8 @@ class FakeRegistry:
         self.fetches.append(Fetch(skill.skill_id, org or "", query.get("channel"), query.get("purpose")))
         return _json(200, data, cache="public, max-age=300" if anonymous else "private, no-store")
 
-    def _registry_bundle(self, ref: str, query: Mapping[str, str]) -> httpx.Response:
+    def _registry_bundle(self, ref: str, query: Mapping[str, str], *,
+                         formats: Optional[Sequence[str]] = None) -> httpx.Response:
         public = [s for s in self.skills if s.public]
         skill = next((s for s in public if s.skill_id == ref), None) \
             or next((s for s in public if s.url_slug == ref), None) \
@@ -774,10 +817,13 @@ class FakeRegistry:
         if refusal:
             return _refusal(410, "revoked", f"version {version.number} of {skill.name} is {refusal}",
                             reason=refusal)
+        fmt = _bundle_format(None, formats)
+        if isinstance(fmt, httpx.Response):
+            return fmt
         render_hash, fields = self.snapshot(skill, version)
         bundle = skillfmt.render_bundle(fields, version.files,
                                         install_name=skillfmt.install_name_for(skill.name, skill.skill_id),
-                                        variant="foreign")
+                                        variant="foreign", format=fmt)
         data = bundle.to_dict()
         if self.tamper is not None:
             self.tamper(data)
@@ -795,6 +841,62 @@ class FakeRegistry:
 
 
 # ── responses, shaped like the platform's ────────────────────────────────────────────
+
+
+def _supported() -> str:
+    return ", ".join(str(f) for f in sorted(skillfmt.SUPPORTED_FORMATS))
+
+
+def _unreadable_ref(ref: str) -> bool:
+    """A reference the registry cannot read: a control character (C0, DEL, C1), an
+    unpaired surrogate, or more than ``MAX_REF_LENGTH`` characters."""
+    return (len(ref) > MAX_REF_LENGTH
+            or any(unicodedata.category(c) in ("Cc", "Cs") for c in ref))
+
+
+def _format_unsupported() -> httpx.Response:
+    """None of the requested formats is rendered: one refusal for the whole request."""
+    supported = sorted(skillfmt.SUPPORTED_FORMATS)
+    return _refusal(422, "format_unsupported",
+                    f"none of the requested formats is rendered here; this registry renders "
+                    f"format(s) {_supported()}", supported=supported)
+
+
+def _too_many_formats(count: int) -> Optional[httpx.Response]:
+    if count <= MAX_FORMATS:
+        return None
+    return _refusal(422, "too_many_formats",
+                    f"at most {MAX_FORMATS} formats per request, got {count}",
+                    max_formats=MAX_FORMATS)
+
+
+def _choose_format(formats: Sequence[int]) -> Union[int, httpx.Response]:
+    """The highest requested format this registry renders, or the refusal."""
+    too_many = _too_many_formats(len(formats))
+    if too_many is not None:
+        return too_many
+    common = set(formats) & set(skillfmt.SUPPORTED_FORMATS)
+    return max(common) if common else _format_unsupported()
+
+
+def _bundle_format(exact: Optional[str], formats: Optional[Sequence[str]]) -> Any:
+    """The format a bundle is rendered in, or the refusal (an ``httpx.Response``)."""
+    values = list(formats) if formats is not None else [str(skillfmt.FORMAT)]
+    too_many = _too_many_formats(len(values))
+    if too_many is not None:
+        return too_many
+    if any(not (v.isascii() and v.isdigit()) for v in values):
+        return _refusal(422, "invalid_formats", "formats takes format numbers, ASCII digits only")
+    chosen = _choose_format([int(v) for v in values])
+    if exact is None or isinstance(chosen, httpx.Response):
+        return chosen
+    if not (exact.isascii() and exact.isdigit()):
+        return _validation_error("format", "an integer is required")
+    fmt = int(exact)
+    allowed = {int(v) for v in values} if formats is not None else {fmt}
+    if fmt not in skillfmt.SUPPORTED_FORMATS or fmt not in allowed:
+        return _format_unsupported()
+    return fmt
 
 
 def _route_of(path: str) -> str:
@@ -854,7 +956,8 @@ def _unauthorized() -> httpx.Response:
 
 __all__ = [
     "ANON_BUNDLES", "ANON_RESOLVE", "APP_URL", "AUTH_BUNDLES", "AUTH_RESOLVE", "BASE_URL",
-    "FakeRegistry", "FakeRequest", "FakeSkill", "FakeVersion", "Fetch", "MAX_RESOLVE_ITEMS",
+    "FakeRegistry", "FakeRequest", "FakeSkill", "FakeVersion", "Fetch", "MAX_ANONYMOUS_RESOLVE_ITEMS",
+    "MAX_FORMATS", "MAX_REF_LENGTH", "MAX_RESOLVE_ITEMS",
     "OTHER_KEY", "OTHER_ORG", "OWNER_KEY", "OWNER_ORG", "ROUTES", "fake_id",
 ]
 

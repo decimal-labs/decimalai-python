@@ -53,6 +53,7 @@ from skillevaluation import skillfmt
 from .errors import (
     ForeignLockEntriesError,
     LegacyLockError,
+    LocalChangesError,
     LockHashMismatch,
     SkillsLockError,
     SkillsNotInstalledError,
@@ -64,6 +65,7 @@ __all__ = [
     "LOCK_VERSION",
     "Lock",
     "check_entry",
+    "check_plugin_json",
     "check_version",
     "commit_entry",
     "dumps",
@@ -74,6 +76,7 @@ __all__ = [
     "loads",
     "make_entry",
     "plugin_json_bytes",
+    "plugin_json_is_ours",
     "save",
     "write_plugin_json",
 ]
@@ -94,6 +97,8 @@ _SOURCE = ".decimal/skills.lock"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 _PLUGIN_DESCRIPTION = "Skills installed by `decimalai skills`. Managed: edit through the CLI."
+#: The keys of the ``plugin.json`` this engine writes, in order.
+_PLUGIN_KEYS = ("name", "version", "description", "author")
 
 
 # ── the Lock value ───────────────────────────────────────────────────────────
@@ -560,8 +565,53 @@ def plugin_json_bytes(lock_hash: str) -> bytes:
     return (json.dumps(data, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def write_plugin_json(project: Project, lock_hash: str) -> bool:
-    """Write ``plugin.json`` if it does not already match ``lock_hash``. Returns whether it wrote."""
+def plugin_json_is_ours(project: Project) -> bool:
+    """Whether ``.agents/.claude-plugin/plugin.json`` is absent or one this engine writes.
+
+    This engine's is a JSON object named ``decimalai-skills`` with no key but ``name``,
+    ``version``, ``description`` and ``author``. Anything else (another plugin's
+    manifest, extra keys such as ``hooks``, text that is not JSON) is the user's.
+    """
+    path = project.plugin_json_path
+    project.refuse_symlinks(path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return True
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (isinstance(data, dict) and data.get("name") == PLUGIN_NAME
+            and set(data) <= set(_PLUGIN_KEYS))
+
+
+def check_plugin_json(project: Project) -> None:
+    """Refuse a ``plugin.json`` this engine did not write (see :func:`plugin_json_is_ours`).
+
+    Raises:
+        LocalChangesError: it is the user's; ``--force`` backs it up, then replaces it.
+    """
+    if plugin_json_is_ours(project):
+        return
+    rel = project.rel(project.plugin_json_path)
+    raise LocalChangesError(
+        f"`{rel}` is not the one this engine writes: `.agents` is loaded as the "
+        f"`{PLUGIN_NAME}` plugin, and its plugin.json belongs to the engine",
+        path=rel,
+        fix=(f"move your plugin.json out of `{project.rel(project.plugin_json_path.parent)}`, "
+             "or re-run with `--force` to replace it (a copy is kept in `.decimal/backup/`)"))
+
+
+def write_plugin_json(project: Project, lock_hash: str, *, replace_foreign: bool = False) -> bool:
+    """Write ``plugin.json`` if it does not already match ``lock_hash``. Returns whether it wrote.
+
+    An existing file this engine wrote is replaced. One it did not write is refused unless
+    ``replace_foreign`` (the caller has backed it up).
+
+    Raises:
+        LocalChangesError: the file is the user's, and ``replace_foreign`` is false.
+    """
     data = plugin_json_bytes(lock_hash)
     path = project.plugin_json_path
     project.refuse_symlinks(path)
@@ -570,5 +620,8 @@ def write_plugin_json(project: Project, lock_hash: str) -> bool:
             return False
     except FileNotFoundError:
         pass
+    else:
+        if not replace_foreign:
+            check_plugin_json(project)
     project.write_file(path, data)
     return True

@@ -507,6 +507,43 @@ class TestPluginJson:
         assert project.plugin_json_path.stat().st_mtime_ns == before.st_mtime_ns
         assert L.write_plugin_json(project, L.empty().lock_hash) is True
 
+    @pytest.mark.parametrize("content", [
+        b'{"name": "my-tools", "version": "1.0.0"}\n',                       # another plugin
+        b'{"name": "decimalai-skills", "version": "x", "hooks": {}}\n',      # a key it never writes
+        b"not json at all\n",
+        b"[1, 2]\n",
+    ])
+    def test_a_plugin_json_it_did_not_write_is_refused(self, tmp_path, content):
+        project = P.Project.at(tmp_path)
+        project.plugin_json_path.parent.mkdir(parents=True)
+        project.plugin_json_path.write_bytes(content)
+        assert L.plugin_json_is_ours(project) is False
+        with pytest.raises(E.LocalChangesError) as excinfo:
+            L.write_plugin_json(project, L.empty().lock_hash)
+        assert excinfo.value.exit_code == E.ExitCode.LOCAL_CHANGES
+        assert "--force" in excinfo.value.fix
+        assert project.plugin_json_path.read_bytes() == content
+
+    def test_replace_foreign_replaces_it(self, tmp_path):
+        project = P.Project.at(tmp_path)
+        project.plugin_json_path.parent.mkdir(parents=True)
+        project.plugin_json_path.write_bytes(b'{"name": "my-tools"}\n')
+        assert L.write_plugin_json(project, L.empty().lock_hash, replace_foreign=True) is True
+        assert project.plugin_json_path.read_bytes() == L.plugin_json_bytes(L.empty().lock_hash)
+
+    @pytest.mark.parametrize("content", [
+        None,                                                               # absent
+        b'{"name": "decimalai-skills", "version": "lock-000000000000"}\n',  # an older lock
+        b'{"name":"decimalai-skills","version":"lock-1","description":"d","author":{"name":"x"}}',
+    ])
+    def test_an_absent_or_engine_written_file_is_ours(self, tmp_path, content):
+        project = P.Project.at(tmp_path)
+        if content is not None:
+            project.plugin_json_path.parent.mkdir(parents=True)
+            project.plugin_json_path.write_bytes(content)
+        assert L.plugin_json_is_ours(project) is True
+        assert L.write_plugin_json(project, L.empty().lock_hash) is True
+
     @pytest.mark.skipif(os.name != "posix", reason="symlinks")
     def test_refuses_a_symlinked_agents_dir(self, tmp_path):
         project = P.Project.at(tmp_path / "p")

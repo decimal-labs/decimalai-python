@@ -32,6 +32,12 @@ What every call holds to:
   declares next to it and, when the caller passes them, the hashes and exec bits it
   expects (the lock's, for ``install --frozen``). Every path must be safe to write. A
   bundle that fails any check raises before the caller writes anything.
+- **Formats are negotiated.** Every resolve and bundle request sends ``formats``, the
+  folder formats this client reads (:data:`FORMATS`). The registry answers in the
+  highest of them it renders, or refuses the item with ``format_unsupported``, which
+  this client reports as :class:`~decimalai.skillpkg.errors.RenderInvalidError` (exit 7)
+  with the upgrade command as its fix. An answer in any other format is a contract
+  failure (exit 6): the registry never sends a format it was not asked for.
 
 A reference that travels in a URL path is percent-encoded, with ``/`` kept literal for
 namespaced registry names, as the delivery routes have always sent them. References in a
@@ -44,10 +50,12 @@ to a cold registry instance can take most of the budget and leaves it warm.
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import math
 import os
 import re
 import time
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import (
@@ -76,6 +84,7 @@ from .errors import (
     NetworkError,
     RegistryTooOldError,
     RenderGoneError,
+    RenderInvalidError,
     SkillpkgError,
     UnavailableError,
     UsageError,
@@ -85,6 +94,8 @@ __all__ = [
     "CHANNELS",
     "DEFAULT_BASE_URL",
     "DEFAULT_TIMEOUT",
+    "FORMATS",
+    "MAX_ANONYMOUS_RESOLVE_ITEMS",
     "MAX_RESOLVE_ITEMS",
     "PURPOSES",
     "Bundle",
@@ -105,8 +116,17 @@ DEFAULT_BASE_URL = "https://api.decimal.ai"
 #: registry instance that is still starting can take most of it.
 DEFAULT_TIMEOUT = 30.0
 
-#: Items per ``resolve`` request; a longer list is sent in batches.
+#: Items per authenticated ``resolve`` request; a longer list is sent in batches.
 MAX_RESOLVE_ITEMS = 100
+#: Items per anonymous ``resolve`` request: the public rail has the tighter cap.
+MAX_ANONYMOUS_RESOLVE_ITEMS = 20
+#: The longest reference the registry reads, in characters.
+MAX_REF_LENGTH = 512
+
+#: The folder formats this client reads, sent as ``formats`` with every resolve and bundle
+#: request. A format is listed here once this SDK has been built and tested to read it,
+#: not merely because ``skillfmt`` can render it; every entry is one ``skillfmt`` supports.
+FORMATS: Tuple[int, ...] = (1,)
 
 #: Who is fetching, as the registry's disk-fetch counter records it.
 CHANNELS = ("sdk", "cli", "plugin", "npx", "web", "raw", "mcp")
@@ -134,6 +154,9 @@ _MODE_RE = re.compile(r"^0?[0-7]{3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGITS_RE = re.compile(r"^[0-9]+$")
 _UPGRADE_FIX = "run `pip install -U decimalai`, then retry"
+_FORMAT_UNSUPPORTED = "format_unsupported"
+_BAD_REF = "bad_ref"
+_TOO_MANY_ITEMS = "too_many_items"
 
 
 # ── What a caller asks for ───────────────────────────────────────────────────────
@@ -263,6 +286,9 @@ class Resolved:
     latest: Optional[VersionRef] = None
     invocation: str = "model"
     relationship: Optional[str] = None   # owned, used or public
+    #: The caller's organization, as the registry identified it; None when anonymous, or
+    #: from a registry that does not say.
+    org_id: Optional[str] = None
     unavailable: Tuple[Unavailable, ...] = ()
     policy_notes: Tuple[str, ...] = ()
     safety: Safety = Safety("unreviewed", False)
@@ -420,18 +446,24 @@ class RegistryClient:
         *,
         taken: Optional[Mapping[str, Optional[str]]] = None,
         purpose: str,
-    ) -> List[Union[Resolved, UnavailableError]]:
+    ) -> List[Union[Resolved, SkillpkgError]]:
         """Resolve each item; one result per item, in order.
 
-        A result is a :class:`Resolved`, or the item's refusal as a typed
+        A result is a :class:`Resolved`, or the item's refusal, returned, not raised: one
+        refused item never hides the others. A refusal is a typed
         :class:`~decimalai.skillpkg.errors.UnavailableError` (``SkillNotFoundError``,
-        ``AmbiguousRefError``, ``SkillWithheldError``, ...), returned, not raised: one
-        refused item never hides the others.
+        ``AmbiguousRefError``, ``SkillWithheldError``, ...; exit 7), or a
+        :class:`~decimalai.skillpkg.errors.UsageError` (exit 2) for a reference the
+        registry cannot read at all (``bad_ref``: a control character, an unpaired
+        surrogate, more than :data:`MAX_REF_LENGTH` characters), which names the
+        reference by its position in ``items``.
 
         ``taken`` maps each install name this project already uses to its skill id, or to
         ``None`` for a folder the engine does not manage; the registry picks names around
-        them. More than :data:`MAX_RESOLVE_ITEMS` items are sent in batches, and each
-        batch's chosen names are added to ``taken`` for the next.
+        them. Items are sent in batches of :data:`MAX_RESOLVE_ITEMS`
+        (:data:`MAX_ANONYMOUS_RESOLVE_ITEMS` without a key), or of the smaller cap a
+        registry names when it refuses a batch as ``too_many_items``; each batch's chosen
+        names are added to ``taken`` for the next.
 
         Raises:
             UsageError: a malformed item, ``taken`` or ``purpose``.
@@ -444,13 +476,19 @@ class RegistryClient:
         requests = [_as_request(item) for item in items]
         names = _check_taken(taken)
         path = _ANON_RESOLVE if self.anonymous else _RESOLVE
-        out: List[Union[Resolved, UnavailableError]] = []
-        for start in range(0, len(requests), MAX_RESOLVE_ITEMS):
-            batch = requests[start:start + MAX_RESOLVE_ITEMS]
+        out: List[Union[Resolved, SkillpkgError]] = []
+        size = MAX_ANONYMOUS_RESOLVE_ITEMS if self.anonymous else MAX_RESOLVE_ITEMS
+        start = 0
+        while start < len(requests):
+            batch = requests[start:start + size]
             body = {"items": [r.to_json() for r in batch], "taken": dict(names),
-                    "channel": self.channel, "purpose": purpose}
+                    "channel": self.channel, "purpose": purpose, "formats": list(FORMATS)}
             skill = batch[0].label if len(batch) == 1 else None
             resp = self._send("POST", path, json=body, skill=skill)
+            smaller = _smaller_cap(resp, len(batch))
+            if smaller is not None:
+                size = smaller   # strictly smaller each time, so this ends
+                continue
             if resp.status_code != 200:
                 self._refuse(resp, "POST", path, skill=skill, route_is_resolve=True)
             answers = _json_object(resp, "resolve", skill).get("items")
@@ -459,11 +497,12 @@ class RegistryClient:
                     f"the registry answered {len(batch)} resolve item(s) with "
                     f"{len(answers) if isinstance(answers, list) else 'no'} result(s)",
                     skill=skill, fix=_UPGRADE_FIX)
-            for request, answer in zip(batch, answers):
-                result = _item_result(request, answer)
+            for offset, (request, answer) in enumerate(zip(batch, answers)):
+                result = _item_result(request, answer, position=start + offset + 1)
                 out.append(result)
                 if isinstance(result, Resolved):
                     names[result.install_name] = result.skill_id
+            start += len(batch)
         return out
 
     def resolve_one(
@@ -539,7 +578,7 @@ class RegistryClient:
         for key, value in (("render_hash", render_hash), ("format", format), ("variant", variant)):
             if value is not None:
                 params[key] = value
-        params.update(channel=self.channel, purpose=purpose)
+        params.update(formats=list(FORMATS), channel=self.channel, purpose=purpose)
         path = (_ANON_BUNDLES if self.anonymous else _BUNDLES) + _segment(version_id)
         resp = self._send("GET", path, params=params, skill=name)
         if resp.status_code != 200:
@@ -581,7 +620,7 @@ class RegistryClient:
         params: Dict[str, Any] = {}
         if version is not None and version != "latest":
             params["version"] = _version_spec(version)
-        params.update(channel=self.channel, purpose=purpose)
+        params.update(formats=list(FORMATS), channel=self.channel, purpose=purpose)
         path = f"{_REGISTRY_SKILLS}{_path_text(ref)}/bundle"
         resp = self._send("GET", path, params=params, skill=ref, anonymous=True)
         if resp.status_code != 200:
@@ -610,12 +649,19 @@ class RegistryClient:
     ) -> httpx.Response:
         """One request, retried past admission aborts and one timeout; any answer returns."""
         headers = self._headers(self.anonymous if anonymous is None else anonymous)
+        content: Optional[bytes] = None
+        if json is not None:
+            # ASCII-escaped: a reference holding an unpaired surrogate still travels, and
+            # the registry answers it with `bad_ref` instead of the encoder failing here.
+            content = _json.dumps(json, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+            headers["Content-Type"] = "application/json"
         timeouts_left = _TIMEOUT_RETRIES
         retries = 0
         waited = 0.0
         while True:
             try:
-                resp = self._http.request(method, path, params=params, json=json, headers=headers)
+                resp = self._http.request(method, path, params=params, content=content,
+                                          headers=headers)
             except httpx.TimeoutException as exc:
                 if timeouts_left > 0:
                     timeouts_left -= 1
@@ -657,6 +703,8 @@ class RegistryClient:
             ("status", status), ("route", f"{method} {path}"), ("registry_code", ref.code),
             ("request_id", ref.request_id),
         ) if v is not None}
+        for key, value in ref.extra.items():   # e.g. `supported`, `max_items`
+            details.setdefault(key, value)
         said = f": {ref.message}" if ref.message else ""
 
         # The resolve route never refuses a whole batch with a 404, so any 404 there means
@@ -667,6 +715,8 @@ class RegistryClient:
                 f"the registry at {self.base_url} has no install routes (HTTP {status} on "
                 f"{method} {path}); this decimalai needs a newer registry",
                 skill=skill, details=details)
+        if ref.code == _FORMAT_UNSUPPORTED:
+            raise _format_unsupported(ref.message, skill=skill, details=details)
         if status == 401:
             raise AccessDeniedError(f"the registry rejected the API key (HTTP 401){said}",
                                     skill=skill, details=details)
@@ -717,6 +767,8 @@ class _Refusal:
     reason: Optional[str]
     request_id: Optional[str]
     framework: bool   # the framework's own "no such route"
+    #: The other fields of a structured ``detail`` (``supported``, ``max_items``, ...).
+    extra: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def of(cls, resp: httpx.Response) -> "_Refusal":
@@ -729,10 +781,13 @@ class _Refusal:
             return cls(None, None, None, resp.headers.get("X-Request-ID"), True)
         detail = body.get("detail")
         code = message = reason = None
+        extra: Dict[str, Any] = {}
         if isinstance(detail, dict):
             code = _text(detail.get("code")) or _text(detail.get("error"))
             message = _text(detail.get("message")) or _text(detail.get("detail"))
             reason = _text(detail.get("reason"))
+            extra = {k: v for k, v in detail.items()
+                     if k not in ("code", "error", "message", "detail", "reason")}
         elif isinstance(detail, str):
             message = detail
         top = _text(body.get("code"))
@@ -743,7 +798,7 @@ class _Refusal:
         framework = (code is None and reason is None
                      and (detail is None or (isinstance(detail, str) and detail in _FRAMEWORK_DETAILS)))
         request_id = _text(body.get("request_id")) or resp.headers.get("X-Request-ID")
-        return cls(code, message, reason, request_id, framework)
+        return cls(code, message, reason, request_id, framework, extra)
 
 
 def _text(value: Any) -> Optional[str]:
@@ -761,7 +816,8 @@ def _json_object(resp: httpx.Response, what: str, skill: Optional[str]) -> Dict[
     return data
 
 
-def _item_result(request: ResolveRequest, answer: Any) -> Union[Resolved, UnavailableError]:
+def _item_result(request: ResolveRequest, answer: Any, *,
+                 position: int = 1) -> Union[Resolved, SkillpkgError]:
     skill = request.label
     if isinstance(answer, dict) and answer.get("ok") is True:
         return _parse_resolved(request, answer)
@@ -770,6 +826,10 @@ def _item_result(request: ResolveRequest, answer: Any) -> Union[Resolved, Unavai
             and _text(error.get("code"))):
         code = error["code"]
         extra = {k: v for k, v in error.items() if k not in ("code", "message")}
+        if code == _FORMAT_UNSUPPORTED:
+            return _format_unsupported(_text(error.get("message")), skill=skill, details=extra)
+        if code == _BAD_REF:
+            return _bad_ref(request, position, _text(error.get("message")), extra)
         return UnavailableError.for_code(
             code, _text(error.get("message")) or f"the registry refused it ({code})",
             skill=skill, details=extra or None)
@@ -877,6 +937,7 @@ def _parse_resolved(request: ResolveRequest, data: Mapping[str, Any]) -> Resolve
         latest=latest,
         invocation=_text(data.get("invocation")) or "model",
         relationship=_text(data.get("relationship")),
+        org_id=_text(data.get("org_id")),
         unavailable=f.unavailable(),
         policy_notes=f.notes(),
         safety=Safety(band=_text(raw_safety.get("band")) or "unreviewed",
@@ -1082,9 +1143,79 @@ def _path_text(ref: str) -> str:
 
 
 def _is_supported_format(value: Any) -> bool:
-    return (isinstance(value, int) and not isinstance(value, bool)
-            and value in skillfmt.SUPPORTED_FORMATS)
+    return isinstance(value, int) and not isinstance(value, bool) and value in FORMATS
 
 
 def _formats() -> str:
-    return ", ".join(str(f) for f in sorted(skillfmt.SUPPORTED_FORMATS))
+    return ", ".join(str(f) for f in sorted(FORMATS))
+
+
+def _smaller_cap(resp: httpx.Response, sent: int) -> Optional[int]:
+    """The per-request cap a ``too_many_items`` refusal names, when it is below ``sent``."""
+    if resp.status_code != 422:
+        return None
+    ref = _Refusal.of(resp)
+    cap = ref.extra.get("max_items")
+    if (ref.code == _TOO_MANY_ITEMS and isinstance(cap, int) and not isinstance(cap, bool)
+            and 1 <= cap < sent):
+        return cap
+    return None
+
+
+def _escaped(text: str, limit: int = 60) -> str:
+    """``text`` with every unprintable character written as ``\\uXXXX``, cut to ``limit``."""
+    shown = "".join(c if c.isprintable() else f"\\u{ord(c):04x}" for c in text[:limit])
+    return shown + ("..." if len(text) > limit else "")
+
+
+def _why_unreadable(ref: str) -> Optional[str]:
+    """What makes ``ref`` one the registry cannot read, as far as this client can tell."""
+    for i, c in enumerate(ref):
+        category = unicodedata.category(c)
+        if category == "Cs":
+            return f"has an unpaired surrogate at position {i + 1}"
+        if category == "Cc":
+            return f"has a control character at position {i + 1}"
+    if len(ref) > MAX_REF_LENGTH:
+        return f"is {len(ref)} characters long; the limit is {MAX_REF_LENGTH}"
+    return None
+
+
+def _bad_ref(request: ResolveRequest, position: int, message: Optional[str],
+             details: Mapping[str, Any]) -> UsageError:
+    """A reference the registry cannot read: the caller's mistake, so exit 2 (usage).
+
+    It is named by its position in the items, and printed with its unprintable
+    characters escaped, since the reference itself may not print.
+    """
+    ref = request.ref if request.ref is not None else str(request.skill_id)
+    escaped = _escaped(ref)
+    shown = f"'{escaped}'"
+    why = _why_unreadable(ref) or "is not a reference the registry can read"
+    out = dict(details)
+    out.update(registry_code=_BAD_REF, position=position)
+    text = f"the registry cannot read reference #{position} ({shown})"
+    if message:
+        text += f": {_escaped(message, limit=200)}"
+    return UsageError(
+        text, skill=escaped, details=out,
+        fix=(f"correct reference #{position} ({shown}): it {why}; a reference is a registry "
+             f"name, url_slug, install name or skill id of at most {MAX_REF_LENGTH} "
+             "printable characters"))
+
+
+def _format_unsupported(
+    message: Optional[str], *, skill: Optional[str], details: Optional[Mapping[str, Any]] = None,
+) -> RenderInvalidError:
+    """The registry cannot render the skill in any format this client reads.
+
+    A newer decimalai reads newer formats, so the fix is the upgrade. Reported as
+    :class:`RenderInvalidError` (exit 7, "render invalid"): the registry has no rendering
+    this client can write, though nothing it sent was wrong.
+    """
+    out = dict(details or {})
+    out.update(registry_code=_FORMAT_UNSUPPORTED, formats=list(FORMATS))
+    return RenderInvalidError(
+        message or f"the registry renders it in no format this decimalai reads "
+                   f"(it reads format(s) {_formats()})",
+        skill=skill, details=out, fix=_UPGRADE_FIX)

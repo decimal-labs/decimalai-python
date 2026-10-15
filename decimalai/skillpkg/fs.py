@@ -4,8 +4,9 @@
 without a folder, is in one :class:`State`: ``CLEAN`` (exactly the locked files, hashes
 and exec bits), ``MODIFIED`` (some file differs, is missing or is extra), ``MISSING``,
 ``UNMANAGED`` (a folder the lock does not list; ``UNMANAGED_STAMPED`` when its SKILL.md
-carries a ``decimalai-skill-id``) or ``ILLEGAL`` (a symlink anywhere, or a file where a
-folder belongs). OS and tool clutter (:data:`CLUTTER`) is ignored everywhere, and so are
+carries a ``decimalai-skill-id``) or ``ILLEGAL`` (a symlink anywhere, a file where a
+folder belongs, or a file or folder the engine cannot read, with a reason starting
+``unreadable:``). OS and tool clutter (:data:`CLUTTER`) is ignored everywhere, and so are
 the ``.<name>.partial`` folders an interrupted copy across devices leaves in the root.
 
 **Changing a folder** is staged, then swapped::
@@ -28,9 +29,10 @@ under the root changes until :func:`swap`, which replaces one whole folder:
 A whole-folder swap is what removes files a new version dropped. Removing a skill is
 step 2 alone. One kind of file crosses over: a file the user placed by hand where the
 lock lists an ``unavailable`` (binary) file is copied into the new folder when the new
-version still lists it as unavailable; when the new version serves that path, the served
-bytes win and the hand-placed copy is saved to ``.decimal/backup/<txid>/<name>/``, with
-a warning naming it.
+version still lists it as unavailable; when the new version serves that path, no longer
+lists it, or the skill is removed, the hand-placed copy is saved to
+``.decimal/backup/<txid>/<name>/`` (unless it equals the served bytes), with a warning
+naming it.
 
 **Recovery** (:func:`recover`). A journal at startup means a run died inside a swap.
 The folder decides: if it is the new one, the new entry is committed; if the old one
@@ -38,6 +40,10 @@ still stands, or waits in ``.old``, it is put back and the old entry kept; anyth
 is a :class:`~decimalai.skillpkg.errors.JournalConflictError` and nothing is touched. So
 a crash leaves the old folder and entry or the new ones, never a folder that looks like
 a local edit.
+
+**Moving a folder without recording anything** (:func:`move_folder`): the same
+cross-device-safe move a swap uses, with no journal and no lock write, for a staged
+folder the lock already describes (``install --frozen``) or a folder leaving the root.
 
 **One run at a time** (:class:`ProcessLock`): ``.decimal/.skills.lck``, created
 exclusively, holding the pid. A dead holder's lock, or one older than ten minutes, is
@@ -61,7 +67,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from skillevaluation import skillfmt
 
@@ -89,6 +95,7 @@ __all__ = [
     "check_folder",
     "discard_staging",
     "is_clutter_path",
+    "move_folder",
     "new_txid",
     "read_journal",
     "recover",
@@ -195,21 +202,37 @@ def _walk(folder: Path) -> Tuple[Dict[str, os.stat_result], Optional[str]]:
     pending: List[Tuple[Path, str]] = [(folder, "")]
     while pending:
         directory, prefix = pending.pop()
-        with os.scandir(directory) as it:
-            for item in it:
-                rel = prefix + item.name
-                st = item.stat(follow_symlinks=False)
-                if _is_clutter(item.name, st.st_mode):
-                    continue
-                if stat.S_ISLNK(st.st_mode):
-                    return files, f"`{rel}` is a symlink"
-                if stat.S_ISDIR(st.st_mode):
-                    pending.append((Path(item.path), rel + "/"))
-                elif stat.S_ISREG(st.st_mode):
-                    files[rel] = st
-                else:
-                    return files, f"`{rel}` is not a regular file"
+        try:
+            with os.scandir(directory) as it:
+                entries = [(item, item.stat(follow_symlinks=False)) for item in it]
+        except OSError as exc:
+            return files, _unreadable(prefix.rstrip("/") or ".", exc)
+        for item, st in entries:
+            rel = prefix + item.name
+            if _is_clutter(item.name, st.st_mode):
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                return files, f"`{rel}` is a symlink"
+            if stat.S_ISDIR(st.st_mode):
+                pending.append((Path(item.path), rel + "/"))
+            elif stat.S_ISREG(st.st_mode):
+                files[rel] = st
+            else:
+                return files, f"`{rel}` is not a regular file"
     return files, None
+
+
+def _unreadable(rel: str, exc: OSError) -> str:
+    """The ILLEGAL reason for a file or folder the engine cannot read."""
+    return f"unreadable: `{rel}` ({exc.strerror or exc})"
+
+
+def _rel_in(folder: Path, filename: Any) -> str:
+    """``filename`` relative to ``folder``, as an ILLEGAL reason names it."""
+    try:
+        return Path(os.fspath(filename)).relative_to(folder).as_posix()
+    except (TypeError, ValueError):
+        return "."
 
 
 def _illegal_entry(path: Path) -> Optional[str]:
@@ -226,7 +249,13 @@ def check_folder(path: Path, entry: Mapping[str, Any], *, name: Optional[str] = 
     """The state of the folder at ``path`` against its lock ``entry``.
 
     One of ``CLEAN``, ``MODIFIED``, ``MISSING`` or ``ILLEGAL``. Files the entry lists as
-    ``unavailable`` may be present or absent.
+    ``unavailable`` may be present or absent. A folder inside it that cannot be listed
+    makes it ``ILLEGAL`` with a reason starting ``unreadable:``.
+
+    Raises:
+        OSError: a file cannot be opened to hash it. :func:`scan_root` reports that folder
+            as ``ILLEGAL`` (``unreadable: <path>``); callers that grade the bytes
+            themselves catch it here.
     """
     name = name or path.name
     if not os.path.lexists(path):
@@ -325,7 +354,12 @@ def scan_root(project: Project, skills: Mapping[str, Mapping[str, Any]]) -> Dict
         path = root / name
         entry = skills.get(name)
         if entry is not None:
-            out[name] = check_folder(path, entry, name=name)
+            try:
+                out[name] = check_folder(path, entry, name=name)
+            except OSError as exc:
+                # It cannot be hashed, so it can be neither trusted nor safely replaced.
+                out[name] = FolderState(name, State.ILLEGAL,
+                                        reason=_unreadable(_rel_in(path, exc.filename), exc))
             continue
         why = _illegal_entry(path)
         if why is None:
@@ -630,26 +664,66 @@ def _move(src: Path, dst: Path) -> None:
     shutil.rmtree(aside)
 
 
-def _carry_hand_placed(project: Project, txid: str, name: str, target: Path, staged: Path,
-                       old_entry: Optional[Mapping[str, Any]], new_entry: Mapping[str, Any],
+def move_folder(project: Project, src: Union[str, "os.PathLike[str]"],
+                dst: Union[str, "os.PathLike[str]"]) -> None:
+    """Move the folder ``src`` to ``dst``, both inside the project, in one rename where
+    possible. The lock, the manifest and the journal are not touched.
+
+    For moves nothing needs to record: putting a staged folder in place when the lock
+    already describes it (``install --frozen``, where the lock never changes), or moving a
+    folder out of the skills root into a backup. A change the lock must follow goes
+    through :func:`swap`, whose journal lets :func:`recover` settle a crash.
+
+    ``dst`` must not exist; its parent directories are created. Across devices the folder
+    is copied beside ``dst`` (as ``.<name>.partial``), checked file by file, bytes and mode,
+    and renamed into place; only then is ``src`` renamed aside and deleted. A crash leaves
+    ``src`` whole, or gone with ``dst`` complete, never a half-copied ``dst``. A
+    ``.<name>.partial`` left in the skills root is removed by :func:`recover` and
+    :func:`discard_staging`; one under ``.decimal/staging/<txid>/`` goes with its staging.
+
+    Raises:
+        UsageError: ``dst`` exists, ``src`` is not a folder, or a path is outside the project.
+        IllegalEntryError: ``src`` or ``dst``, or a directory on the way to either, is a
+            symlink.
+        IntegrityError: a copy across devices did not reproduce a file.
+    """
+    source, target = Path(src), Path(dst)
+    project.refuse_symlinks(source)
+    project.refuse_symlinks(target)
+    try:
+        is_dir = stat.S_ISDIR(os.lstat(source).st_mode)
+    except FileNotFoundError:
+        is_dir = False
+    if not is_dir:
+        raise UsageError(f"`{project.rel(source)}` is not a folder", path=source)
+    if os.path.lexists(target):
+        raise UsageError(f"`{project.rel(target)}` already exists", path=target)
+    project.makedirs(target.parent)
+    _move(source, target)
+
+
+def _carry_hand_placed(project: Project, txid: str, name: str, target: Path,
+                       staged: Optional[Path], old_entry: Optional[Mapping[str, Any]],
+                       new_entry: Optional[Mapping[str, Any]],
                        warn: Callable[[str], None]) -> None:
     """Keep the files a user placed by hand where the lock lists an unavailable file.
 
     Still unavailable in the new entry: copied into the staged folder (bytes and mode).
-    Served by the new entry, or not listed by it at all: the hand-placed copy does not go
-    into the new folder; unless it equals the served bytes it is saved to
-    ``.decimal/backup/<txid>/<name>/`` and ``warn`` names it. Runs before the journal, so
-    only ``.decimal/`` changes.
+    Served by the new entry, not listed by it at all, or the skill removed (``new_entry``
+    None, no staged folder): the hand-placed copy does not go into a new folder; unless
+    it equals the served bytes it is saved to ``.decimal/backup/<txid>/<name>/`` and
+    ``warn`` names it. Runs before the journal, so only ``.decimal/`` changes.
     """
     on_disk, why = _walk(target)
     if why:
         raise IllegalEntryError(f"`{project.rel(target)}`: {why}", skill=name, path=target)
-    still = {u.get("path") for u in new_entry.get("unavailable") or ()}
+    new: Mapping[str, Any] = new_entry or {}
+    still = {u.get("path") for u in new.get("unavailable") or ()} if staged is not None else set()
     was = {u.get("path") for u in (old_entry or {}).get("unavailable") or ()}
-    served: Mapping[str, str] = new_entry.get("files") or {}
+    served: Mapping[str, str] = new.get("files") or {}
     for rel in sorted(on_disk):
         source = target.joinpath(*rel.split("/"))
-        if rel in still:
+        if rel in still and staged is not None:
             dest = staged.joinpath(*rel.split("/"))
             if not os.path.lexists(dest):
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -660,9 +734,13 @@ def _carry_hand_placed(project: Project, txid: str, name: str, target: Path, sta
             backup = project.backup_dir / txid / name / rel
             project.makedirs(backup.parent)
             shutil.copy2(source, backup)
-            version = new_entry.get("version")
-            why = (f"version {version} serves it now, so the served file replaces it"
-                   if rel in served else f"version {version} no longer has that file")
+            version = new.get("version")
+            if new_entry is None:
+                why = "the skill is removed with its folder"
+            elif rel in served:
+                why = f"version {version} serves it now, so the served file replaces it"
+            else:
+                why = f"version {version} no longer has that file"
             warn(f"{name}: `{rel}` was placed by hand; {why}. Your copy is saved in "
                  f"`{project.rel(backup)}`")
 
@@ -700,8 +778,9 @@ def swap(project: Project, txid: str, name: str, new_entry: Optional[Mapping[str
         raise IllegalEntryError(f"`{project.rel(target)}` is {_illegal_entry(target)}",
                                 skill=name, path=target)
     old_entry = lock.skills.get(name)
-    if old_present and new_entry is not None:
-        _carry_hand_placed(project, txid, name, target, staged, old_entry, new_entry,
+    if old_present:
+        _carry_hand_placed(project, txid, name, target,
+                           staged if new_entry is not None else None, old_entry, new_entry,
                            on_warning or _log.warning)
     journal = Journal(txid, name, None if old_entry is None else dict(old_entry),
                       None if new_entry is None else dict(new_entry), old_present)
@@ -768,8 +847,9 @@ def recover(project: Project) -> Optional[Recovery]:
     Only the journal's one entry of the lock is changed, and no other entry is checked,
     so a lock the crashed run had read with ``repair=True`` does not block recovery.
     Then the journal, the transaction's staging and any ``.<name>.partial`` debris in the
-    root are removed, and ``plugin.json`` is brought in line with the lock. With no
-    journal, only the debris is removed. Safe to run again after a crash of its own.
+    root are removed, and ``plugin.json`` is brought in line with the lock (unless it is
+    a plugin.json this engine did not write: that is left for the next command to refuse
+    or, with ``--force``, back up). With no journal, only the debris is removed. Safe to run again after a crash of its own.
 
     Raises:
         JournalConflictError: the folder matches neither entry, or the journal is unreadable.
@@ -820,7 +900,8 @@ def recover(project: Project) -> Optional[Recovery]:
     # (merged entries, a stale lock_hash): it is left for the next command to report.
     lock_hash = _lock.commit_entry(project, name, entry)
     if lock_hash is not None:
-        _lock.write_plugin_json(project, lock_hash)
+        if _lock.plugin_json_is_ours(project):  # a user's own plugin.json is never replaced here
+            _lock.write_plugin_json(project, lock_hash)
     with contextlib.suppress(FileNotFoundError):
         os.unlink(project.journal_path)
     fsync_dir(project.state_dir)

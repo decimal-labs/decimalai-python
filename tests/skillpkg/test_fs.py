@@ -929,6 +929,101 @@ class TestCrossDeviceRemoval:
         assert target.stat().st_ino == inode
 
 
+class TestRecoveryLeavesAForeignPluginJson:
+    def test_recover_never_overwrites_a_plugin_json_it_did_not_write(self, tmp_path, monkeypatch):
+        project, lock, txid, name, old, new, before = _scenario(tmp_path, "replace")
+
+        def crash_at(label):
+            if label == "new_moved":
+                raise Crash(label)
+
+        monkeypatch.setattr(fs, "_checkpoint", crash_at)
+        with pytest.raises(Crash):
+            fs.swap(project, txid, name, new, lock)
+        monkeypatch.undo()
+        mine = b'{"name": "my-tools", "version": "1.0.0"}\n'
+        project.plugin_json_path.write_bytes(mine)
+        assert fs.recover(project).outcome == "new"
+        assert project.plugin_json_path.read_bytes() == mine
+
+
+class TestMoveFolder:
+    """``move_folder``: one folder to a new place in the project, lock untouched.
+
+    It is how a staged folder is put in place when the lock already describes it
+    (``install --frozen``), and how a folder leaves the root for a backup.
+    """
+
+    def _staged(self, tmp_path):
+        project, lock = _installed(tmp_path, _v1())
+        txid = fs.new_txid()
+        b = _bundle("fresh-skill", sid=2, vid=201)
+        fs.stage(project, txid, "fresh-skill", _contents(b), _entry(b))
+        return project, lock, project.staging_dir / txid / "fresh-skill"
+
+    def test_moves_the_folder_with_its_bytes_and_modes(self, tmp_path):
+        project, _, staged = self._staged(tmp_path)
+        before = _tree(staged)
+        inode = staged.stat().st_ino
+        lock_bytes = project.lock_path.read_bytes()
+        target = project.skill_dir("fresh-skill")
+        fs.move_folder(project, staged, target)
+        assert not staged.exists()
+        assert _tree(target) == before
+        assert target.stat().st_ino == inode, "one rename on one device"
+        assert project.lock_path.read_bytes() == lock_bytes
+        assert not project.journal_path.exists()
+
+    def test_across_devices_it_copies_checks_and_leaves_no_partial(self, tmp_path, monkeypatch):
+        project, _, staged = self._staged(tmp_path)
+        before = _tree(staged)
+        monkeypatch.setattr(fs, "_same_device", lambda a, b: False)
+        target = project.skill_dir("fresh-skill")
+        fs.move_folder(project, staged, target)
+        assert not staged.exists()
+        assert _tree(target) == before
+        leftovers = [p.name for p in project.skills_root.iterdir() if p.name.endswith(".partial")]
+        assert leftovers == []
+        assert [p.name for p in staged.parent.iterdir() if p.name.endswith(".partial")] == []
+
+    def test_creates_the_parent_of_the_destination(self, tmp_path):
+        project, _, staged = self._staged(tmp_path)
+        target = project.backup_dir / "x" / "fresh-skill"
+        fs.move_folder(project, staged, target)
+        assert (target / "SKILL.md").is_file()
+
+    def test_an_existing_destination_is_refused_and_nothing_moves(self, tmp_path):
+        project, _, staged = self._staged(tmp_path)
+        target = project.skill_dir("acme-refund-policy")
+        before = (_tree(staged), _tree(target))
+        with pytest.raises(E.UsageError):
+            fs.move_folder(project, staged, target)
+        assert (_tree(staged), _tree(target)) == before
+
+    @needs_posix
+    @pytest.mark.parametrize("side", ["source", "destination"])
+    def test_a_symlink_on_either_path_is_refused(self, tmp_path, side):
+        project, _, staged = self._staged(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        link = project.state_dir / "linked"
+        os.symlink(elsewhere, link)
+        if side == "source":
+            src, dst = link / "x", project.skill_dir("fresh-skill")
+        else:
+            src, dst = staged, link / "fresh-skill"
+        with pytest.raises(E.IllegalEntryError):
+            fs.move_folder(project, src, dst)
+        assert list(elsewhere.iterdir()) == []
+
+    def test_a_path_outside_the_project_is_refused(self, tmp_path):
+        project, _, staged = self._staged(tmp_path)
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        with pytest.raises(E.UsageError):
+            fs.move_folder(project, staged, outside)
+        assert staged.is_dir() and not outside.exists()
+
+
 class TestRecovery:
     def test_no_journal_is_nothing_to_do(self, tmp_path):
         project, _ = _installed(tmp_path, _v1())
@@ -1211,6 +1306,98 @@ class TestHandPlacedUnavailableFiles:
         warned = []
         fs.swap(project, txid, name, new, lock, on_warning=warned.append)
         assert warned == [] and not project.backup_dir.exists()
+
+
+class TestHandPlacedFilesOnRemoval:
+    """Removing a skill takes its folder away whole; files the user placed where the lock
+    lists an unavailable file are not the registry's to delete."""
+
+    def test_removing_the_skill_backs_up_a_hand_placed_file_and_warns(self, tmp_path):
+        project, lock = _installed(tmp_path, _v1(_logo()))
+        _place_logo(project, mode=0o640)
+        txid, warned = fs.new_txid(), []
+        new_lock = fs.swap(project, txid, "acme-refund-policy", None, lock,
+                           on_warning=warned.append)
+        fs.discard_staging(project, txid)
+        backup = project.backup_dir / txid / "acme-refund-policy" / "assets" / "logo.png"
+        assert backup.read_bytes() == LOGO
+        if POSIX:
+            assert backup.stat().st_mode & 0o777 == 0o640
+        assert not project.skill_dir("acme-refund-policy").exists()
+        assert "acme-refund-policy" not in new_lock.skills
+        (message,) = warned
+        assert "assets/logo.png" in message and project.rel(backup) in message
+        assert "removed" in message
+
+    def test_nothing_placed_means_no_backup(self, tmp_path):
+        project, lock = _installed(tmp_path, _v1(_logo()))
+        txid, warned = fs.new_txid(), []
+        fs.swap(project, txid, "acme-refund-policy", None, lock, on_warning=warned.append)
+        assert warned == []
+        assert not project.backup_dir.exists()
+
+    def test_the_skills_own_files_are_not_backed_up(self, tmp_path):
+        project, lock = _installed(tmp_path, _v1(_logo()))
+        txid = fs.new_txid()
+        _place_logo(project)
+        fs.swap(project, txid, "acme-refund-policy", None, lock, on_warning=lambda m: None)
+        backed = sorted(p.relative_to(project.backup_dir / txid).as_posix()
+                        for p in (project.backup_dir / txid).rglob("*") if p.is_file())
+        assert backed == ["acme-refund-policy/assets/logo.png"]
+
+
+def _restore_modes(root: Path) -> None:
+    for path in [root, *root.rglob("*")]:
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o755)
+        elif path.is_file() and not path.is_symlink():
+            path.chmod(0o644)
+
+
+unreadable_ok = pytest.mark.skipif(not POSIX or os.geteuid() == 0,
+                                   reason="POSIX permissions, enforced only for non-root")
+
+
+@unreadable_ok
+class TestUnreadable:
+    """``scan_root`` reports a file or folder the engine cannot read as ILLEGAL (reason
+    ``unreadable: ...``), never a traceback: it cannot be hashed, backed up or safely
+    replaced."""
+
+    @pytest.fixture
+    def project(self, tmp_path):
+        project, lock = _installed(tmp_path, _v1())
+        yield project, lock
+        for d in (project.skills_root, project.directory):
+            os.chmod(d, 0o755)
+        _restore_modes(project.skills_root)
+
+    def test_an_unreadable_file_makes_a_locked_folder_illegal(self, project):
+        project, lock = project
+        (project.skill_dir("acme-refund-policy") / "references" / "fees.md").chmod(0o000)
+        st = fs.scan_root(project, lock.skills)["acme-refund-policy"]
+        assert st.state is fs.State.ILLEGAL
+        assert st.reason.startswith("unreadable: `references/fees.md`")
+        # check_folder itself raises, for callers that report it in their own words.
+        with pytest.raises(PermissionError):
+            fs.check_folder(project.skill_dir("acme-refund-policy"),
+                            lock.skills["acme-refund-policy"])
+
+    def test_an_unreadable_directory_too(self, project):
+        project, lock = project
+        (project.skill_dir("acme-refund-policy") / "scripts").chmod(0o000)
+        st = fs.scan_root(project, lock.skills)["acme-refund-policy"]
+        assert st.state is fs.State.ILLEGAL
+        assert st.reason.startswith("unreadable: `scripts`")
+
+    def test_an_unmanaged_folder_that_cannot_be_listed(self, project):
+        project, lock = project
+        mine = project.skills_root / "mine"
+        (mine / "deep").mkdir(parents=True)
+        (mine / "SKILL.md").write_text("---\nname: mine\ndescription: d\n---\nbody\n")
+        (mine / "deep").chmod(0o000)
+        st = fs.scan_root(project, lock.skills)["mine"]
+        assert st.state is fs.State.ILLEGAL and st.reason.startswith("unreadable: `deep`")
 
 
 class TestCrashDebris:
