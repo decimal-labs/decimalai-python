@@ -23,14 +23,16 @@ import asyncio
 import contextvars
 import functools
 import inspect
+import json
 import logging
+import re
 import threading
 import warnings
 import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from ._skill_witness import copy_delivered_versions, merge_delivered_versions
@@ -56,7 +58,7 @@ def _coerce_span_id(raw: Any) -> Optional[UUID]:
 
 from .schema.common import FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
-from .schema.trace import LlmCallRecord, RunTrace, TraceSpan
+from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
 
 logger = logging.getLogger("decimalai.openai_agents")
 
@@ -1973,6 +1975,13 @@ def _register_manifest_from_agent(
 #: ``DecimalTracingProcessor._note_span_error`` for why each one is here.
 _RECOVERABLE_SPAN_TYPES = frozenset({"function", "custom"})
 
+#: Longest text a tool span preview, or a tool call's recorded result, carries.
+#: 2000 is what the platform keeps: ingest cuts every span preview there, so a
+#: longer one would be cut anyway, and the LangChain adapter's previews use the
+#: same bound. The old 200 stopped inside the first sentence or two of a loaded
+#: skill body, which is the text a reader opens a skill-loading trace to see.
+_TOOL_TEXT_LIMIT = 2000
+
 
 class _TraceAccumulator:
     """Per-trace state that accumulates spans as they complete."""
@@ -2020,6 +2029,14 @@ class _TraceAccumulator:
         # and the menu would have been promoted wholesale. The inference
         # writes offered/delivered now; see the call site in `_send_trace`.)
         self.system_prompt_by_call: Dict[Any, str] = {}
+        # Tool calls a model turn asked for whose run has not been seen yet:
+        # (the record on that turn's llm_call, the names its function span can
+        # carry, the arguments as the model wrote them). `_handle_function`
+        # takes the matching entry and fills in the result, so each call is ONE
+        # record from request to result. An entry still here at trace end was
+        # never seen to run (a handoff, an approval that never came) and stays
+        # `running`: requested, outcome unseen.
+        self.open_tool_calls: List[Tuple[ToolCallRecord, Set[str], str]] = []
 
     @property
     def live_agent(self) -> Any:
@@ -2240,10 +2257,16 @@ class DecimalTracingProcessor:
         if started_at and ended_at:
             latency_ms = int((ended_at - started_at).total_seconds() * 1000)
 
+        # The tool calls this turn asked for. On this path they are already in
+        # `output` (the chat message carries them), but not on the record.
+        requested = _requested_tool_calls(
+            raw_output if isinstance(raw_output, (list, tuple)) else [raw_output]
+        )
+
         # Error handling
         span_error = getattr(span, "error", None)
         status = Status.SUCCESS
-        finish_reason = FinishReason.STOP
+        finish_reason = FinishReason.TOOL_CALLS if requested else FinishReason.STOP
         if span_error:
             status = Status.ERROR
             finish_reason = FinishReason.ERROR
@@ -2269,6 +2292,7 @@ class DecimalTracingProcessor:
             started_at=started_at,
             ended_at=ended_at,
         )
+        self._record_requested_tool_calls(acc, call, requested)
         acc.llm_calls.append(call)
 
         # Also create a wrapper span
@@ -2288,7 +2312,8 @@ class DecimalTracingProcessor:
     def _handle_function(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
     ) -> None:
-        """Map a FunctionSpanData to ToolCallRecord + TraceSpan."""
+        """Map a FunctionSpanData to a TraceSpan, and its result onto the
+        ToolCallRecord of the model turn that asked for this call."""
         span_id = _coerce_span_id(getattr(span, "span_id", None)) or uuid4()
         parent_id = _coerce_span_id(getattr(span, "parent_id", None))
         started_at = _parse_iso(getattr(span, "started_at", None))
@@ -2314,10 +2339,60 @@ class DecimalTracingProcessor:
             status=status,
             started_at=started_at,
             ended_at=ended_at,
-            input_preview=str(func_input)[:200] if func_input else None,
-            output_preview=str(func_output)[:200] if func_output else None,
+            input_preview=str(func_input)[:_TOOL_TEXT_LIMIT] if func_input else None,
+            output_preview=str(func_output)[:_TOOL_TEXT_LIMIT] if func_output else None,
         )
         acc.spans.append(trace_span)
+
+        record = self._claim_requested_tool_call(acc, func_name, func_input)
+        if record is not None:
+            # The record IS this span: the backend reads tool calls from both
+            # the records and the tool spans and joins them on id, so a record
+            # with an id of its own was counted as a second call.
+            record.id = span_id
+            record.status = status
+            record.result = (
+                None if func_output is None else _stringify(func_output)[:_TOOL_TEXT_LIMIT]
+            )
+            record.latency_ms = latency_ms
+
+    def _record_requested_tool_calls(
+        self, acc: _TraceAccumulator, call: LlmCallRecord, requested: List[Dict[str, Any]],
+    ) -> None:
+        """Put the calls a model turn asked for on its llm_call, as requested.
+
+        `running` until the tool's own span is seen: the turn only shows that
+        the model ASKED. `_handle_function` records what the tool returned.
+        """
+        for req in requested:
+            record = ToolCallRecord(
+                tool_name=req["name"],
+                status=Status.RUNNING,
+                args=_tool_call_args(req["arguments"]),
+            )
+            call.tool_calls.append(record)
+            # The SDK names a namespaced tool's span `namespace.name`.
+            names = {req["name"]}
+            if req["namespace"]:
+                names.add(f"{req['namespace']}.{req['name']}")
+            with self._lock:
+                acc.open_tool_calls.append((record, names, req["arguments"]))
+
+    def _claim_requested_tool_call(
+        self, acc: _TraceAccumulator, name: Any, arguments: Any,
+    ) -> Optional[ToolCallRecord]:
+        """The open request a finished function span answers, removed from the
+        open list, or None. A function span carries the tool name and the
+        arguments string but no call id, so the match is on the name, and on
+        the arguments where two open calls share one: parallel calls to the
+        same tool can finish in any order."""
+        with self._lock:
+            matches = [i for i, (_, names, _) in enumerate(acc.open_tool_calls) if name in names]
+            if not matches:
+                return None
+            exact = [i for i in matches if acc.open_tool_calls[i][2] == arguments]
+            record, _, _ = acc.open_tool_calls.pop((exact or matches)[0])
+            return record
 
     def _handle_agent(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
@@ -2431,6 +2506,14 @@ class DecimalTracingProcessor:
         raw_input = getattr(span_data, "input", None)
         _note_user_input(acc, raw_input)
         output_text = _response_output_text(response_obj) if response_obj else None
+        # The tool calls the model asked for. A turn that calls a tool usually
+        # has no text at all, so keeping only text recorded the turn that
+        # decided to call `load_skill` as one that said nothing and stopped.
+        requested = (
+            _requested_tool_calls(getattr(response_obj, "output", None))
+            if response_obj is not None
+            else []
+        )
 
         # The system half of the prompt, as the SERVER reports having received
         # it. `span_data.input` is the input-items list only, so the
@@ -2455,8 +2538,22 @@ class DecimalTracingProcessor:
         # Error handling
         span_error = getattr(span, "error", None)
         status = Status.SUCCESS
-        finish_reason = FinishReason.STOP
-        output_dict = {"content": output_text} if output_text else None
+        finish_reason = FinishReason.TOOL_CALLS if requested else FinishReason.STOP
+        output_dict: Optional[Dict[str, Any]] = {}
+        if output_text:
+            output_dict["content"] = output_text
+        if requested:
+            # The chat-completions shape, which is the one that carries the
+            # call id and the one the trace view renders as a tool request.
+            output_dict["tool_calls"] = [
+                {
+                    "id": req["call_id"],
+                    "type": "function",
+                    "function": {"name": req["name"], "arguments": req["arguments"]},
+                }
+                for req in requested
+            ]
+        output_dict = output_dict or None
         if span_error:
             status = Status.ERROR
             finish_reason = FinishReason.ERROR
@@ -2490,6 +2587,7 @@ class DecimalTracingProcessor:
                 started_at=started_at,
                 ended_at=ended_at,
             )
+            self._record_requested_tool_calls(acc, call, requested)
             acc.llm_calls.append(call)
             if echoed_instructions:
                 acc.system_prompt_by_call[call.id] = echoed_instructions
@@ -2537,6 +2635,22 @@ class DecimalTracingProcessor:
             attributes={"from_agent": from_agent, "to_agent": to_agent},
         )
         acc.spans.append(trace_span)
+
+        # A handoff is a function call the model made (`transfer_to_<agent>`),
+        # run by this span rather than a function span. Without this its record
+        # stayed `running` for good, which reads as a tool call that never
+        # returned. A handoff given a custom tool name is not matched here and
+        # keeps `running`: the span names the target agent, not the tool.
+        if isinstance(to_agent, str) and to_agent:
+            record = self._claim_requested_tool_call(
+                acc, _handoff_tool_name(to_agent), None,
+            )
+            if record is not None:
+                record.id = span_id
+                record.status = Status.SUCCESS
+                record.result = f"Handed off to {to_agent}"
+                if started_at and ended_at:
+                    record.latency_ms = int((ended_at - started_at).total_seconds() * 1000)
 
     def _handle_guardrail(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
@@ -3024,6 +3138,79 @@ def _response_output_text(response_obj: Any) -> Optional[str]:
     except Exception:
         logger.debug("Response output text extraction failed", exc_info=True)
         return None
+
+
+def _requested_tool_calls(items: Any) -> List[Dict[str, Any]]:
+    """The function calls a model turn asked for, in the order it asked.
+
+    Reads the shapes the Agents SDK puts on a span: Responses API output items
+    (``type == "function_call"``, as objects or as their dumps, including a
+    dumped ``Response`` whose ``output`` holds them) and chat-completions
+    messages carrying ``tool_calls``. Each entry has the call id, the tool
+    name, the arguments string exactly as the model wrote it, and the
+    namespace when the call has one. Never raises: a shape it cannot read
+    yields nothing, and the record stays as it would have been.
+    """
+    found: List[Dict[str, Any]] = []
+    try:
+        for item in items or ():
+            is_dict = isinstance(item, dict)
+            kind = item.get("type") if is_dict else getattr(item, "type", None)
+            if kind == "function_call":
+                get = item.get if is_dict else functools.partial(getattr, item)
+                name = get("name", None)
+                if isinstance(name, str) and name:
+                    arguments = get("arguments", None)
+                    namespace = get("namespace", None)
+                    call_id = get("call_id", None)
+                    found.append({
+                        "call_id": call_id if isinstance(call_id, str) else None,
+                        "name": name,
+                        "arguments": arguments if isinstance(arguments, str) else "",
+                        "namespace": namespace if isinstance(namespace, str) and namespace else None,
+                    })
+                continue
+            if not is_dict:
+                continue
+            for tc in item.get("tool_calls") or ():
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                name = fn.get("name") if isinstance(fn, dict) else None
+                if isinstance(name, str) and name:
+                    arguments = fn.get("arguments")
+                    call_id = tc.get("id")
+                    found.append({
+                        "call_id": call_id if isinstance(call_id, str) else None,
+                        "name": name,
+                        "arguments": arguments if isinstance(arguments, str) else "",
+                        "namespace": None,
+                    })
+            nested = item.get("output")
+            if isinstance(nested, (list, tuple)):
+                found.extend(_requested_tool_calls(nested))
+    except Exception:
+        logger.debug("Tool-call extraction failed", exc_info=True)
+        return []
+    return found
+
+
+def _handoff_tool_name(agent_name: str) -> str:
+    """The tool name the Agents SDK gives a handoff to ``agent_name`` by default:
+    ``transfer_to_<name>`` with whitespace and anything outside
+    ``[A-Za-z0-9_]`` turned into ``_``, lower-cased."""
+    name = re.sub(r"\s", "_", f"transfer_to_{agent_name}")
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name).lower()
+
+
+def _tool_call_args(arguments: str) -> Dict[str, Any]:
+    """The argument dict the model wrote. Arguments that are not a JSON object
+    are kept verbatim under ``raw`` rather than dropped."""
+    if not arguments.strip():
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, TypeError):
+        return {"raw": arguments}
+    return parsed if isinstance(parsed, dict) else {"raw": arguments}
 
 
 def _attach_system_prompts(

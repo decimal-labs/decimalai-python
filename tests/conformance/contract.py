@@ -804,8 +804,7 @@ def _activation_evidence(trace: Dict[str, Any], name: str, sig: str) -> List[str
     NOT evidence, ever: the name or the body appearing in a system, developer or
     user message. That is the router delivering, or the user typing. Several
     channels are accepted rather than one because they differ per framework
-    (openai-agents has the span and the function_call but no ``tool_calls``;
-    pydantic-ai has ``tool_calls`` but no tool span), and because an item that
+    (pydantic-ai, for one, has ``tool_calls`` but no tool span), and because an item that
     hardcodes one channel breaks the day an adapter legitimately changes it.
     """
     found: List[str] = []
