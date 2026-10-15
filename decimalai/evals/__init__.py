@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import random
 from dataclasses import dataclass, field
@@ -531,6 +532,46 @@ def run_evals(
     return all_scores
 
 
+def _tool_call_view(tc: Any) -> Optional[ToolCallView]:
+    """One recorded tool call as a ``ToolCallView``, whichever shape it is in.
+
+    * ``ToolCallRecord``, what every adapter in this SDK writes:
+      ``{"tool_name": ..., "args": {...}}``.
+    * ``{"name": ..., "args" | "arguments": ...}``.
+    * chat-completions: ``{"function": {"name": ..., "arguments": ...}}``,
+      whose ``arguments`` is usually a JSON string.
+
+    Reading only the last two made every adapter-recorded call reach an eval
+    with an empty name and no arguments. Arguments that are not a JSON object
+    give ``{}``. A non-dict entry gives None and is skipped.
+    """
+    if not isinstance(tc, dict):
+        return None
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+    name = fn.get("name") or tc.get("name") or tc.get("tool_name") or ""
+    if "arguments" in fn:
+        raw_args = fn.get("arguments")
+    elif "args" in tc:
+        raw_args = tc.get("args")
+    else:
+        raw_args = tc.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except (ValueError, TypeError):
+            raw_args = None
+    return ToolCallView(
+        name=str(name),
+        args=raw_args if isinstance(raw_args, dict) else {},
+        result=tc.get("result"),
+    )
+
+
+def _tool_call_views(llm_call: Dict[str, Any]) -> List[ToolCallView]:
+    raw = llm_call.get("tool_calls_json") or llm_call.get("tool_calls") or []
+    return [v for v in (_tool_call_view(tc) for tc in raw) if v is not None]
+
+
 def trace_to_trace_data(trace: Any) -> TraceData:
     """Convert a RunTrace (or dict) to a TraceData view for evals.
 
@@ -546,15 +587,7 @@ def trace_to_trace_data(trace: Any) -> TraceData:
     # Flatten tool_calls from LLM calls
     tool_calls: List[ToolCallView] = []
     for llm_call in d.get("llm_calls", []):
-        for tc in (llm_call.get("tool_calls_json") or llm_call.get("tool_calls") or []):
-            func = tc.get("function", {})
-            tool_calls.append(
-                ToolCallView(
-                    name=func.get("name") or tc.get("name", ""),
-                    args=func.get("arguments", {}) if isinstance(func.get("arguments"), dict) else {},
-                    result=tc.get("result"),
-                )
-            )
+        tool_calls.extend(_tool_call_views(llm_call))
 
     # Build LlmCallView list
     llm_calls: List[LlmCallView] = []
@@ -575,14 +608,7 @@ def trace_to_trace_data(trace: Any) -> TraceData:
                 # answers these fields exist to keep apart.
                 cache_read_tokens=lc.get("cache_read_tokens"),
                 cache_creation_tokens=lc.get("cache_creation_tokens"),
-                tool_calls=[
-                    ToolCallView(
-                        name=(tc.get("function", {}).get("name") or tc.get("name", "")),
-                        args=tc.get("function", {}).get("arguments", {}) if isinstance(tc.get("function", {}).get("arguments"), dict) else {},
-                        result=tc.get("result"),
-                    )
-                    for tc in (lc.get("tool_calls_json") or lc.get("tool_calls") or [])
-                ],
+                tool_calls=_tool_call_views(lc),
             )
         )
 
