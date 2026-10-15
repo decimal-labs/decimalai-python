@@ -75,11 +75,18 @@ dependencies = [
     # the lowest version every floor allows and importing the instrumentors.
     "opentelemetry-sdk>=1.28.0",
     "opentelemetry-api>=1.28.0",
-    # Floor rationale: the SDK code imports only skillevaluation.parser (stable since
-    # 0.1.0) and the runner CLI (0.2.0). Floored at 0.4.0 for `skillevaluation.safety`,
-    # which `decimalai skills scan` imports. Verify by installing at the floor
-    # and importing.
-    "skillevaluation>=0.4.0",
+    # Floored at 0.8.0 for `skillevaluation.skillfmt`: the on-disk skill format that
+    # `decimalai.skillpkg` installs, checks and hashes (install names, SKILL.md bytes,
+    # the validator, lock_hash). The registry renders with the same module, so the two
+    # agree by construction. 0.8.0 also has everything older floors were for:
+    # `skillevaluation.parser`, the runner CLI and `skillevaluation.safety`.
+    "skillevaluation>=0.8.0",
+    # SKILL.md frontmatter is YAML, and the SDK parses it. Declared here rather than
+    # left to arrive through skillevaluation's own requirements.
+    "PyYAML>=6.0",
+    # `.decimal/skills.toml` is TOML. Python 3.11 ships tomllib; 3.10 reads it with
+    # tomli, the same parser under its pre-stdlib name.
+    'tomli>=2; python_version < "3.11"',
 ]
 
 [project.optional-dependencies]
