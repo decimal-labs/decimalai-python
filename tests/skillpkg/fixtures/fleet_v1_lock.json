@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "skills": {
+    "incident-triage": {
+      "version": 1,
+      "content_hash": "e3b0c44298fc",
+      "source": "platform",
+      "skill_id": "c0ffee00-0000-4000-8000-000000000001",
+      "installed_at": "2026-06-17T05:44:40.796217+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    },
+    "release-notes": {
+      "version": 1,
+      "content_hash": "e3b0c44298fc",
+      "source": "platform",
+      "skill_id": "c0ffee00-0000-4000-8000-000000000002",
+      "installed_at": "2026-06-17T05:44:40.797137+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    },
+    "vendor-onboarding": {
+      "version": 1,
+      "content_hash": "e3b0c44298fc",
+      "source": "platform",
+      "skill_id": "c0ffee00-0000-4000-8000-000000000003",
+      "installed_at": "2026-06-17T05:44:40.797512+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    },
+    "weekly-digest": {
+      "version": 1,
+      "content_hash": "e3b0c44298fc",
+      "source": "platform",
+      "skill_id": "c0ffee00-0000-4000-8000-000000000004",
+      "installed_at": "2026-06-17T05:44:40.797893+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    }
+  },
+  "updated_at": "2026-08-01T11:04:19.706994+00:00"
+}

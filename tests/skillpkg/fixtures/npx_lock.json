@@ -1,0 +1,17 @@
+{
+  "contract-review-6f1c2a": {
+    "version": 2,
+    "sha256": "6b1d3f0a9c2e47d58f0e1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
+    "files": [
+      ".claude/skills/contract-review-6f1c2a/SKILL.md",
+      ".claude/skills/contract-review-6f1c2a/references/clauses.md"
+    ]
+  },
+  "pdf-tools": {
+    "version": 3,
+    "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "files": [
+      ".claude/skills/pdf-tools/SKILL.md"
+    ]
+  }
+}
