@@ -7,6 +7,7 @@ import urllib.parse
 import click
 
 from .. import __version__
+from . import skills_pm
 
 logger = logging.getLogger("decimalai")
 
@@ -1097,10 +1098,20 @@ def evaluators_remove(evaluator_id, api_key, base_url, project):
 
 # ── Skills commands ────────────────────────────────────────
 
-@cli.group()
+@cli.group(epilog=skills_pm._EXIT_CODES)
 def skills():
-    """Skill commands."""
+    """Skill commands.
+
+    Registry skills are managed like packages: `add` records a skill in
+    .decimal/skills.toml and installs it into .agents/skills/<name>/,
+    .decimal/skills.lock records the exact bytes, and CI runs `install --frozen`.
+    Your own skills in ./skills go to the platform with `sync`.
+    """
     pass
+
+
+# add, install, update, remove, status, verify, migrate, pull and the deprecated export.
+skills_pm.register(skills)
 
 
 @skills.command("list")
@@ -1129,6 +1140,14 @@ def skills_list(limit, api_key, base_url, project):
             click.echo(json.dumps(data, indent=2))
     finally:
         client.close()
+
+
+def _registry_stamped(frontmatter) -> bool:
+    """Whether a SKILL.md carries the registry's stamp (``metadata.decimalai-skill-id``):
+    a folder `decimalai skills` installed, which is someone's registry skill, not yours."""
+    metadata = frontmatter.get("metadata") if isinstance(frontmatter, dict) else None
+    skill_id = metadata.get("decimalai-skill-id") if isinstance(metadata, dict) else None
+    return isinstance(skill_id, str) and bool(skill_id.strip())
 
 
 @skills.command("sync")
@@ -1180,6 +1199,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
     # layouts: <root>/<name>/SKILL.md and <root>/<name>.md (rare).
     skills_payload: list[dict] = []
     discovered_paths: dict[str, Path] = {}
+    installed: list[str] = []
 
     for skill_md in base.rglob("SKILL.md"):
         try:
@@ -1188,7 +1208,12 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
             click.echo(f"  ⚠ skipping {skill_md} ({e})", err=True)
             continue
 
-        frontmatter, body = _split_frontmatter(content)
+        frontmatter, body = _split_frontmatter(content, path=str(skill_md))
+        # A folder `decimalai skills` installed is someone's registry skill: syncing it
+        # would create a private copy of it in your organization.
+        if _registry_stamped(frontmatter):
+            installed.append(skill_md.parent.name)
+            continue
         if not body or not body.strip():
             click.echo(f"  ⚠ skipping {skill_md} (empty body)", err=True)
             continue
@@ -1275,8 +1300,16 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
         skills_payload.append(entry)
         discovered_paths[name] = skill_md
 
+    if installed:
+        click.echo(
+            f"  • Not syncing {len(installed)} folder(s) installed from the registry "
+            f"(`decimalai skills` manages them): {', '.join(sorted(installed))}"
+        )
     if not skills_payload:
-        click.echo(f"  No SKILL.md files found under {base}")
+        if installed:
+            click.echo(f"  No skills of your own under {base}; nothing to sync")
+        else:
+            click.echo(f"  No SKILL.md files found under {base}")
         return
 
     click.echo(f"  Discovered {len(skills_payload)} skill(s) under {base}")
@@ -1439,11 +1472,13 @@ _STATUS_ORDER = {
 }
 
 
-@skills.command("status")
-@click.argument("skills_dir", type=click.Path(exists=True, file_okay=False), default="./skills")
-@common_options
-def skills_status(skills_dir, api_key, base_url, project):
-    """Show per-install sync divergence for local SKILL.md files.
+#: Authored statuses `decimalai skills status --check` counts as drift.
+AUTHORED_DRIFT = ("local_ahead", "remote_ahead", "conflict")
+
+
+def _authored_status(skills_dir, api_key, base_url, project, *, project_root=None,
+                     combined=False):
+    """The authored section of `decimalai skills status`: per-install sync divergence.
 
     Hashes each local skill (SHA-256 of body_markdown) and asks the platform
     how it compares to *this install's* last-synced baseline, reporting a
@@ -1458,12 +1493,14 @@ def skills_status(skills_dir, api_key, base_url, project):
       unknown       no baseline recorded — run `decimalai skills sync` once
 
     Read-only on skill content: it reports local hashes without pushing any
-    bodies. The install identity comes from `.decimal/install.json`.
+    bodies, and it writes nothing locally. The install identity comes from
+    `.decimal/install.json` (of ``project_root`` when given); a checkout without one
+    has never synced, has no baseline, and is not reported: it is told to sync once.
+    Folders installed from the registry are skipped, as `skills sync` skips them.
 
-    \b
-    Examples:
-        $ decimalai skills status                # uses ./skills
-        $ decimalai skills status ./agents/skills
+    Returns ``{status: count}``. When the platform call fails: alone (`status
+    DIR`) it exits 1, as it always has; inside the combined view (``combined``)
+    it prints a warning and returns None, and the caller decides the exit code.
     """
     import hashlib
     from pathlib import Path
@@ -1481,8 +1518,8 @@ def skills_status(skills_dir, api_key, base_url, project):
         except OSError as e:
             click.echo(f"  ⚠ skipping {skill_md} ({e})", err=True)
             continue
-        _frontmatter, body = _split_frontmatter(content)
-        if not body or not body.strip():
+        _frontmatter, body = _split_frontmatter(content, path=str(skill_md))
+        if not body or not body.strip() or _registry_stamped(_frontmatter):
             continue
         name = (_frontmatter.get("name") or "").strip() or skill_md.parent.name
         if not name:
@@ -1494,13 +1531,30 @@ def skills_status(skills_dir, api_key, base_url, project):
 
     if not items:
         click.echo(f"  No SKILL.md files found under {base}")
-        return
+        return {}
 
-    from .._install import get_install_identity
+    from .._install import (
+        INSTALL_FILE,
+        STATE_DIR,
+        find_project_root,
+        get_install_identity,
+    )
 
-    identity = get_install_identity()
+    # No baseline, nothing to compare: a checkout that never synced would report under an
+    # install id nothing keeps, and the platform records an install for every id it is
+    # sent. The same root `get_install_identity` reads.
+    root = Path(project_root) if project_root else Path(find_project_root())
+    if not (root / STATE_DIR / INSTALL_FILE).is_file():
+        click.echo(f"  • {len(items)} skill(s) under {base}: no sync baseline yet; "
+                   "run `decimalai skills sync` once")
+        return {}
+
+    identity = get_install_identity(project_root, create=False)
     install_id = identity.get("install_id")
     if not install_id:
+        if combined:
+            click.echo("  ⚠ The authored check was skipped: no install id", err=True)
+            return None
         click.echo("  ✗ Could not determine install id", err=True)
         raise SystemExit(1)
 
@@ -1513,6 +1567,9 @@ def skills_status(skills_dir, api_key, base_url, project):
         resp.raise_for_status()
         result = resp.json() or {}
     except Exception as e:
+        if combined:
+            click.echo(f"  ⚠ The authored check failed: {e}", err=True)
+            return None
         click.echo(f"  ✗ Status check failed: {e}", err=True)
         raise SystemExit(1)
     finally:
@@ -1538,6 +1595,7 @@ def skills_status(skills_dir, api_key, base_url, project):
     if drift:
         click.echo("")
         click.echo("  → Run `decimalai skills sync` to reconcile.")
+    return counts
 
 
 @skills.command("scan")
@@ -1569,10 +1627,11 @@ def skills_scan(skills_dir, fmt, fail_on):
 
     try:
         from skillevaluation import safety as _safety
+        from skillevaluation import skillfmt as _skillfmt
     except ImportError:
         raise click.ClickException(
-            "skills scan needs skillevaluation>=0.4.0 (the safety module). "
-            "Upgrade with: pip install -U 'skillevaluation>=0.4.0'"
+            "skills scan needs skillevaluation>=0.8.0 (the safety and skillfmt modules). "
+            "Upgrade with: pip install -U 'skillevaluation>=0.8.0'"
         )
 
     p = Path(skills_dir).resolve()
@@ -1590,14 +1649,15 @@ def skills_scan(skills_dir, fmt, fail_on):
     worst = 0
     per: list[tuple] = []
     for f in files:
-        fm, body = _split_frontmatter(f.read_text(encoding="utf-8"))
+        fm, body = _split_frontmatter(f.read_text(encoding="utf-8"), path=str(f))
         fm = fm or {}
         name = str(fm.get("name") or f.parent.name)
         res = _safety.scan_skill_content(
             body,
             name=name,
             description=str(fm.get("description") or ""),
-            category=fm.get("category"),
+            # metadata.decimalai-category first, then a top-level `category`; a string or None.
+            category=_skillfmt.taxonomy(fm)["category"],
             allowed_tools=fm.get("allowed-tools") or fm.get("allowed_tools"),
             trigger_phrases=fm.get("trigger_phrases") or fm.get("triggers"),
         )
@@ -1669,411 +1729,6 @@ def skills_review(skill_name, api_key, base_url, project):
         click.echo(f"      intent review: {iv['summary']}")
     if band == "blocked":
         sys.exit(1)
-
-
-# The anonymous pull path builds no client and reuses no connection, and
-# a cold prod instance has served first requests in 9-28s — a flat 20s
-# timeout killed pulls the server went on to complete. Budget 30s per
-# request and retry once on timeout: the attempt that timed out warms
-# the instance the retry then hits.
-_PULL_HTTP_TIMEOUT = 30.0
-
-
-def _pull_get(url, **kwargs):
-    """GET for the anonymous pull path — one retry on timeout."""
-    import httpx
-
-    try:
-        return httpx.get(url, timeout=_PULL_HTTP_TIMEOUT, **kwargs)
-    except httpx.TimeoutException:
-        return httpx.get(url, timeout=_PULL_HTTP_TIMEOUT, **kwargs)
-
-
-@skills.command("pull")
-@click.argument("slug")
-@click.option(
-    "--out", "out_dir", default=None,
-    help="Write SKILL.md to OUT/<slug>/SKILL.md. Default: current directory.",
-)
-@click.option(
-    "--base-url",
-    envvar=["DECIMAL_BASE_URL", "DECIMALAI_BASE_URL"],
-    default="https://api.decimal.ai",
-    show_envvar=True,
-    help="Platform URL",
-)
-@click.option(
-    "--no-evals", "no_evals", is_flag=True, default=False,
-    help="Skip pulling the eval.yaml test suite (default: pull it).",
-)
-@click.option(
-    "--stdout", "to_stdout", is_flag=True, default=False,
-    help="Print body markdown to stdout instead of writing to disk.",
-)
-def skills_pull(slug, out_dir, base_url, no_evals, to_stdout):
-    """Pull a public registry skill to disk — no signup required.
-
-    Fetches the latest version of a public skill from the registry and writes
-    SKILL.md (plus its bundled files and eval.yaml) to disk (or stdout).
-    Read-only: no fork is created, no activations are tracked. Use
-    `decimalai skills install` to fork + sync (which requires an API key).
-
-    \b
-    Examples:
-        # Write ./playwright-cli/SKILL.md
-        $ decimalai skills pull playwright-cli
-    \b
-        # Write to a specific path
-        $ decimalai skills pull pdf --out ./agents/skills/
-    \b
-        # Just print the body
-        $ decimalai skills pull pdf --stdout
-    """
-    import os
-
-    import httpx
-
-    # Public endpoints — no auth header, no api_key required.
-    url = f"{base_url.rstrip('/')}/api/v1/registry/skills"
-    from .._registry_resolve import RESOLVE_LIMIT, find_exact, not_found_message
-
-    try:
-        # `q=` is a semantic search that always ranks *something*; resolve by
-        # exact name or fail loudly. Taking items[0] used to write an unrelated
-        # skill to disk on any typo and report it as a success.
-        search = _pull_get(url, params={"q": slug, "limit": RESOLVE_LIMIT})
-        search.raise_for_status()
-        items = (search.json() or {}).get("items") or []
-        match = find_exact(items, slug)
-        if match is None:
-            click.echo(f"  ✗ {not_found_message(slug, items)}", err=True)
-            raise SystemExit(1)
-        skill_id = match["id"]
-        # The registry's own spelling — `slug` may differ only in case.
-        slug = match.get("name") or slug
-
-        detail_resp = _pull_get(f"{url}/{skill_id}")
-        detail_resp.raise_for_status()
-        detail = detail_resp.json()
-    except httpx.HTTPError as e:
-        click.echo(f"  ✗ Registry lookup failed: {e}", err=True)
-        raise SystemExit(1)
-
-    body = detail.get("body_markdown") or ""
-    # The skill name is server-controlled; reject a
-    # traversal/absolute name before it reaches os.path.join (arbitrary file write).
-    from ..disk_export import SkillExportUnsafePathError, _safe_skill_dirname
-    try:
-        # `url_slug`, not `name`. A registry name may be namespaced
-        # (`owner/skill`) and a slash cannot be a single path component.
-        # `url_slug` is the slash-free identifier minted for this; falling back
-        # to `name` keeps older backends working, and for a plain name the two
-        # are identical.
-        name = _safe_skill_dirname(detail.get("url_slug") or detail.get("name") or slug)
-    except SkillExportUnsafePathError as e:
-        click.echo(f"  ✗ Refusing to pull: {e}", err=True)
-        raise SystemExit(1)
-
-    if to_stdout:
-        click.echo(body, nl=False)
-        return
-
-    # Registry bodies don't carry frontmatter (the loader strips it on
-    # import) — write a parseable SKILL.md, or discover_skills()/the
-    # skillevaluation runner silently skip the file we just pulled.
-    # Bodies that already have frontmatter (bring-your-own round-trips)
-    # pass through verbatim.
-    if not body.startswith("---"):
-        from ..disk_export import _reconstruct_skill_md
-        body = _reconstruct_skill_md(
-            name, detail.get("description") or name, body,
-        )
-
-    target_dir = os.path.join(out_dir or os.getcwd(), name)
-    os.makedirs(target_dir, exist_ok=True)
-    target = os.path.join(target_dir, "SKILL.md")
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(body)
-
-    eff = detail.get("effectiveness") or {}
-    bench = detail.get("benchmark_summary") or {}
-    click.echo(f"  ✓ Pulled {name} v{detail.get('latest_version_number', '?')}")
-    click.echo(f"    → {target}")
-
-    # SkillScore v2 quality line, e.g.:
-    #   SkillScore 87 (provisional) · +60 pts vs no skill · 96% live pass
-    # SkillScore is the quality composite (benchmark pass / live eval
-    # pass / AI-rated trace quality); "provisional" = one evidence leg.
-    score = eff.get("skill_score")
-    if score is None:
-        score = eff.get("avg_effectiveness")  # frozen alias (older backends)
-    quality_parts = []
-    if score is not None:
-        components = eff.get("score_components") or {}
-        early = " (provisional)" if components.get("provisional") else ""
-        quality_parts.append(f"SkillScore {score * 100:.0f}{early}")
-    lift = bench.get("pass_rate_delta_pts")
-    if lift is not None:
-        quality_parts.append(f"{'+' if lift >= 0 else ''}{lift:.0f} pts vs no skill")
-    live_pass = eff.get("avg_pass_rate")
-    if live_pass is not None:
-        quality_parts.append(f"{live_pass * 100:.0f}% live pass")
-    if quality_parts:
-        click.echo(f"    {' · '.join(quality_parts)}")
-
-    # Bundled attachments: pulled bodies reference
-    # scripts/* and references/* the old pull never delivered. The registry
-    # exposes them publicly — GET /registry/skills/{id}/attachments (metadata)
-    # then /attachments/{att_id} (content) — so deliver them next to SKILL.md.
-    # Best-effort: a failed file warns and continues; the summary line names
-    # anything the pull could not deliver.
-    from ..disk_export import _safe_join_within
-
-    attachment_count = detail.get("attachment_count") or 0
-    written_attachments = 0
-    attachments = []
-    if attachment_count:  # skip the round-trip for the bundle-less majority
-        try:
-            atts_resp = _pull_get(f"{url}/{skill_id}/attachments")
-            atts_resp.raise_for_status()
-            attachments = (atts_resp.json() or {}).get("attachments") or []
-        except httpx.HTTPError as e:
-            click.echo(f"  ⚠ bundled-file list fetch failed: {e} — skipping", err=True)
-    for att in attachments:
-        file_path = att.get("file_path") or ""
-        att_id = att.get("id") or ""
-        if not file_path:
-            continue
-        content = att.get("content_text") or ""
-        if not content and att_id:
-            try:
-                full_resp = _pull_get(f"{url}/{skill_id}/attachments/{att_id}")
-                full_resp.raise_for_status()
-                content = (full_resp.json() or {}).get("content_text") or ""
-            except httpx.HTTPError as e:
-                click.echo(f"  ⚠ bundled file {file_path} fetch failed: {e} — skipping", err=True)
-                continue
-        if not content:
-            continue
-        try:
-            att_target = _safe_join_within(target_dir, file_path)
-        except SkillExportUnsafePathError as e:
-            # Server-supplied path — same traversal guard as the installer.
-            click.echo(f"  ⚠ skipping bundled file: {e}", err=True)
-            continue
-        os.makedirs(os.path.dirname(att_target), exist_ok=True)
-        with open(att_target, "w", encoding="utf-8") as f:
-            f.write(content)
-        written_attachments += 1
-    if written_attachments:
-        click.echo(f"    → {written_attachments} bundled file(s) (scripts/references/…)")
-    if attachment_count > written_attachments:
-        missing = attachment_count - written_attachments
-        click.echo(
-            f"    note: this skill references {missing} bundled file(s) not included in pull"
-        )
-
-    # Also write eval.yaml from the dedicated registry endpoint.
-    # 404 means the skill has no publisher/community-authored eval.yaml
-    # (typical for GitHub imports). --no-evals skips the fetch entirely.
-    if not no_evals:
-        try:
-            eval_resp = _pull_get(f"{url}/{skill_id}/eval")
-            if eval_resp.status_code == 200:
-                eval_payload = eval_resp.json()
-                eval_yaml = eval_payload.get("eval_yaml_text") or ""
-                if eval_yaml:
-                    eval_path = os.path.join(target_dir, "eval.yaml")
-                    with open(eval_path, "w", encoding="utf-8") as f:
-                        f.write(eval_yaml)
-                    case_count = eval_payload.get("case_count", 0)
-                    click.echo(f"    → {eval_path} ({case_count} test cases)")
-            elif eval_resp.status_code == 404:
-                # No eval.yaml authored yet — quiet skip, the SKILL.md is
-                # still useful on its own.
-                pass
-            else:
-                click.echo(
-                    f"  ⚠ eval.yaml fetch returned HTTP {eval_resp.status_code} — skipping",
-                    err=True,
-                )
-        except httpx.HTTPError as e:
-            click.echo(f"  ⚠ eval.yaml fetch failed: {e} — skipping", err=True)
-
-    # Efficiency headline — the cost story (tokens primary). The
-    # pass-rate lift moved up into the SkillScore quality line, so this
-    # block no longer repeats it.
-    parts = []
-    if bench.get("tokens_delta_pct") is not None:
-        sign = "+" if bench["tokens_delta_pct"] >= 0 else ""
-        parts.append(f"{sign}{bench['tokens_delta_pct']:.0f}% tokens")
-    if bench.get("turns_delta_pct") is not None:
-        sign = "+" if bench["turns_delta_pct"] >= 0 else ""
-        parts.append(f"{sign}{bench['turns_delta_pct']:.0f}% turns")
-    if parts:
-        click.echo(f"\n  Efficiency vs no skill: {' · '.join(parts)}")
-
-    click.echo("")
-    click.echo("    Next — fork it into your workspace (adds telemetry + versioning):")
-    click.echo(f"      $ decimalai skills install {slug}        # with an API key")
-    click.echo(f"      {_dashboard_url(base_url)}/skills/{slug}   # or in the dashboard")
-
-
-@skills.command("export")
-@click.argument("slug")
-@click.option(
-    "--agent", "agents", multiple=True,
-    help="Agent runtime to write SKILL.md for (repeatable): claude-code, cursor, "
-         "github-copilot, … Default: universal (.agents/skills).",
-)
-@click.option(
-    "--scope", type=click.Choice(["project", "global"]), default="project",
-    show_default=True,
-    help="project → .claude/skills, .agents/skills (cwd); global → ~/… dirs.",
-)
-@click.option(
-    "--out", "project_root", default=None,
-    help="Project root for --scope=project (default: current directory).",
-)
-@common_options
-def skills_export(slug, agents, scope, project_root, api_key, base_url, project):
-    """Write a skill to disk for file-loading runtimes. No copy is taken.
-
-    Export is the FILE half of adoption, on its own. It writes SKILL.md (+
-    scripts) into each agent runtime's skills dir so Claude Code / Cursor / …
-    load it — and that is all it does. Nothing about writing a file requires
-    owning the skill.
-
-    Works on anything in your workspace: a skill you own, or one you installed
-    (linked) from the registry. `decimalai skills install` used to be this
-    command, but it forked first, so asking for a file also took an editable
-    copy you never asked for.
-
-    \b
-    Examples:
-        $ decimalai skills export pdf
-        $ decimalai skills export pdf --agent claude-code --agent cursor
-        $ decimalai skills export playwright-cli --scope global
-
-    For a public skill you have NOT added to your workspace — no key, no
-    account — use `decimalai skills pull`.
-    """
-    from ..skill_router import SkillRouter
-
-    if not api_key:
-        click.echo("  ✗ Export reads the skill from your workspace, so an API key is required.", err=True)
-        click.echo('    Set it:   export DECIMAL_API_KEY="dai_sk_..."', err=True)
-        click.echo(f"    Public skill you have not added yet:   decimalai skills pull {slug}", err=True)
-        raise SystemExit(1)
-
-    router = SkillRouter(api_key=api_key, base_url=base_url or "https://api.decimal.ai")
-    try:
-        summary = router.export(
-            slug, agents=list(agents) or None, scope=scope, project_root=project_root,
-        )
-    except Exception as e:  # noqa: BLE001 — surfaced to the user, not swallowed
-        click.echo(f"  ✗ {e}", err=True)
-        raise SystemExit(1)
-
-    written = summary.get("skills_written", 0)
-    if not written:
-        click.echo("  ✗ Nothing was written — is the skill in your workspace?", err=True)
-        raise SystemExit(1)
-    click.echo(f"  ✓ Wrote {slug} to disk")
-    for p_ in (summary.get("paths") or [])[:8]:
-        click.echo(f"    → {p_}")
-    for err in summary.get("errors") or []:
-        click.echo(f"    ⚠ {err.get('skill')}: {err.get('error')}", err=True)
-
-
-@skills.command("install")
-@click.argument("slug")
-@click.option(
-    "--agent", "agents", multiple=True,
-    help="Agent runtime to write SKILL.md for (repeatable): claude-code, cursor, "
-         "github-copilot, … Default: universal (.agents/skills).",
-)
-@click.option(
-    "--scope", type=click.Choice(["project", "global"]), default="project",
-    show_default=True,
-    help="project → .claude/skills, .agents/skills (cwd); global → ~/… dirs.",
-)
-@click.option(
-    "--out", "project_root", default=None,
-    help="Project root for --scope=project (default: current directory).",
-)
-@common_options
-def skills_install(slug, agents, scope, project_root, api_key, base_url, project):
-    """Fork a registry skill into your workspace AND write it to disk.
-
-    DEPRECATED — the two halves are separate commands now:
-      `decimalai skills export <slug>`  writes the files (no copy)
-      the Install button / `router.use()` links the skill (no copy)
-      `router.fork()` takes the editable copy
-    This still works and still forks; it is just no longer the shape to reach for.
-
-    The full on-ramp (needs an API key). Two steps in one:
-
-      \b
-      1. Fork  — copy the registry skill into your workspace as a skill you
-                 own, tracked + versioned (POST /registry/skills/{id}/install).
-      2. Install to disk — write SKILL.md (+ scripts) into each agent
-                 runtime's skills dir so Claude Code / Cursor / … load it.
-
-    For just the file — no fork, no signup — use `decimalai skills pull`.
-
-    \b
-    Examples:
-        $ decimalai skills install pdf
-        $ decimalai skills install pdf --agent claude-code --agent cursor
-        $ decimalai skills install playwright-cli --scope global
-    """
-    from ..skill_router import SkillRouter
-
-    if not api_key:
-        click.echo("  ✗ Installing forks the skill into your workspace, so an API key is required.", err=True)
-        click.echo('    Set it:   export DECIMAL_API_KEY="dai_sk_..."', err=True)
-        click.echo(f"    Just the file instead (no fork):   decimalai skills pull {slug}", err=True)
-        raise SystemExit(1)
-
-    router = SkillRouter(api_key=api_key, base_url=base_url or "https://api.decimal.ai")
-    agent_list = list(agents) or None
-
-    def _echo_paths(export):
-        for p in (export.get("paths") or [])[:8]:
-            click.echo(f"    → {p}")
-
-    try:
-        result = router.install(
-            slug, agents=agent_list, scope=scope, project_root=project_root,
-        )
-    except Exception as e:  # SkillRouter raises RuntimeError / ValueError
-        msg = str(e)
-        if "409" in msg or "lready installed" in msg:
-            # Already forked — not an error; just (re)write the files to disk.
-            try:
-                export = router.export_to_disk(
-                    skills=[slug], agents=agent_list, scope=scope, project_root=project_root,
-                )
-            except Exception as e2:
-                click.echo(f"  ✗ Already in your workspace, but writing to disk failed: {e2}", err=True)
-                raise SystemExit(1)
-            click.echo(f"  ✓ '{slug}' already in your workspace — refreshed {export.get('skills_written', 0)} file(s) on disk")
-            _echo_paths(export)
-            return
-        click.echo(f"  ✗ Install failed: {e}", err=True)
-        raise SystemExit(1)
-
-    name = result.get("skill_name", slug)
-    export = result.get("export") or {}
-    written = export.get("skills_written", 0)
-    click.echo(f"  ✓ Forked '{name}' into your workspace (tracked + versioned)")
-    if written:
-        click.echo(f"  ✓ Wrote SKILL.md to disk ({written} file(s))")
-        _echo_paths(export)
-    else:
-        click.echo("  • No disk files written (pass --agent claude-code to materialize on disk).")
-    click.echo("")
 
 
 @skills.command("benchmark")
@@ -2178,7 +1833,7 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
     # Skill name preferably from frontmatter; fall back to dir name.
     from ..skills import _split_frontmatter
     content = skill_md.read_text(encoding="utf-8")
-    frontmatter, body = _split_frontmatter(content)
+    frontmatter, body = _split_frontmatter(content, path=str(skill_md))
     name = (frontmatter.get("name") or "").strip() or base.name
     if not body or not body.strip():
         click.echo(f"  ✗ {skill_md} has an empty body", err=True)
@@ -2189,6 +1844,9 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
         # 1. Sync this skill body + (optionally) eval.yaml so the backend
         #    has the latest test cases before running.
         body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        # The sync endpoint takes one category string and rejects the whole request for
+        # a list (`category: [a, b]`), as `skills sync` already guards.
+        category = frontmatter.get("category")
         payload = {
             "skills": [
                 {
@@ -2196,7 +1854,7 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
                     "content_hash": body_hash,
                     "body_markdown": body,
                     "description": frontmatter.get("description") or name,
-                    "category": frontmatter.get("category"),
+                    "category": category if isinstance(category, str) else None,
                 }
             ],
             "conflict_policy": "local_wins",  # benchmark always pushes local

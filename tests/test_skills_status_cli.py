@@ -83,12 +83,47 @@ class TestInstallIdentity:
 
     def test_find_project_root_prefers_existing_decimal_dir(self, tmp_path):
         # A run from a subdirectory must share the repo's install_id, so the
-        # root resolver prefers an ancestor that already has .decimal/.
+        # root resolver prefers an ancestor that already has .decimal/ ...
         root = tmp_path / "repo"
-        (root / ".decimal").mkdir(parents=True)
+        (root / ".git").mkdir(parents=True)
+        (root / "pkg" / ".decimal").mkdir(parents=True)
+        (root / ".decimal").mkdir()
         sub = root / "pkg" / "nested"
         sub.mkdir(parents=True)
-        assert _install.find_project_root(str(sub)) == str(root)
+        assert _install.find_project_root(str(sub)) == str((root / "pkg").resolve())
+        # ... and a .decimal/ holding the skills manifest beats a nearer bare one.
+        (root / ".decimal" / "skills.toml").write_text("[skills]\n", encoding="utf-8")
+        assert _install.find_project_root(str(sub)) == str(root.resolve())
+
+    def test_find_project_root_stops_at_the_repository(self, tmp_path):
+        # A folder of repositories with a .decimal/ of its own is not the project of a
+        # directory inside one of them: the search stops at the first `.git` entry.
+        (tmp_path / ".decimal").mkdir()
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        sub = repo / "src"
+        sub.mkdir()
+        assert _install.find_project_root(str(sub)) == str(repo.resolve())
+
+    def test_find_project_root_stops_at_a_git_file(self, tmp_path):
+        # A git worktree's `.git` is a file; it bounds the search the same way.
+        (tmp_path / ".decimal").mkdir()
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        assert _install.find_project_root(str(tree)) == str(tree.resolve())
+
+    def test_find_project_root_never_climbs_to_home(self, tmp_path, monkeypatch):
+        # Running the SDK in the home directory leaves ~/.decimal/install.json; a
+        # directory under home (outside any repository) is still its own project.
+        home = tmp_path / "home"
+        (home / ".decimal").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        work = home / "scratch" / "tool"
+        work.mkdir(parents=True)
+        assert _install.find_project_root(str(work)) == str(work.resolve())
+        # Started at home itself, home is the project.
+        assert _install.find_project_root(str(home)) == str(home.resolve())
 
 
 # ── skills status ──────────────────────────────────────────
@@ -153,6 +188,7 @@ class TestSkillsStatusCommand:
         })
         runner = CliRunner()
         with runner.isolated_filesystem():
+            _install.get_install_identity(".")  # this checkout has synced before
             _seed("alpha-dir", SKILL_ALPHA)
             _seed("bravo", SKILL_BRAVO)
             with patch("decimalai.cli.main._make_client", return_value=client):
@@ -186,6 +222,7 @@ class TestSkillsStatusCommand:
         })
         runner = CliRunner()
         with runner.isolated_filesystem():
+            _install.get_install_identity(".")
             _seed("alpha", SKILL_ALPHA)
             with patch("decimalai.cli.main._make_client", return_value=client):
                 result = runner.invoke(cli, [
@@ -208,6 +245,22 @@ class TestSkillsStatusCommand:
                 mk.assert_not_called()
         assert result.exit_code == 0, result.output
         assert "No SKILL.md files found" in result.output
+
+    def test_no_sync_baseline_skips_the_report_and_writes_nothing(self):
+        # A checkout that never synced has no baseline: the platform is not asked (it would
+        # record an install under an id nothing keeps), and status creates no identity.
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            _seed("alpha", SKILL_ALPHA)
+            with patch("decimalai.cli.main._make_client") as mk:
+                result = runner.invoke(cli, [
+                    "skills", "status", "skills",
+                    "--api-key", "k", "--base-url", "http://localhost:8000",
+                ])
+                mk.assert_not_called()
+            assert not os.path.exists(".decimal")
+        assert result.exit_code == 0, result.output
+        assert "no sync baseline yet; run `decimalai skills sync` once" in result.output
 
 
 # ── skills sync (the install-stamp + pull-reconcile half) ─────

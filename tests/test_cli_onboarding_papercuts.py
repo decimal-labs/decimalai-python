@@ -10,8 +10,8 @@ truncated help example.
 * Version column: `skills list` reads the version from
   `latest_version.version_number` (the key the endpoint actually serializes)
   instead of printing "v?".
-* Bundled attachments: `skills pull` downloads the attachments the body
-  references via the public registry attachment endpoints.
+* Bundled attachments: `skills pull` writes the files the body references
+  from the registry's bundle, and names the ones it cannot deliver.
 * Help papercuts: unmangled pull examples, complete one-liners, and a
   "start here" hint on the bare invocation.
 """
@@ -183,84 +183,59 @@ class TestSkillsListVersion:
 # ── pull delivers bundled attachments ───────────────────────
 
 
-def _resp(payload=None, status=200):
-    r = MagicMock()
-    r.status_code = status
-    r.json.return_value = payload if payload is not None else {}
-    if status >= 400:
-        r.raise_for_status.side_effect = httpx.HTTPStatusError(
-            f"{status}", request=MagicMock(), response=MagicMock(status_code=status),
-        )
-    else:
-        r.raise_for_status = MagicMock()
-    return r
-
-
 class TestPullAttachments:
-    DETAIL = {
-        "id": "sk1",
-        "name": "pdf",
-        "url_slug": "pdf",
-        "description": "PDF skill",
-        "body_markdown": "# PDF\n\nRun scripts/extract.py first.",
-        "latest_version_number": 1,
-        "attachment_count": 1,
-        "effectiveness": {},
-        "benchmark_summary": {},
-    }
+    """`skills pull` writes every bundled file the body references, beside SKILL.md, from
+    the registry's own bundle (tests/fakes/fake_registry.py on a socket)."""
 
-    def _fake_get(self, atts_list_resp, att_detail_resp):
-        def fake_get(url, **kwargs):
-            if url.endswith("/api/v1/registry/skills"):
-                return _resp({"items": [{"id": "sk1", "name": "pdf"}]})
-            if url.endswith("/registry/skills/sk1"):
-                return _resp(self.DETAIL)
-            if url.endswith("/sk1/attachments"):
-                return atts_list_resp
-            if url.endswith("/sk1/attachments/a1"):
-                return att_detail_resp
-            if url.endswith("/sk1/eval"):
-                return _resp(status=404)
-            raise AssertionError(f"unexpected GET {url}")
-        return fake_get
+    FILES = (
+        {"path": "scripts/extract.py", "content": "print('extract')", "executable": True},
+    )
+
+    def _pull(self, files, tamper=None):
+        from tests.fakes.fake_registry import FakeRegistry
+
+        registry = FakeRegistry()
+        registry.add_skill("pdf", body="# PDF\n\nRun scripts/extract.py first.\n", files=files)
+        registry.tamper = tamper
+        with registry.serve() as url:
+            return CliRunner().invoke(cli, ["skills", "pull", "pdf", "--no-evals",
+                                            "--base-url", url])
 
     def test_attachments_written_next_to_skill_md(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        fake = self._fake_get(
-            _resp({"attachments": [{"id": "a1", "file_path": "scripts/extract.py"}]}),
-            _resp({"id": "a1", "file_path": "scripts/extract.py",
-                   "content_text": "print('extract')"}),
-        )
-        with patch("httpx.get", side_effect=fake):
-            result = CliRunner().invoke(cli, ["skills", "pull", "pdf"])
+        result = self._pull(self.FILES)
         assert result.exit_code == 0, result.output
         script = tmp_path / "pdf" / "scripts" / "extract.py"
         assert script.read_text() == "print('extract')"
+        if os.name == "posix":
+            assert script.stat().st_mode & 0o111
         assert "1 bundled file(s)" in result.output
-        assert "not included in pull" not in result.output
+        assert "not included" not in result.output
 
     def test_undeliverable_attachments_are_named_not_silent(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        fake = self._fake_get(_resp(status=500), _resp(status=500))
-        with patch("httpx.get", side_effect=fake):
-            result = CliRunner().invoke(cli, ["skills", "pull", "pdf"])
+        # A binary attachment: the registry stores no bytes for it, and lists it.
+        result = self._pull(({"path": "scripts/extract.bin", "content": None},))
         assert result.exit_code == 0, result.output
-        assert "references 1 bundled file(s) not included in pull" in result.output
+        assert "not included: scripts/extract.bin" in result.output
+        assert (tmp_path / "pdf" / "SKILL.md").is_file()
 
     def test_traversal_attachment_path_is_refused(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        fake = self._fake_get(
-            _resp({"attachments": [
-                {"id": "a1", "file_path": "../../evil.sh", "content_text": "boom"},
-            ]}),
-            _resp({}),
-        )
-        with patch("httpx.get", side_effect=fake):
-            result = CliRunner().invoke(cli, ["skills", "pull", "pdf"])
-        assert result.exit_code == 0, result.output
-        assert not (tmp_path.parent / "evil.sh").exists()
-        assert not (tmp_path.parent.parent / "evil.sh").exists()
-        assert "skipping bundled file" in result.output
+        work = tmp_path / "a" / "b"
+        work.mkdir(parents=True)
+        monkeypatch.chdir(work)
+
+        def tamper(data):
+            data["files"][1]["path"] = "../../evil.sh"
+
+        result = self._pull(self.FILES, tamper)
+        # A server-supplied path outside the folder: the whole bundle is refused (exit 6)
+        # before anything is written, not just the one file.
+        assert result.exit_code == 6, result.output
+        assert not (tmp_path / "evil.sh").exists()
+        assert not (tmp_path / "a" / "evil.sh").exists()
+        assert list(work.iterdir()) == []
+        assert "../../evil.sh" in result.output
 
 
 # ── click help papercuts ────────────────────────────────────

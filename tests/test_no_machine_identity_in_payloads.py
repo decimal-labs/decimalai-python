@@ -126,6 +126,13 @@ class TestSyncPayloadOmitsLabel:
 
         runner = CliRunner()
         with runner.isolated_filesystem():
+            # `status` reports only for a checkout that has synced, so it reads an existing
+            # identity: here one an older release wrote, labelled with this machine's name.
+            os.makedirs(".decimal")
+            with open(".decimal/install.json", "w", encoding="utf-8") as f:
+                json.dump({"install_id": "11111111-2222-3333-4444-555555555555",
+                           "install_label": socket.gethostname(),
+                           "created_at": "2026-01-01T00:00:00+00:00"}, f)
             os.makedirs("skills/alpha-dir")
             with open("skills/alpha-dir/SKILL.md", "w", encoding="utf-8") as f:
                 f.write("---\nname: alpha\ndescription: first\n---\n\n# Alpha\n")
@@ -139,6 +146,7 @@ class TestSyncPayloadOmitsLabel:
         path = client._http.post.call_args[0][0]
         body = client._http.post.call_args.kwargs["json"]
         assert path == "/api/v1/skills/installs/report"
+        assert body["install_id"] == "11111111-2222-3333-4444-555555555555"
         assert "install_label" not in body
         assert socket.gethostname() not in json.dumps(body)
 

@@ -126,12 +126,22 @@ class TestRepairCli:
         assert "tool_rename" in result.output
 
 
+def _quality(registry, detail):
+    """Answer `pull`'s two registry reads beside the bundle: no eval.yaml, then the detail
+    the quality line comes from (the fake answers neither route itself)."""
+    import httpx
+
+    registry.fault("other", httpx.Response(404, json={"detail": "Not Found"}),
+                   httpx.Response(200, json=detail))
+
+
 class TestSkillsPullCli:
-    """Tests for `decimalai skills pull <slug>` — the no-auth public registry pull.
+    """Tests for `decimalai skills pull <ref>` — the no-auth public registry pull.
 
     Key invariant: this command must NOT require an API key. Anonymous
-    developers can read a skill into ./<slug>/SKILL.md as a first
-    interaction with DecimalAI.
+    developers can copy a skill into ./<install-name>/SKILL.md as a first
+    interaction with DecimalAI. It writes the registry's own bytes, through the
+    anonymous bundle route (tests/fakes/fake_registry.py).
     """
 
     def test_help_describes_no_signup(self):
@@ -143,22 +153,20 @@ class TestSkillsPullCli:
         assert "--out" in result.output
         assert "--stdout" in result.output
 
-    def test_pull_writes_skill_md_to_disk(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock, patch
+    def _pull(self, tmp_path, name, detail=None, *extra):
+        from tests.fakes.fake_registry import FakeRegistry
 
-        search_resp = MagicMock(status_code=200)
-        search_resp.json.return_value = {
-            "items": [{"id": "sk-pull-001", "name": "code-review"}],
-        }
-        detail_resp = MagicMock(status_code=200)
-        detail_resp.json.return_value = {
-            "id": "sk-pull-001",
-            "name": "code-review",
-            "body_markdown": "# Code Review\n\nDo a code review.",
-            "latest_version_number": 3,
-            # SkillScore v2 shape: composite +
-            # decomposition flags + live pass, with the benchmark lift in
-            # its own summary block.
+        registry = FakeRegistry()
+        registry.add_skill(name, body=f"# {name}\n\nDo a code review.\n")
+        _quality(registry, {"id": "x", "name": name, **(detail or {})})
+        with registry.serve() as url:
+            return registry, CliRunner().invoke(
+                cli, ["skills", "pull", name, "--out", str(tmp_path), "--base-url", url, *extra])
+
+    def test_pull_writes_skill_md_to_disk(self, tmp_path):
+        _, result = self._pull(tmp_path, "code-review", {
+            # SkillScore v2 shape: composite + decomposition flags + live pass,
+            # with the benchmark lift in its own summary block.
             "effectiveness": {
                 "skill_score": 0.87,
                 "score_components": {"legs": 2, "provisional": False},
@@ -169,28 +177,12 @@ class TestSkillsPullCli:
                 "tokens_delta_pct": -43.0,
                 "turns_delta_pct": -30.0,
             },
-        }
-        # The pull command now also fetches /{slug}/eval to drop an
-        # eval.yaml alongside SKILL.md (a registry UX improvement).
-        # A 404 means "no eval authored" → quiet skip, the SKILL.md is still
-        # written. Without this third mock the iter()'d side_effect runs out
-        # and the CLI crashes with StopIteration (exit code 1).
-        eval_resp = MagicMock(status_code=404)
-        eval_resp.json.return_value = {}
-        for r in (search_resp, detail_resp, eval_resp):
-            r.raise_for_status = MagicMock()
-
-        with patch("httpx.get", side_effect=[search_resp, detail_resp, eval_resp]):
-            runner = CliRunner()
-            result = runner.invoke(
-                cli,
-                ["skills", "pull", "code-review", "--out", str(tmp_path)],
-            )
-
+        })
         assert result.exit_code == 0, result.output
         written = tmp_path / "code-review" / "SKILL.md"
         assert written.exists(), f"missing {written}"
         body = written.read_text()
+        assert body.startswith("---\nname: code-review\n")
         assert "Do a code review" in body
         # Quality line — composite · lift · live pass, on one line.
         assert "SkillScore 87 · +60 pts vs no skill · 96% live pass" in result.output
@@ -199,37 +191,14 @@ class TestSkillsPullCli:
         # Efficiency headline is tokens-first and no longer repeats the lift.
         assert "Efficiency vs no skill: -43% tokens · -30% turns" in result.output
         assert "pts pass rate" not in result.output
-        # Sends users to the canonical /skills/<slug> URL post-pull
+        # Sends users to the canonical /skills/<name> URL post-pull, and to `add`.
         assert "/skills/code-review" in result.output
-
-    def _pull(self, tmp_path, detail_payload):
-        """Run `skills pull` against a mocked registry detail payload."""
-        from unittest.mock import MagicMock, patch
-
-        search_resp = MagicMock(status_code=200)
-        search_resp.json.return_value = {
-            "items": [{"id": detail_payload["id"], "name": detail_payload["name"]}],
-        }
-        detail_resp = MagicMock(status_code=200)
-        detail_resp.json.return_value = detail_payload
-        eval_resp = MagicMock(status_code=404)
-        eval_resp.json.return_value = {}
-        for r in (search_resp, detail_resp, eval_resp):
-            r.raise_for_status = MagicMock()
-
-        with patch("httpx.get", side_effect=[search_resp, detail_resp, eval_resp]):
-            runner = CliRunner()
-            return runner.invoke(
-                cli,
-                ["skills", "pull", detail_payload["name"], "--out", str(tmp_path)],
-            )
+        assert "decimalai skills add code-review" in result.output
 
     def test_pull_quality_line_marks_provisional(self, tmp_path):
         """One evidence leg → the score renders `(provisional)` so a pulled
         skill never overstates one-signal evidence."""
-        result = self._pull(tmp_path, {
-            "id": "sk-prov", "name": "prov-skill",
-            "body_markdown": "# P\nbody.", "latest_version_number": 1,
+        _, result = self._pull(tmp_path, "prov-skill", {
             "effectiveness": {
                 "skill_score": 0.97,
                 "score_components": {"legs": 1, "provisional": True},
@@ -244,9 +213,7 @@ class TestSkillsPullCli:
     def test_pull_quality_line_falls_back_to_frozen_alias(self, tmp_path):
         """Older backends without `skill_score` still surface the composite
         via the frozen `avg_effectiveness` alias."""
-        result = self._pull(tmp_path, {
-            "id": "sk-alias", "name": "alias-skill",
-            "body_markdown": "# A\nbody.", "latest_version_number": 2,
+        _, result = self._pull(tmp_path, "alias-skill", {
             "effectiveness": {"avg_effectiveness": 0.72},
         })
         assert result.exit_code == 0, result.output
@@ -255,82 +222,41 @@ class TestSkillsPullCli:
     def test_pull_no_evidence_omits_quality_line(self, tmp_path):
         """No score, no benchmark, no live pass → the pull stays clean
         (no quality line at all) instead of printing empty scaffolding."""
-        result = self._pull(tmp_path, {
-            "id": "sk-new", "name": "new-skill",
-            "body_markdown": "# N\nbody.", "latest_version_number": 1,
-        })
+        _, result = self._pull(tmp_path, "new-skill")
         assert result.exit_code == 0, result.output
         assert "SkillScore" not in result.output
         assert "Efficiency vs no skill" not in result.output
         # The pull confirmation + next-steps funnel still print.
-        assert "✓ Pulled new-skill" in result.output
+        assert "✓ Pulled new-skill v1" in result.output
         assert "/skills/new-skill" in result.output
 
-    def test_pull_stdout_mode_prints_body(self, monkeypatch):
-        from unittest.mock import MagicMock, patch
-
-        search_resp = MagicMock(status_code=200)
-        search_resp.json.return_value = {
-            "items": [{"id": "sk-pull-stdout", "name": "pdf"}],
-        }
-        detail_resp = MagicMock(status_code=200)
-        detail_resp.json.return_value = {
-            "id": "sk-pull-stdout",
-            "name": "pdf",
-            "body_markdown": "# PDF\nConvert PDFs.",
-            "latest_version_number": 1,
-        }
-        for r in (search_resp, detail_resp):
-            r.raise_for_status = MagicMock()
-
-        with patch("httpx.get", side_effect=[search_resp, detail_resp]):
-            runner = CliRunner()
-            result = runner.invoke(cli, ["skills", "pull", "pdf", "--stdout"])
-
+    def test_pull_stdout_mode_prints_body(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, result = self._pull(tmp_path / "unused", "pdf", None, "--stdout")
         assert result.exit_code == 0, result.output
-        assert "# PDF" in result.output
-        assert "Convert PDFs" in result.output
+        assert result.stdout.startswith("---\nname: pdf\n")
+        assert "Do a code review" in result.stdout
+        assert not (tmp_path / "unused").exists() and not (tmp_path / "pdf").exists()
 
-    def test_pull_exits_1_when_skill_not_found(self):
-        from unittest.mock import MagicMock, patch
+    def test_pull_exits_7_when_skill_not_found(self, tmp_path):
+        from tests.fakes.fake_registry import FakeRegistry
 
-        empty_search = MagicMock(status_code=200)
-        empty_search.json.return_value = {"items": []}
-        empty_search.raise_for_status = MagicMock()
+        registry = FakeRegistry()
+        with registry.serve() as url:
+            result = CliRunner().invoke(cli, ["skills", "pull", "no-such-skill",
+                                              "--out", str(tmp_path), "--base-url", url])
+        assert result.exit_code == 7
+        assert "no-such-skill" in result.output
+        assert "no public skill" in result.output
 
-        with patch("httpx.get", return_value=empty_search):
-            runner = CliRunner()
-            result = runner.invoke(cli, ["skills", "pull", "no-such-skill"])
-        assert result.exit_code == 1
-        assert "not found" in result.output.lower()
-
-    def test_pull_does_not_require_api_key(self):
-        """The command must not call _make_client() — verify by inspecting
-        that it works with no DECIMAL_API_KEY in env."""
-        import os
-        from unittest.mock import MagicMock, patch
-
-        # Belt + suspenders: scrub the env so an accidental client-create blows up.
-        for k in ("DECIMAL_API_KEY", "DECIMALAI_API_KEY"):
-            os.environ.pop(k, None)
-
-        search_resp = MagicMock(status_code=200)
-        search_resp.json.return_value = {"items": [{"id": "x", "name": "x"}]}
-        detail_resp = MagicMock(status_code=200)
-        detail_resp.json.return_value = {
-            "id": "x", "name": "x", "body_markdown": "# x\nx.",
-            "latest_version_number": 1,
-        }
-        for r in (search_resp, detail_resp):
-            r.raise_for_status = MagicMock()
-
-        with patch("httpx.get", side_effect=[search_resp, detail_resp]):
-            runner = CliRunner()
-            result = runner.invoke(cli, ["skills", "pull", "x", "--stdout"])
-
+    def test_pull_does_not_require_or_send_an_api_key(self, tmp_path, monkeypatch):
+        """A key in the environment is never sent: pull is the anonymous door."""
+        monkeypatch.setenv("DECIMAL_API_KEY", "dai_sk_should_not_travel")
+        registry, result = self._pull(tmp_path, "x", None, "--stdout")
         assert result.exit_code == 0, result.output
-        # No "API key" error in the output
         assert "api key" not in result.output.lower()
+        assert registry.requests
+        assert not any(r.headers.get("authorization") for r in registry.requests)
 
 
 class TestTracesImportWireFormat:

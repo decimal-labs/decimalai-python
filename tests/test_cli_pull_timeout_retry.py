@@ -1,11 +1,11 @@
 """Tests for the anonymous pull path's timeout budget + single retry.
 
-`decimalai skills pull` talks to the registry anonymously — plain
-`httpx.get`, no client, no connection reuse — and a cold prod instance
-has served first requests in 9-28s. The old flat 20s timeout killed
-pulls the server went on to complete. Every pull-path request now
-routes through `_pull_get`, which budgets `_PULL_HTTP_TIMEOUT` per
-attempt and retries exactly once on timeout.
+`decimalai skills pull` talks to the registry anonymously, and a cold prod
+instance has served first requests in 9-28s. The old flat 20s timeout killed
+pulls the server went on to complete. The bundle comes through the skills
+engine's registry client (30s per request, one retry on timeout); the reads
+beside it (eval.yaml, the quality line) go through `_pull_get`, which budgets
+`_PULL_HTTP_TIMEOUT` per attempt and retries exactly once on timeout.
 """
 
 from unittest.mock import MagicMock, patch
@@ -14,7 +14,10 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from decimalai.cli.main import _PULL_HTTP_TIMEOUT, _pull_get, cli
+from decimalai.cli.main import cli
+from decimalai.cli.skills_pm import _PULL_HTTP_TIMEOUT, _pull_get
+from decimalai.skillpkg.client import DEFAULT_TIMEOUT, RegistryClient
+from tests.fakes.fake_registry import BASE_URL, FakeRegistry
 
 
 def _resp(payload, status_code=200):
@@ -22,15 +25,6 @@ def _resp(payload, status_code=200):
     resp.json.return_value = payload
     resp.raise_for_status = MagicMock()
     return resp
-
-
-_SEARCH = {"items": [{"id": "sk-timeout-001", "name": "slow-skill"}]}
-_DETAIL = {
-    "id": "sk-timeout-001",
-    "name": "slow-skill",
-    "body_markdown": "# Slow\n\nbody.",
-    "latest_version_number": 1,
-}
 
 
 class TestPullGetRetry:
@@ -79,31 +73,45 @@ class TestPullGetRetry:
 
 
 class TestPullCommandColdStart:
-    """`skills pull` end-to-end with a timeout injected mid-sequence."""
+    """`skills pull` end-to-end with a timeout injected on the bundle request."""
 
-    def test_pull_survives_one_cold_start_timeout(self, tmp_path):
-        with patch(
-            "httpx.get",
-            side_effect=[
-                httpx.ReadTimeout("cold start"),  # search, first attempt
-                _resp(_SEARCH),                   # search, retry
-                _resp(_DETAIL),                   # detail
-                _resp({}, status_code=404),       # eval — none authored
-            ],
-        ):
-            result = CliRunner().invoke(
-                cli, ["skills", "pull", "slow-skill", "--out", str(tmp_path)]
-            )
+    @pytest.fixture
+    def registry(self, monkeypatch):
+        """The fake registry in process: every client the CLI builds sends through it."""
+        registry = FakeRegistry()
+        registry.add_skill("slow-skill", body="# Slow\n\nbody.\n")
+        transport = registry.transport()
+        real = RegistryClient.from_env
+
+        def from_env(*args, **kwargs):
+            kwargs.setdefault("transport", transport)
+            kwargs.setdefault("sleep", lambda _s: None)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(RegistryClient, "from_env", from_env)
+        return registry
+
+    def _pull(self, tmp_path):
+        return CliRunner().invoke(cli, ["skills", "pull", "slow-skill", "--out", str(tmp_path),
+                                        "--no-evals", "--base-url", BASE_URL])
+
+    def test_the_bundle_request_runs_on_the_cold_budget(self, registry, tmp_path):
+        result = self._pull(tmp_path)
+        assert result.exit_code == 0, result.output
+        (call,) = registry.calls("registry_bundle")
+        assert call.timeout["read"] == DEFAULT_TIMEOUT == _PULL_HTTP_TIMEOUT
+
+    def test_pull_survives_one_cold_start_timeout(self, registry, tmp_path):
+        registry.fault("registry_bundle", "timeout")
+        result = self._pull(tmp_path)
         assert result.exit_code == 0, result.output
         assert (tmp_path / "slow-skill" / "SKILL.md").exists()
+        assert len(registry.calls("registry_bundle")) == 2
 
-    def test_pull_fails_cleanly_when_retry_also_times_out(self, tmp_path):
-        with patch(
-            "httpx.get",
-            side_effect=[httpx.ReadTimeout("cold"), httpx.ReadTimeout("dead")],
-        ):
-            result = CliRunner().invoke(
-                cli, ["skills", "pull", "slow-skill", "--out", str(tmp_path)]
-            )
-        assert result.exit_code == 1
-        assert "Registry lookup failed" in result.output
+    def test_pull_fails_cleanly_when_retry_also_times_out(self, registry, tmp_path):
+        registry.fault("registry_bundle", "timeout", "timeout")
+        result = self._pull(tmp_path)
+        assert result.exit_code == 8
+        assert "did not answer within 30s" in result.output
+        assert "Traceback" not in result.output
+        assert not (tmp_path / "slow-skill").exists()
