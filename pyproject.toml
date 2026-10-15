@@ -279,6 +279,11 @@ conformance-tests = [
     # (init(anthropic=True) / init(openai=True) warn and SKIP without them, which
     # would grade those drivers on a tracing path nothing turned on).
     "decimalai[providers-tests]",
+    # The native skill loaders with no DecimalAI adapter (tests/native_loaders, which
+    # rides the default `pytest tests/` run). Each adds packages and moves no pin here.
+    "deepagents>=0.7.25",
+    "agent-framework-core>=1.21.0",
+    "pydantic-ai-harness>=0.56.0",
 ]
 # HERMETIC conformance, openai 2 world: the drivers whose framework cannot be
 # installed beside openai>=3, plus the unit tests that need those packages (the
@@ -306,6 +311,11 @@ conformance-tests-openai2 = [
     "openinference-instrumentation-crewai>=1.1.21",
     "openinference-instrumentation-openai>=0.1.65",
     "openinference-instrumentation-litellm>=0.1.50",
+    # The Strands native skill loader (tests/native_loaders). Here, not in the openai 3
+    # extra, although it needs no openai: strands-agents caps mcp<2.2, which in the
+    # openai 3 environment would move mcp under claude-agent-sdk and openai-agents.
+    # Here it only adds packages. Re-check with a resolve diff when either floor moves.
+    "strands-agents>=1.61.0",
 ]
 
 [project.scripts]

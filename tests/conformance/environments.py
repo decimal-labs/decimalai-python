@@ -116,6 +116,37 @@ DRIVER_ENVS: Dict[str, FrozenSet[str]] = {
 }
 
 
+#: Native skill loader (``tests/native_loaders``) -> the environment(s) that grade
+#: it. Kept here, beside ``DRIVER_ENVS``, so "which environment grades what" lives
+#: in one module. These loaders read our folders with no DecimalAI adapter at all.
+#: Six ride in openai3. CrewAI pins openai<3. Strands-agents is openai2 for another
+#: reason: its ``mcp<2.2`` cap would move mcp under claude-agent-sdk and
+#: openai-agents in openai3, while openai2 already holds an mcp it accepts.
+#: ``tests/native_loaders/test_native_coverage.py`` fails on a loader missing here,
+#: and on one whose environment's extras do not install it.
+LOADER_ENVS: Dict[str, FrozenSet[str]] = {
+    "claude-agent-sdk": _OPENAI3,
+    # The native check drives ADK with a scripted BaseLlm, not LiteLLM, so unlike the
+    # conformance driver it needs nothing from openai2.
+    "google-adk": _OPENAI3,
+    "openai-agents": _OPENAI3,
+    "deepagents": _OPENAI3,          # requires langchain, an openai 3 package here
+    "agent-framework": _OPENAI3,
+    "pydantic-ai-harness": _OPENAI3,  # on pydantic-ai-slim
+    "strands-agents": _OPENAI2,
+    "crewai": _OPENAI2,
+}
+
+
+def loader_graded_elsewhere(loader_name: str, env: Optional[str] = None) -> Optional[str]:
+    """The environment(s) that grade native loader ``loader_name``, if this one does not."""
+    env = env or current_env()
+    homes = LOADER_ENVS.get(loader_name)
+    if not homes or env in homes:
+        return None
+    return ", ".join(sorted(homes))
+
+
 def current_env() -> str:
     """The environment this process is in. Raises on a value nobody defined."""
     value = (os.environ.get(ENV_VAR) or "").strip() or DEFAULT_ENV

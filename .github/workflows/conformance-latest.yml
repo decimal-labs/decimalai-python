@@ -111,6 +111,15 @@ jobs:
           DECIMAL_CONFORMANCE_REQUIRE_ALL: "1"
         run: python -m pytest tests/conformance -q -rs -m conformance
 
+      - name: Run the native skill loaders against newest
+        # tests/native_loaders: the eight native loaders read the folders a correct
+        # install writes, with no DecimalAI adapter involved. It also rides the default
+        # `pytest tests/` run; here it answers "did an upstream release change how a
+        # loader reads our folders?". The full loader x defect ledger matrix is the
+        # release gate's (python -m tests.native_loaders.matrix --check-ledger).
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/native_loaders -q -rs
+
       - name: Upload the resolved versions
         if: always()
         uses: actions/upload-artifact@v4

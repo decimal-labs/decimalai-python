@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "skills": {
+    "acme/refund-policy": {
+      "version": 3,
+      "content_hash": "2a4e1cef5e2d6cd1e04ecda449ca22ca1820449faa8c129db168a7330435d1b7",
+      "body_hash": "2f33f8484ec39eba8be9cf1a92e0dde325070eb951a351b825828f0aaab21e08",
+      "source": "platform",
+      "skill_id": "00000000-0000-0000-0000-00005eed0000",
+      "installed_at": "2026-10-14T15:44:30.425612+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    },
+    "acme/returns-desk": {
+      "version": 3,
+      "content_hash": "c84f20780ee59e03797060ba1ab82af2ed2097e68072c39f554206b4b054b3b6",
+      "body_hash": "8d15072d27487901ca32f959c64b0925977e2ec6a31196da9c80ba6ef02e7e7f",
+      "source": "platform",
+      "skill_id": "00000000-0000-0000-0000-00005eed0001",
+      "installed_at": "2026-10-14T15:44:30.425947+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    },
+    "some-github-owner/an-extremely-long-imported-skill-name-that-exceeds-the-limit": {
+      "version": 3,
+      "content_hash": "b5e25fe2b00a0ecfb8c4f088139360ab260713a2bc79819006a774557cea4d0f",
+      "body_hash": "923879981c9e8b9122d41a6aba884f44da871b0889d9e601b69a938370469e20",
+      "source": "platform",
+      "skill_id": "00000000-0000-0000-0000-00005eed0002",
+      "installed_at": "2026-10-14T15:44:30.426430+00:00",
+      "agents": [
+        "universal"
+      ],
+      "scope": "project"
+    }
+  },
+  "updated_at": "2026-10-14T15:44:30.426482+00:00"
+}

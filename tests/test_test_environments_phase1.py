@@ -68,6 +68,13 @@ def test_an_environment_requires_every_line_its_extras_expand_to():
     # Through `conformance-tests-openai2` -> `decimalai[test-toolchain,evals,adk,...]`.
     assert {"pytest", "crewai", "litellm", "llama-index-llms-openai", "google-adk"} <= openai2
     assert "decimalai" not in openai3 | openai2, "a self-reference was not expanded"
+    # The native-loader suite (tests/native_loaders): three loaders with no DecimalAI
+    # adapter ride in openai3; Strands rides in openai2, because its `mcp<2.2` cap would
+    # move mcp under claude-agent-sdk and openai-agents in openai3.
+    assert {"deepagents", "agent-framework-core", "pydantic-ai-harness"} <= openai3
+    assert "strands-agents" in openai2
+    assert "strands-agents" not in openai3
+    assert not openai2 & {"deepagents", "agent-framework-core", "pydantic-ai-harness"}
     # The two worlds stay apart: neither environment asks for the other's openai.
     assert not openai3 & {"crewai", "litellm", "llama-index-llms-openai"}
     assert not openai2 & {"openai-agents", "pydantic-ai-slim", "langchain"}

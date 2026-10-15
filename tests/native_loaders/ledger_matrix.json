@@ -1,0 +1,171 @@
+{
+  "cells": {
+    "baseline": {
+      "agent-framework": "OK",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "allowed-tools as a YAML list": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "LOUD",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "compatibility as a YAML list": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "OK",
+      "google-adk": "LOUD",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "nested map under metadata": {
+      "agent-framework": "OK (+w)",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "unquoted number in metadata": {
+      "agent-framework": "OK",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "namespaced name": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "RENAMED (+w)",
+      "google-adk": "LOUD",
+      "openai-agents": "RENAMED",
+      "pydantic-ai-harness": "WARNED",
+      "strands-agents": "WARNED"
+    },
+    "folder name differs from name": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "RENAMED",
+      "crewai": "WARNED",
+      "deepagents": "OK (+w)",
+      "google-adk": "LOUD",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "WARNED",
+      "strands-agents": "WARNED"
+    },
+    "skill folder is a symlink": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "SILENT",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "unknown top-level key": {
+      "agent-framework": "OK",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "uppercase name": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "RENAMED (+w)",
+      "google-adk": "LOUD",
+      "openai-agents": "RENAMED",
+      "pydantic-ai-harness": "WARNED",
+      "strands-agents": "WARNED"
+    },
+    "name over 64 characters": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "OK (+w)",
+      "google-adk": "LOUD",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "WARNED",
+      "strands-agents": "WARNED"
+    },
+    "double hyphen in name": {
+      "agent-framework": "WARNED",
+      "claude-agent-sdk": "OK",
+      "crewai": "WARNED",
+      "deepagents": "OK (+w)",
+      "google-adk": "LOUD",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "WARNED",
+      "strands-agents": "WARNED"
+    },
+    "symlinked resource file": {
+      "agent-framework": "OK (+w)",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    },
+    "a second SKILL.md inside the folder": {
+      "agent-framework": "OK",
+      "claude-agent-sdk": "OK",
+      "crewai": "OK",
+      "deepagents": "OK",
+      "google-adk": "OK",
+      "openai-agents": "OK",
+      "pydantic-ai-harness": "OK",
+      "strands-agents": "OK"
+    }
+  },
+  "measured_at": {
+    "agent-framework": {
+      "agent-framework-core": "1.21.0"
+    },
+    "claude-agent-sdk": {
+      "claude-agent-sdk": "0.2.166"
+    },
+    "crewai": {
+      "crewai": "1.15.27"
+    },
+    "deepagents": {
+      "deepagents": "0.7.25"
+    },
+    "google-adk": {
+      "google-adk": "2.12.0"
+    },
+    "openai-agents": {
+      "openai-agents": "0.23.1"
+    },
+    "pydantic-ai-harness": {
+      "pydantic-ai-harness": "0.56.0",
+      "pydantic-ai-slim": "2.56.0"
+    },
+    "strands-agents": {
+      "strands-agents": "1.60.0"
+    }
+  }
+}

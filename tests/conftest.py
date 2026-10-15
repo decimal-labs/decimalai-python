@@ -90,6 +90,9 @@ OPENAI2_UNIT_TESTS = (
     "unit/test_prebuilt_evals.py",
     "test_llamaindex_*.py",      # llama-index-core beside llama-index-llms-openai
     "test_version_floors_phase1.py",  # the extras admit what THIS environment runs
+    # The native skill loaders: CrewAI and Strands are graded here, the other six in
+    # openai3 (tests/conformance/environments.py:LOADER_ENVS).
+    "native_loaders/test_*.py",
 )
 
 #: Importable in the openai 2 environment, or the slice above would pass by
@@ -101,6 +104,7 @@ OPENAI2_REQUIRED_MODULES = (
     "litellm",
     "llama_index.core",
     "llama_index.llms.openai",
+    "strands",                    # the Strands native loader (tests/native_loaders)
 )
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
