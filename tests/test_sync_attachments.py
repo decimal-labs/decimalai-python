@@ -80,3 +80,93 @@ def test_sync_to_platform_sends_the_bundle_only_when_there_is_one(tmp_path, monk
     assert "attachments" not in captured["skills"]["bare"], (
         "an absent key means 'leave attachments alone' on the server; an empty map must not be sent"
     )
+
+
+def test_sync_to_platform_skips_a_registry_install_and_its_bundle(tmp_path, monkeypatch):
+    """A folder that `decimalai skills add` installed carries the registry's stamp
+    (``metadata.decimalai-skill-id``). Syncing it would mint the org a private copy of
+    someone else's skill, bundle included, so it is not sent. Its unmanaged neighbour is."""
+    _skill(tmp_path, "mine")
+    installed = tmp_path / "acme-refund-policy"
+    installed.mkdir()
+    (installed / "SKILL.md").write_text(
+        "---\nname: acme-refund-policy\ndescription: \"Refund rules.\"\nmetadata:\n"
+        "  decimalai-skill-id: \"6f1c0000-0000-0000-0000-000000000001\"\n"
+        "  decimalai-version-id: \"9b2e0000-0000-0000-0000-000000000003\"\n"
+        "  decimalai-version: \"3\"\n"
+        f"  decimalai-body-sha256: \"{'0' * 64}\"\n"
+        "  decimalai-name: \"acme/refund-policy\"\n"
+        "  decimalai-format: \"1\"\n"
+        "  decimalai-invocation: \"model\"\n"
+        "---\n# Acme refund policy\nRefunds within thirty days of delivery.\n"
+    )
+    (installed / "references").mkdir()
+    (installed / "references" / "fees.md").write_text("# fees\n")
+
+    captured = {}
+
+    class FakeRouter:
+        def __init__(self, **kw):
+            pass
+
+        def sync_skills(self, skills, **kwargs):
+            captured["skills"] = {s["name"]: s for s in skills}
+            return {"created": 1, "updated": 0, "unchanged": 0}
+
+    monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)])
+
+    assert set(captured["skills"]) == {"mine"}
+
+
+def test_sync_to_platform_sends_nothing_when_every_folder_is_a_registry_install(
+    tmp_path, monkeypatch
+):
+    installed = tmp_path / "acme-refund-policy"
+    installed.mkdir()
+    (installed / "SKILL.md").write_text(
+        "---\nname: acme-refund-policy\ndescription: d\nmetadata:\n"
+        "  decimalai-skill-id: \"6f1c\"\n---\n# Acme\nRefunds within thirty days.\n"
+    )
+
+    class FakeRouter:
+        def __init__(self, **kw):
+            raise AssertionError("no request is made when there is nothing to sync")
+
+    monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    assert sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)]) == {
+        "created": 0, "updated": 0, "unchanged": 0,
+    }
+
+
+def test_cli_sync_sends_a_category_only_when_it_is_one_string(tmp_path, monkeypatch):
+    """The sync endpoint takes ``category`` as a string and rejects the WHOLE batch (422)
+    when one skill sends a list. Read as YAML, ``category: [devops, ci]`` is a list, so it
+    is sent as no category; the frontmatter still carries the list as written."""
+    from unittest.mock import MagicMock, patch
+
+    from click.testing import CliRunner
+
+    from decimalai.cli.main import cli
+
+    monkeypatch.delenv("DECIMALAI_INSTALL_LABEL", raising=False)
+    for name, category in (("listed", "[devops, ci]"), ("single", "devops")):
+        sdir = tmp_path / "skills" / name
+        sdir.mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\ncategory: {category}\n---\n\n# {name}\nBody.\n",
+            encoding="utf-8",
+        )
+    client = MagicMock()
+    client._http.post.return_value.json.return_value = {"actions": []}
+    client._http.post.return_value.status_code = 200
+    monkeypatch.chdir(tmp_path)
+    with patch("decimalai.cli.main._make_client", return_value=client):
+        result = CliRunner().invoke(cli, [
+            "skills", "sync", "--api-key", "k", "--base-url", "http://localhost:8000",
+        ])
+    assert result.exit_code == 0, result.output
+    sent = {s["name"]: s for s in client._http.post.call_args.kwargs["json"]["skills"]}
+    assert sent["listed"]["category"] is None
+    assert sent["listed"]["frontmatter"]["category"] == ["devops", "ci"]
+    assert sent["single"]["category"] == "devops"

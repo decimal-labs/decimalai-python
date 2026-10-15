@@ -1210,13 +1210,16 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
         from ..skills import _local_updated_at_iso
         local_updated_at = _local_updated_at_iso(str(skill_md))
 
+        # The endpoint takes one category string and rejects the whole batch for a
+        # list, which YAML reads `category: [a, b]` as; the frontmatter keeps the list.
+        category = frontmatter.get("category")
         entry = {
             "name": name,
             "display_name": _title_from_skill_md(frontmatter, body),
             "content_hash": content_hash,
             "body_markdown": body,
             "description": frontmatter.get("description") or "",
-            "category": frontmatter.get("category"),
+            "category": category if isinstance(category, str) else None,
             "trigger_phrases": frontmatter.get("trigger_phrases"),
             "frontmatter": frontmatter or None,
             "local_updated_at": local_updated_at,

@@ -33,21 +33,23 @@ See https://docs.decimal.ai/guides/skills for the full user-facing documentation
 
 from __future__ import annotations
 
+import datetime
+import functools
 import hashlib
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("decimalai.skills")
 
-# Default scan paths for SKILL.md auto-discovery.
-# Covers project-local paths for all known agent runtimes.
-# Deduplicated — many agents share `.agents/skills/`.
+# Default scan paths for SKILL.md auto-discovery, relative to the project root.
+# Covers the project directory of every agent runtime in `disk_export.AGENT_PATHS`
+# (a test keeps the two in step). Deduplicated — many agents share `.agents/skills/`.
 DEFAULT_SKILL_PATHS = [
-    # Primary agent skill directories (alphabetical by agent)
-    ".agents/skills",          # universal, cursor, copilot, cline, warp, etc.
+    # Primary agent skill directories
+    ".agents/skills",          # universal, cursor, copilot, cline, warp, etc.; the managed root
     ".claude/skills",          # claude-code
     ".continue/skills",        # continue
     ".windsurf/skills",        # windsurf
@@ -57,9 +59,21 @@ DEFAULT_SKILL_PATHS = [
     ".trae/skills",            # trae
     ".melty/skills",           # melty
     ".void/skills",            # void
+    ".codebuddy/skills",       # codebuddy
+    ".commandcode/skills",     # command-code
+    ".cortex/skills",          # cortex
+    ".crush/skills",           # crush
+    ".factory/skills",         # droid
     # Legacy / alternate
     ".skills",                 # generic fallback
 ]
+
+# The folder-name grammar every native skill loader accepts: lowercase letters, digits and
+# single hyphens, at most 64 characters, a leading digit allowed. Equal to
+# `skillevaluation.skillfmt.NAME_RE` / `NAME_MAX` (a test pins it), and kept here so a
+# reader without skillevaluation applies the same rule.
+_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_NAME_MAX = 64
 
 # Global skill dirs (user-wide, not project-scoped)
 GLOBAL_SKILL_PATHS = [
@@ -135,6 +149,7 @@ def discover_skills(
     search_paths: Optional[List[str]] = None,
     *,
     include_global: bool = False,
+    project_root: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Scan for SKILL.md files following the agentskills.io spec.
 
@@ -147,6 +162,22 @@ def discover_skills(
     registry. The two concerns are kept separate now: project skills go
     up automatically, personal/global skills are a deliberate opt-in.
 
+    The default paths are read from the working directory and then from the
+    PROJECT ROOT, so a script run from a subdirectory finds the repo's skills,
+    and a skill in the working directory's own folders wins over one with the
+    same name at the root. The project is the one ``decimalai skills`` uses
+    (``decimalai.skillpkg.project.find_project``): the search stops at the
+    repository's ``.git``, and home is the project only when the working
+    directory is home itself.
+
+    In a project where ``decimalai skills install`` has run (a version 2
+    ``.decimal/skills.lock``), its ``.agents/skills`` (``decimalai.skills_dir()``)
+    is always read, explicit ``search_paths`` or not, because those are skills
+    the agent loads natively.
+
+    Results are deduplicated by ``skill_id`` when a folder carries the
+    registry's stamp, then by name; the first directory searched wins.
+
     Args:
         search_paths: Override the list of directories to scan.
             Defaults to project-local paths from ``DEFAULT_SKILL_PATHS``
@@ -156,38 +187,104 @@ def discover_skills(
             Defaults to ``False``, so only project-local skills are
             returned and nothing from your home directory is picked up
             unless you ask for it. Pass ``True`` to include them.
+        project_root: The project to read, instead of finding it from the
+            working directory. The default paths are read under it, and the
+            working directory is not read.
 
     Returns:
         List of skill descriptors with ``name``, ``description``, ``version``,
         ``hash``, ``stability``, ``category``, ``skill_type``, ``skill_scope``,
-        ``invocation``, and ``source_path`` keys.
+        ``invocation``, ``source_path`` and ``body`` keys, plus the registry
+        stamp: ``managed``, ``registry_name``, ``skill_id``, ``version_id``
+        and ``body_sha256`` (see :func:`parse_skill_md`).
     """
-    paths = list(search_paths or DEFAULT_SKILL_PATHS)
+    if search_paths:
+        paths = [os.path.expanduser(p) for p in search_paths]
+    else:
+        paths = _default_search_paths(project_root)
     if include_global:
-        paths.extend(GLOBAL_SKILL_PATHS)
+        paths.extend(os.path.expanduser(p) for p in GLOBAL_SKILL_PATHS)
+    managed_root = _managed_skills_root(project_root)
+    if managed_root and not any(_same_dir(p, managed_root) for p in paths):
+        paths.append(managed_root)
 
     skills: List[Dict[str, Any]] = []
-    seen_names: set = set()
+    seen_ids: Set[str] = set()
+    seen_names: Set[str] = set()
 
     for base_path in paths:
-        expanded = os.path.expanduser(base_path)
-        if not os.path.isdir(expanded):
+        if not os.path.isdir(base_path):
             continue
-        for skill_dir in _find_skill_dirs(expanded):
+        for skill_dir in _find_skill_dirs(base_path):
             skill_md = os.path.join(skill_dir, "SKILL.md")
             if not os.path.isfile(skill_md):
                 continue
             try:
                 descriptor = parse_skill_md(skill_md)
-                if descriptor and descriptor["name"] not in seen_names:
-                    skills.append(descriptor)
-                    seen_names.add(descriptor["name"])
             except Exception:
                 logger.warning("Failed to parse %s", skill_md, exc_info=True)
+                continue
+            if not descriptor:
+                continue
+            skill_id = descriptor.get("skill_id")
+            if (skill_id and skill_id in seen_ids) or descriptor["name"] in seen_names:
+                continue
+            skills.append(descriptor)
+            seen_names.add(descriptor["name"])
+            if skill_id:
+                seen_ids.add(skill_id)
 
     if skills:
         logger.info("Auto-discovered %d skills from SKILL.md files", len(skills))
     return skills
+
+
+def _default_search_paths(project_root: Optional[str]) -> List[str]:
+    """``DEFAULT_SKILL_PATHS`` under the working directory, then under the project root
+    when that is somewhere else. The nearer folder comes first, so a package inside a
+    monorepo keeps its own ``deploy`` when the root has one too (the first wins).
+
+    When the root IS the working directory the paths stay relative, as they always
+    were: a descriptor's ``source_path`` reaches the sync payload, and an absolute one
+    would carry the home directory with it.
+    """
+    if project_root:
+        root = os.path.abspath(os.path.expanduser(project_root))
+        return [os.path.join(root, p) for p in DEFAULT_SKILL_PATHS]
+    try:
+        cwd = os.getcwd()
+        # Standard library only: `import decimalai` and discovery work without
+        # skillevaluation. The search stops at the repository's `.git` and at the home
+        # directory, so a `.decimal/` above the repo is never this project.
+        from .skillpkg.project import find_project
+
+        root = str(find_project(cwd).directory)
+    except OSError:  # the working directory was deleted
+        return list(DEFAULT_SKILL_PATHS)
+    here = list(DEFAULT_SKILL_PATHS)
+    if _same_dir(root, cwd):
+        return here
+    return here + [os.path.join(root, p) for p in DEFAULT_SKILL_PATHS]
+
+
+def _managed_skills_root(start: Optional[str] = None) -> Optional[str]:
+    """``decimalai.skills_dir()`` from ``start`` (default: the working directory), or None.
+
+    That is the absolute ``.agents/skills`` of a project whose lock is a version 2 lock,
+    with no symlink on the way. Every refusal means "no managed root" here: a version 1,
+    corrupt or missing lock, a missing or symlinked root, or skillevaluation not being
+    installed (the lock module needs it). A reader must not fail because of a lock.
+    """
+    try:
+        from .skillpkg.project import skills_dir
+
+        return str(skills_dir(start))
+    except Exception:
+        return None
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
 
 
 def _title_from_skill_md(frontmatter: Dict[str, Any], body: str) -> Optional[str]:
@@ -216,9 +313,18 @@ def _title_from_skill_md(frontmatter: Dict[str, Any], body: str) -> Optional[str
 def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
     """Parse a SKILL.md file into a skill descriptor.
 
-    Extracts YAML frontmatter (name, description, metadata.version, plus the
+    Reads the YAML frontmatter (name, description, metadata.version, plus the
     taxonomy labels category / skill-type / skill-scope / invocation when
-    present) and hashes the markdown body.
+    present) and hashes the markdown body. The taxonomy is read from
+    ``metadata.decimalai-*`` first, where a registry install keeps it, then
+    from the legacy top-level keys.
+
+    A folder installed from the registry carries the registry's stamp in
+    ``metadata`` and reads as ``managed``: ``registry_name`` is the skill's
+    registry name (the frontmatter ``name`` is its install name), and
+    ``skill_id``, ``version_id`` and ``body_sha256`` are the stamped values.
+    All four are None on a hand-authored folder. ``hash`` is always the hash of
+    the body as read.
 
     Args:
         path: Absolute or relative path to the SKILL.md file.
@@ -229,32 +335,41 @@ def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    frontmatter, body = _split_frontmatter(content)
+    frontmatter, body = _split_frontmatter(content, path=path)
     if not frontmatter or not body or len(body.strip()) < _MIN_BODY_LENGTH:
         return None
 
     # Slug source: frontmatter `name:`, else the skill directory's basename —
     # matching the `decimalai skills sync` CLI (cli/main.py), so the same tree
     # syncs identically whether discovered programmatically or via the CLI.
-    name = (frontmatter.get("name") or "").strip() or Path(path).parent.name
+    folder = Path(path).parent.name
+    name = (frontmatter.get("name") or "").strip() or folder
     if not name:
         return None
 
-    # Validate name per agentskills.io spec: lowercase a-z, digits, single hyphens
-    _SPEC_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
-    if not _SPEC_NAME_RE.match(name) or len(name) > 64:
+    if not _NAME_RE.match(name) or len(name) > _NAME_MAX:
         logger.warning(
             "Skipping skill '%s' — name does not match agentskills.io spec "
-            "(must be 1-64 chars, lowercase a-z/0-9 and single hyphens, starting with a letter)",
+            "(must be 1-64 chars of lowercase a-z, 0-9 and single hyphens)",
             name,
         )
         return None
+    if name != folder:
+        _warn_once(
+            ("folder", os.path.abspath(path)),
+            "Skill '%s' in %s: the name differs from its folder '%s'. It is read, but "
+            "most native skill loaders require the two to match.",
+            name, os.path.dirname(os.path.abspath(path)), folder,
+        )
 
-    metadata = frontmatter.get("metadata", {})
-    version = metadata.get("version") if isinstance(metadata, dict) else None
+    metadata = frontmatter.get("metadata")
+    meta: Dict[str, Any] = metadata if isinstance(metadata, dict) else {}
+    version = meta.get("version")
 
     # Validate description length (spec: 1-1024 chars)
-    description = frontmatter.get("description", "")
+    description = frontmatter.get("description") or ""
+    if not isinstance(description, str):
+        description = str(description)
     if len(description) > 1024:
         logger.warning(
             "Skill '%s' description exceeds 1024 chars (%d) — truncating",
@@ -272,22 +387,29 @@ def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
     # working. Claude Code's `disable-model-invocation: true` is accepted as
     # `invocation: user` (round-trip both spellings). Absent keys stay None —
     # no default is stamped, so a legacy SKILL.md gains no frontmatter on
-    # re-export.
-    raw_skill_type = frontmatter.get("skill-type") or frontmatter.get("skill_type")
-    raw_skill_scope = frontmatter.get("skill-scope") or frontmatter.get("skill_scope")
+    # re-export. A registry install keeps all four in `metadata.decimalai-*`,
+    # which `_taxonomy` reads before the top-level keys.
+    labels = _taxonomy(frontmatter)
+    raw_skill_type = labels["skill_type"] or frontmatter.get("skill_type")
+    raw_skill_scope = labels["skill_scope"] or frontmatter.get("skill_scope")
     skill_type, skill_scope = _resolve_skill_taxonomy(raw_skill_type, raw_skill_scope)
-    invocation = frontmatter.get("invocation")
+    invocation = labels["invocation"]
 
     # The backend's SyncSkillItem caps category at 100 chars and requires a
     # string — an oversized or nested-map category would 422 the WHOLE sync
     # batch. Clamp here (same pattern as the description cap above) so every
     # surface that syncs a descriptor is covered.
-    category = frontmatter.get("category")
-    if category is not None and not isinstance(category, str):
+    category = labels["category"]
+    raw_category = next(
+        (v for v in (meta.get("decimalai-category"), frontmatter.get("category"))
+         if v is not None),
+        None,
+    )
+    if category is None and raw_category is not None and not isinstance(raw_category, str):
         logger.warning(
-            "Skill '%s' category is not a string (%s) — dropping", name, type(category).__name__,
+            "Skill '%s' category is not a string (%s) — dropping",
+            name, type(raw_category).__name__,
         )
-        category = None
     elif category and len(category) > 100:
         logger.warning(
             "Skill '%s' category exceeds 100 chars (%d) — truncating", name, len(category),
@@ -297,6 +419,11 @@ def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
         frontmatter.get("disable-model-invocation") or ""
     ).strip().lower() in ("true", "yes", "1"):
         invocation = "user"
+
+    # The registry's stamp. The skill id is what makes it one: without it the other
+    # decimalai-* keys are not trusted as identity.
+    skill_id = _meta_str(meta, "decimalai-skill-id")
+    managed = skill_id is not None
 
     return {
         "name": name,
@@ -318,7 +445,17 @@ def parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
         # registry at the OFFERED rung. The body is already read above to
         # compute the hash, so this is no extra I/O.
         "body": body,
+        "managed": managed,
+        "registry_name": _meta_str(meta, "decimalai-name") if managed else None,
+        "skill_id": skill_id,
+        "version_id": _meta_str(meta, "decimalai-version-id") if managed else None,
+        "body_sha256": _meta_str(meta, "decimalai-body-sha256") if managed else None,
     }
+
+
+def _meta_str(meta: Dict[str, Any], key: str) -> Optional[str]:
+    value = meta.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 class SkillRegistry:
@@ -523,6 +660,11 @@ def infer_prompt_rungs(
     those would let one run's routing suppress another run's genuine disk
     skills.
 
+    A registry install sits in a folder named for its INSTALL name
+    (``acme-refund-policy``) while the router reports the REGISTRY name
+    (``acme/refund-policy``), so a descriptor is subtracted when either its
+    ``name`` or its ``registry_name`` was accounted.
+
     Args:
         rendered_inputs: The ``rendered_input`` of each LLM call in the run.
         skill_registry: Disk-discovered (or explicitly passed) skill
@@ -549,6 +691,12 @@ def infer_prompt_rungs(
     }
 
     registry = list(skill_registry)
+    # Every name a descriptor answers to: its own, and its registry name when installed.
+    aliases: Dict[str, Set[str]] = {}
+    for skill in registry:
+        own = skill.get("name")
+        if own:
+            aliases.setdefault(own, {own}).add(skill.get("registry_name") or own)
     offered: List[str] = []
     delivered: List[str] = []
     for rendered_input in rendered_inputs or ():
@@ -560,7 +708,7 @@ def infer_prompt_rungs(
             fuzzy_match=fuzzy_match,
             fuzzy_threshold=fuzzy_threshold,
         ):
-            if name in accounted:
+            if accounted.intersection(aliases.get(name, {name})):
                 # The router already accounted for this skill on this run —
                 # observed, so never re-inferred.
                 #
@@ -620,10 +768,14 @@ def _find_skill_dirs(base_path: str) -> List[str]:
     return dirs
 
 
-def _split_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+def _split_frontmatter(
+    content: str, *, path: Optional[str] = None
+) -> Tuple[Dict[str, Any], str]:
     """Split YAML frontmatter from markdown body.
 
     Returns (frontmatter_dict, body_string). If no frontmatter, returns ({}, content).
+    The frontmatter is parsed as YAML (see :func:`_parse_frontmatter`); ``path``
+    only names the file in a warning.
     """
     content = content.strip()
     if not content.startswith("---"):
@@ -645,16 +797,253 @@ def _split_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     yaml_str = "\n".join(lines[1:end_line]).strip()
     body = "\n".join(lines[end_line + 1:]).strip()
 
-    # Parse simple YAML (key: value) without requiring PyYAML dependency
-    frontmatter = _parse_simple_yaml(yaml_str)
-    return frontmatter, body
+    return _parse_frontmatter(yaml_str, path), body
+
+
+@functools.lru_cache(maxsize=1)
+def _skillfmt() -> Any:
+    """``skillevaluation.skillfmt``, or None when it (or PyYAML) is not installed.
+
+    Imported on first use, so importing this module needs nothing outside the
+    standard library. Without it the simple reader below is used, and that is
+    said once per process.
+    """
+    try:
+        from skillevaluation import skillfmt
+    except ImportError:
+        logger.warning(
+            "SKILL.md frontmatter is read with the simple 'key: value' reader, because "
+            "skillevaluation>=0.8.0 (with PyYAML) is not installed: YAML lists, quoted "
+            "escapes and the metadata taxonomy are not read. Fix: pip install -U decimalai"
+        )
+        return None
+    return skillfmt
+
+
+_warned: Set[Any] = set()
+
+
+def _warn_once(key: Any, msg: str, *args: Any) -> None:
+    """Log a warning the first time ``key`` is seen in this process. Discovery runs on
+    every ``instrument()`` and, for some adapters, on every trace."""
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(msg, *args)
+
+
+def _parse_frontmatter(yaml_str: str, path: Optional[str] = None) -> Dict[str, Any]:
+    """Frontmatter text -> dict, through ``skillevaluation.skillfmt`` (PyYAML).
+
+    Lists stay lists and quoted escapes are decoded, then the values are made safe
+    for the callers, which read these keys as strings and post the dict as JSON
+    (see :func:`_normalize_frontmatter`).
+
+    Text that is not YAML, a duplicate key, or a frontmatter that is not a mapping
+    falls back to :func:`_parse_simple_yaml` with a warning: hand-authored trees
+    contain ``description: Use when: ...``, and discovery has always read them.
+    """
+    if not yaml_str.strip():
+        return {}
+    skillfmt = _skillfmt()
+    if skillfmt is None:
+        return _parse_simple_yaml(yaml_str)
+    try:
+        data, _ = skillfmt.parse_skill_md_text(f"---\n{yaml_str}\n---\n")
+    except skillfmt.SkillMdParseError as exc:
+        reason = (str(exc).splitlines() or ["invalid"])[0]
+        _warn_once(
+            ("yaml", os.path.abspath(path) if path else yaml_str),
+            "%s: %s. Reading it as simple 'key: value' lines instead; quote a value that "
+            "contains ': ' or starts with a YAML indicator.",
+            path or "SKILL.md", reason,
+        )
+        return _parse_simple_yaml(yaml_str)
+    return _normalize_frontmatter(data, yaml_str)
+
+
+# Keys that format 1 writes as one string, which hand-authored trees often write as a
+# YAML list: joined with the separator their callers split on.
+_JOINED_KEYS = {"allowed-tools": " ", "allowed_tools": " ", "compatibility": "; "}
+
+
+def _normalize_frontmatter(data: Dict[Any, Any], yaml_str: str) -> Dict[Any, Any]:
+    """Make parsed frontmatter safe for the readers' callers.
+
+    - ``name`` and ``description`` are stripped strings or None (a list or a map
+      there is not a name).
+    - YAML 1.1 reads ``yes``, ``no``, ``404``, ``1.10`` and ``2024-01-01`` as a
+      bool, a number or a date. In ``name``, ``description``, ``category`` and
+      every ``metadata`` value, which callers read as strings, they keep the text
+      that was written.
+    - An unquoted ``description``, ``category`` or ``metadata`` value that YAML
+      reads short (see :func:`_plain_values_yaml_cuts`) keeps the text written on
+      its line, as the reader before YAML did.
+    - ``allowed-tools`` and ``compatibility`` lists are joined into strings.
+    - Any other date, datetime or bytes value becomes a string, so the dict
+      serializes as JSON (``skills sync`` posts it).
+    """
+    sources: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None
+    cut: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None
+
+    def written(key: str, in_metadata: bool = False) -> Optional[str]:
+        nonlocal sources
+        if sources is None:
+            sources = _scalar_sources(yaml_str)
+        return sources[1 if in_metadata else 0].get(key)
+
+    def as_text(value: Any, key: str, in_metadata: bool = False) -> Any:
+        if value is None or isinstance(value, (str, dict, list)):
+            return value
+        text = written(key, in_metadata)
+        return text if text is not None else _json_safe(value)
+
+    def as_written(value: Any, key: str, in_metadata: bool = False) -> Any:
+        nonlocal cut
+        if isinstance(value, (dict, list)):  # YAML read a collection: leave it
+            return value
+        if cut is None:
+            cut = _plain_values_yaml_cuts(yaml_str)
+        text = cut[1 if in_metadata else 0].get(key)
+        return text if text is not None else as_text(value, key, in_metadata)
+
+    out: Dict[Any, Any] = {}
+    for key, value in data.items():
+        if key == "name":  # a slug: ` #` or `&` as written could never be one
+            value = as_text(None if isinstance(value, (dict, list)) else value, key)
+            value = value.strip() if isinstance(value, str) else value
+        elif key == "description":
+            value = None if isinstance(value, (dict, list)) else as_written(value, key)
+            value = value.strip() if isinstance(value, str) else value
+        elif key == "category":
+            value = as_written(value, key)
+        elif key in _JOINED_KEYS and isinstance(value, list):
+            value = _JOINED_KEYS[key].join(
+                str(_json_safe(v)) for v in value
+                if v is not None and not isinstance(v, (dict, list))
+            )
+        elif key == "metadata" and isinstance(value, dict):
+            value = {
+                k: (as_written(v, k, True) if isinstance(k, str) else _json_safe(v))
+                for k, v in value.items()
+            }
+        elif isinstance(key, str) and isinstance(value, (datetime.date, bytes)):
+            value = as_text(value, key)
+        out[key] = _json_safe(value)
+    return out
+
+
+def _scalar_sources(yaml_str: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """The text of each plain scalar at the top level and in ``metadata``, by key."""
+    import yaml
+
+    top: Dict[str, str] = {}
+    meta: Dict[str, str] = {}
+    try:
+        root = yaml.compose(yaml_str, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return top, meta
+    if not isinstance(root, yaml.MappingNode):
+        return top, meta
+    for key_node, value_node in root.value:
+        if not isinstance(key_node, yaml.ScalarNode):
+            continue
+        if isinstance(value_node, yaml.ScalarNode):
+            top[key_node.value] = value_node.value
+        elif key_node.value == "metadata" and isinstance(value_node, yaml.MappingNode):
+            for k, v in value_node.value:
+                if isinstance(k, yaml.ScalarNode) and isinstance(v, yaml.ScalarNode):
+                    meta[k.value] = v.value
+    return top, meta
+
+
+# In a plain scalar, whitespace then `#` starts a comment, and a leading `&` or `*` is an
+# anchor or an alias. A value that is only a comment (`key: # note`) is YAML's to read.
+_YAML_CUTS = re.compile(r"\S\s+#|^[&*]")
+_KEY_LINE = re.compile(r"([\w.-]+):(?:\s(.*))?$")
+
+
+def _plain_values_yaml_cuts(yaml_str: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """The text written after ``key:`` on its own line, at the top level and in
+    ``metadata``, for each unquoted value that YAML reads short: ``issue #123`` reads as
+    ``issue``, and ``&escape sequences`` as ``sequences``. Quoted values, block scalars
+    (``|``, ``>``) and flow collections (``[``, ``{``) are left out, and so is anything
+    on a continuation line."""
+    top: Dict[str, str] = {}
+    meta: Dict[str, str] = {}
+    if "#" not in yaml_str and "&" not in yaml_str and "*" not in yaml_str:
+        return top, meta
+    in_metadata = False
+    child_indent: Optional[int] = None
+    for line in yaml_str.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            target = top
+            child_indent = None
+        elif in_metadata:
+            child_indent = indent if child_indent is None else child_indent
+            if indent != child_indent:
+                continue
+            target = meta
+        else:
+            continue
+        match = _KEY_LINE.match(stripped)
+        value = (match.group(2) or "").strip() if match else ""
+        if indent == 0:
+            in_metadata = bool(match) and match.group(1) == "metadata" and (
+                not value or value.startswith("#"))
+        if match and value and value[0] not in "\"'|>[{" and _YAML_CUTS.search(value):
+            target[match.group(1)] = value
+    return top, meta
+
+
+def _json_safe(value: Any) -> Any:
+    """Dates and bytes as strings, recursively; everything else unchanged."""
+    if isinstance(value, datetime.date):  # datetime is a date
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, dict):
+        return {
+            (_json_safe(k) if isinstance(k, (datetime.date, bytes)) else k): _json_safe(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _taxonomy(frontmatter: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Category, skill type, skill scope and invocation: ``skillfmt.taxonomy`` reads
+    ``metadata.decimalai-*`` first, then the top-level keys. Without skillfmt, the
+    top-level keys only, as this reader always has."""
+    skillfmt = _skillfmt()
+    if skillfmt is not None:
+        return skillfmt.taxonomy(frontmatter)
+
+    def text(key: str) -> Optional[str]:
+        value = frontmatter.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    invocation = text("invocation")
+    return {
+        "category": text("category"),
+        "skill_type": text("skill-type"),
+        "skill_scope": text("skill-scope"),
+        "invocation": invocation.lower() if invocation else None,
+    }
 
 
 def _parse_simple_yaml(yaml_str: str) -> Dict[str, Any]:
     """Parse simple key: value YAML without external deps.
 
     Handles basic scalar values and simple nested maps (metadata block).
-    Not a full YAML parser — sufficient for SKILL.md frontmatter.
+    Not a full YAML parser — sufficient for SKILL.md frontmatter. It is the
+    fallback for frontmatter that is not valid YAML, and the reader when
+    skillevaluation is not installed.
     """
     result: Dict[str, Any] = {}
     current_key = None
@@ -801,6 +1190,10 @@ def sync_to_platform(
     org registry by an accidental ``decimalai skills sync``. Set
     ``include_global=True`` to opt back in.
 
+    Folders installed from the registry (``managed`` descriptors, which carry
+    the registry's stamp) are never sent: they are someone's registry skill,
+    and syncing one would create a private copy of it in your org.
+
     Args:
         api_key: DecimalAI API key.
         base_url: Platform API base URL.
@@ -819,6 +1212,14 @@ def sync_to_platform(
     from .skill_router import SkillRouter
 
     discovered = discover_skills(search_paths, include_global=include_global)
+    installed = sorted(s["name"] for s in discovered if s.get("managed"))
+    if installed:
+        logger.info(
+            "Not syncing %d skill(s) installed from the DecimalAI registry (%s); "
+            "`decimalai skills` manages them",
+            len(installed), ", ".join(installed),
+        )
+        discovered = [s for s in discovered if not s.get("managed")]
     if not discovered:
         logger.info("No local skills discovered — nothing to sync")
         return {"created": 0, "updated": 0, "unchanged": 0}
@@ -955,7 +1356,7 @@ def _read_skill_body(skill_dir: str) -> Optional[str]:
     with open(skill_md, "r", encoding="utf-8") as f:
         content = f.read()
 
-    _, body = _split_frontmatter(content)
+    _, body = _split_frontmatter(content, path=skill_md)
     return body if body and len(body.strip()) >= _MIN_BODY_LENGTH else None
 
 

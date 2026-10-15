@@ -171,6 +171,39 @@ class TestPrecedenceUnit:
         )
         assert (offered, delivered) == ([], ["refund-policy"])
 
+    def test_a_managed_folder_is_subtracted_by_its_registry_name(self):
+        """A registry skill installed on disk lives in a folder named for its install name
+        (``acme-refund-policy``), while the router reports the registry name
+        (``acme/refund-policy``). The subtraction must see that they are one skill, or
+        the router's own injection comes back as a disk inference."""
+        managed = [{
+            "name": "acme-refund-policy",
+            "registry_name": "acme/refund-policy",
+            "managed": True,
+            "hash": "sha256:aa",
+            "body": BODY,
+        }]
+        offered, delivered = infer_prompt_rungs(
+            [_sys(f"## Skill: acme-refund-policy\n{BODY}")],
+            managed,
+            router_accounted={"acme/refund-policy"},
+        )
+        assert (offered, delivered) == ([], [])
+
+    def test_the_install_name_still_subtracts_a_managed_folder(self):
+        managed = [{"name": "acme-refund-policy", "registry_name": "acme/refund-policy",
+                    "hash": "sha256:aa", "body": BODY}]
+        assert infer_prompt_rungs(
+            [_sys(BODY)], managed, router_delivered=["acme-refund-policy"],
+        ) == ([], [])
+
+    def test_an_unaccounted_managed_folder_reports_its_install_name(self):
+        managed = [{"name": "acme-refund-policy", "registry_name": "acme/refund-policy",
+                    "hash": "sha256:aa", "body": BODY}]
+        assert infer_prompt_rungs(
+            [_sys(BODY)], managed, router_accounted={"tone-guide"},
+        ) == ([], ["acme-refund-policy"])
+
 
 # ── the overlap case, end to end on a real TraceContext ──────
 

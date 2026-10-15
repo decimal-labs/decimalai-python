@@ -227,6 +227,148 @@ class TestParseSkillMd:
         assert result["invocation"] is None
 
 
+def _write_skill(tmp_path, folder, frontmatter, body="# Body\nDo the thing carefully.\n"):
+    d = tmp_path / folder
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+    return d / "SKILL.md"
+
+
+class TestNameGrammar:
+    """The folder-name grammar every native loader accepts: lowercase letters, digits and
+    single hyphens, at most 64 characters. A leading digit is allowed."""
+
+    def test_a_leading_digit_is_a_valid_name(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "2slides-ppt-generator",
+            "name: 2slides-ppt-generator\ndescription: Make slides",
+        )
+        result = parse_skill_md(str(path))
+        assert result is not None
+        assert result["name"] == "2slides-ppt-generator"
+        names = {s["name"] for s in discover_skills([str(tmp_path)])}
+        assert "2slides-ppt-generator" in names
+
+    @pytest.mark.parametrize("bad", ["-x", "x--y", "x-", "Upper", "under_score", "a" * 65])
+    def test_names_outside_the_grammar_are_still_skipped(self, tmp_path, bad):
+        path = _write_skill(tmp_path, "folder", f'name: "{bad}"\ndescription: d')
+        assert parse_skill_md(str(path)) is None
+
+    def test_a_name_that_differs_from_its_folder_is_warned_about_and_read(
+        self, tmp_path, caplog
+    ):
+        path = _write_skill(tmp_path, "folder-name", "name: frontmatter-name\ndescription: d")
+        with caplog.at_level("WARNING", logger="decimalai.skills"):
+            result = parse_skill_md(str(path))
+        assert result is not None and result["name"] == "frontmatter-name"
+        assert any(
+            "frontmatter-name" in r.getMessage() and "folder-name" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+
+class TestYamlValues:
+    """Frontmatter is YAML: quoted escapes decode, and YAML 1.1's typed scalars do not
+    change what a name, a description or a metadata value says."""
+
+    def test_an_escaped_description_is_decoded(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "shipper",
+            'name: shipper\ndescription: "Use when the user says \\"ship it\\": deploy\\tnow"',
+        )
+        result = parse_skill_md(str(path))
+        assert result["description"] == 'Use when the user says "ship it": deploy\tnow'
+
+    def test_yes_no_and_dates_stay_the_strings_that_were_written(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "yes",
+            "name: yes\ndescription: no\nmetadata:\n  version: 1.10\n  updated: 2024-01-01",
+        )
+        result = parse_skill_md(str(path))
+        assert result["name"] == "yes"
+        assert result["description"] == "no"
+        assert result["version"] == "1.10"
+        fm, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm["metadata"] == {"version": "1.10", "updated": "2024-01-01"}
+
+    @pytest.mark.parametrize("written", [
+        "Triage GitHub issue #123 and label it",
+        "Idiomatic C# for .NET projects #dotnet tips",
+        "Format markdown headings like # Title and ## Sub",
+        "&escape sequences in shell",
+    ])
+    def test_an_unquoted_description_yaml_would_cut_keeps_its_text(self, tmp_path, written):
+        """In YAML a ` #` starts a comment and a leading `&` is an anchor, so these read
+        short. The reader before YAML kept the line as written, and so does this one."""
+        path = _write_skill(tmp_path, "cut", f"name: cut\ndescription: {written}")
+        assert parse_skill_md(str(path))["description"] == written
+        fm, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm["description"] == written  # what `skills sync` posts
+
+    def test_an_alias_to_an_earlier_anchor_keeps_its_text(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "alias", "name: alias\ncategory: &ops devops\ndescription: *ops"
+        )
+        result = parse_skill_md(str(path))
+        assert result["description"] == "*ops"
+        assert result["category"] == "&ops devops"
+
+    def test_a_category_and_a_metadata_value_keep_their_text(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "meta",
+            "name: meta\ndescription: d\ncategory: devops # ci tools\n"
+            "metadata:\n  version: &v 2.0\n  owner: platform #infra",
+        )
+        result = parse_skill_md(str(path))
+        assert result["category"] == "devops # ci tools"
+        assert result["version"] == "&v 2.0"
+        fm, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm["metadata"] == {"version": "&v 2.0", "owner": "platform #infra"}
+
+    def test_comments_on_their_own_lines_and_after_quotes_stay_comments(self, tmp_path):
+        path = _write_skill(
+            tmp_path, "commented",
+            "name: commented\n# description: the old one\n"
+            'description: "Fix issue #123" # quoted, so this is a comment\n'
+            "metadata:\n  # stamped by hand\n  version: '1.0' # pinned",
+        )
+        result = parse_skill_md(str(path))
+        assert result["description"] == "Fix issue #123"
+        fm, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm["metadata"] == {"version": "1.0"}
+
+    def test_a_name_is_read_as_yaml_reads_it(self, tmp_path):
+        """A name is a slug, which can never hold ` #` or `&`: the text as written would
+        only make the skill unreadable, so a trailing comment stays a comment there."""
+        path = _write_skill(tmp_path, "deploy", "name: deploy  # the slug\ndescription: d")
+        assert parse_skill_md(str(path))["name"] == "deploy"
+
+    def test_a_date_valued_key_leaves_the_frontmatter_json_serializable(self):
+        """`skills sync` posts the frontmatter as JSON; a YAML date must not break that."""
+        fm, _ = _split_frontmatter(
+            "---\nname: dated\ndescription: d\ndate: 2025-01-15\n"
+            "tags:\n  - 2025-01-15\n---\n# Body"
+        )
+        assert fm["date"] == "2025-01-15"
+        json.dumps(fm)
+
+    def test_invalid_yaml_falls_back_to_the_simple_reader_with_a_warning(
+        self, tmp_path, caplog
+    ):
+        """`key: value: more` is not YAML, but hand-authored trees have it and discovery
+        has always read it. It is still read, and it is no longer read silently."""
+        path = _write_skill(
+            tmp_path, "colon", "name: colon\ndescription: Use when: the user asks"
+        )
+        with caplog.at_level("WARNING", logger="decimalai.skills"):
+            result = parse_skill_md(str(path))
+        assert result is not None
+        assert result["description"] == "Use when: the user asks"
+        assert any("YAML" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+
 # ── discover_skills ───────────────────────────────────────
 
 
@@ -409,6 +551,24 @@ class TestSplitFrontmatter:
         fm, body = _split_frontmatter("---\nname: test\n---\nIntro\n\n---\n\nMore")
         assert fm["name"] == "test"
         assert "---" in body
+
+    def test_lists_are_read_then_joined_into_strings(self):
+        """YAML lists in `allowed-tools` and `compatibility` are read (the old reader
+        returned None for both), then joined, because every caller of these two keys
+        takes a string: `allowed-tools` is space-separated, `compatibility` joins with
+        '; '."""
+        fm, _ = _split_frontmatter(
+            "---\nname: x\ndescription: d\n"
+            "compatibility:\n  - \"python>=3.10\"\n  - git\n"
+            "allowed-tools:\n  - \"Bash(git log:*)\"\n  - Read\n"
+            "---\n# b"
+        )
+        assert fm["allowed-tools"] == "Bash(git log:*) Read"
+        assert fm["compatibility"] == "python>=3.10; git"
+
+    def test_a_flow_list_is_joined_too(self):
+        fm, _ = _split_frontmatter("---\nname: x\nallowed-tools: [Read, Grep]\n---\n# b")
+        assert fm["allowed-tools"] == "Read Grep"
 
 
 class TestSkillAppearsInText:
