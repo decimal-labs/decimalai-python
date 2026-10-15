@@ -486,7 +486,7 @@ class TestCoreDependencies:
         assert str(deps["skillevaluation"].specifier) == ">=0.8.0"
         assert deps["skillevaluation"].marker is None
         # SKILL.md frontmatter is YAML.
-        assert str(deps["pyyaml"].specifier) == ">=6.0"
+        assert str(deps["pyyaml"].specifier) == ">=6.0.2"
         assert deps["pyyaml"].marker is None
         # The manifest is TOML; Python 3.11 added tomllib.
         tomli = deps["tomli"]

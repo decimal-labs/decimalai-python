@@ -83,7 +83,7 @@ dependencies = [
     "skillevaluation>=0.8.0",
     # SKILL.md frontmatter is YAML, and the SDK parses it. Declared here rather than
     # left to arrive through skillevaluation's own requirements.
-    "PyYAML>=6.0",
+    "PyYAML>=6.0.2",  # 6.0.2: the first release with Python 3.13 wheels (6.0 cannot build there)
     # `.decimal/skills.toml` is TOML. Python 3.11 ships tomllib; 3.10 reads it with
     # tomli, the same parser under its pre-stdlib name.
     'tomli>=2; python_version < "3.11"',

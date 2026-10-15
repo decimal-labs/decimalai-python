@@ -238,7 +238,7 @@ their replacement. Unless noted, each stops working in 0.16.
 
 ### Dependencies
 
-- New core dependencies: `PyYAML>=6.0` (SKILL.md frontmatter) and `tomli>=2` on
+- New core dependencies: `PyYAML>=6.0.2` (SKILL.md frontmatter) and `tomli>=2` on
   Python 3.10 (`.decimal/skills.toml`; 3.11+ uses `tomllib`).
 - `skillevaluation>=0.8.0` (was `>=0.4.0`), for `skillevaluation.skillfmt`, the
   on-disk format module the registry renders with.
