@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-10-18
+
 ### Added: native mode — a framework's own skill loader, seen by DecimalAI
 
 Eight frameworks load the skills `decimalai skills add` installed with a loader of
@@ -48,6 +50,14 @@ received. Each helper is in its framework's module (`import decimalai.adk` first
   warns when the sandbox would list no skills (it skips symlinked folders silently).
 - Microsoft Agent Framework and Strands need no adapter: with `decimalai.init(otel=True)`
   their own OpenTelemetry spans become the trace, and the load is recorded on it.
+
+### Deprecated (unchanged, and kept one release longer)
+
+The 0.14 disk verbs (`decimalai skills export <ref>`, `decimalai skills install <ref>`,
+`SkillRouter.install()`, `install_skill()`, `pull_missing()`, `export_to_disk()` and the
+`disk_export` writers) and the version 1 lock fallback still work in 0.16.0, with the same
+warning. The 0.15.0 notes said they would stop working in 0.16; they now stop working in
+0.17, and the warnings say so.
 
 ### Fixed
 
