@@ -50,6 +50,9 @@ received. Each helper is in its framework's module (`import decimalai.adk` first
   warns when the sandbox would list no skills (it skips symlinked folders silently).
 - Microsoft Agent Framework and Strands need no adapter: with `decimalai.init(otel=True)`
   their own OpenTelemetry spans become the trace, and the load is recorded on it.
+- The Pydantic AI harness is graded at 0.57.0 (the `conformance-tests` floor), which keeps a
+  user-only skill (`disable-model-invocation: true`) out of the model's catalog, as only
+  Claude Code did before.
 
 ### Deprecated (unchanged, and kept one release longer)
 

@@ -101,7 +101,8 @@ NA_BUDGET = 2
 
 _OFFERS_USER_ONLY = Exemption(
     "offers a disable-model-invocation skill to the model; only Claude Code honours "
-    "the key (an upstream fact the docs loader page states)",
+    "the key, and the Pydantic AI harness since 0.57 (an upstream fact the docs loader "
+    "page states)",
     _field(("user_only", "offered"), lambda v: v is True, "True (offered to the model)"))
 
 UPSTREAM_GAPS: Dict[str, Exemption] = {
@@ -111,10 +112,10 @@ UPSTREAM_GAPS: Dict[str, Exemption] = {
              _field(("exec_bit", "copy"), lambda v: v is False, "False (the copy drops it)"))),
     **{f"{name}:N7": _OFFERS_USER_ONLY for name in (
         "google-adk", "openai-agents", "deepagents", "agent-framework", "strands-agents",
-        "pydantic-ai-harness", "crewai")},
+        "crewai")},
 }
 
-GAP_BUDGET = 8
+GAP_BUDGET = 7
 
 # ── facts behind how an item is graded on one loader ────────────────────────
 
@@ -146,8 +147,8 @@ PROOFS: Dict[str, Exemption] = {
 NOISE_ALLOWLIST: Dict[str, List[Tuple[str, str]]] = {
     "pydantic-ai-harness": [(
         r"^UserWarning: Ignoring unsupported Agent Skill behavioral frontmatter fields: ",
-        "the harness enforces neither allowed-tools nor disable-model-invocation and "
-        "warns once per run that it ignores them",
+        "the harness does not enforce allowed-tools and warns once per run that it "
+        "ignores it (since 0.57 it does honour disable-model-invocation)",
     )],
 }
 

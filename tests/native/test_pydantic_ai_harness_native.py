@@ -91,7 +91,10 @@ def test_after_an_update_the_activation_names_the_version_the_model_read(native_
 def test_the_catalog_the_model_was_shown_is_offered(native_project):
     result = _scenario("column", native_project)
     offered = set(_trace(result, 0)["skills_offered_in_prompt"])
-    listed = {native_project.expected(name)["name"] for name in native_project.lock["skills"]}
+    # Since 0.57 the harness keeps a user-only skill out of the model's catalog.
+    listed = {native_project.expected(name)["name"]
+              for name, entry in native_project.lock["skills"].items()
+              if entry["invocation"] != "user"}
     assert offered == listed, (offered, listed)
 
 
@@ -118,8 +121,11 @@ def test_the_router_leaves_an_agent_with_skills_alone(native_project):
 def test_the_pointer_helper_lists_the_installed_skills(native_project):
     result = _scenario("checks", native_project)
     catalog = result["observed"]["instructions"]
-    for name in native_project.lock["skills"]:
-        assert f"- {name}: " in catalog, catalog[-600:]
+    for name, entry in native_project.lock["skills"].items():
+        if entry["invocation"] == "user":   # honoured since 0.57: kept from the model
+            assert f"- {name}: " not in catalog, catalog[-600:]
+        else:
+            assert f"- {name}: " in catalog, catalog[-600:]
 
 
 # ── the observer's reading of a rendered skill ───────────────────────────────
