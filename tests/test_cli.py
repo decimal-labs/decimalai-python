@@ -322,6 +322,31 @@ class TestTracesImportWireFormat:
         )
         assert "content" not in call, "the file must not be sent as a raw body"
 
+    def test_import_format_rejects_unknown_choice_before_import(self, tmp_path):
+        from unittest.mock import patch
+
+        f = tmp_path / "traces.json"
+        f.write_text("[]")
+
+        with patch("decimalai.cli.main._make_client") as make_client:
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "traces",
+                    "import",
+                    str(f),
+                    "--format",
+                    "josn",
+                    "--api-key",
+                    "dai_sk_test",
+                ],
+            )
+
+        assert result.exit_code == 2
+        assert "Invalid value for '--format'" in result.output
+        assert "'josn' is not one of 'auto', 'json', 'jsonl'" in result.output
+        make_client.assert_not_called()
+
     def test_a_server_error_prints_what_the_server_said(self, tmp_path):
         from unittest.mock import MagicMock, patch
         from click.testing import CliRunner

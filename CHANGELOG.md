@@ -21,6 +21,11 @@ and patch releases are fixes.
   given together with `agent=` applies to that agent only. An INFO line says so once when the
   two names differ. Pydantic AI keeps its documented rule (`Agent(name=)` first).
 
+### Fixed
+
+- `decimalai traces import --format` now rejects unsupported values instead of silently
+  treating them as JSON.
+
 ## [0.16.0] — 2026-10-18
 
 ### Added: native mode — a framework's own skill loader, seen by DecimalAI
