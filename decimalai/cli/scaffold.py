@@ -166,62 +166,51 @@ import shlex
 import sys
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-if TYPE_CHECKING:  # keeps this module pure — it imports nothing at run time
+from .. import _frameworks as _registry
+
+if TYPE_CHECKING:  # keeps this module pure — at run time it imports only the registry
     from .._agent import AgentConfig
 
-# Changing this is a one-line edit in the generated file; it lives here so the
+# ── what this command knows about each framework ─────────────────────
+#
+# Every per-framework fact below is DERIVED from `decimalai/_frameworks.py`, the one
+# registry the docs' framework tables and the dashboard's snippets are generated from
+# too. Edit a fact there, not here; the reasons behind each value (why pydantic-ai's
+# default model carries a provider prefix, why adk's env var is GOOGLE_API_KEY, when
+# crewai and adk changed category) are written beside it there.
+
+# Changing this is a one-line edit in the generated file; the registry keeps it so the
 # CLI's --model default and the template cannot drift apart.
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = _registry.DEFAULT_MODEL
 
 #: Per-framework overrides of `DEFAULT_MODEL`, for frameworks whose model
-#: identifier is not the bare OpenAI name.
-#:
-#: Pydantic AI resolves `provider:model` and REFUSES a bare one —
-#: `infer_model("gpt-4o-mini")` raises `UserError: Unknown model`, checked
-#: against pydantic-ai-slim 2.56. So the shared default would have produced a file
-#: that dies on the line that builds the Agent, every run, for the default
-#: invocation of the command.
+#: identifier is not the bare OpenAI name (pydantic-ai's `provider:model`, adk's Gemini).
 _FRAMEWORK_DEFAULT_MODELS: Dict[str, str] = {
-    "pydantic-ai": "openai:gpt-4o-mini",
-    # Never an OpenAI name: `decimalai[adk]` installs google-adk only, and ADK
-    # would resolve `gpt-*` to its OpenAI shim and die on the first model call.
-    # `normalize_model` refuses non-Gemini names for adk so this stays true.
-    "adk": "gemini-3.5-flash",
+    f.key: f.default_model for f in _registry.FRAMEWORKS
+    if f.default_model and f.default_model != DEFAULT_MODEL
 }
 
 DEFAULT_OUTPUT = "agent.py"
 
 #: Frameworks `init` can scaffold, in the order they are offered.
-SUPPORTED_FRAMEWORKS: tuple = ("langchain", "openai-agents", "pydantic-ai", "adk")
+SUPPORTED_FRAMEWORKS: tuple = tuple(
+    f.key for f in _registry.FRAMEWORKS if f.scaffold == _registry.TEMPLATE
+)
 
 #: Frameworks whose adapter carries `enable_skill_loader` but which have no
 #: template yet. Named separately from the seamless ones because the answer to
 #: "why not?" is different, and so is what we'd have to do to add them.
 UNSCAFFOLDED_WITH_SEAM: Dict[str, str] = {
-    "anthropic": "The Anthropic Messages adapter",
-    # adk moved here from NO_PROMPT_SEAM on 2026-09-03 (seam proven by C14 and
-    # a live Gemini end-to-end test) and on to SUPPORTED_FRAMEWORKS on
-    # 2026-09-05: the premise that held the template back — "google-genai has no
-    # base-url environment override, so the hermetic J1 stub cannot stand in for
-    # Gemini" — was false. google-genai reads GOOGLE_GEMINI_BASE_URL (present
-    # since v1.72, google-adk 2.0.0's own floor) and the journey stub now speaks
-    # `:generateContent`. Nothing in the generated file knows about the stub.
-    #
-    # crewai moved here from NO_PROMPT_SEAM on 2026-10-08: decimalai/crewai.py
-    # delivers skills through CrewAI's before_llm_call hook, graded by C8/C14 and
-    # the injected delivery cell. There is no template yet, so `decimalai init`
-    # says "not yet" instead of "no seam".
-    "crewai": "CrewAI",
+    f.key: f.cli_label for f in _registry.FRAMEWORKS
+    if f.scaffold == _registry.SEAM_NO_TEMPLATE
 }
 
 #: Frameworks deliberately NOT offered: their adapters have no prompt seam, so
 #: a generated file would trace correctly and deliver none of the agent's
 #: skills — the exact silent failure this scaffold exists to prevent.
 NO_PROMPT_SEAM: Dict[str, str] = {
-    "llamaindex": "LlamaIndex",
-    "claude-agent-sdk": "The Claude Agent SDK",
-    "autogen": "AutoGen / AG2",
-    "otel": "The generic OpenTelemetry rail",
+    f.key: f.cli_label for f in _registry.FRAMEWORKS
+    if f.scaffold == _registry.NO_SEAM
 }
 
 
@@ -886,19 +875,9 @@ _RENDERERS = {
 #: What the user has to install and export for the generated file to run.
 #: `decimalai[openai]` pulls the openai SDK, NOT the Agents SDK — they are
 #: separate extras, and copy-pasting the wrong one leaves the import failing on
-#: a machine that looks correctly set up.
+#: a machine that looks correctly set up. From the registry, like ENV_VARS below.
 INSTALL: Dict[str, str] = {
-    "langchain": 'pip install "decimalai[langchain]" langchain langchain-openai',
-    "openai-agents": 'pip install "decimalai[openai-agents]"',
-    # One line, whatever the model. `decimalai[pydantic-ai]` resolves to
-    # `pydantic-ai-slim[openai,google,anthropic]`, so those three provider
-    # bindings come with it, and the OpenTelemetry SDK the template's tracing
-    # needs is already a core dependency of decimalai. Not the `pydantic-ai`
-    # meta package: its logfire extra needs an opentelemetry-api that
-    # google-adk rules out of `decimalai[all]`.
-    # A provider outside those three adds a token; see _PYDANTIC_AI_PROVIDERS.
-    "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
-    "adk": 'pip install "decimalai[adk]"',
+    f.key: f.install for f in _registry.FRAMEWORKS if f.scaffold == _registry.TEMPLATE
 }
 
 #: Extras whose framework floor needs a newer Python than decimalai itself
@@ -907,8 +886,7 @@ INSTALL: Dict[str, str] = {
 #: Python it installs the newest decimalai release whose requirements still
 #: resolve, older than the one that wrote the file, and prints nothing.
 EXTRA_MIN_PYTHON: Dict[str, Tuple[int, int]] = {
-    "adk": (3, 11),
-    "pydantic-ai": (3, 11),
+    f.key: f.min_python for f in _registry.FRAMEWORKS if f.min_python
 }
 
 
@@ -934,12 +912,7 @@ def install_python_note(
 
 
 ENV_VARS: Dict[str, tuple] = {
-    "langchain": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
-    "openai-agents": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
-    "pydantic-ai": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
-    # google-genai reads GOOGLE_API_KEY ahead of GEMINI_API_KEY; name the one
-    # that wins so the `Set:` block and the file's own guard agree.
-    "adk": ("DECIMAL_API_KEY", "GOOGLE_API_KEY"),
+    f.key: f.env_vars for f in _registry.FRAMEWORKS if f.scaffold == _registry.TEMPLATE
 }
 
 #: LangChain's `init_chat_model` takes a `provider:model` string. The provider

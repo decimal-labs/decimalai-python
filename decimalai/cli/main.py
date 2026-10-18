@@ -457,6 +457,16 @@ def _scaffold_agent_file(
     click.echo("")
 
 
+def _framework_help() -> str:
+    """`init --framework`'s help: "langchain (default), openai-agents, pydantic-ai or adk"."""
+    from .scaffold import SUPPORTED_FRAMEWORKS
+
+    first, *rest = SUPPORTED_FRAMEWORKS
+    names = [f"{first} (default)", *rest]
+    listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " or " + names[-1]
+    return f"Framework to generate for: {listed}"
+
+
 @cli.command()
 @click.argument("agent_name", required=False)
 @click.option("--api-key", envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"], help="API key")
@@ -474,10 +484,9 @@ def _scaffold_agent_file(
     # loudly refused. The default is applied below instead.
     "--framework",
     default=None,
-    help=(
-        "Framework to generate for: langchain (default), openai-agents, "
-        "pydantic-ai or adk"
-    ),
+    # Read off the scaffold's ledger (decimalai/_frameworks.py), never typed here: this
+    # help listed the frameworks by hand and was one more copy to keep in step.
+    help=_framework_help(),
 )
 @click.option("--out", "out_path", default=None,
               help="Where to write (default: ./agent.py)")
