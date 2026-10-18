@@ -215,3 +215,42 @@ def two_catalogs(ctx: dict) -> dict:
     s.run(once)
     s.notes.update({"system": [r["system"][0] for r in seen["runs"]], "logs": logs.lines})
     return s.result()
+
+
+def unknown_name(ctx: dict) -> dict:
+    """The model asks for a skill nobody installed, then for the real one: the guarded
+    capability answers the first instead of aborting the run (W3)."""
+    s = col.Session("openai-agents", distributions=DISTRIBUTIONS, openai_agents=True)
+    turns = Turns()
+    the_agent = agent(turns.model)
+    seen: Dict[str, Any] = {}
+
+    def once(run: col.Run) -> None:
+        seen["run"] = got = drive(turns, the_agent,
+                                  ("load_skill", {"skill_name": "no-such-skill"}), load(),
+                                  cat("SKILL.md"))
+        _into(run, got)
+
+    s.run(once)
+    s.notes["outputs"] = seen.get("run", {}).get("outputs")
+    return s.result()
+
+
+def symlinked(ctx: dict) -> dict:
+    """The installed folders replaced by symlinks to copies elsewhere: the sandbox lists
+    none of them, and sandbox_skills() says so (W3)."""
+    import shutil
+
+    logs = _Logs()
+    logging.getLogger("decimalai.openai_agents").addHandler(logs)
+    root = col.skills_dir()
+    elsewhere = root.parent.parent.parent / "elsewhere-skills"
+    shutil.copytree(root, elsewhere)
+    for folder in list(root.iterdir()):
+        if folder.is_dir():
+            shutil.rmtree(folder)
+            folder.symlink_to(elsewhere / folder.name, target_is_directory=True)
+    from decimalai.openai_agents import sandbox_skills
+
+    sandbox_skills()
+    return {"logs": logs.lines}

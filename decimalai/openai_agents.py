@@ -1634,13 +1634,22 @@ def sandbox_skills(directory: Any = None) -> Any:
     SDK lists nothing from a source outside it, so a project that is not under the
     working directory raises here instead of listing zero skills.
 
+    Two guards the plain capability lacks:
+
+    * **An empty listing says why.** The sandbox lists only real folders holding a
+      ``SKILL.md`` and skips a symlinked one without a word, so a project whose skills are
+      symlinks gives the model no skills and no error. A WARNING here names the folder.
+    * **An unknown name does not end the run.** The sandbox's ``load_skill`` raises on a
+      name it cannot find (or that two folders share), which aborts the whole run; the
+      capability returned here answers the model instead, with the names it can load.
+
     Args:
         directory: where to look for the project (default: the working directory).
     """
     from pathlib import Path
 
     try:
-        from agents.sandbox.capabilities import LocalDirLazySkillSource, Skills
+        from agents.sandbox.capabilities import LocalDirLazySkillSource
         from agents.sandbox.entries import LocalDir
     except ImportError:
         raise ImportError(
@@ -1649,8 +1658,74 @@ def sandbox_skills(directory: Any = None) -> Any:
         ) from None
     from .skillpkg.project import skills_dir
 
-    return Skills(lazy_from=LocalDirLazySkillSource(
-        source=LocalDir(src=skills_dir(directory, relative_to=Path.cwd()))))
+    source = skills_dir(directory, relative_to=Path.cwd())
+    _warn_if_nothing_to_list(Path.cwd() / source)
+    return _guarded_skills_class()(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=source)))
+
+
+#: Built on first use: it subclasses the SDK's ``Skills``, which may not be installed.
+_GUARDED_SKILLS: Any = None
+#: What the sandbox raises for a name it cannot load: the guard answers these.
+_UNLOADABLE = ("lazy skill not found", "lazy skill name is ambiguous")
+
+
+def _guarded_skills_class() -> Any:
+    global _GUARDED_SKILLS
+    if _GUARDED_SKILLS is not None:
+        return _GUARDED_SKILLS
+    from agents.sandbox.capabilities import Skills
+    from agents.sandbox.errors import SkillsConfigError
+
+    class DecimalSkills(Skills):
+        """``Skills`` whose ``load_skill`` answers an unloadable name instead of raising."""
+
+        async def load_skill(self, skill_name: str) -> Dict[str, str]:
+            try:
+                return await super().load_skill(skill_name)
+            except SkillsConfigError as exc:
+                if getattr(exc, "message", None) not in _UNLOADABLE:
+                    raise
+                available = _loadable_names(self)
+                return {
+                    "status": "not_found",
+                    "skill_name": skill_name,
+                    "error": (f"No skill can be loaded as {skill_name!r} "
+                              f"({getattr(exc, 'message', exc)}). "
+                              + (f"Load one of: {', '.join(available)}." if available
+                                 else "No skills are available.")),
+                }
+
+    _GUARDED_SKILLS = DecimalSkills
+    return DecimalSkills
+
+
+def _loadable_names(skills: Any) -> List[str]:
+    try:
+        session = getattr(skills, "session", None)
+        grants = session.state.manifest.extra_path_grants if session is not None else ()
+        return sorted({m.name for m in skills.lazy_from.list_skill_metadata(
+            skills_path=skills.skills_path, source_grants=grants)})
+    except Exception:  # noqa: BLE001 - the answer is still better than an aborted run
+        logger.debug("could not list the sandbox's skills", exc_info=True)
+        return []
+
+
+def _warn_if_nothing_to_list(folder: Any) -> None:
+    """Say so when the sandbox would list no skills from ``folder``: it lists real folders
+    holding a ``SKILL.md`` and skips symlinks silently."""
+    try:
+        entries = [p for p in folder.iterdir() if p.is_dir()]
+        real = [p for p in entries if not p.is_symlink() and (p / "SKILL.md").is_file()]
+        if real:
+            return
+        linked = [p.name for p in entries if p.is_symlink()]
+        logger.warning(
+            "decimalai: sandbox_skills(): the sandbox will list no skills from %s%s. Run "
+            "`decimalai skills install` to write real skill folders there.", folder,
+            f" (it skips symlinked folders: {', '.join(sorted(linked))})" if linked else
+            " (it holds no skill folder with a SKILL.md)")
+    except OSError:
+        logger.debug("could not check the sandbox skill folder", exc_info=True)
 
 # ── Type aliases for duck-typing against the OpenAI Agents SDK ──
 # We avoid hard imports so the module loads even without openai-agents installed.

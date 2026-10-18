@@ -131,3 +131,23 @@ def test_the_pointer_helper_lists_the_installed_skills(result, native_project):
     system = result["notes"]["system"][0]
     for name in native_project.lock["skills"]:
         assert f"- {name}: " in system and f"(file: .agents/{name})" in system
+
+
+def test_an_unknown_skill_name_is_answered_not_fatal(native_project):
+    """The sandbox raises on a name it cannot load, which ends the run; the capability
+    sandbox_skills() returns answers the model and the run goes on to load the real one."""
+    got = _scenario(native_project, "unknown_name")
+    run = got["runs"][0]
+    assert run["error"] is None, run["error"]
+    answers = " ".join(got["notes"]["outputs"] or [])
+    assert "no-such-skill" in answers and "not_found" in answers
+    assert "acme-refund-policy" in answers  # the names it can load
+    (trace,) = run["traces"]
+    assert [e["version_id"] for e in trace["active_skills"]] == [
+        native_project.expected()["version_id"]]
+
+
+def test_a_listing_the_sandbox_would_leave_empty_is_named(native_project):
+    got = _scenario(native_project, "symlinked")
+    warnings = [line["message"] for line in got["logs"] if line["level"] == "WARNING"]
+    assert any("will list no skills" in m and "symlinked" in m for m in warnings), got["logs"]
