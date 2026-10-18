@@ -93,6 +93,9 @@ OPENAI2_UNIT_TESTS = (
     # The native skill loaders: CrewAI and Strands are graded here, the other six in
     # openai3 (tests/conformance/environments.py:LOADER_ENVS).
     "native_loaders/test_*.py",
+    # Native mode (Phase 3): the CrewAI and Strands hooks and their native-column cells
+    # run here; the other six frameworks' cells skip as graded in openai3.
+    "native/test_*.py",
 )
 
 #: Importable in the openai 2 environment, or the slice above would pass by

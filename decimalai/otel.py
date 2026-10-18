@@ -710,6 +710,8 @@ def instrument(
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace_api.set_tracer_provider(provider)
     _register_flush_atexit(provider)
+    with _installed_providers_lock:
+        _installed_providers.append(provider)
 
     logger.info(
         "DecimalAI OTEL exporter installed (agent_name=%s, service=%s)",
@@ -1006,6 +1008,9 @@ class DecimalSpanExporter:
 
     def _finalize_trace(self, tid: int, group: List[Any]) -> None:
         """Assemble one trace_id's buffered spans into a RunTrace and send it."""
+        # Taken before anything can fail, so a run whose trace is never sent does not
+        # leave its native loads in the shared store until the cap evicts them.
+        native = _pop_native_rail(tid)
         try:
             result = self._assemble_trace(group)
             if result is not None:
@@ -1080,7 +1085,6 @@ class DecimalSpanExporter:
                 # Skills the framework's own loader loaded in this run, with the version
                 # the model received. After the inference, so a native activation replaces
                 # an inferred entry of the same name rather than the other way round.
-                native = _pop_native_rail(tid)
                 if native:
                     native.apply(run_trace)
                 # Who asked for this run, captured when it started (see
@@ -1294,6 +1298,16 @@ class DecimalSpanExporter:
         if root_declared or any_declared:
             agent_name = root_declared or any_declared
 
+        # ── A tool's outcome, on the call that asked for it ──
+        # The model's request (a ``tool_call`` part of the LLM span's output) carries the
+        # arguments in full but no outcome; the ``execute_tool`` span carries the outcome,
+        # and a preview of its input capped at 200 characters, which a long absolute path
+        # fills before the script's name. GenAI semconv gives both the same call id, so
+        # join them after the loop, the way the ADK adapter joins a tool's answer onto
+        # the model's request. Unjoined, a tool call stays RUNNING: requested, unseen.
+        requested_calls: Dict[str, ToolCallRecord] = {}
+        tool_outcomes: List[tuple] = []
+
         for otel_span in otel_spans:
             attrs = _get_attributes(otel_span)
             name = _get_span_name(otel_span)
@@ -1378,6 +1392,11 @@ class DecimalSpanExporter:
                     seen_tools.setdefault(tname, {"name": tname})
                 for tc in llm_call.tool_calls:
                     seen_tools.setdefault(tc.tool_name, {"name": tc.tool_name})
+                for tc, (part_name, call_id) in zip(
+                    llm_call.tool_calls, _semconv_tool_call_ids(attrs)
+                ):
+                    if call_id and tc.tool_name == part_name:
+                        requested_calls[call_id] = tc
 
                 # Accumulate model for manifest auto-detection
                 if seen_model is None:
@@ -1452,6 +1471,11 @@ class DecimalSpanExporter:
                         attrs.get("gen_ai.tool.name") or attrs.get("tool.name") or name
                     )
                     seen_tools.setdefault(tool_name, {"name": tool_name})
+                    call_id = attrs.get("gen_ai.tool.call.id")
+                    if call_id and "gen_ai.tool.call.result" in attrs:
+                        tool_outcomes.append(
+                            (str(call_id), attrs["gen_ai.tool.call.result"], span_status)
+                        )
 
                 trace_span = TraceSpan(
                     id=span_uuid,
@@ -1466,6 +1490,13 @@ class DecimalSpanExporter:
                     output_preview=_preview_from_attrs(attrs, "output"),
                 )
                 trace_spans.append(trace_span)
+
+        for call_id, outcome, outcome_status in tool_outcomes:
+            record = requested_calls.get(call_id)
+            if record is not None:
+                text = outcome if isinstance(outcome, str) else str(outcome)
+                record.result = text[:_TOOL_RESULT_MAX_CHARS]
+                record.status = outcome_status
 
         if not trace_spans and not llm_calls:
             return None
@@ -1679,6 +1710,58 @@ def _submit_or_send_inline(client: Any, trace: RunTrace) -> None:
     _config._sender._record_success()
 
 
+#: Every provider :func:`instrument` built, so :func:`flush_installed` can export what they
+#: still hold. A framework traced only through OTel (Strands, Microsoft Agent Framework,
+#: the Pydantic AI harness) queues a run's spans in a ``BatchSpanProcessor``; until they
+#: are exported there is no trace for ``decimalai.flush()`` to send.
+_installed_providers: List[Any] = []
+_installed_providers_lock = threading.Lock()
+#: How long :func:`flush_installed` waits for the export, as CrewAI's flush does.
+_FLUSH_TIMEOUT_S = 5.0
+
+
+def flush_installed(timeout_s: Optional[float] = None) -> bool:
+    """Export the spans the providers :func:`instrument` built still hold. True if it
+    finished within ``timeout_s``.
+
+    Bounded the way ``decimalai.crewai._flush_tracing`` is, and for the same reasons: the
+    SDK's ``force_flush`` cannot bound itself, and an unbounded wait would deadlock a flush
+    called while the export lock is held on this thread. Past the bound the export carries
+    on in the background. Never raises.
+    """
+    if timeout_s is None:
+        timeout_s = _FLUSH_TIMEOUT_S
+    with _installed_providers_lock:
+        providers = list(_installed_providers)
+    if not providers:
+        return True
+    done = threading.Event()
+    budget_ms = max(1, int(timeout_s * 1000))
+
+    def _export() -> None:
+        try:
+            for provider in providers:
+                try:
+                    provider.force_flush(budget_ms)
+                except Exception:  # noqa: BLE001
+                    logger.debug("OTel tracer provider flush failed", exc_info=True)
+        finally:
+            done.set()
+
+    try:
+        threading.Thread(target=_export, name="decimalai-otel-flush", daemon=True).start()
+    except RuntimeError:
+        # The interpreter is shutting down; _register_flush_atexit's hook flushes them.
+        return False
+    if done.wait(timeout_s):
+        return True
+    logger.warning(
+        "decimalai.flush(): the OTel trace pipeline did not finish exporting within "
+        "%.0fs. The export continues in the background and the trace is still sent "
+        "when it completes.", timeout_s)
+    return False
+
+
 def _register_flush_atexit(provider: Any) -> None:
     """Flush ``provider`` early enough that the background sender is still alive.
 
@@ -1873,6 +1956,34 @@ def _semconv_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:
                 )
             )
     return records
+
+
+#: A joined tool result is kept up to this many characters, as the ADK adapter keeps one.
+_TOOL_RESULT_MAX_CHARS = 2000
+
+
+def _semconv_tool_call_ids(attrs: Dict[str, Any]) -> List[tuple]:
+    """``(name, call id)`` of each ``tool_call`` part :func:`_semconv_tool_calls` reads,
+    in the same order, so the two zip."""
+    raw = attrs.get("gen_ai.output.messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: List[tuple] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        for part in entry.get("parts") or ():
+            if isinstance(part, dict) and part.get("type") == "tool_call" and part.get("name"):
+                call_id = part.get("id")
+                out.append((str(part["name"]), str(call_id) if call_id else None))
+    return out
 
 
 def _extract_tool_calls(attrs: Dict[str, Any]) -> List[ToolCallRecord]:

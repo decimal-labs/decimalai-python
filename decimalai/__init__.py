@@ -118,15 +118,14 @@ def _register_sigterm_flush() -> None:
 def _flush_otel_pipelines() -> None:
     """Export what is still queued in the OTel pipelines this SDK assembles from.
 
-    Today that is CrewAI's: a CrewAI run reaches DecimalAI as spans, queued in a
+    CrewAI's, and the one ``otel.instrument()`` built. A CrewAI run reaches DecimalAI as spans, queued in a
     ``BatchSpanProcessor`` for up to five seconds before the exporter turns them
     into a trace and hands it to the sender — so a flush that only drains the
     sender can finish before the run's trace exists. Bounded by
     ``decimalai.crewai._FLUSH_TIMEOUT_S``.
 
-    A no-op unless CrewAI tracing was set up by this SDK (``init(crewai=True)``
-    or ``decimalai.crewai.instrument()``): the module is only looked up, never
-    imported, and it flushes only the pipelines it built. Never raises.
+    A no-op for a pipeline this SDK did not set up: each module is only looked up,
+    never imported, and flushes only the providers it built. Never raises.
 
     Not called from :func:`_atexit_flush`. At a normal exit those providers have
     already been shut down — and so flushed, by the SDK's bounded
@@ -135,12 +134,19 @@ def _flush_otel_pipelines() -> None:
     handler.
     """
     crewai = sys.modules.get(f"{__name__}.crewai")
-    if crewai is None:
-        return
-    try:
-        crewai._flush_tracing()
-    except Exception:  # noqa: BLE001 — flushing must never raise into the caller
-        logger.debug("CrewAI trace pipeline flush failed", exc_info=True)
+    if crewai is not None:
+        try:
+            crewai._flush_tracing()
+        except Exception:  # noqa: BLE001 — flushing must never raise into the caller
+            logger.debug("CrewAI trace pipeline flush failed", exc_info=True)
+    # And the pipeline `init(otel=True)` / `otel.instrument()` built, which is what
+    # carries a framework traced only through OTel (Strands, Microsoft Agent Framework).
+    otel = sys.modules.get(f"{__name__}.otel")
+    if otel is not None:
+        try:
+            otel.flush_installed()
+        except Exception:  # noqa: BLE001
+            logger.debug("OTel trace pipeline flush failed", exc_info=True)
 
 
 def _atexit_flush() -> None:
