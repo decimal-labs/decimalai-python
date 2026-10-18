@@ -3,14 +3,14 @@
 Two gaps from the 2026-10-13 framework integration audit, both pinned here on
 crewai 1.15.27, the only CrewAI the adapter supports:
 
-1. **Two catalogs, no warning.** CrewAI has its own Agent Skills
-   (``Agent(skills=...)`` / ``Crew(skills=...)``). They render into CrewAI's
-   system prompt — an ``<available_skills>`` catalog plus a native ``load_skill``
-   tool for metadata-level skills, an always-on ``<skills>`` block for activated
-   ones — and the DecimalAI loader's routed menu lands right after it. The model
-   is shown two catalogs with two different instructions, and a skill CrewAI
-   loads natively is never a DecimalAI activation. Native-mode delivery is a
-   later phase; until then the hook says so, once, when both are in the call.
+1. **Two catalogs.** CrewAI has its own Agent Skills (``Agent(skills=...)`` /
+   ``Crew(skills=...)``). They render into CrewAI's system prompt — an
+   ``<available_skills>`` catalog plus a native ``load_skill`` tool for
+   metadata-level skills, an always-on ``<skills>`` block for activated ones.
+   Phase 1 warned when the DecimalAI loader's routed menu landed beside them.
+   Since native mode (Phase 3, D7) the router stays out of such an agent's calls
+   altogether and says so once per agent at INFO; its loads are recorded as
+   activations (``tests/native/test_crewai_native.py``).
 
 2. **The routing call and the event loop.** CrewAI hooks are synchronous by
    CrewAI's design (``crewai/hooks/dispatch.py``: hooks "may be invoked from
@@ -158,9 +158,11 @@ def _reset_sdk():
         for name in (
             "_tracing_installed", "_skill_loader_installed", "_install_agent_name",
             "_skill_router_singleton", "_native_skills_warned", "_loop_block_warned",
+            "_router_off_logged",
         )
         if hasattr(dc, name)
     }
+    dc._router_off_logged = set()
     dc._skill_loader_installed = False
     dc._install_agent_name = None
     dc._skill_router_singleton = None
@@ -185,6 +187,17 @@ def use_router(monkeypatch):
         return router
 
     return _use
+
+
+ROUTER_OFF = "does not inject"
+
+
+def _infos(caplog, needle: str) -> List[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "decimalai.crewai" and r.levelno == logging.INFO
+        and needle in r.getMessage()
+    ]
 
 
 def _warnings(caplog, needle: str) -> List[str]:
@@ -322,7 +335,7 @@ def _crew(agent, **kw):
 @needs_crewai
 class TestNativeSkillsAreNamed:
     """CrewAI's own skills, configured the three ways CrewAI documents, with the
-    DecimalAI loader on as well."""
+    DecimalAI loader on as well: the router stays out of that agent's calls."""
 
     @pytest.fixture(autouse=True)
     def _loader(self):
@@ -335,54 +348,64 @@ class TestNativeSkillsAreNamed:
         yield
         unregister_before_llm_call_hook(dc._skill_hook)
 
-    def test_agent_skills_warn_once_naming_both_catalogs(self, tmp_path, use_router, caplog):
-        use_router(_Router())
+    def test_agent_skills_turn_the_router_off_and_say_so_once(self, tmp_path, use_router, caplog):
+        router = use_router(_Router())
         seen: List[List[Dict[str, Any]]] = []
         agent = _agent(seen, skills=[_skills_dir(tmp_path)])
-        with caplog.at_level(logging.WARNING, logger="decimalai.crewai"):
+        with caplog.at_level(logging.INFO, logger="decimalai.crewai"):
             _crew(agent).kickoff()
             _crew(agent).kickoff()
 
-        found = _warnings(caplog, TWO_CATALOGS)
+        assert router.calls == [], "the routing call was made for an agent it cannot serve"
+        found = _infos(caplog, ROUTER_OFF)
         assert len(found) == 1, caplog.text
         assert NATIVE_NAME in found[0]
         assert "load_skill" in found[0], "the native load_skill tool goes unnamed"
-        # Detection only: both catalogs still reach the model, as before.
+        assert _warnings(caplog, TWO_CATALOGS) == []
+        # One catalog reaches the model: CrewAI's.
         request = "\n".join(str(m["content"]) for m in seen[0])
-        assert SENTINEL in request
+        assert SENTINEL not in request
         assert "<available_skills>" in request and NATIVE_NAME in request
 
     def test_crew_level_skills_are_detected_too(self, tmp_path, use_router, caplog):
         """``Crew(skills=...)`` reaches each agent at kickoff
         (``crews/utils.py::setup_agents`` → ``Agent.set_skills``)."""
-        use_router(_Router())
+        router = use_router(_Router())
         seen: List[List[Dict[str, Any]]] = []
-        with caplog.at_level(logging.WARNING, logger="decimalai.crewai"):
+        with caplog.at_level(logging.INFO, logger="decimalai.crewai"):
             _crew(_agent(seen), skills=[_skills_dir(tmp_path)]).kickoff()
-        found = _warnings(caplog, TWO_CATALOGS)
+        found = _infos(caplog, ROUTER_OFF)
         assert len(found) == 1 and NATIVE_NAME in found[0], caplog.text
+        assert router.calls == []
+        assert not any(SENTINEL in str(m["content"]) for m in seen[0])
 
     def test_an_inline_activated_skill_is_detected_as_always_on(self, use_router, caplog):
         """An inline SKILL.md string is activated on load: CrewAI renders its
         body in an always-on ``<skills>`` block and registers no tool."""
         use_router(_Router())
         seen: List[List[Dict[str, Any]]] = []
-        with caplog.at_level(logging.WARNING, logger="decimalai.crewai"):
+        with caplog.at_level(logging.INFO, logger="decimalai.crewai"):
             _crew(_agent(seen, skills=[INLINE_SKILL])).kickoff()
-        found = _warnings(caplog, TWO_CATALOGS)
+        found = _infos(caplog, ROUTER_OFF)
         assert len(found) == 1, caplog.text
         assert "tone-guide" in found[0]
         assert "always-on" in found[0]
         assert "load_skill" not in found[0], "no native tool exists to name"
+        assert not any(SENTINEL in str(m["content"]) for m in seen[0])
 
-    def test_a_name_in_both_catalogs_is_called_out(self, tmp_path, use_router, caplog):
-        use_router(_OverlappingRouter())
-        seen: List[List[Dict[str, Any]]] = []
-        with caplog.at_level(logging.WARNING, logger="decimalai.crewai"):
-            _crew(_agent(seen, skills=[_skills_dir(tmp_path)])).kickoff()
-        found = _warnings(caplog, TWO_CATALOGS)
-        assert len(found) == 1, caplog.text
-        assert f"offered by both: {NATIVE_NAME}" in found[0]
+    def test_an_agent_without_skills_is_still_routed_beside_one_with(
+        self, tmp_path, use_router, caplog,
+    ):
+        """The router is turned off per agent, not for the process."""
+        router = use_router(_OverlappingRouter())
+        native_seen: List[List[Dict[str, Any]]] = []
+        plain_seen: List[List[Dict[str, Any]]] = []
+        with caplog.at_level(logging.INFO, logger="decimalai.crewai"):
+            _crew(_agent(native_seen, skills=[_skills_dir(tmp_path)])).kickoff()
+            _crew(_agent(plain_seen)).kickoff()
+        assert len(router.calls) == 1
+        assert not any(SENTINEL in str(m["content"]) for m in native_seen[0])
+        assert any(SENTINEL in str(m["content"]) for m in plain_seen[0])
 
     def test_no_native_skills_no_warning(self, use_router, caplog):
         use_router(_Router())

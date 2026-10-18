@@ -52,18 +52,36 @@ that ask the same question while that call is in flight — the branches of a
 ``ParallelAgent`` — wait for it and share its answer, so one user turn is one
 routing decision and the trace names it.
 
-ADK itself ships a native skill mechanism — ``google.adk.tools.skill_toolset.
+Native mode: ADK's own skill loader
+-----------------------------------
+ADK ships a skill loader of its own — ``google.adk.tools.skill_toolset.
 SkillToolset``, with ``list_skills`` / ``load_skill`` / ``load_skill_resource``
-tools and an optional ``SkillRegistry`` — but this adapter does not plug
-DecimalAI skills into it. It registers no tool of its own either: prompt
-injection is the ONLY body channel this adapter has, which is the
-``has_tool_loop=False`` answer ``DecimalConfig.resolve_inject_body`` gives
-bodies-by-default for. A ``SkillToolset`` the caller adds to their agent works
-as ADK built it; DecimalAI neither routes its skills nor records its
-``load_skill`` calls as activations.
+/ ``run_skill_script`` tools. Pointed at the skills ``decimalai skills add``
+installed::
 
-Its calls are traced like every other tool call, results included: each
-result lands on the ``ToolCallRecord`` of the model turn that asked for it
+    from google.adk.tools.skill_toolset import SkillToolset
+    import decimalai.adk
+
+    agent = LlmAgent(..., tools=[SkillToolset(skills=decimalai.adk.skills(),
+                                              code_executor=...)])
+
+the plugin sees each ``load_skill`` result and records it as an activation
+carrying the registry identity of the body the MODEL received
+(``decimalai._native``): the stamp in the frontmatter ADK handed over, checked
+against that body's hash, else the lock. ADK parses the folders once, when
+``skills()`` runs, so after ``decimalai skills update`` an agent built earlier
+keeps serving the old version, and its activations say so. A skill loaded twice
+in one invocation is one activation. The names ``list_skills`` returns (or the
+catalog an ``EAGER`` toolset writes into the system instruction) are recorded
+as offered.
+
+The router's injection stays off for an agent that carries a ``SkillToolset``:
+the toolset already offers the skills, and a second catalog in the same prompt
+would give the model two sets of instructions for one job. That is said once
+per agent at INFO. Every other agent of the same runner is routed as before.
+
+The toolset's calls are traced like every other tool call, results included:
+each result lands on the ``ToolCallRecord`` of the model turn that asked for it
 (matched by function-call id), as a bounded JSON-safe copy. A ``load_skill`` /
 ``load_skill_resource`` / ``run_skill_script`` result keeps the skill's name,
 the file path and the frontmatter's ``name`` and ``metadata`` whole, so the
@@ -77,15 +95,19 @@ ADK is built around Gemini; the release gate pairs this adapter with the
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import os
+import re
 import threading
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import UUID, uuid4
 
+from ._native import Load, NativeLoads, record
 from ._skill_witness import copy_delivered_versions
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
@@ -405,6 +427,182 @@ def _recorded_tool_result(tool: Any, result: Any) -> Any:
     if isinstance(result, dict) and _is_skill_tool(tool):
         return _skill_tool_result(result)
     return _bounded_tool_result(result)
+
+
+# ── native mode: ADK's own SkillToolset ─────────────────────
+#
+# Recognised by class name and module, through the MRO, like `_is_skill_tool`:
+# importing google-adk here would make `import decimalai.adk` need it, and a
+# subclass of ADK's toolset is still ADK's loader.
+
+
+def _is_adk_class(obj: Any, name: str) -> bool:
+    return any(
+        cls.__module__ == _SKILL_TOOL_MODULE and cls.__name__ == name
+        for cls in type(obj).__mro__
+    )
+
+
+def _has_skill_toolset(agent: Any) -> bool:
+    """True when ``agent`` offers skills through ADK's own ``SkillToolset``."""
+    try:
+        return any(_is_adk_class(t, "SkillToolset") for t in getattr(agent, "tools", None) or ())
+    except Exception:  # noqa: BLE001 - an agent shape we do not know is not a native one
+        return False
+
+
+_CATALOG_RE = re.compile(r"<available_skills>(.*?)</available_skills>", re.S)
+_CATALOG_NAME_RE = re.compile(r"<name>\s*(.*?)\s*</name>", re.S)
+
+
+def _catalog_names(text: Any) -> List[str]:
+    """The skill names in ADK's ``<available_skills>`` listing(s) inside ``text``.
+
+    The XML ``google.adk.skills.prompt.format_skills_as_xml`` writes, for both the
+    ``list_skills`` result and an ``EAGER`` toolset's system instruction. Names
+    are HTML-escaped there, so they are unescaped here.
+    """
+    if not isinstance(text, str) or "<available_skills>" not in text:
+        return []
+    names: List[str] = []
+    for block in _CATALOG_RE.findall(text):
+        for raw in _CATALOG_NAME_RE.findall(block):
+            name = html.unescape(raw)
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _wire_names(names: List[str]) -> List[str]:
+    """Each listed name as the trace reports that skill (decimalai._native, D6): an
+    installed skill by its wire name, so a listing and an activation of one skill
+    cannot arrive under two names. Anything else as it was listed."""
+    from .skillpkg.identity import current_index
+
+    index = current_index()
+    out: List[str] = []
+    for name in names:
+        managed = index.get(name)
+        wire = managed.wire_name if managed is not None else name
+        if wire not in out:
+            out.append(wire)
+    return out
+
+
+#: Agents the router's injection was turned off for, named once each at INFO.
+_router_off_logged: set = set()
+#: Said once per process: a native load in a run the router also delivered into.
+_both_catalogs_warned = False
+_native_log_lock = threading.Lock()
+
+
+def _say_router_off(agent_name: Optional[str]) -> None:
+    key = agent_name or ""
+    with _native_log_lock:
+        if key in _router_off_logged:
+            return
+        _router_off_logged.add(key)
+    logger.info(
+        "DecimalAI ADK: agent %r carries ADK's own SkillToolset, so DecimalAI's skill "
+        "router does not inject its menu or bodies into that agent's requests: the "
+        "toolset already offers the installed skills, and its load_skill calls are "
+        "recorded as activations. Other agents are routed as before.", agent_name,
+    )
+
+
+def _warn_both_catalogs(skill_name: Optional[str]) -> None:
+    global _both_catalogs_warned
+    with _native_log_lock:
+        if _both_catalogs_warned:
+            return
+        _both_catalogs_warned = True
+    logger.warning(
+        "DecimalAI ADK: ADK's SkillToolset loaded %r in an invocation whose requests "
+        "also carried DecimalAI's routed skills, so two skill catalogs reached the "
+        "model. The router is turned off only for an agent whose own tools include "
+        "the SkillToolset; give the toolset to the agent that uses it, or turn the "
+        "skill loader off. Logged once per process.", skill_name,
+    )
+
+
+def _native_listing(state: "_RunState", text: Any) -> None:
+    names = _catalog_names(text)
+    if names:
+        state.native.listed(_wire_names(names))
+
+
+def _observe_native_tool(state: "_RunState", tool: Any, result: Any) -> None:
+    """Turn a SkillToolset ``list_skills`` / ``load_skill`` result into the run's
+    native loads. What is recorded is what the tool returned, which is what ADK
+    hands the model: the skill is never re-read from disk (decimalai._native, D1)."""
+    if _is_adk_class(tool, "ListSkillsTool"):
+        # ADK returns the XML string; a wrapped {"result": ...} is accepted too.
+        text = result.get("result") if isinstance(result, dict) else result
+        _native_listing(state, text)
+        return
+    if not _is_adk_class(tool, "LoadSkillTool") or not isinstance(result, dict):
+        return
+    instructions = result.get("instructions")
+    if "error" in result or not isinstance(instructions, str):
+        return  # a refused load delivered nothing
+    frontmatter = result.get("frontmatter")
+    metadata = frontmatter.get("metadata") if isinstance(frontmatter, dict) else None
+    name = result.get("skill_name")
+    record(Load(framework="adk", name=name if isinstance(name, str) else None,
+                body=instructions,
+                metadata=metadata if isinstance(metadata, dict) else None),
+           loads=state.native)
+    if state.skills_delivered:
+        _warn_both_catalogs(name if isinstance(name, str) else None)
+
+
+def skills(directory: Optional[Union[str, "os.PathLike[str]"]] = None) -> List[Any]:
+    """The project's installed skills, read by ADK's own loader, for ``SkillToolset``::
+
+        SkillToolset(skills=decimalai.adk.skills(), code_executor=...)
+
+    ADK's ``load_skills_from_dir`` fails the whole load when ANY folder is bad (a
+    name that does not match its folder, frontmatter it cannot parse). This reads
+    the same folders with ADK's ``load_skill_from_dir``, one at a time, in the
+    same order, and skips a folder ADK refuses with one WARNING naming it, so one
+    broken skill cannot take every other skill away from the agent. A folder with
+    no ``SKILL.md`` is skipped silently, as ADK does.
+
+    ADK keeps what it read: an agent built from this list serves these bodies
+    until it is rebuilt, also after ``decimalai skills update``, and the
+    activations DecimalAI records name that version (see the module docstring).
+
+    Args:
+        directory: where to start looking for the project (default: the working
+            directory), as for :func:`decimalai.skills_dir`.
+
+    Returns:
+        ``google.adk.skills.Skill`` objects, sorted by folder name.
+
+    Raises:
+        Whatever :func:`decimalai.skills_dir` raises for a project with no
+        installed skills; ``ImportError`` without google-adk.
+    """
+    from google.adk.skills import load_skill_from_dir
+
+    from .skillpkg.project import skills_dir
+
+    loaded: List[Any] = []
+    for folder in sorted(skills_dir(directory).iterdir()):
+        if not folder.is_dir():
+            continue
+        if not ((folder / "SKILL.md").exists() or (folder / "skill.md").exists()):
+            continue
+        try:
+            loaded.append(load_skill_from_dir(folder))
+        except Exception as exc:  # noqa: BLE001 - one bad folder must not cost the rest
+            reason = (str(exc).splitlines() or [""])[0][:300]
+            logger.warning(
+                "decimalai.adk.skills(): skipped the skill folder %r: ADK cannot load it "
+                "(%s: %s). The other skills are loaded; `decimalai skills verify` "
+                "checks the installed folders.", folder.name, type(exc).__name__, reason,
+            )
+    return loaded
 
 
 @dataclass
@@ -828,6 +1026,7 @@ class _RunState:
         "routing_id", "skills_offered", "skills_delivered",
         "skills_delivered_versions", "routing_flights",
         "parent_trace_id", "on_trace", "enable_skill_loader",
+        "native", "native_agents",
     )
 
     def __init__(self, *, agent_name: Optional[str], started_at: datetime):
@@ -884,6 +1083,12 @@ class _RunState:
         # invocation that ask one at the same moment (a ParallelAgent's
         # branches) share it. See `_route_turn_shared`.
         self.routing_flights: Dict[str, "asyncio.Future[Optional[_RoutedTurn]]"] = {}
+        # Skills ADK's own SkillToolset listed and loaded in this invocation, as
+        # decimalai._native resolved them; applied onto the RunTrace in `_finalize`.
+        self.native = NativeLoads()
+        # Names of the agents of this invocation that carry a SkillToolset: the
+        # router does not inject into their requests (see `_say_router_off`).
+        self.native_agents: set = set()
 
 
 def _plugin_class() -> Any:
@@ -1067,6 +1272,11 @@ def _plugin_class() -> Any:
             state = self._get_run(getattr(callback_context, "invocation_id", None))
             if state is None:
                 return None
+            # The agent object is only handed to this callback; the model
+            # callback knows the agent by name. Noted here so the router can
+            # stay out of an agent whose own SkillToolset offers the skills.
+            if _has_skill_toolset(agent):
+                state.native_agents.add(getattr(agent, "name", None))
             span = TraceSpan(
                 parent_span_id=self._parent_id(state),
                 span_type=SpanType.AGENT,
@@ -1177,7 +1387,12 @@ def _plugin_class() -> Any:
             # question meanwhile waits for this call instead of making its own,
             # so the turn is one routing decision. The decision is appended to
             # THIS request here, on the loop, by the turn that owns it.
-            if state.enable_skill_loader:
+            # An agent whose own SkillToolset offers the skills is not routed at
+            # all (D7 of the Phase 3 design): its toolset is the catalog.
+            native = getattr(callback_context, "agent_name", None) in state.native_agents
+            if state.enable_skill_loader and native:
+                _say_router_off(getattr(callback_context, "agent_name", None))
+            elif state.enable_skill_loader:
                 try:
                     routed = await _route_turn_shared(
                         state, _query_from_request(llm_request, state.user_input_preview),
@@ -1214,6 +1429,13 @@ def _plugin_class() -> Any:
             sys_text = _system_instruction_text(llm_request)
             if sys_text:
                 rendered_input.append({"role": "system", "content": sys_text})
+            if native:
+                # An EAGER toolset writes its catalog into the system
+                # instruction instead of answering list_skills.
+                try:
+                    _native_listing(state, sys_text)
+                except Exception:
+                    logger.debug("native skill listing not recorded (non-fatal)", exc_info=True)
             for c in getattr(llm_request, "contents", None) or []:
                 txt = _content_to_text(c)
                 if txt:
@@ -1434,6 +1656,10 @@ def _plugin_class() -> Any:
                     "DecimalAI ADK: could not record the result of tool %r; the trace "
                     "will not carry it", getattr(tool, "name", None), exc_info=True,
                 )
+            try:
+                _observe_native_tool(state, tool, result)
+            except Exception:  # noqa: BLE001 - observing must never break the run
+                logger.debug("native skill load not recorded (non-fatal)", exc_info=True)
             return None
 
         async def on_tool_error_callback(self, *, tool: Any, tool_args: Any, tool_context: Any, error: Exception):  # noqa: ANN001
@@ -1503,6 +1729,11 @@ def _plugin_class() -> Any:
                         for name, digest, route_id, skill_id, version_id in sorted(state.skills_delivered_versions)
                     ],
                 )
+                try:
+                    # Before the observer, so it sees the trace that is exported.
+                    state.native.apply(trace)
+                except Exception:  # noqa: BLE001 - a native load must not cost the trace
+                    logger.debug("native skill loads not applied (non-fatal)", exc_info=True)
                 if state.on_trace is not None:
                     try:
                         # Observers cannot mutate the trace that will be exported.
@@ -1613,7 +1844,9 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
             follows whatever ``instrument()`` was told; pass ``True``/``False``
             to answer for this plugin alone, which is what the explicit
             ``plugins=[DecimalaiPlugin(...)]`` path needs — it never calls
-            ``instrument()``, so there is no module flag to inherit.
+            ``instrument()``, so there is no module flag to inherit. An agent
+            carrying ADK's own ``SkillToolset`` is never routed: the toolset
+            is its catalog, and its loads are recorded as activations.
         enable_load_skill_tool: Accepted and DORMANT — this adapter
             registers no ``load_skill`` tool (ADK's own ``SkillToolset`` is not
             wired to DecimalAI skills), so the model cannot ask for a body.
@@ -1680,7 +1913,10 @@ def instrument(
             adapter registers no ``load_skill`` tool to fetch them on demand —
             are appended to ``llm_request.config.system_instruction`` before
             the request goes out. Off by default, like every other adapter's
-            loader.
+            loader. An agent carrying ADK's own ``SkillToolset`` is never
+            routed (said once per agent at INFO): the toolset is its catalog,
+            and its ``load_skill`` calls are recorded as activations whether
+            or not this is on.
         enable_load_skill_tool: Accepted and DORMANT, exactly as on the
             langchain adapter. This adapter registers no ``load_skill`` tool
             and does not connect DecimalAI skills to ADK's own
