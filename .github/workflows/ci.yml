@@ -376,6 +376,42 @@ jobs:
           python -m pytest tests -q
           -m "not live_llm and not conformance and not integration"
 
+  floors-native:
+    # The native column (tests/native) and the native loaders (tests/native_loaders) at
+    # the floors of the six frameworks graded in the openai 3 world: claude-agent-sdk,
+    # google-adk, openai-agents, deepagents, agent-framework-core, pydantic-ai-harness.
+    # `floors` installs `.[dev]` alone, so there they skip as not installed; the
+    # framework-integration "done" criterion is that every framework's native column
+    # holds AT ITS FLOOR (CrewAI's and Strands' are graded by `floors-openai2`). Added
+    # 2026-10-18 with Phase 3. 3.11 and 3.12, the interpreters the `test` job builds
+    # `conformance-tests` on. Editable, because the loaders' producer runs this
+    # checkout's `decimalai` CLI.
+    name: Native column at the floors (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "${{ matrix.python-version }}"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install at the lowest declared versions
+        run: uv pip install --system --resolution lowest-direct -e ".[dev,conformance-tests]"
+
+      - name: Show what resolved
+        run: uv pip list --system
+
+      - name: The native column holds at the floors
+        env:
+          DECIMAL_TEST_ENV: openai3
+        run: python -m pytest tests/native tests/native_loaders -q -rs
+
   audit:
     # Known-advisory check against the resolved dependency set. The pyproject
     # already tracks specific CVEs in hand-written comments; this is the same job
