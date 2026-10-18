@@ -771,6 +771,11 @@ Stated so nobody mistakes a green cell for a guarantee.
   deepagents, Microsoft Agent Framework, Strands, pydantic-ai-harness, CrewAI)
   read the folders an install writes is a different question, about files rather
   than traces, and has its own suite: [`tests/native_loaders`](../native_loaders/README.md).
+  Whether DecimalAI records those loads as activations on the wire, with the version
+  the model received, is the **native column**, [`tests/native`](../native/README.md):
+  one scenario and six items (NC1-NC6) per framework, graded against this suite's
+  probe, but in a child process per framework and collected by default, so the floors
+  jobs grade it at the frameworks' floor versions.
 - **Structured-JSON previews.** C4 flags a preview that is a bare role name,
   empty, or an unambiguous Python repr (`<X object at 0x…>` / `Class(kwarg=…`).
   A preview that embeds a JSON blob still carries the text and is not flagged —
