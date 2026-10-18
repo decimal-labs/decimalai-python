@@ -38,7 +38,10 @@ Where the activation goes: Agent Framework emits OpenTelemetry spans of its own
 trace with its model calls and tool spans, and the load is recorded on that run. Inside a
 ``decimalai.start_trace()`` the load is recorded on that trace instead. With neither, the
 load is dropped and a warning says so once. Pass ``agent_name`` to ``init``: the exporter
-names a trace by it, not by the ``Agent``'s own name.
+names a trace by it, not by the ``Agent``'s own name. Agent Framework keeps tool arguments
+and results out of its spans unless you call
+``agent_framework.observability.enable_sensitive_telemetry()``; without it the activation is
+still recorded, but the trace does not show what each tool call read or returned.
 
 There is no router to turn off here: DecimalAI has no Agent Framework adapter that injects
 skills, so the loader above is the only catalog the model sees.
