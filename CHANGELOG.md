@@ -6,6 +6,58 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added: native mode — a framework's own skill loader, seen by DecimalAI
+
+Eight frameworks load the skills `decimalai skills add` installed with a loader of
+their own. Each now has a one-line helper that points that loader at
+`.agents/skills`, and DecimalAI records every skill the loader hands the model as an
+activation carrying the exact skill id and version id of the bytes the model
+received:
+
+| framework | helper |
+|---|---|
+| Claude Agent SDK | `ClaudeAgentOptions(plugins=[decimalai.claude_agent_sdk.skills_plugin()])` |
+| Google ADK | `SkillToolset(skills=decimalai.adk.skills(), ...)` |
+| CrewAI | `Agent(skills=decimalai.crewai.skills(), tools=decimalai.crewai.skill_tools())` |
+| OpenAI Agents (sandbox) | `SandboxAgent(capabilities=[Shell(), decimalai.openai_agents.sandbox_skills()], ...)` |
+| Deep Agents | `create_deep_agent(model, **decimalai.deepagents.skills())` |
+| Microsoft Agent Framework | `Agent(..., context_providers=[decimalai.agent_framework.skills()])` |
+| Pydantic AI harness | `Agent(model, capabilities=[LocalWorkspace(project), decimalai.pydantic_ai_harness.skills(project), FileSystem(), Shell()])` |
+| Strands | `Agent(plugins=[decimalai.strands.skills()])` |
+
+- **The version is the one the model received, not the one on disk.** ADK,
+  Microsoft Agent Framework and Strands keep serving a skill they already loaded after
+  `decimalai skills update` wrote a new version; the activation then names the old
+  version, because that is what the model read. The version comes from the delivered
+  copy's stamp, else the lock by the body's hash, else any version this process has
+  seen. A body that is none of them is reported with its skill and hash and no
+  version, and the platform resolves it if it can.
+- **A skill loaded twice in one run is one activation.**
+- **The router stays out of an agent whose own loader serves its skills** (ADK with a
+  `SkillToolset`, CrewAI with `skills=`, an OpenAI `SandboxAgent` with `Skills`, Deep
+  Agents, a Pydantic AI agent with the harness's `Skills`): no menu, no
+  `load_skill` of DecimalAI's, so the model sees one catalog. Before, the OpenAI
+  adapter renamed its own tool to `decimalai_load_skill` beside the sandbox's, and
+  CrewAI warned that two catalogs reached the model.
+- **Gap-fillers.** `decimalai.crewai.skill_tools()` gives CrewAI the resource reader and
+  script runner it lacks (confined to installed skills; `scripts=False` leaves the
+  runner out). `decimalai.agent_framework.skills()` adds the script runner Microsoft
+  Agent Framework does not ship, and runs skill loads and reads without asking for
+  approval (scripts still ask unless `auto_approve_scripts=True`).
+  `sandbox_skills()` answers an unknown skill name instead of aborting the run, and
+  warns when the sandbox would list no skills (it skips symlinked folders silently).
+- Microsoft Agent Framework and Strands need no adapter: with `decimalai.init(otel=True)`
+  their own OpenTelemetry spans become the trace, and the load is recorded on it.
+
+### Fixed
+
+- `decimalai.flush()` now also exports the spans the `init(otel=True)` pipeline still
+  holds. It drained only CrewAI's, so a short script could exit before a run traced
+  through OpenTelemetry became a trace.
+- The OpenTelemetry exporter joins each tool span's result onto the model's tool call
+  (by `gen_ai.tool.call.id`), so a trace shows what a tool returned even when its
+  input, cut at 200 characters, does not.
+
 ## [0.15.0] — 2026-10-15
 
 ### Added: registry skills on disk, managed like packages
