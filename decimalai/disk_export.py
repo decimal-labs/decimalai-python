@@ -700,7 +700,7 @@ def _export(
 # lock, instead of the engine (which refuses that lock until `decimalai skills migrate`
 # runs, and must not migrate implicitly). The bytes are the registry's own, fetched and
 # checked by the engine's client; the folders go where 0.14 put them, one per agent
-# directory; and the version 1 lock is kept up to date. 0.16 removes this fallback.
+# directory; and the version 1 lock is kept up to date. 0.17 removes this fallback.
 
 
 def _sha256_file(path: Path) -> Optional[str]:
@@ -939,7 +939,7 @@ def export_skill_to_disk(
     .. deprecated:: 0.15
         Use ``decimalai skills add <name>`` or :func:`decimalai.skillpkg.add`, which
         install the registry's own bytes and pin them in ``.decimal/skills.lock``. This
-        stops working in 0.16.
+        stops working in 0.17.
 
     The SKILL.md is rendered locally in the registry's format (see the module notes)
     and written into the skills folder of each agent runtime, one folder per distinct
@@ -978,7 +978,7 @@ def export_skill_to_disk(
     """
     _warn_deprecated(
         "export_skill_to_disk",
-        "disk_export.export_skill_to_disk() is deprecated and stops working in 0.16: "
+        "disk_export.export_skill_to_disk() is deprecated and stops working in 0.17: "
         "install registry skills with `decimalai skills add <name>` "
         "(decimalai.skillpkg.add()), which pins what it writes in .decimal/skills.lock.")
     return _export(skill, agents=agents, scope=scope, project_root=project_root,
@@ -998,7 +998,7 @@ def export_skills_to_disk(
 
     .. deprecated:: 0.15
         Use ``decimalai skills add <name>`` for each skill, or
-        :func:`decimalai.skillpkg.add`. This stops working in 0.16.
+        :func:`decimalai.skillpkg.add`. This stops working in 0.17.
 
     Each skill is written as :func:`export_skill_to_disk` writes it, with the dict's own
     ``attachments``.
@@ -1017,7 +1017,7 @@ def export_skills_to_disk(
     """
     _warn_deprecated(
         "export_skills_to_disk",
-        "disk_export.export_skills_to_disk() is deprecated and stops working in 0.16: "
+        "disk_export.export_skills_to_disk() is deprecated and stops working in 0.17: "
         "install registry skills with `decimalai skills add <name>` "
         "(decimalai.skillpkg.add()), which pins what it writes in .decimal/skills.lock.")
     root = project_root or os.getcwd()

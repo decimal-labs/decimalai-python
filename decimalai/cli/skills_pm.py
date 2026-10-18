@@ -19,7 +19,7 @@ command runs, so ``decimalai --help`` loads none of it.
 
 The 0.14 verbs still work, with a warning: ``skills export <ref>`` and the positional
 ``skills install <ref>`` are ``skills add``, which no longer forks the skill. They stop
-working in 0.16. ``skills status DIR`` stays: it prints the authored section for DIR alone.
+working in 0.17. ``skills status DIR`` stays: it prints the authored section for DIR alone.
 """
 from __future__ import annotations
 
@@ -275,7 +275,7 @@ def skills_install(ref, frozen, offline, force, yes, agents, scope, out_dir, dir
 
     word = shlex.quote(ref)
     click.echo(f"  ⚠ `decimalai skills install <ref>` is deprecated and stops working in "
-               f"0.16: run `decimalai skills add {word}`.", err=True)
+               f"0.17: run `decimalai skills add {word}`.", err=True)
     click.echo("    It no longer forks the skill into your workspace. For an editable copy, "
                "fork it with `router.fork()` or in the dashboard: "
                f"{_dashboard_url(base_url)}/skills/{urllib.parse.quote(ref, safe='/')}",
@@ -894,9 +894,9 @@ def skills_export(ref, agents, scope, out_dir, yes, force, directory, api_key, b
     """Deprecated: `decimalai skills add` does this now.
 
     Adds the skill to the project as `decimalai skills add REF` does. Stops working in
-    0.16.
+    0.17.
     """
-    click.echo("  ⚠ `decimalai skills export` is deprecated and stops working in 0.16: run "
+    click.echo("  ⚠ `decimalai skills export` is deprecated and stops working in 0.17: run "
                f"`decimalai skills add {shlex.quote(ref)}`", err=True)
     _legacy_layout(ref, agents, scope)
     _add(ref, yes=yes, force=force, no_install=False, directory=directory or out_dir,

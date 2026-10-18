@@ -745,7 +745,7 @@ class TestVersion1Projects:
         (notice,) = _v1_notices(caplog)
         assert notice.levelno == logging.WARNING
         assert "`decimalai skills migrate`" in notice.getMessage()
-        assert "0.16" in notice.getMessage()
+        assert "0.17" in notice.getMessage()
 
     def test_the_notice_is_logged_once_per_process(self, registry, project, monkeypatch,
                                                    caplog):

@@ -1383,7 +1383,7 @@ def _v1_project(project_root: Optional[str]) -> Any:
     _log_once(
         "v1-lock",
         "%s uses a version 1 skills lock; run `decimalai skills migrate` to move to the "
-        "package manager (0.16 removes this fallback). Until then SkillRouter's disk "
+        "package manager (0.17 removes this fallback). Until then SkillRouter's disk "
         "methods write the registry's folders and update that lock as 0.14 did.",
         project.directory,
     )
@@ -3761,7 +3761,7 @@ class SkillRouter:
 
         .. deprecated:: 0.15
             Use ``decimalai skills add <name>`` or :func:`decimalai.skillpkg.add` per
-            skill. With ``skills=None`` this stops working in 0.16.
+            skill. With ``skills=None`` this stops working in 0.17.
 
         Each name becomes a manifest entry in ``.decimal/skills.toml``, a folder under
         ``.agents/skills`` and a lock entry, exactly as :meth:`export` does. With
@@ -3792,7 +3792,7 @@ class SkillRouter:
             _warn_deprecated(
                 "export_to_disk(skills=None)",
                 "SkillRouter.export_to_disk() without skills is deprecated and stops "
-                "working in 0.16: list the skills the project uses with "
+                "working in 0.17: list the skills the project uses with "
                 "`decimalai skills add <name>` (decimalai.skillpkg.add()).")
         _check_scope(scope, (skills or [None])[0])
         names = list(skills) if skills else [s["name"] for s in self.list_skills()]
@@ -4100,7 +4100,7 @@ class SkillRouter:
 
         .. deprecated:: 0.15
             Use ``decimalai skills add <name>`` (or :meth:`export`). This stops working
-            in 0.16.
+            in 0.17.
 
         It **no longer forks**. It used to take an editable copy of the skill into your
         workspace and then write it to disk; now it only installs the skill, as
@@ -4113,7 +4113,7 @@ class SkillRouter:
         """
         _warn_deprecated(
             "install",
-            "SkillRouter.install() is deprecated and stops working in 0.16, and it no "
+            "SkillRouter.install() is deprecated and stops working in 0.17, and it no "
             "longer forks: it adds the skill like `decimalai skills add <name>` "
             "(decimalai.skillpkg.add()). For an editable copy use router.fork() or the "
             "dashboard.")
@@ -4149,7 +4149,7 @@ class SkillRouter:
         """
         _warn_deprecated(
             "install_skill",
-            "SkillRouter.install_skill() is deprecated and stops working in 0.16, and it "
+            "SkillRouter.install_skill() is deprecated and stops working in 0.17, and it "
             "no longer forks: use `decimalai skills add <name>` "
             "(decimalai.skillpkg.add()), or router.fork() for an editable copy.")
         return self._install_without_fork(name, agents=agents, scope=scope,
@@ -4463,7 +4463,7 @@ class SkillRouter:
 
         .. deprecated:: 0.15
             Run ``decimalai skills install`` (or :func:`decimalai.skillpkg.install`).
-            This stops working in 0.16.
+            This stops working in 0.17.
 
         It no longer copies every org skill to disk. In a project with a manifest it
         runs the engine's install, which fetches only what the manifest lists and the
@@ -4487,7 +4487,7 @@ class SkillRouter:
 
         _warn_deprecated(
             "pull_missing",
-            "SkillRouter.pull_missing() is deprecated and stops working in 0.16: run "
+            "SkillRouter.pull_missing() is deprecated and stops working in 0.17: run "
             "`decimalai skills install` (decimalai.skillpkg.install()), which installs "
             "the skills .decimal/skills.toml lists.")
         v1 = _v1_project(project_root)
