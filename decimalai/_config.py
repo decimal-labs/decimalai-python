@@ -57,6 +57,40 @@ def _tristate_env(name: str) -> Optional[bool]:
     return raw in ("1", "true", "yes", "on")
 
 
+# The two spellings of the key variable, in precedence order. `DECIMAL_API_KEY`
+# is primary and is what every error message names; `DECIMALAI_API_KEY` is an
+# accepted alias because the CLI has taken both since it shipped
+# (`envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"]`) and the install snippet on
+# the marketing site exports the alias. Until 0.10.2 the library took only the
+# primary, so pasting that snippet and calling `decimalai.init()` raised
+# "No API key provided" with the key sitting right there in the environment.
+_API_KEY_ENV_VARS = ("DECIMAL_API_KEY", "DECIMALAI_API_KEY")
+
+#: The agent name ``init()`` falls back to when it is not given one.
+AGENT_NAME_ENV_VAR = "DECIMAL_AGENT_NAME"
+
+
+def _api_key_from_env() -> str:
+    """First non-empty key among the accepted env-var spellings.
+
+    Whitespace-only counts as empty: an exported-but-blank primary should fall
+    through to the alias rather than shadow it.
+    """
+    for name in _API_KEY_ENV_VARS:
+        value = os.environ.get(name, "")
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return ""
+
+
+def _agent_name_from_env() -> Optional[str]:
+    """``DECIMAL_AGENT_NAME``, or None when it is unset or blank."""
+    value = (os.environ.get(AGENT_NAME_ENV_VAR) or "").strip()
+    return value or None
+
+
 # ── SDK identity ───────────────────────────────────────────────
 #
 # Every request the SDK makes must say which SDK version made it.
@@ -160,6 +194,14 @@ class DecimalConfig:
     base_url: str = "https://api.decimal.ai"
     project: Optional[str] = None
     enabled: bool = True
+    # The agent this process traces and routes for when a call does not name
+    # one: init(agent_name=...), else DECIMAL_AGENT_NAME. Read it through
+    # `default_agent_name()`: every adapter's instrument(), start_trace(),
+    # @trace and SkillRouter fall back to it that way, so the name is
+    # given once instead of in five places that had to agree. A mismatch
+    # between those places was silent: the traces went to one agent and the
+    # skills were routed for another (or for none).
+    agent_name: Optional[str] = field(default_factory=_agent_name_from_env)
     # When True, the SDK runs in CI manifest-extraction mode:
     # - Background trace sender does NOT start
     # - Framework integrations capture manifest data but do not send traces
@@ -315,6 +357,31 @@ def _get_client() -> "DecimalAIClient":  # type: ignore[name-defined]
             "DecimalAI SDK not initialized. Call decimalai.init(api_key=...) first."
         )
     return _client
+
+
+def default_agent_name(explicit: Optional[str] = None) -> Optional[str]:
+    """The agent name to use: ``explicit`` when given, else the process default.
+
+    The default is ``init(agent_name=...)``, else ``DECIMAL_AGENT_NAME``
+    (read by ``init()``; read here directly when ``init()`` has not run). None
+    when nothing names one. Only None counts as "not given": an explicit value
+    always wins, even one the caller's validation will then reject.
+    """
+    if explicit is not None:
+        return explicit
+    if _config is not None:
+        return _config.agent_name
+    return _agent_name_from_env()
+
+
+def default_api_key(explicit: Optional[str] = None) -> str:
+    """The API key to use: ``explicit`` when given, else ``init()``'s key, else
+    ``DECIMAL_API_KEY`` / ``DECIMALAI_API_KEY``. Empty when there is none."""
+    if explicit is not None:
+        return explicit
+    if _config is not None and _config.api_key:
+        return _config.api_key
+    return _api_key_from_env()
 
 
 def _is_enabled() -> bool:

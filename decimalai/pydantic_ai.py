@@ -154,6 +154,9 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
+            # Every routing call names its agent; no router default (see
+            # `skill_router._AGENT_FROM_INIT`).
+            agent_name=None,
             inject_body=config.resolve_inject_body(has_tool_loop=_load_skill_tool_enabled()),
         )
         return _skill_router_singleton
@@ -819,8 +822,10 @@ def instrument(
             and it exists because Pydantic AI's own fallback is worse:
             ``_infer_name`` fills a missing name from the local variable, so
             ``agent = Agent(...)`` traces as the agent ``"agent"`` and the
-            dashboard page for the agent you configured stays empty. Leave it
-            None to keep exactly that pre-existing behaviour.
+            dashboard page for the agent you configured stays empty. Defaults
+            to the name an earlier call set, else the agent
+            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``); with none of
+            those, the pre-existing behaviour exactly.
         enable_skill_loader: When True, monkey-patch Agent so new
             instances get the routed skills menu as an instructions function
             (routed once per run, on every turn of a conversation) and the
@@ -837,6 +842,12 @@ def instrument(
         from .skill_router import _warn_if_disk_runtime_detected
         _warn_if_disk_runtime_detected("pydantic_ai")
         _install_skill_loader()
+    if agent_name is None and _default_agent_name is None:
+        # Named by neither this call nor an earlier one: the agent init()
+        # named (or DECIMAL_AGENT_NAME). Still only the fallback below an
+        # explicit ``Agent(name=...)``.
+        from ._config import default_agent_name
+        agent_name = default_agent_name()
     if agent_name is not None:
         _default_agent_name = agent_name
     if trace_runs or enable_skill_loader:

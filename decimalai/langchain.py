@@ -973,6 +973,9 @@ def _get_skill_router() -> Any:
             priority_skills=_priority_skills,
             api_key=config.api_key,
             base_url=config.base_url,
+            # Every routing call names its agent; no router default (see
+            # `skill_router._AGENT_FROM_INIT`).
+            agent_name=None,
             inject_body=config.resolve_inject_body(has_tool_loop=False),
         )
         return _skill_router_singleton
@@ -1592,7 +1595,8 @@ def instrument(
 
     Args:
         agent_name: Default agent name for all traces, and the agent skills
-            are routed for. If None, each run is named by a per-call
+            are routed for. Defaults to the agent ``decimalai.init()`` named
+            (or ``DECIMAL_AGENT_NAME``). If None, each run is named by a per-call
             ``CallbackHandler(agent_name=...)`` or else by the name of the
             chain/graph being executed (``create_agent(name=...)``), and
             falls back to ``"langchain-agent"`` when nothing names it. Skill
@@ -1724,6 +1728,12 @@ def instrument(
             "langchain-core is required for instrument() but is not installed. "
             "Install the LangChain extra with: pip install \"decimalai[langchain]\""
         )
+
+    # Not named here: the agent init() named (or DECIMAL_AGENT_NAME). Resolved
+    # after the repeat-call check above, which compares only a name THIS call
+    # passed — a repeat call that names nothing keeps the installed one.
+    from ._config import default_agent_name
+    agent_name = default_agent_name(agent_name)
 
     _global_handler.on_trace = on_trace
     _skill_body_top_k = skill_body_top_k

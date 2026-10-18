@@ -85,11 +85,13 @@ def _tool(ctx: Ctx) -> Any:
     return function_tool(lookup, name_override=ctx.tool_name)
 
 
-def _agent(ctx: Ctx, *, tools: bool = True, guardrails: Sequence[Any] = ()) -> Any:
+def _agent(
+    ctx: Ctx, *, tools: bool = True, guardrails: Sequence[Any] = (), name: Optional[str] = None,
+) -> Any:
     from agents import Agent
 
     return Agent(
-        name=ctx.agent_name,
+        name=name or ctx.agent_name,
         instructions=SYSTEM_PROMPT,
         tools=[_tool(ctx)] if tools else [],
         model=_model(),
@@ -250,28 +252,44 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     return fanout_threads(_one)(pairs)
 
 
-def _rail_on() -> None:
-    """The skills phase's install again, with no agent name: it is the Agent's
-    own ``name`` that names a run here. ``exclusive=True`` for the reason the
-    module docstring gives — the stock exporter would ship to OpenAI."""
+def _rail_on(ctx: Ctx) -> None:
+    """The skills phase's install again, naming THIS phase's agent.
+
+    The DecimalAI name wins over ``Agent(name=...)`` for the trace and for
+    routing (since 2026-10-18), and a repeat ``instrument()`` that names no
+    agent keeps the one already installed — so without a name here every later
+    phase would be filed under the skills phase's agent. ``exclusive=True`` for
+    the reason the module docstring gives — the stock exporter would ship to
+    OpenAI."""
     from decimalai.openai_agents import instrument
 
-    instrument(exclusive=True, enable_skill_loader=True)
+    instrument(agent_name=ctx.agent_name, exclusive=True, enable_skill_loader=True)
+
+
+#: What the unnamed phase's Agent calls itself: anything but the DecimalAI name.
+_FRAMEWORK_AGENT_NAME = "Assistant"
 
 
 def run_unnamed(ctx: Ctx) -> Any:
-    """The rail on an Agent named only by its own ``name=``.
+    """The rail on an Agent OpenAI Agents names one way and DecimalAI another.
 
     An OpenAI Agents ``Agent`` cannot be unnamed — ``name`` is required — so
-    the case here is the other half of the same question: no DecimalAI name is
-    given for this run at all (the install was named for a different agent by
-    the skills phase), and the framework object's name is the only one there is.
+    the case is the one ADK's driver grades: the framework object is called
+    ``Assistant`` while the DecimalAI agent, given once at the install, is this
+    run's. The trace and the routing call must both name the DecimalAI agent.
+
+    Until 2026-10-18 this phase ran the Agent under its own name with no
+    DecimalAI name for the run, because ``Agent(name=...)`` won both the trace
+    and routing. The DecimalAI name wins now (it is the agent the skills are
+    attached to), and once the skills phase has installed one this process has
+    no way back to "no DecimalAI name" — that case is a unit test instead
+    (tests/test_init_agent_name_defaults.py).
     """
     from agents import Runner
 
-    _rail_on()
+    _rail_on(ctx)
     _wire().register(ctx, script=_skill_script(ctx))
-    return Runner.run_sync(_agent(ctx), user_message(ctx))
+    return Runner.run_sync(_agent(ctx, name=_FRAMEWORK_AGENT_NAME), user_message(ctx))
 
 
 def run_conversation(ctxs: Sequence[Ctx]) -> Any:
@@ -279,8 +297,8 @@ def run_conversation(ctxs: Sequence[Ctx]) -> Any:
     a new user message — the SDK's documented manual conversation pattern."""
     from agents import Runner
 
-    _rail_on()
     first, second = ctxs
+    _rail_on(first)
     for ctx in ctxs:
         _wire().register(ctx, script=_skill_script(ctx))
     agent = _agent(first)
@@ -305,9 +323,9 @@ def _sandbox_shape(ctxs: Sequence[Ctx]) -> Any:
     from agents.sandbox import SandboxAgent, SandboxRunConfig
     from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
-    _rail_on()
     out = []
     for ctx in ctxs:
+        _rail_on(ctx)
         _wire().register(ctx)
         agent = SandboxAgent(
             name=ctx.agent_name,

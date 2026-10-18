@@ -769,10 +769,15 @@ def start_trace(
         ) as child:
             child.log_llm_call(model="gpt-4o", input=msgs, output=resp)
 
+    ``agent_name`` defaults to the agent ``decimalai.init(agent_name=...)``
+    (or ``DECIMAL_AGENT_NAME``) named.
+
     The trace is auto-sent on context exit unless ``auto_send=False``.
     """
+    from . import _config
+
     ctx = TraceContext(
-        agent_name=agent_name,
+        agent_name=_config.default_agent_name(agent_name),
         session_id=session_id,
         auto_send=auto_send,
         session_metadata=session_metadata,
@@ -832,14 +837,21 @@ def trace(
         def run_child(task):
             ...
 
+    ``agent_name`` defaults to the agent ``decimalai.init(agent_name=...)``
+    (or ``DECIMAL_AGENT_NAME``) named, then to the function's name. Resolved
+    on each call, not at decoration: the decorator usually runs at import,
+    before ``init()`` has.
+
     The trace is auto-sent when the function returns.
     """
 
     def decorator(fn: Callable) -> Callable:
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            from . import _config
+
             with start_trace(
-                agent_name=agent_name or fn.__name__,
+                agent_name=agent_name or _config.default_agent_name() or fn.__name__,
                 session_id=session_id,
                 auto_send=auto_send,
                 parent_trace_id=parent_trace_id,

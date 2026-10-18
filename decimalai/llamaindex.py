@@ -1578,7 +1578,8 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
 
     Args:
         agent_name: The name runs are filed under when nothing names them.
-            Defaults to ``"llamaindex-agent"``.
+            Defaults to the agent ``decimalai.init()`` named (or
+            ``DECIMAL_AGENT_NAME``), then ``"llamaindex-agent"``.
 
     Returns:
         The ``DecimalSpanHandler`` instance.
@@ -1624,7 +1625,9 @@ def instrument(agent_name: Optional[str] = None) -> "DecimalSpanHandler":
             "\"llama-index-core>=0.14.25\""
         )
 
-    handler = DecimalSpanHandler(agent_name=agent_name)
+    from ._config import default_agent_name
+
+    handler = DecimalSpanHandler(agent_name=default_agent_name(agent_name))
     dispatcher = get_dispatcher()
     dispatcher.add_span_handler(handler)
     _install_llm_event_handler(dispatcher, handler)

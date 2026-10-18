@@ -716,6 +716,9 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
+            # Every routing call names its agent; no router default (see
+            # `skill_router._AGENT_FROM_INIT`).
+            agent_name=None,
             # This adapter registers no `load_skill` tool (and does not bridge
             # ADK's own SkillToolset), so there is no on-demand fetch to defer
             # to: injection is the only body channel. That is exactly the case
@@ -1902,7 +1905,8 @@ def instrument(
     ``DecimalaiPlugin`` answers for its runner and nothing is traced twice.
 
     Args:
-        agent_name: Optional DecimalAI trace label. When omitted, uses the
+        agent_name: Optional DecimalAI trace label. When omitted, the agent
+            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``), else the
             ADK agent's own name.
         on_trace: Optional observer called once per real invocation, including
             failed invocations. Receives a detached trace with witnessed delivery
@@ -1935,6 +1939,11 @@ def instrument(
     global _install_agent_name, _runner_patched, _skill_loader_enabled, _instrument_config
     if enable_load_skill_tool:
         logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
+    # Not named here: the agent init() named (or DECIMAL_AGENT_NAME). Each call
+    # replaces the name, so a bare `instrument(enable_skill_loader=True)` after
+    # `init(adk=True, agent_name=...)` used to drop it back to ADK's node name.
+    from ._config import default_agent_name
+    agent_name = default_agent_name(agent_name)
     with _instrument_lock:
         _install_agent_name = agent_name
         # Preserve the loader's existing sticky opt-in, and atomically publish

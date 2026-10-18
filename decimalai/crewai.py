@@ -309,6 +309,9 @@ def _get_skill_router() -> Any:
             _skill_router_singleton = SkillRouter(
                 api_key=config.api_key,
                 base_url=config.base_url,
+                # Every routing call names its agent; no router default (see
+                # `skill_router._AGENT_FROM_INIT`).
+                agent_name=None,
                 # No `load_skill` tool on this rail, so injection is the only
                 # body channel — the `has_tool_loop=False` case
                 # `resolve_inject_body` answers True for. An explicit
@@ -1385,7 +1388,8 @@ def instrument(
         agent_name: The DecimalAI agent these runs belong to. Names the traces,
             and scopes the routed skill menu to this agent — agent-scope skills
             (a registry skill pulled onto one agent) are only offered when it is
-            sent.
+            sent. Defaults to the name an earlier call set, else the agent
+            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``).
         enable_skill_loader: Route every agent turn through ``SkillRouter`` and
             insert the result — skill bodies included — into the model call's
             messages, after CrewAI's own system prompt. Off by default, like
@@ -1409,6 +1413,11 @@ def instrument(
             and a run already in flight keeps the one it started with.
     """
     global _install_agent_name, _instrument_config
+    if agent_name is None and _install_agent_name is None:
+        # Named by neither this call nor an earlier one: the agent init()
+        # named (or DECIMAL_AGENT_NAME).
+        from ._config import default_agent_name
+        agent_name = default_agent_name()
     if agent_name is not None:
         _install_agent_name = agent_name
     # Published before tracing is installed, so the first run after this call

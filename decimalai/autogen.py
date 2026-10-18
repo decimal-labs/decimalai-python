@@ -91,7 +91,8 @@ def instrument(
     Prefer ``decimalai.init(otel=True)`` in new code.
 
     Args:
-        agent_name: Default agent name for all captured traces.
+        agent_name: Default agent name for all captured traces. Defaults to
+            the agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``).
         provider: Existing OTel ``TracerProvider`` to add the exporter to.
             If None, creates a new one and sets it as global.
 
@@ -102,10 +103,11 @@ def instrument(
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+    from ._config import default_agent_name
     from .otel import DecimalSpanExporter, _register_flush_atexit
 
     _warn_autogen_not_supported()
-    exporter = DecimalSpanExporter(agent_name=agent_name)
+    exporter = DecimalSpanExporter(agent_name=default_agent_name(agent_name))
     if provider is None:
         # shutdown_on_exit=False: the SDK's own exit flush runs after CPython
         # has stopped the thread pool the trace is sent on, so a plain script

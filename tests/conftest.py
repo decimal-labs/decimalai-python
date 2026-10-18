@@ -54,6 +54,10 @@ def pytest_configure(config):
     decimalai at module-level get the right behavior.
     """
     os.environ.setdefault("DECIMALAI_SKIP_VERIFY", "1")
+    # init()'s default agent name. Exported in a developer's shell (or a demo's
+    # .env) it would rename every agent the suite does not name explicitly —
+    # the tests that want it set it themselves.
+    os.environ.pop("DECIMAL_AGENT_NAME", None)
     _check_test_environment()
     _check_openai2_environment()
 

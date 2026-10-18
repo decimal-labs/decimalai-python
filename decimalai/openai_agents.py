@@ -536,6 +536,9 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
+            # Every routing call names its agent; no router default (see
+            # `skill_router._AGENT_FROM_INIT`).
+            agent_name=None,
             inject_body=config.resolve_inject_body(has_tool_loop=_has_tool_loop()),
         )
         return _skill_router_singleton
@@ -1031,6 +1034,48 @@ def _make_skill_aware_instructions(base: str):
     return instructions_fn
 
 
+def _routing_agent_name(agent: Any) -> Optional[str]:
+    """The agent ``agent``'s turns are routed for, and its ``load_skill`` loads for.
+
+    The Agent's DecimalAI name when it has one — given with it to
+    ``instrument(agent=..., agent_name=...)``, else the process's from
+    ``instrument(agent_name=...)`` or ``decimalai.init()`` (or
+    ``DECIMAL_AGENT_NAME``) — because that is the agent the skills are attached
+    to; else the Agent's own ``name``. Read off the registered processor by the
+    same lookup `_send_trace` files the trace under, so routing and the trace
+    cannot name two different agents (conformance C18). Until 2026-10-18
+    ``Agent(name=...)`` won here and on the trace, so
+    ``init(agent_name="support")`` with ``Agent(name="Assistant")`` filed every
+    run under "Assistant" and never offered support's skills.
+    """
+    own = getattr(agent, "name", None)
+    processor = _tracing_processor
+    if processor is not None and _processor_is_registered(processor):
+        return processor.decimal_name_for(own) or own
+    return own
+
+
+#: (DecimalAI name, Agent name) pairs `_note_name_override` has already logged.
+_name_overrides_noted: set = set()
+
+
+def _note_name_override(decimal_name: Optional[str], agent_name: Optional[str]) -> None:
+    """Say once per pair, at INFO, that a run of ``Agent(name=agent_name)`` was
+    filed and routed as ``decimal_name``. Without it, someone who named an Agent
+    "triage" and finds no "triage" on the dashboard has nothing to go on."""
+    if not decimal_name or not agent_name or decimal_name == agent_name:
+        return
+    key = (decimal_name, agent_name)
+    if key in _name_overrides_noted:
+        return
+    _name_overrides_noted.add(key)
+    logger.info(
+        "DecimalAI: runs of Agent(name=%r) are traced and routed as agent %r, the "
+        "name instrument()/init() was given — the agent the skills are attached to.",
+        agent_name, decimal_name,
+    )
+
+
 def _skill_aware_prompt(base: str, ctx: Any, agent: Any) -> str:
     """`base`, then this turn's routed skill fragment. Blocking; never raises."""
     try:
@@ -1053,7 +1098,7 @@ def _skill_aware_prompt(base: str, ctx: Any, agent: Any) -> str:
         try:
             fragment, routing_id = router.build_prompt_fragment(
                 query=_extract_query(ctx),
-                agent_name=getattr(agent, "name", None),
+                agent_name=_routing_agent_name(agent),
                 **kwargs,
             )
         except TypeError:
@@ -1062,7 +1107,7 @@ def _skill_aware_prompt(base: str, ctx: Any, agent: Any) -> str:
             try:
                 fragment, routing_id = router.build_prompt_fragment(
                     query=_extract_query(ctx),
-                    agent_name=getattr(agent, "name", None),
+                    agent_name=_routing_agent_name(agent),
                 )
             except Exception:
                 consume_last_delivered_versions()
@@ -1260,7 +1305,7 @@ def _install_agent_hooks() -> bool:
                     # No DecimalAI tool beside the sandbox's own loader, not even one
                     # the constructor patch put on the declared list.
                     return [t for t in tools if not _is_decimalai_skill_tool(t)]
-                agent_name = getattr(self, "name", None)
+                agent_name = _routing_agent_name(self)
                 # `decimalai_load_skill` next to a sandbox's own `load_skill`.
                 tool_name = _skill_tool_name(self)
                 for index, existing in enumerate(tools):
@@ -1432,7 +1477,7 @@ def _install_skill_loader() -> None:
             try:
                 tools = getattr(self, "tools", None)
                 if isinstance(tools, list) and not _agent_has_load_skill_tool(self):
-                    tool = _make_load_skill_tool(getattr(self, "name", None))
+                    tool = _make_load_skill_tool(_routing_agent_name(self))
                     if tool is not None:
                         tools.append(tool)
             except Exception:
@@ -1853,18 +1898,27 @@ def _register_processor(
     exclusive: bool,
     add_trace_processor: Any,
     set_trace_processors: Any,
+    agent_binding: Optional[Tuple[str, str]] = None,
+    fallback_agent_name: Optional[str] = None,
 ) -> "DecimalTracingProcessor":
     """Register this process's one processor, configured by THIS call.
 
     A repeat call reconfigures the existing processor rather than adding a
     second: its skills registry becomes this call's (the same registry a single
-    call would have produced), and its default agent name changes only when this
-    call names one — `instrument(enable_skill_loader=True)` after
-    `init(agent_name="support", openai_agents=True)` keeps "support".
+    call would have produced), and the process's DecimalAI agent name changes
+    only when this call names one — `instrument(enable_skill_loader=True)` after
+    `init(agent_name="support", openai_agents=True)` keeps "support". With no
+    name from this call or an earlier one, it is the agent `decimalai.init()`
+    named (or DECIMAL_AGENT_NAME). ``agent_binding`` is ``(Agent name,
+    DecimalAI name)`` for a name given with ``agent=``.
     """
     global _tracing_processor, _tracing_processor_added
+    from ._config import default_agent_name
+
     with _tracing_processor_lock:
         processor = _tracing_processor
+        if agent_name is None and (processor is None or processor.default_agent_name is None):
+            agent_name = default_agent_name()
         if processor is None:
             processor = _tracing_processor = DecimalTracingProcessor(
                 agent_name=agent_name, skills_registry=skills_registry,
@@ -1873,6 +1927,10 @@ def _register_processor(
             if agent_name is not None:
                 processor.default_agent_name = agent_name
             processor._skills_registry = skills_registry or []
+        if agent_binding is not None:
+            processor.agent_names[agent_binding[0]] = agent_binding[1]
+        if fallback_agent_name is not None:
+            processor.fallback_agent_name = fallback_agent_name
         if exclusive:
             set_trace_processors([processor])
         elif not _processor_is_registered(processor):
@@ -1897,14 +1955,22 @@ def instrument(
     call will be automatically traced and sent to the DecimalAI backend.
 
     Args:
-        agent_name: Default agent name for all traces. If None, the name
-            is auto-detected from the root agent span.
+        agent_name: The DecimalAI agent: the name traces are filed under AND
+            turns are routed for, over the Agent's own ``name=`` — it is the
+            agent the skills are attached to. Given with ``agent=``, it is that
+            Agent's (and any Agent of the same ``name=``); every other Agent
+            keeps its own. Given alone, it is every Agent's, and so is the
+            agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``) when
+            no call names one; a later call that names none keeps it. With no
+            DecimalAI name at all, a trace is named by its root Agent's
+            ``name=``, and each Agent's turns are routed for its own.
         agent: Optional ``agents.Agent`` instance. If provided, DecimalAI
             will introspect it for full tool schemas, instructions, model,
             and handoffs to register a manifest immediately. This gives
             the highest fidelity manifest (full JSON schemas for tools).
             If omitted, manifest is auto-detected from span data at trace
-            time (tool names only, no schemas).
+            time (tool names only, no schemas). Its ``name`` names a trace
+            only when nothing else does.
         exclusive: If True, replaces ALL existing trace processors (including
             OpenAI's default). If False (default), adds alongside existing
             processors so traces still go to the OpenAI dashboard too.
@@ -1913,7 +1979,7 @@ def instrument(
     and then ``instrument(enable_skill_loader=True)``. There is only ever one
     DecimalAI processor, so each run is sent once; a later call can turn the
     skill loader on, and replaces the skills registry and (when it names one)
-    the default agent name.
+    the DecimalAI agent name.
 
     Raises:
         ImportError: If ``openai-agents`` is not installed.
@@ -1961,9 +2027,13 @@ def instrument(
         except Exception:
             disk_sync = True
 
-    # Resolve agent name from Agent object if not provided
-    if agent_name is None and agent is not None:
-        agent_name = getattr(agent, "name", None)
+    # A name given WITH an Agent is that Agent's DecimalAI name, not the
+    # process's; the Agent's own name= is only ever a fallback. Either one
+    # process-wide would outrank every other Agent's name= in the process.
+    own_name = getattr(agent, "name", None) if agent is not None else None
+    agent_binding = (own_name, agent_name) if own_name and agent_name is not None else None
+    process_name = None if agent_binding is not None else agent_name
+    fallback_name = (agent_name or own_name) if agent is not None else None
 
     # Resolve skills (auto-discover or explicit). Skip discovery entirely
     # when disk_sync is False — the caller is signaling that the platform
@@ -2035,17 +2105,21 @@ def instrument(
         except Exception:
             logger.debug("Skill sync setup failed (non-fatal)", exc_info=True)
 
-    _register_processor(
-        agent_name,
+    processor = _register_processor(
+        process_name,
         resolved_skills,
         exclusive=exclusive,
         add_trace_processor=add_trace_processor,
         set_trace_processors=set_trace_processors,
+        agent_binding=agent_binding,
+        fallback_agent_name=fallback_name,
     )
+    agent_name = processor.decimal_name_for(own_name)
 
-    # If an Agent object was provided, introspect it for manifest
+    # If an Agent object was provided, introspect it for manifest — under the
+    # name its traces will carry.
     if agent is not None:
-        _register_manifest_from_agent(agent, agent_name, resolved_skills)
+        _register_manifest_from_agent(agent, agent_name or own_name, resolved_skills)
 
     # SkillRouter dynamic loader — opt-in. When enabled, Agent.__init__
     # is monkey-patched so newly created Agents have their string
@@ -2364,10 +2438,45 @@ class DecimalTracingProcessor:
     """
 
     def __init__(self, agent_name: Optional[str] = None, skills_registry: Optional[List[Dict[str, Any]]] = None):
+        # The process's DecimalAI name: `instrument(agent_name=...)` without
+        # `agent=`, else the one init() named. When set it names every trace,
+        # over the root Agent's own `name=` — it is the agent the skills are
+        # attached to — and `_routing_agent_name` routes every turn for it too.
         self.default_agent_name = agent_name
+        # Agent `name=` -> DecimalAI name, from `instrument(agent=a,
+        # agent_name=...)`: a name given WITH an Agent is that Agent's, ahead of
+        # the process's, and leaves every other Agent alone. A process that
+        # installs once per agent ("each its own agent") would otherwise file
+        # every run under whichever install came last.
+        self.agent_names: Dict[str, str] = {}
+        # The name for a trace no agent span named: the Agent handed to
+        # `instrument(agent=...)`, by its DecimalAI name when it was given one.
+        self.fallback_agent_name: Optional[str] = None
         self._skills_registry = skills_registry or []
         self._traces: Dict[str, _TraceAccumulator] = {}
         self._lock = threading.Lock()
+
+    def decimal_name_for(self, agent_name: Optional[str]) -> Optional[str]:
+        """The DecimalAI name of the Agent called ``agent_name``: its own from
+        ``instrument(agent=..., agent_name=...)``, else the process's. None
+        when there is neither."""
+        own = self.agent_names.get(agent_name) if agent_name else None
+        return own or self.default_agent_name
+
+    def _agent_name(self, acc: _TraceAccumulator) -> Optional[str]:
+        """The agent this trace is filed under: the root Agent's DecimalAI name,
+        else its ``name=`` (the root agent span's), else the fallback.
+
+        The DecimalAI name used to be the LAST resort, under the root agent's
+        own name, against `instrument()`'s own docstring ("Default agent name
+        for all traces") — and routing followed the Agent's name too, so
+        ``init(agent_name=...)`` named nothing on this adapter.
+        """
+        return (
+            self.decimal_name_for(acc.agent_name)
+            or acc.agent_name
+            or self.fallback_agent_name
+        )
 
     # ── TracingProcessor protocol ──────────────────────────
 
@@ -2573,7 +2682,7 @@ class DecimalTracingProcessor:
         call = LlmCallRecord(
             id=uuid4(),
             span_id=parent_id,
-            agent_name=acc.agent_name or self.default_agent_name,
+            agent_name=self._agent_name(acc),
             provider=provider,
             model_name=model,
             temperature=model_config.get("temperature") if isinstance(model_config, dict) else None,
@@ -2868,7 +2977,7 @@ class DecimalTracingProcessor:
             call = LlmCallRecord(
                 id=uuid4(),
                 span_id=parent_id,
-                agent_name=acc.agent_name or self.default_agent_name,
+                agent_name=self._agent_name(acc),
                 provider=_infer_provider(call_model),
                 model_name=call_model,
                 temperature=temperature,
@@ -3034,7 +3143,8 @@ class DecimalTracingProcessor:
             logger.debug("Tracing disabled, skipping send")
             return
 
-        agent_name = acc.agent_name or self.default_agent_name or acc.trace_name
+        agent_name = self._agent_name(acc) or acc.trace_name
+        _note_name_override(self.decimal_name_for(acc.agent_name), acc.agent_name)
         ended_at = datetime.now(timezone.utc)
 
         # Auto-register manifest from span data + the live Agent object

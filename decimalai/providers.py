@@ -243,9 +243,11 @@ def instrument(
 
     Args:
         openai/anthropic/google: Per-provider tri-state flag (see above).
-        agent_name: Default agent name stamped on captured traces. A trace can
-            still override it via a ``decimal.agent_name`` / ``gen_ai.agent.name``
-            span attribute (see :class:`decimalai.otel.DecimalSpanExporter`).
+        agent_name: Default agent name stamped on captured traces. Defaults to
+            the agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``). A
+            trace can still override it via a ``decimal.agent_name`` /
+            ``gen_ai.agent.name`` span attribute (see
+            :class:`decimalai.otel.DecimalSpanExporter`).
         tracer_provider: Optional OTel ``TracerProvider`` to attach the exporter
             to instead of the process-global one. When given, the global cache
             and the once-per-provider idempotency guard are bypassed (the caller
@@ -256,6 +258,9 @@ def instrument(
         cached/passed provider if nothing new was instrumented (``None`` if no
         provider was requested and none was set up yet).
     """
+    from ._config import default_agent_name
+
+    agent_name = default_agent_name(agent_name)
     explicit_provider = tracer_provider is not None
     requested = {"openai": openai, "anthropic": anthropic, "google": google}
     auto_all = all(v is None for v in requested.values())

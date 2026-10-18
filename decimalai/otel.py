@@ -635,8 +635,10 @@ def instrument(
     framework that emits OTEL spans (CrewAI, AutoGen, Haystack, etc.).
 
     Args:
-        agent_name: Default agent name. If None, auto-detected from
-            the root span's ``service.name`` resource attribute.
+        agent_name: Default agent name. Defaults to the agent
+            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``); with none,
+            auto-detected from the root span's ``service.name`` resource
+            attribute.
         service_name: OTEL service name for the resource.
             Defaults to ``"decimal-agent"``.
         prompts: Optional explicit static prompt templates
@@ -678,6 +680,9 @@ def instrument(
             "Reinstall with: pip install decimalai"
         )
 
+    from ._config import default_agent_name
+
+    agent_name = default_agent_name(agent_name)
     resource = Resource.create({SERVICE_NAME: service_name})
     # shutdown_on_exit=False + our own earlier hook: the SDK's default exit
     # flush runs too late to reach the background sender. See

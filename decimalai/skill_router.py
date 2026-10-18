@@ -1495,6 +1495,22 @@ class SkillRouterError(Exception):
         super().__init__(message)
 
 
+class _InitAgentName:
+    """The default of ``SkillRouter(agent_name=...)``: the agent ``init()`` named."""
+
+    def __repr__(self) -> str:
+        return "<the agent decimalai.init() named>"
+
+
+#: ``SkillRouter(agent_name=...)`` left out. Distinct from an explicit None,
+#: which keeps the meaning it has always had — no default agent, so a call that
+#: names none routes against the org-wide skill set. The adapters build their
+#: routers with that explicit None: they name the agent on every call (the one
+#: the trace is filed under), and a router default would route a run they could
+#: not name as an agent its trace never mentions.
+_AGENT_FROM_INIT: Any = _InitAgentName()
+
+
 class SkillRouter:
     """SDK-side skill routing client.
 
@@ -1508,6 +1524,10 @@ class SkillRouter:
         )
         # base_url defaults to the same resolution decimalai.init() uses:
         # explicit argument, else DECIMAL_BASE_URL, else https://api.decimal.ai.
+        # After decimalai.init(agent_name="my-agent"), SkillRouter() is the same
+        # router: api_key defaults to init()'s key (then DECIMAL_API_KEY /
+        # DECIMALAI_API_KEY), and agent_name to init()'s agent (then
+        # DECIMAL_AGENT_NAME). Explicit arguments win.
 
         # Get the skill menu prompt fragment
         menu = router.get_menu()
@@ -1523,9 +1543,9 @@ class SkillRouter:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        agent_name: Optional[str] = None,
+        agent_name: Optional[str] = _AGENT_FROM_INIT,
         strategy: str = "auto",
         max_menu_size: int = 20,
         fragment_cache_ttl: float = 30.0,
@@ -1538,12 +1558,36 @@ class SkillRouter:
         body_load_deadline_s: float = 20.0,
         priority_skills: Optional[List[str]] = None,
     ):
+        from . import _config
+        from ._config import DecimalConfigError, default_agent_name, default_api_key
+
+        # Required until 2026-10-18, with no fallback: a router built next to
+        # `decimalai.init()` had to be handed the same key and agent again, and
+        # an agent left out routed against the org-wide skill set while the
+        # traces were filed under the agent init() named — silently.
+        init_url = ""
+        if api_key is None:
+            api_key = default_api_key()
+            initialized = _config._config
+            if initialized is not None and api_key and api_key == initialized.api_key:
+                # init()'s key goes to the host init() was pointed at, which it
+                # may have been given explicitly (`init(base_url=...)`).
+                init_url = initialized.base_url
+            if not api_key:
+                raise DecimalConfigError(
+                    "SkillRouter has no API key. Pass api_key=, call "
+                    "decimalai.init(), or set the DECIMAL_API_KEY environment "
+                    "variable."
+                )
+        if agent_name is _AGENT_FROM_INIT:
+            agent_name = default_agent_name()
         self.api_key = api_key
         # Same resolution decimalai.init() uses (explicit → DECIMAL_BASE_URL
         # → default) so a directly-constructed router doesn't silently split
         # a non-default deployment onto the public host.
         self.base_url = (
             base_url
+            or init_url
             or os.environ.get("DECIMAL_BASE_URL", "")
             or "https://api.decimal.ai"
         ).rstrip("/")

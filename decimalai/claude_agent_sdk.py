@@ -308,8 +308,12 @@ class _RunState:
         user_input: Optional[str],
         options: Any,
     ):
+        from ._config import default_agent_name
+
         self.trace_id: UUID = uuid4()
-        self.agent_name = agent_name or _install_agent_name or "claude-agent"
+        self.agent_name = (
+            agent_name or _install_agent_name or default_agent_name() or "claude-agent"
+        )
         self.project = project
         self.parent_trace_id = parent_trace_id
         self.started_at = _now()
@@ -999,7 +1003,8 @@ async def trace_stream(
         stream: The async iterator returned by ``claude_agent_sdk.query(...)``
             (or ``ClaudeSDKClient.receive_response()``).
         agent_name: Agent label for the trace. Falls back to the global
-            ``instrument()`` name, then ``"claude-agent"``.
+            ``instrument()`` name, then the agent ``decimalai.init()`` named
+            (or ``DECIMAL_AGENT_NAME``), then ``"claude-agent"``.
         user_input: The prompt text, for ``user_input_preview``.
         project: Optional project grouping.
         parent_trace_id: Link this run to a parent orchestrator trace.
@@ -1072,9 +1077,13 @@ def instrument(agent_name: Optional[str] = None) -> None:
 
     Args:
         agent_name: Default agent name for traces whose stream supplies none.
+            Defaults to the agent ``decimalai.init()`` named (or
+            ``DECIMAL_AGENT_NAME``).
     """
     global _install_agent_name, _query_patched
-    _install_agent_name = agent_name
+    from ._config import default_agent_name
+
+    _install_agent_name = agent_name = default_agent_name(agent_name)
 
     if _query_patched:
         return

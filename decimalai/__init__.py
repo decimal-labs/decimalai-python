@@ -692,14 +692,10 @@ def _activate_crewai_instrumentation(
         logger.info("DecimalAI tracing enabled for %s SDK calls (via CrewAI)", pname)
 
 
-# The two spellings of the key variable, in precedence order. `DECIMAL_API_KEY`
-# is primary and is what every error message names; `DECIMALAI_API_KEY` is an
-# accepted alias because the CLI has taken both since it shipped
-# (`envvar=["DECIMAL_API_KEY", "DECIMALAI_API_KEY"]`) and the install snippet on
-# the marketing site exports the alias. Until 0.10.2 the library took only the
-# primary, so pasting that snippet and calling `decimalai.init()` raised
-# "No API key provided" with the key sitting right there in the environment.
-_API_KEY_ENV_VARS = ("DECIMAL_API_KEY", "DECIMALAI_API_KEY")
+# The two spellings of the key variable live in `_config`, next to the other
+# defaults (`SkillRouter` falls back to them too); re-exported here because the
+# CLI's skillpkg client and the tests import them from the package.
+from ._config import _API_KEY_ENV_VARS, _api_key_from_env  # noqa: E402, F401
 
 
 def _router_inputs(config: Any) -> tuple:
@@ -803,21 +799,6 @@ def _skills_from_env() -> bool:
     return False
 
 
-def _api_key_from_env() -> str:
-    """First non-empty key among the accepted env-var spellings.
-
-    Whitespace-only counts as empty: an exported-but-blank primary should fall
-    through to the alias rather than shadow it.
-    """
-    for name in _API_KEY_ENV_VARS:
-        value = os.environ.get(name, "")
-        if isinstance(value, str):
-            value = value.strip()
-        if value:
-            return value
-    return ""
-
-
 def init(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -882,7 +863,8 @@ def init(
     Args:
         api_key: API key. Falls back to the ``DECIMAL_API_KEY`` env var, then
             to its accepted alias ``DECIMALAI_API_KEY`` (the spelling the CLI
-            also takes).
+            also takes). A ``SkillRouter`` built without ``api_key=`` uses
+            this one.
         base_url: Backend URL. Falls back to ``DECIMAL_BASE_URL``, then
             ``https://api.decimal.ai``.
         project: DEPRECATED and inert — the platform never read it, so it has
@@ -941,8 +923,14 @@ def init(
             add ``decimalai.anthropic.instrument(enable_skill_loader=True)``.
         google: If ``True``, auto-trace direct Google GenAI
             (``google.genai``) SDK calls.
-        agent_name: Default agent name for auto-install integrations. It is
-            also the agent whose skills the flag form routes for.
+        agent_name: The agent this process traces and routes skills for.
+            Falls back to the ``DECIMAL_AGENT_NAME`` env var. It is the
+            default wherever a name is not given: the framework flags above,
+            a later ``instrument()`` of any adapter, ``start_trace()``,
+            ``@trace`` and ``SkillRouter``. On OpenAI Agents it wins over
+            ``Agent(name=...)``, for the trace and for routing alike: it is
+            the agent the skills are attached to. An explicit name passed to
+            any of those still wins over this one.
         verify: If ``True`` (default), synchronously probe the backend
             during init to (a) validate the API key, (b) detect a
             wrong/unreachable ``base_url``, and (c) cache the backend's
@@ -1082,7 +1070,14 @@ def init(
         _config_kwargs["inject_skill_body"] = inject_skill_body
     if load_skill_tool is not None:
         _config_kwargs["load_skill_tool"] = load_skill_tool
+    if agent_name:
+        _config_kwargs["agent_name"] = agent_name
     config = DecimalConfig(**_config_kwargs)
+    # From here on `agent_name` is the resolved one (the argument, else
+    # DECIMAL_AGENT_NAME), so the flags below install every adapter under the
+    # name this config now holds, and the near-miss check covers a typo in the
+    # env var as well as in the argument.
+    agent_name = config.agent_name
     previous_config = _cfg._config
     _cfg._config = config
     # After the swap, so a router an adapter builds from here on reads the new

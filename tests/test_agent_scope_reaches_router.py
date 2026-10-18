@@ -142,8 +142,9 @@ class TestAnthropicSendsAgentName:
         assert spy.calls[0]["agent_name"] is None
 
     def test_instrument_records_the_agent_name(self, monkeypatch):
-        """`instrument(agent_name=...)` is the only way to set it on this
-        adapter — it has no `init()` wiring, unlike langchain."""
+        """`instrument(agent_name=...)` sets it. `init(anthropic=True)` installs
+        the tracing half only, so `init()`'s name reaches this adapter as
+        `instrument()`'s default (tests/test_init_agent_name_defaults.py)."""
         import decimalai.anthropic as an
 
         monkeypatch.setattr(an, "_install_agent_name", None)
@@ -165,8 +166,13 @@ def test_openai_agents_still_passes_agent_name_at_call_time():
 
     import decimalai.openai_agents as oa
 
+    # Was `agent_name=getattr(agent, "name", None)`: `Agent(name=...)` won
+    # routing outright. Since 2026-10-18 the DecimalAI name (instrument() /
+    # init()) wins over it, for routing and the trace alike, and the Agent's
+    # name is the fallback — `_routing_agent_name`, graded end to end in
+    # tests/test_init_agent_name_defaults.py.
     src = inspect.getsource(oa)
-    assert "agent_name=getattr(agent, \"name\", None)" in src, (
+    assert "agent_name=_routing_agent_name(agent)" in src, (
         "openai_agents stopped passing agent_name — the reference "
         "implementation for per-agent skill scoping"
     )

@@ -118,6 +118,9 @@ def _get_skill_router() -> Any:
         _skill_router_singleton = SkillRouter(
             api_key=config.api_key,
             base_url=config.base_url,
+            # Every routing call names its agent; no router default (see
+            # `skill_router._AGENT_FROM_INIT`).
+            agent_name=None,
             inject_body=config.resolve_inject_body(has_tool_loop=False),
         )
         return _skill_router_singleton
@@ -559,8 +562,10 @@ def instrument(
             workspace-scope skills. A run named with
             ``decimalai.providers.agent_run(name)`` is routed for THAT name,
             the one its trace is filed under; this is the fallback outside
-            one. Callers who assemble ``system`` themselves can keep passing
-            it per-call to :func:`skill_system` instead.
+            one. Defaults to the name an earlier call set, else the agent
+            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``). Callers who
+            assemble ``system`` themselves can keep passing it per-call to
+            :func:`skill_system` instead.
         enable_load_skill_tool: Accepted but DORMANT on this adapter —
             the patch layer is a single
             ``messages.create()`` call, which cannot route a tool result
@@ -570,6 +575,13 @@ def instrument(
             ``decimalai.openai_agents`` and ``decimalai.pydantic_ai``.
     """
     global _install_agent_name
+    if agent_name is None and _install_agent_name is None:
+        # Named by neither this call nor an earlier one: the agent init()
+        # named (or DECIMAL_AGENT_NAME). `init(anthropic=True)` installs the
+        # tracing half (decimalai.providers), never this module, so this is
+        # the only way init()'s name reaches the skill loader.
+        from ._config import default_agent_name
+        agent_name = default_agent_name()
     if agent_name is not None:
         _install_agent_name = agent_name
     if enable_load_skill_tool:
