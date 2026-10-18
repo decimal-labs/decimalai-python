@@ -6,6 +6,21 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed: `init()` is the default agent name and API key
+
+- `init(agent_name=...)` (or the new `DECIMAL_AGENT_NAME`) is now the agent name wherever
+  one is not given: every adapter's `instrument()`, `decimalai.start_trace()`,
+  `@decimalai.trace` (before the function's name) and `SkillRouter`. Before, only the
+  adapters switched on in the same `init()` call saw it, so a later `instrument()` or a
+  `start_trace()` filed traces under another name and routed without the agent's skills.
+- `SkillRouter()` no longer needs `api_key=`: it takes `init()`'s key (and its `base_url`),
+  then `DECIMAL_API_KEY` / `DECIMALAI_API_KEY`.
+- **OpenAI Agents:** a DecimalAI agent name (from `instrument(agent_name=)`, `init()` or
+  `DECIMAL_AGENT_NAME`) now wins over `Agent(name=...)` for both the trace and routing, as
+  `instrument()`'s docstring always said; with none, `Agent(name=)` is used as before. A name
+  given together with `agent=` applies to that agent only. An INFO line says so once when the
+  two names differ. Pydantic AI keeps its documented rule (`Agent(name=)` first).
+
 ## [0.16.0] — 2026-10-18
 
 ### Added: native mode — a framework's own skill loader, seen by DecimalAI
