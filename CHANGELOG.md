@@ -12,7 +12,7 @@ Eight frameworks load the skills `decimalai skills add` installed with a loader 
 their own. Each now has a one-line helper that points that loader at
 `.agents/skills`, and DecimalAI records every skill the loader hands the model as an
 activation carrying the exact skill id and version id of the bytes the model
-received:
+received. Each helper is in its framework's module (`import decimalai.adk` first):
 
 | framework | helper |
 |---|---|
