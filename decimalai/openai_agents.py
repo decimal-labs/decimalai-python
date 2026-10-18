@@ -15,6 +15,14 @@ Custom path (exclusive — replaces default OpenAI tracing)::
 
     from decimalai.openai_agents import instrument
     instrument(exclusive=True)
+
+Native skills: the sandbox's own ``Skills`` capability loads the skills
+``decimalai skills add`` installed (:func:`sandbox_skills`). Each ``load_skill``
+becomes an activation naming the version of the copy the model can read, and the
+SkillRouter adds no menu or tool of its own to that agent::
+
+    from decimalai.openai_agents import sandbox_skills
+    SandboxAgent(..., capabilities=[Shell(), sandbox_skills()], default_manifest=Manifest())
 """
 
 from __future__ import annotations
@@ -35,6 +43,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
+from ._native import Load, NativeLoads
+from ._native import record as _record_native_load
 from ._skill_witness import copy_delivered_versions, merge_delivered_versions
 
 
@@ -789,6 +799,10 @@ def _skill_tool_name(agent: Any) -> str:
     Namespacing keeps both catalogs loadable, and the prompt hint names the tool
     that serves the menu above it (see `_skill_tool_hint`). Every other agent
     keeps the plain name.
+
+    Since phase 3 an agent with the sandbox `Skills` capability gets no DecimalAI
+    tool at all (`_native_skills_serve`), so this only renames ours beside some
+    other capability's `load_skill`.
     """
     native = getattr(agent, "_sandbox_capability_tools", None) or ()
     if any(getattr(tool, "name", None) == _TOOL_NAME for tool in native):
@@ -814,6 +828,43 @@ def _note_namespaced(agent: Any) -> None:
         "the prompt. Activations are recorded the same way under either name.",
         getattr(agent, "name", "<unnamed>"), _NAMESPACED_TOOL_NAME, _NAMESPACED_TOOL_NAME,
     )
+
+
+def _has_native_skills(agent: Any) -> bool:
+    """Whether the sandbox's own ``Skills`` capability serves this agent's skills.
+
+    Read off ``capabilities``, which the sandbox's execution clone and the agent the
+    user built both carry: the eager form (``Skills(skills=...)``, ``from_=``)
+    registers no tool, so the tool list cannot say it is there.
+    """
+    try:
+        from agents.sandbox.capabilities import Skills
+    except Exception:  # an openai-agents with no sandbox: no native loader
+        return False
+    try:
+        return any(isinstance(c, Skills) for c in (getattr(agent, "capabilities", None) or ()))
+    except TypeError:
+        return False
+
+
+#: Set once the router-off rule has been announced: once per process, not per turn.
+_native_skills_notice_emitted = False
+
+
+def _native_skills_serve(agent: Any) -> bool:
+    """`_has_native_skills`, and the first time it is true, say why nothing is injected."""
+    global _native_skills_notice_emitted
+    if not _has_native_skills(agent):
+        return False
+    if not _native_skills_notice_emitted:
+        _native_skills_notice_emitted = True
+        logger.info(
+            "DecimalAI: agent %r loads its skills with the sandbox Skills capability, so "
+            "DecimalAI adds neither its skill menu nor its load_skill tool to it (two "
+            "skill catalogs would reach the model). Its loads are recorded as activations.",
+            getattr(agent, "name", "<unnamed>"),
+        )
+    return True
 
 
 def _skill_tool_hint(tool_name: str) -> str:
@@ -983,6 +1034,8 @@ def _make_skill_aware_instructions(base: str):
 def _skill_aware_prompt(base: str, ctx: Any, agent: Any) -> str:
     """`base`, then this turn's routed skill fragment. Blocking; never raises."""
     try:
+        if _native_skills_serve(agent):
+            return base
         router = _get_skill_router()
         if router is None:
             return base
@@ -1152,7 +1205,10 @@ def _install_agent_hooks() -> bool:
         # instructions slot, so without this capture the skills menu is
         # invisible to the tracer.
         resolved = base
-        if _skill_loader_installed:
+        # The sandbox's own Skills capability lists and loads this agent's skills, so
+        # the routed menu would be a second catalog (D7). Checked before the retrofit,
+        # whose notice would otherwise claim skills were attached.
+        if _skill_loader_installed and not _native_skills_serve(self):
             try:
                 # On a sandbox run `self` is the execution clone; the user's
                 # own `instructions` live on the agent they built.
@@ -1200,6 +1256,10 @@ def _install_agent_hooks() -> bool:
             if not _skill_loader_installed or not _load_skill_tool_enabled():
                 return tools
             try:
+                if _native_skills_serve(self):
+                    # No DecimalAI tool beside the sandbox's own loader, not even one
+                    # the constructor patch put on the declared list.
+                    return [t for t in tools if not _is_decimalai_skill_tool(t)]
                 agent_name = getattr(self, "name", None)
                 # `decimalai_load_skill` next to a sandbox's own `load_skill`.
                 tool_name = _skill_tool_name(self)
@@ -1399,6 +1459,198 @@ def _install_skill_loader() -> None:
             "DecimalAI SkillRouter loader installed WITHOUT run-time retrofit "
             "(OpenAI Agents) — agents built before this call get no skills"
         )
+
+
+# ── Native skills: the sandbox's own `Skills` capability ─────────────
+#
+# `Skills(lazy_from=...)` gives the model a `load_skill` tool whose result is only
+# `{"status", "skill_name", "path"}`: it copies the skill folder into the sandbox
+# workspace, and the model then reads `SKILL.md` from that copy. So the bytes the
+# model gets are the COPY's, and the hook reads the copy, through the sandbox
+# session, right after `load_skill` made it, never the source folder (a session
+# kept across runs keeps serving its copy after `decimalai skills update`).
+# `Skills.load_skill` is patched on the class because the sandbox clones the
+# capability for every run, and the function span carries only the status dict.
+# The eager forms (`skills=`, `from_=`) mount every skill up front and have no
+# load step, so only their listing is seen.
+
+#: A SKILL.md larger than this is not read back to identify it.
+_MAX_NATIVE_SKILL_MD = 8 * 1024 * 1024
+_native_hook_installed = False
+_two_catalogs_warned = False
+
+
+def _install_native_skills_hook() -> bool:
+    """Patch ``Skills.load_skill`` and ``Skills.instructions`` once. True when in place."""
+    global _native_hook_installed
+    if _native_hook_installed:
+        return True
+    try:
+        from agents.sandbox.capabilities import Skills
+    except Exception:  # an openai-agents with no sandbox: nothing to observe
+        return False
+
+    original_load = getattr(Skills, "load_skill", None)
+    if original_load is not None and not getattr(original_load, _HOOK_MARKER, False):
+        @functools.wraps(original_load)
+        async def load_skill(self, skill_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+            result = await original_load(self, skill_name, *args, **kwargs)
+            await _observe_sandbox_load(self, skill_name, result)
+            return result
+
+        setattr(load_skill, _HOOK_MARKER, True)
+        Skills.load_skill = load_skill  # type: ignore[method-assign]
+
+    original_instructions = getattr(Skills, "instructions", None)
+    if original_instructions is not None and not getattr(original_instructions, _HOOK_MARKER, False):
+        @functools.wraps(original_instructions)
+        async def instructions(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            text = await original_instructions(self, *args, **kwargs)
+            if text:
+                _observe_sandbox_listing(self)
+            return text
+
+        setattr(instructions, _HOOK_MARKER, True)
+        Skills.instructions = instructions  # type: ignore[method-assign]
+
+    _native_hook_installed = True
+    return True
+
+
+def _run_native_loads() -> Optional[NativeLoads]:
+    """This run's native-load collector, held on its rail; None when no trace of this
+    adapter's will carry it (an untraced run, or no DecimalAI processor registered).
+    Then `record` falls back to a `decimalai.start_trace()` trace, or says it dropped it.
+    """
+    run_key = _current_run_key()
+    if run_key is None or isinstance(run_key, _UntracedRunKey):
+        return None
+    processor = _tracing_processor
+    if processor is None or not _processor_is_registered(processor):
+        return None
+    rail = _rails_for(run_key)
+    with _run_rails_lock:
+        loads = rail.get("native")
+        if loads is None:
+            loads = rail["native"] = NativeLoads()
+    return loads
+
+
+def _source_index(skills: Any) -> Any:
+    """The lock of the project the capability's local source folder is in."""
+    from pathlib import Path
+
+    from .skillpkg.identity import current_index
+
+    src = getattr(getattr(getattr(skills, "lazy_from", None), "source", None), "src", None)
+    if src is None:
+        src = getattr(getattr(skills, "from_", None), "src", None)
+    if src is None:
+        return current_index()
+    # The SDK resolves a relative source against the working directory; so does this.
+    return current_index(Path(src) if Path(src).is_absolute() else Path.cwd() / src)
+
+
+async def _observe_sandbox_load(skills: Any, skill_name: Any, result: Any) -> None:
+    """Record one `load_skill` from the copy the model will read. Never raises."""
+    try:
+        if not isinstance(result, dict) or result.get("status") not in ("loaded", "already_loaded"):
+            return
+        from pathlib import Path, PurePosixPath
+
+        session = getattr(skills, "session", None)
+        folder = PurePosixPath(str(result.get("path") or skill_name)).name
+        rel = PurePosixPath(str(getattr(skills, "skills_path", ".agents"))) / folder
+        text: Optional[str] = None
+        if session is not None:
+            path = Path(str(session.state.manifest.root)) / str(rel) / "SKILL.md"
+            # The backend session, not its instrumented wrapper: the wrapper would
+            # add a read the model never made to the user's own trace.
+            reader = getattr(session, "_inner", None) or session
+            handle = await reader.read(path, user=getattr(skills, "run_as", None))
+            try:
+                data = handle.read(_MAX_NATIVE_SKILL_MD + 1)
+            finally:
+                handle.close()
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", errors="replace")
+            if isinstance(data, str) and len(data) <= _MAX_NATIVE_SKILL_MD:
+                text = data
+        name = result.get("skill_name") if isinstance(result.get("skill_name"), str) else skill_name
+        _record_native_load(
+            Load(framework="openai-agents", name=name, text=text, path=str(rel)),
+            loads=_run_native_loads(), index=_source_index(skills),
+        )
+    except Exception:  # noqa: BLE001 - observing must never break the user's run
+        logger.debug("native load_skill observation failed (non-fatal)", exc_info=True)
+
+
+def _observe_sandbox_listing(skills: Any) -> None:
+    """Record the DecimalAI skills in the listing the sandbox put in the prompt.
+
+    Only locked skills are named, by their wire name: a name the lock does not hold
+    says nothing the platform can attribute. Never raises.
+    """
+    try:
+        loads = _run_native_loads()
+        metadata = getattr(skills, "_skills_metadata", None)  # what `instructions` listed
+        if loads is None or not metadata:
+            return
+        index = _source_index(skills)
+        listed = []
+        for item in metadata:
+            skill = index.by_install_name(getattr(item, "name", None) or "")
+            if skill is not None:
+                listed.append(skill.wire_name)
+        loads.listed(listed)
+    except Exception:  # noqa: BLE001
+        logger.debug("native skill listing observation failed (non-fatal)", exc_info=True)
+
+
+def _warn_two_catalogs(agent_name: Optional[str]) -> None:
+    global _two_catalogs_warned
+    if _two_catalogs_warned:
+        return
+    _two_catalogs_warned = True
+    logger.warning(
+        "DecimalAI: a run of %r loaded a skill with the sandbox Skills capability and also "
+        "carried DecimalAI's routed skill menu, so two skill catalogs reached the model. "
+        "The capability was out of the adapter's sight when it injected (for instance on "
+        "another agent of the run); give the skills to one of the two.",
+        agent_name or "<unnamed>",
+    )
+
+
+def sandbox_skills(directory: Any = None) -> Any:
+    """The sandbox ``Skills`` capability over the skills ``decimalai skills add`` installed.
+
+    ::
+
+        from decimalai.openai_agents import sandbox_skills
+        agent = SandboxAgent(..., capabilities=[Shell(), sandbox_skills()],
+                             default_manifest=Manifest())
+
+    The source is :func:`decimalai.skills_dir` relative to the working directory: the
+    SDK lists nothing from a source outside it, so a project that is not under the
+    working directory raises here instead of listing zero skills.
+
+    Args:
+        directory: where to look for the project (default: the working directory).
+    """
+    from pathlib import Path
+
+    try:
+        from agents.sandbox.capabilities import LocalDirLazySkillSource, Skills
+        from agents.sandbox.entries import LocalDir
+    except ImportError:
+        raise ImportError(
+            "sandbox_skills() needs the OpenAI Agents SDK with its sandbox: "
+            "pip install \"decimalai[openai-agents]\""
+        ) from None
+    from .skillpkg.project import skills_dir
+
+    return Skills(lazy_from=LocalDirLazySkillSource(
+        source=LocalDir(src=skills_dir(directory, relative_to=Path.cwd()))))
 
 # ── Type aliases for duck-typing against the OpenAI Agents SDK ──
 # We avoid hard imports so the module loads even without openai-agents installed.
@@ -1734,6 +1986,9 @@ def instrument(
         # without it a run that never completes a model call has nothing to
         # declare a manifest from — so ingest 400s and the trace is lost.
         _install_agent_hooks()
+    # Loader or not: a skill the sandbox's own Skills capability loads is an
+    # activation of this run whichever way the router is configured.
+    _install_native_skills_hook()
 
     logger.info(
         "DecimalAI OpenAI Agents tracing installed (agent_name=%s, exclusive=%s, agent_introspected=%s, skill_loader=%s, disk_sync=%s)",
@@ -2881,6 +3136,17 @@ class DecimalTracingProcessor:
                 acc.skills_delivered_versions, names=acc.skills_delivered,
             ),
         )
+
+        # What the sandbox's own Skills capability listed and loaded on this run, with
+        # the version of the copy the model read (see `_observe_sandbox_load`).
+        native = run_rail.get("native")
+        if native:
+            try:
+                native.apply(trace)
+                if native.activations and (rail_offered or rail_delivered or rail_loaded):
+                    _warn_two_catalogs(agent_name)
+            except Exception:  # noqa: BLE001 - a trace without them beats no trace
+                logger.debug("native skill loads not applied (non-fatal)", exc_info=True)
 
         try:
             client = _config._get_client()

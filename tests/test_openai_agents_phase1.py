@@ -181,6 +181,12 @@ def sdk(monkeypatch):
         monkeypatch.setattr(oa, name, value)
     # Introduced by the fix; absent before it, hence raising=False.
     monkeypatch.setattr(oa, "_namespace_notice_emitted", False, raising=False)
+    # The native-skills hook (phase 3): the notice, and the class patch on `Skills`.
+    monkeypatch.setattr(oa, "_native_skills_notice_emitted", False, raising=False)
+    monkeypatch.setattr(oa, "_native_hook_installed", False, raising=False)
+    monkeypatch.setattr(oa, "_two_catalogs_warned", False, raising=False)
+    for method in ("load_skill", "instructions"):
+        monkeypatch.setattr(Skills, method, getattr(Skills, method))
     monkeypatch.setattr(oa, "_final_output_guard_installed", False, raising=False)
     from agents.run_internal import turn_resolution
 
@@ -263,14 +269,16 @@ class TestSandboxAgentGetsSkills:
         # The user's declaration is untouched: the skills arrive per run.
         assert agent.instructions == "You are helpful."
 
-    def test_a_native_lazy_load_skill_is_kept_and_ours_is_namespaced(
+    def test_a_native_lazy_skills_capability_turns_the_router_off(
         self, sdk, lazy_skills_dir, caplog,
     ):
-        """The sandbox's lazy ``Skills`` registers its own ``load_skill``. Both
-        catalogs must stay loadable, through two tools with distinct names."""
+        """CONTRACT CHANGED (phase 3, D7; was "ours is namespaced"). The sandbox's
+        lazy ``Skills`` lists its skills and registers its own ``load_skill``; a routed
+        menu and ``decimalai_load_skill`` beside them were a second catalog. Now the
+        agent gets neither, no routing call is made, and the reason is said once."""
         router = _Router()
         oa._skill_router_singleton = router
-        model = _ScriptedModel([_call(NAMESPACED, {"name": SKILL}), _text("ok")])
+        model = _ScriptedModel([_text("ok")])
         oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
         agent = SandboxAgent(
             name="sbx", instructions="You are helpful.", model=model,
@@ -278,32 +286,21 @@ class TestSandboxAgentGetsSkills:
                 source=LocalDir(src=lazy_skills_dir)))],
         )
 
-        with caplog.at_level(logging.WARNING, logger="decimalai.openai_agents"):
+        with caplog.at_level(logging.INFO, logger="decimalai.openai_agents"):
             _sandbox_run(agent)
 
-        names = [t.name for t in model.calls[0]["tools"]]
-        assert sorted(names) == sorted(set(names)), f"duplicate tool names: {names}"
-        assert {"load_skill", NAMESPACED} <= set(names)
-        native = next(t for t in model.calls[0]["tools"] if t.name == "load_skill")
-        assert not hasattr(native, oa._SKILL_TOOL_AGENT_ATTR)  # still the sandbox's own
+        tools = [t for t in model.calls[0]["tools"] if t.name in ("load_skill", NAMESPACED)]
+        assert [t.name for t in tools] == ["load_skill"]
+        assert not hasattr(tools[0], oa._SKILL_TOOL_AGENT_ATTR)  # the sandbox's own
         shown = model.calls[0]["instructions"]
-        assert shown.count(MENU) == 1
-        assert f"call the {NAMESPACED} tool" in shown
-        # The registry skill went through DecimalAI, as this agent.
-        assert [(load["name"], load["agent_name"]) for load in router.loads] == [(SKILL, "sbx")]
-        assert any("REFUND BODY SENTINEL" in str(item) for item in model.calls[1]["input"])
-        # ...and the trace says so: offered, loaded, under this run's routing id.
-        (trace,) = _sent(sdk)
-        assert trace.routing_id == ROUTING_ID
-        assert trace.skills_loaded_by_agent == [SKILL]
-        assert SKILL in trace.skills_offered_in_prompt
-        # The rename is announced, once.
-        notices = [r for r in caplog.records if NAMESPACED in r.getMessage()]
-        assert len(notices) == 1
+        assert MENU not in shown and NAMESPACED not in shown
+        assert router.routes == []
+        notices = [r for r in caplog.records if "sandbox Skills capability" in r.getMessage()]
+        assert [r.levelno for r in notices] == [logging.INFO]
 
-    def test_eager_native_skills_add_no_tool_so_ours_keeps_its_name(self, sdk):
-        """``Skills(skills=[...])`` mounts the skills as files and registers no
-        tool, so there is nothing to collide with: one ``load_skill``, ours."""
+    def test_eager_native_skills_turn_the_router_off_too(self, sdk):
+        """``Skills(skills=[...])`` registers no tool, but it is still the agent's skill
+        loader (the skills are mounted and listed): no menu, no DecimalAI tool."""
         from agents.sandbox.capabilities import Skill
 
         router = _Router()
@@ -318,22 +315,22 @@ class TestSandboxAgentGetsSkills:
             )])],
         ))
 
-        tools = [t for t in model.calls[0]["tools"] if t.name in ("load_skill", NAMESPACED)]
-        assert [t.name for t in tools] == ["load_skill"]
-        assert hasattr(tools[0], oa._SKILL_TOOL_AGENT_ATTR)
-        assert model.calls[0]["instructions"].count(MENU) == 1
-        assert len(router.routes) == 1
+        names = [t.name for t in model.calls[0]["tools"]]
+        assert "load_skill" not in names and NAMESPACED not in names
+        assert MENU not in model.calls[0]["instructions"]
+        assert router.routes == []
 
-    def test_the_namespace_notice_is_emitted_once_per_process(self, sdk, lazy_skills_dir, caplog):
+    def test_the_router_off_notice_is_emitted_once_per_process(self, sdk, lazy_skills_dir, caplog):
         oa._skill_router_singleton = _Router()
         oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
         caps = [Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=lazy_skills_dir)))]
-        with caplog.at_level(logging.WARNING, logger="decimalai.openai_agents"):
+        with caplog.at_level(logging.INFO, logger="decimalai.openai_agents"):
             for _ in range(2):
                 _sandbox_run(SandboxAgent(name="sbx", instructions="x",
                                           model=_ScriptedModel([_text("ok")]),
                                           capabilities=caps))
-        assert len([r for r in caplog.records if NAMESPACED in r.getMessage()]) == 1
+        assert len([r for r in caplog.records
+                    if "sandbox Skills capability" in r.getMessage()]) == 1
 
     def test_a_user_written_sandbox_instructions_callable_is_routed(self, sdk):
         """CONTRACT CHANGED (was "is left alone": no routing, no menu). Same

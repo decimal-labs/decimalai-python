@@ -34,6 +34,14 @@ Explicit path (no monkeypatch — wrap a stream you already have)::
 The Claude Agent SDK is Anthropic-native; the release gate pairs this adapter
 with the ``anthropic`` provider only.
 
+Native skills: Claude Code loads the skills ``decimalai skills add`` installed as a
+local plugin (:func:`skills_plugin`), and the wrapped stream turns each skill the
+CLI hands the model into an activation naming the version of the body it handed
+over::
+
+    from decimalai.claude_agent_sdk import skills_plugin
+    options = ClaudeAgentOptions(plugins=[skills_plugin()])
+
 Requires: ``pip install "decimalai[claude-agent-sdk]"``
 """
 
@@ -42,12 +50,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import threading
 import warnings
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, NamedTuple, Optional, Tuple
 from uuid import UUID, uuid4
 
+from ._native import Load, NativeLoads, record
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
@@ -285,6 +296,7 @@ class _RunState:
         "llm_calls", "spans", "pending_tools", "transcript", "root_span",
         "saw_turn_usage",
         "status", "error_message", "session_id", "init_data", "options", "finalized",
+        "native", "skill_calls",
     )
 
     def __init__(
@@ -337,6 +349,11 @@ class _RunState:
         self.init_data: Dict[str, Any] = {}
         self.options = options
         self.finalized = False
+        # The skills Claude Code itself listed and delivered on this run.
+        self.native = NativeLoads()
+        # (skill, args) of each `Skill` call, newest last: the delivered body that
+        # follows names neither, so it is matched back to its call by folder name.
+        self.skill_calls: List[Tuple[Optional[str], Optional[str]]] = []
 
 
 # ── Message ingestion ──────────────────────────────────────────────
@@ -374,6 +391,135 @@ def _ingest_system(state: _RunState, message: Any) -> None:
         state.init_data = data
         if state.session_id is None:
             state.session_id = data.get("session_id")
+        _note_listed(state, data)
+
+
+# ── Native skill loads ──────────────────────────────────────────────
+#
+# What the host stream shows of a skill load (claude-agent-sdk 0.2.166, CLI 2.1.299),
+# measured against the real CLI: the `Skill` ToolUseBlock; a UserMessage whose
+# ToolResultBlock says only "Launching skill: <plugin>:<name>"; then a UserMessage
+# of its own, linked to nothing, whose one TextBlock is
+#
+#     Base directory for this skill: <abs folder>
+#
+#     <the SKILL.md body, frontmatter removed>
+#
+# with "\n\nARGUMENTS: <args>" appended when the call passed args. A repeat call in
+# one session either delivers the body again after a "(Re-invocation ...)" note or
+# says "already loaded above" and delivers nothing. A slash command in the prompt
+# is expanded before the stream starts, so it never shows up here.
+
+#: The line the CLI puts before every skill body it hands the model.
+_SKILL_HEADER = "Base directory for this skill:"
+_SKILL_TOOL = "Skill"
+#: `Skill` calls remembered per run; only the newest few can still be awaiting a body.
+_SKILL_CALLS_KEPT = 32
+
+
+def _blocks(content: Any) -> List[Any]:
+    """A UserMessage's content as a list (the SDK types it ``str | list``)."""
+    if isinstance(content, str):
+        return [content]
+    return content if isinstance(content, list) else []
+
+
+def _block_text(block: Any) -> Optional[str]:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        text = block.get("text") if block.get("type", "text") == "text" else None
+    elif type(block).__name__ == "TextBlock":
+        text = getattr(block, "text", None)
+    else:
+        return None
+    return text if isinstance(text, str) else None
+
+
+def _skill_call_for(state: _RunState, folder: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(skill, args)`` of the newest `Skill` call for ``folder``, consumed.
+
+    Newest first: an earlier call that got "already loaded" delivered nothing and
+    must not lend its args to a later delivery.
+    """
+    for i in range(len(state.skill_calls) - 1, -1, -1):
+        skill, args = state.skill_calls[i]
+        if isinstance(skill, str) and skill.rsplit(":", 1)[-1] == folder:
+            del state.skill_calls[i]
+            return skill, args
+    return None, None
+
+
+def _without_arguments(body: str, args: Optional[str]) -> str:
+    """The body as the skill holds it: the CLI appends the call's args after it."""
+    trimmed = body.rstrip()
+    if args:
+        tail = f"ARGUMENTS: {args}".rstrip()
+        if trimmed.endswith(tail):
+            return trimmed[: -len(tail)]
+        return body
+    # No call to read the args from (a call this stream did not show).
+    match = re.search(r"\n\s*ARGUMENTS: [^\n]*\Z", trimmed)
+    return trimmed[: match.start()] if match else body
+
+
+def _note_skill_delivery(state: _RunState, text: str) -> None:
+    """Record one skill body the CLI handed the model. Never raises."""
+    try:
+        first, _, rest = text.partition("\n")
+        base_dir = first[len(_SKILL_HEADER):].strip()
+        if not base_dir:
+            return
+        name, args = _skill_call_for(state, os.path.basename(base_dir.rstrip("/\\")))
+        from .skillpkg.identity import current_index
+
+        record(
+            Load(framework="claude-agent-sdk", name=name,
+                 body=_without_arguments(rest, args), path=base_dir),
+            loads=state.native,
+            # The project the skill folder is in. The CLI may run elsewhere than this
+            # process (`ClaudeAgentOptions(cwd=...)`), so the working directory is not it.
+            index=current_index(base_dir),
+        )
+    except Exception:  # noqa: BLE001 - observing must never break the user's run
+        logger.debug("claude_agent_sdk: could not record a skill load", exc_info=True)
+
+
+def _note_listed(state: _RunState, init: Dict[str, Any]) -> None:
+    """Record the DecimalAI skills in the CLI's skill catalog. Never raises.
+
+    ``init.skills`` is every skill the CLI knows, Claude Code's own and other
+    plugins' included; only the locked ones are named, by their wire name, because
+    a name the lock does not hold says nothing the platform can attribute. A
+    user-only skill (``invocation: user``) is left out: Claude Code keeps it from
+    the model. The CLI also trims the model's listing to a budget the host cannot
+    see, so under a tight budget this can name a skill the model was not shown.
+    """
+    try:
+        names = [n for n in init.get("skills") or [] if isinstance(n, str)]
+        if not names:
+            return
+        from .skillpkg import lock as _lock
+        from .skillpkg.identity import current_index
+        from .skillpkg.project import Project
+
+        listed: List[str] = []
+        for plugin in init.get("plugins") or []:
+            path = plugin.get("path") if isinstance(plugin, dict) else None
+            if not (isinstance(path, str) and os.path.isabs(path) and os.path.isdir(path)):
+                continue
+            index = current_index(path)
+            if not index:
+                continue
+            entries = _lock.locked_entries(Project.find(path)) or {}
+            for name in names:
+                skill = index.by_plugin_name(name)
+                entry = entries.get(skill.install_name) if skill is not None else None
+                if skill is not None and (entry or {}).get("invocation") != "user":
+                    listed.append(skill.wire_name)
+        state.native.listed(listed)
+    except Exception:  # noqa: BLE001
+        logger.debug("claude_agent_sdk: could not read the skill listing", exc_info=True)
 
 
 def _ingest_assistant(state: _RunState, message: Any) -> None:
@@ -449,6 +595,11 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
     turn_entry: Dict[str, Any] = {"role": "assistant", "content": text_joined}
     for tid, tname, tinput in tool_uses:
         name = str(tname) if tname else "tool"
+        if name == _SKILL_TOOL and isinstance(tinput, dict):
+            args = tinput.get("args")
+            state.skill_calls.append(
+                (tinput.get("skill"), args if isinstance(args, str) else None))
+            del state.skill_calls[:-_SKILL_CALLS_KEPT]
         tc = ToolCallRecord(tool_name=name, args=tinput if isinstance(tinput, dict) else {})
         rec.tool_calls.append(tc)
         turn_entry.setdefault("tool_calls", []).append(
@@ -477,8 +628,13 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
 
 def _ingest_user(state: _RunState, message: Any) -> None:
     """A streamed UserMessage carries the ToolResultBlocks for the prior turn's
-    tool calls. (The initial user prompt is the input, not a streamed message.)"""
+    tool calls. (The initial user prompt is the input, not a streamed message.)
+    It also carries the skill bodies the CLI hands the model (see `_SKILL_HEADER`)."""
     content = getattr(message, "content", None)
+    for block in _blocks(content):
+        text = _block_text(block)
+        if text is not None and text.startswith(_SKILL_HEADER):
+            _note_skill_delivery(state, text)
     if not isinstance(content, list):
         return
     for block in content:
@@ -489,6 +645,12 @@ def _ingest_user(state: _RunState, message: Any) -> None:
         if pending is None:
             continue
         tc, span, started = pending
+        if tc.tool_name == _SKILL_TOOL:
+            # Today the body arrives in a message of its own, above; a CLI that puts
+            # it in the tool result instead is read the same way.
+            delivered = _text_content(getattr(block, "content", None))
+            if delivered.startswith(_SKILL_HEADER):
+                _note_skill_delivery(state, delivered)
         ended = _now()
         result_content = getattr(block, "content", None)
         tc.result = result_content
@@ -767,6 +929,11 @@ def _finalize(state: _RunState) -> None:
             llm_calls=list(state.llm_calls),
             manifest_id=manifest_id,
         )
+        try:
+            # The skills Claude Code listed and handed the model on this run.
+            state.native.apply(trace)
+        except Exception:  # noqa: BLE001 - a trace without them beats no trace
+            logger.debug("claude_agent_sdk: native skill loads not applied", exc_info=True)
         _agent = trace.agent_name
         if _agent in _pending_manifests:
             _config.submit_trace_pending_manifest(
@@ -793,6 +960,25 @@ async def _finalize_off_loop(state: _RunState) -> None:
 
 
 # ── Public API ──────────────────────────────────────────────────────
+
+def skills_plugin(directory: Any = None) -> Dict[str, str]:
+    """The local plugin entry that hands Claude Code the skills ``decimalai skills add``
+    installed, for ``ClaudeAgentOptions(plugins=[...])``::
+
+        from decimalai.claude_agent_sdk import skills_plugin
+        options = ClaudeAgentOptions(plugins=[skills_plugin()])
+
+    The plugin root is the project's ``.agents`` (its ``skills/`` folder is what the CLI
+    loads), as an absolute path: a relative ``--plugin-dir`` loads nothing from a
+    subdirectory, and says so only in the init message's ``plugin_errors``.
+
+    Args:
+        directory: where to look for the project (default: the working directory).
+    """
+    from .skillpkg.project import skills_dir
+
+    return {"type": "local", "path": str(skills_dir(directory).parent)}
+
 
 async def trace_stream(
     stream: AsyncIterator[Any],
