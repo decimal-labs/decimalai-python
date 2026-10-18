@@ -852,7 +852,13 @@ def traces_stats(agent_name, api_key, base_url, project):
 
 @traces.command("import")
 @click.argument("file_path", type=click.Path(exists=True))
-@click.option("--format", "fmt", default="auto", help="Import format: auto, json, jsonl")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["auto", "json", "jsonl"]),
+    default="auto",
+    help="Import format: auto, json, jsonl",
+)
 @click.option(
     "--agent-name",
     default=None,
