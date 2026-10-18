@@ -11,6 +11,8 @@ Observes only; the assertions are the parent's.
   the column: the system prompt of every model call, a run whose agent carries an
   ACTIVATED (always-on) skill, a control agent with no skills of its own, and the
   ``decimalai.crewai`` log lines.
+* :func:`live`: the live native check's trials (``tests/native/live.py``): the same
+  loader with a real OpenAI model, every tool call read off CrewAI's event bus.
 """
 
 from __future__ import annotations
@@ -165,3 +167,98 @@ def native(ctx: Dict[str, Any]) -> Dict[str, Any]:
     out["calls"] = calls
     out["logs"] = logs.lines
     return out
+
+
+# ── the live check (``test_native_live.py``): a REAL model, the same loader ──────────────
+
+
+class _ToolEvents:
+    """The tool calls CrewAI's own event bus reports during one kickoff.
+
+    ``ToolUsageStartedEvent`` is emitted for every tool call the model makes, an unknown
+    tool name included, before CrewAI runs it; ``ToolUsageFinishedEvent`` carries what the
+    model was handed back. Handlers run on the bus's thread pool, so the bus is flushed and
+    the events put back in emission order before they are read.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self.started: List[Any] = []
+        self.finished: List[Any] = []
+        self._lock = threading.Lock()
+
+    def _on_started(self, source: Any, event: Any) -> None:
+        with self._lock:
+            self.started.append(event)
+
+    def _on_finished(self, source: Any, event: Any) -> None:
+        with self._lock:
+            self.finished.append(event)
+
+    def __enter__(self) -> "_ToolEvents":
+        from crewai.events.event_bus import crewai_event_bus
+        from crewai.events.types.tool_usage_events import (
+            ToolUsageFinishedEvent,
+            ToolUsageStartedEvent,
+        )
+
+        crewai_event_bus.register_handler(ToolUsageStartedEvent, self._on_started)
+        crewai_event_bus.register_handler(ToolUsageFinishedEvent, self._on_finished)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        from crewai.events.event_bus import crewai_event_bus
+        from crewai.events.types.tool_usage_events import (
+            ToolUsageFinishedEvent,
+            ToolUsageStartedEvent,
+        )
+
+        crewai_event_bus.flush()
+        crewai_event_bus.off(ToolUsageStartedEvent, self._on_started)
+        crewai_event_bus.off(ToolUsageFinishedEvent, self._on_finished)
+
+    @staticmethod
+    def _ordered(events: List[Any]) -> List[Any]:
+        return sorted(events, key=lambda e: (getattr(e, "emission_sequence", None) or 0,
+                                             getattr(e, "timestamp", None)))
+
+    def into(self, run: Run) -> None:
+        for event in self._ordered(self.started):
+            run.called(event.tool_name, event.tool_args)
+        for event in self._ordered(self.finished):
+            run.saw(str(event.output))
+
+
+def _live_trial(run: Run) -> None:
+    """One kickoff of a fresh agent: CrewAI's own loader over the installed skills
+    (``decimalai.crewai.skills()`` + ``skill_tools()``), a real OpenAI model, the live
+    check's instructions as the agent's backstory and its question as the task."""
+    from crewai import LLM, Agent, Crew, Task
+
+    import decimalai.crewai
+    from tests.native import live
+
+    agent = Agent(role="Customer support agent", goal="Answer the customer's question",
+                  backstory=live.INSTRUCTIONS, llm=LLM(model=f"openai/{live.openai_model()}"),
+                  skills=decimalai.crewai.skills(), tools=decimalai.crewai.skill_tools())
+    task = Task(description=live.QUESTION, expected_output="Your answer to the customer.",
+                agent=agent)
+    events = _ToolEvents()
+    try:
+        with events:
+            out = Crew(agents=[agent], tasks=[task]).kickoff()
+    finally:
+        events.into(run)
+    run.answered(getattr(out, "raw", None) if out is not None else None)
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """The live native check (``tests/native/live.py``): ``live.trials(ctx)`` independent
+    trials, each a fresh agent with a real model."""
+    from tests.native import live as live_check
+
+    s = Session("crewai", distributions=["crewai", "openai"], crewai=True)
+    for _ in range(live_check.trials(ctx)):
+        s.run(_live_trial)
+    return s.result()

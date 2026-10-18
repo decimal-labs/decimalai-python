@@ -190,3 +190,57 @@ def user_trace(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     s.run(fn)
     return s.result()
+
+
+# ── the live check (``test_native_live.py``): a REAL model, the same plugin ─────────────
+
+
+def _record_messages(r: col.Run, messages: List[Dict[str, Any]]) -> None:
+    """Every tool call the model made (its ``toolUse`` blocks) and every tool result it was
+    handed, from the agent's own conversation, in order."""
+    for message in messages:
+        for block in message.get("content") or []:
+            use = block.get("toolUse")
+            if use:
+                r.called(use.get("name"), use.get("input"))
+            result = block.get("toolResult")
+            if result:
+                r.saw("\n".join(str(c.get("text", c.get("json", "")))
+                                for c in result.get("content") or []))
+
+
+def _live_trial(r: col.Run) -> None:
+    """One invocation of a fresh agent: Strands' own ``AgentSkills`` plugin over the
+    installed skills (``decimalai.strands.skills()``), its ``file_editor`` and ``shell``
+    as documented, and a real OpenAI model."""
+    from strands import Agent
+    from strands.models.openai import OpenAIModel
+    from strands.vended_tools import file_editor, shell
+
+    from decimalai.strands import skills
+    from tests.native import live
+
+    agent = Agent(model=OpenAIModel(model_id=live.openai_model()), name=AGENT,
+                  system_prompt=live.INSTRUCTIONS, tools=[file_editor, shell],
+                  plugins=[skills()], callback_handler=None)
+    result = None
+    try:
+        result = agent(live.QUESTION)
+    finally:
+        _flush_spans()
+        r.saw(agent.system_prompt or "")
+        _record_messages(r, agent.messages)
+    r.answered(str(result).strip() if result is not None else None)
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """The live native check (``tests/native/live.py``): ``live.trials(ctx)`` independent
+    trials, each a fresh agent with a real model, set up as :func:`column` is."""
+    from tests.native import live as live_check
+
+    os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = CONTENT_ON_SPANS
+    s = col.Session("strands-agents", distributions=DISTRIBUTIONS + ["openai"], otel=True,
+                    agent_name=AGENT)
+    for _ in range(live_check.trials(ctx)):
+        s.run(_live_trial)
+    return s.result()

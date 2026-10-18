@@ -8,6 +8,8 @@ project as its working directory. Observes only; the assertions are the parent's
   the column: the system instruction of every model call (is the router out of the
   native agent's requests?), a control agent with no toolset (is the router on at
   all?), and the ``decimalai.adk`` log lines.
+* :func:`live`: the live native check's trials (``tests/native/live.py``): the same
+  toolset with a real OpenAI model through ``LiteLlm``.
 """
 
 from __future__ import annotations
@@ -151,3 +153,75 @@ def native(ctx: Dict[str, Any]) -> Dict[str, Any]:
     out["calls"] = calls
     out["logs"] = logs.lines
     return out
+
+
+# ── the live check (``test_native_live.py``): a REAL model, the same toolset ────────────
+
+
+def _text_of(content: Any) -> str:
+    parts = getattr(content, "parts", None) or []
+    return "".join(p.text for p in parts if getattr(p, "text", None) and not getattr(p, "thought", None))
+
+
+def _live_trial(run: Run) -> None:
+    """One invocation of a fresh agent on a fresh runner and session: ADK's own
+    ``SkillToolset`` over ``decimalai.adk.skills()`` (as :func:`_agent` builds it) and a
+    real OpenAI model through ADK's ``LiteLlm``. Every ``function_call`` event is a tool
+    call the model made; every ``function_response`` event is what it was handed back."""
+    from google.adk.agents import LlmAgent
+    from google.adk.code_executors.unsafe_local_code_executor import (
+        UnsafeLocalCodeExecutor,
+    )
+    from google.adk.models.lite_llm import LiteLlm
+    from google.adk.runners import InMemoryRunner
+    from google.adk.tools.skill_toolset import SkillToolset
+    from google.genai import types
+
+    import decimalai.adk
+    from tests.native import live
+
+    agent = LlmAgent(name="support", model=LiteLlm(model=f"openai/{live.openai_model()}"),
+                     instruction=live.INSTRUCTIONS,
+                     tools=[SkillToolset(skills=decimalai.adk.skills(),
+                                         code_executor=UnsafeLocalCodeExecutor())])
+    answers: List[str] = []
+    errors: List[str] = []
+
+    async def go() -> None:
+        runner = InMemoryRunner(agent=agent, app_name="native-live")
+        session = await runner.session_service.create_session(app_name="native-live",
+                                                               user_id="u")
+        msg = types.Content(role="user", parts=[types.Part(text=live.QUESTION)])
+        try:
+            async for event in runner.run_async(user_id="u", session_id=session.id,
+                                                new_message=msg):
+                if event.partial:
+                    continue
+                for call in event.get_function_calls():
+                    run.called(call.name, dict(call.args or {}))
+                for response in event.get_function_responses():
+                    run.saw(response.response)
+                if event.error_code:
+                    errors.append(f"{event.error_code}: {event.error_message}")
+                elif event.is_final_response() and _text_of(event.content):
+                    answers.append(_text_of(event.content))
+        finally:
+            await runner.close()
+
+    asyncio.run(go())
+    if errors and not answers:
+        # ADK reported the model call's failure as an event, not an exception: surface it,
+        # so a provider's refusal is graded as one and not as a run with no answer.
+        raise RuntimeError("the model call failed: " + "; ".join(errors))
+    run.answered("\n".join(answers) if answers else None)
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """The live native check (``tests/native/live.py``): ``live.trials(ctx)`` independent
+    trials, each a fresh agent with a real model, set up as :func:`column` is."""
+    from tests.native import live as live_check
+
+    s = Session("google-adk", distributions=["google-adk", "litellm"], adk=True)
+    for _ in range(live_check.trials(ctx)):
+        s.run(_live_trial)
+    return s.result()

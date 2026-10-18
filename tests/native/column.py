@@ -188,8 +188,12 @@ def _traces(requests: List[Any]) -> List[Dict[str, Any]]:
 
 
 def _versions(distributions: Iterable[str]) -> Dict[str, str]:
-    out = {}
-    for dist in ["decimalai", *distributions]:
+    import decimalai
+
+    # The module, not the installed metadata: a venv's editable install can carry an older
+    # version number than the source on PYTHONPATH that is actually running.
+    out = {"decimalai": decimalai.__version__}
+    for dist in distributions:
         try:
             out[dist] = importlib.metadata.version(dist)
         except importlib.metadata.PackageNotFoundError:

@@ -38,7 +38,10 @@ def trials(ctx: dict) -> int:
 
 #: Error text that means the provider refused for money or rate, not that the code failed.
 _PROVIDER_WALLS = ("insufficient_quota", "credit balance is too low", "billing",
-                   "rate limit", "rate_limit", "429", "quota", "RESOURCE_EXHAUSTED")
+                   "rate limit", "rate_limit", "429", "quota", "RESOURCE_EXHAUSTED",
+                   # As tests/integration's live helpers treat them: the provider did not
+                   # answer in time, which says nothing about the loader.
+                   "timed out", "APITimeoutError")
 
 
 def provider_wall(error: Optional[str]) -> bool:
