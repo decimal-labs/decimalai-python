@@ -18,6 +18,7 @@ from tests.native_loaders import ledger
 
 from . import column_contract as contract
 from ._runner import run_scenario
+from .conftest import missing_imports
 
 #: framework (its LOADER_ENVS name) -> its scenario module under tests/native.
 FRAMEWORKS: Dict[str, str] = {
@@ -44,6 +45,12 @@ def column_result(native_project, request):
     if loader_graded_elsewhere(framework):
         ledger.skip_declared("elsewhere", f"{framework}:column",
                              f"{framework}'s native column")
+    # Absent here: allowed only when no test environment is named (CI's `.[dev]` floors
+    # job, a bare local run); under DECIMAL_TEST_ENV it fails, as everywhere in this suite.
+    missing = missing_imports(framework)
+    if missing:
+        ledger.skip_declared("unavailable", f"{framework}:column",
+                             f"{framework} is not installed (no {', '.join(missing)})")
     if framework not in _results:
         _results[framework] = run_scenario(
             f"tests.native.{FRAMEWORKS[framework]}:column", {}, cwd=native_project.root)

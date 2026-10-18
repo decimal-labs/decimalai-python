@@ -99,3 +99,59 @@ def native_project(tmp_path, monkeypatch) -> NativeProject:
 def body_of(skill_md: bytes) -> str:
     parts = skillfmt.split_frontmatter(skill_md.decode("utf-8"))
     return parts[1] if parts else skill_md.decode("utf-8")
+
+
+#: Each framework's own test module -> the native loader it exercises (its LOADER_ENVS name).
+_FRAMEWORK_OF_MODULE = {
+    "test_claude_agent_sdk_native": "claude-agent-sdk",
+    "test_adk_native": "google-adk",
+    "test_crewai_native": "crewai",
+    "test_openai_agents_native": "openai-agents",
+    "test_deepagents_native": "deepagents",
+    "test_agent_framework_native": "agent-framework",
+    "test_pydantic_ai_harness_native": "pydantic-ai-harness",
+    "test_strands_native": "strands-agents",
+}
+
+
+@pytest.fixture(autouse=True)
+def _framework_present(request):
+    """A framework's test module runs where its framework is graded and installed.
+
+    Graded in the other test environment: a declared skip naming it. Not installed with no
+    environment named (CI's ``.[dev]`` floors job, a bare local run): a declared skip.
+    Not installed in an environment that says it holds the framework: a failure, as
+    everywhere in these suites (``ledger.skip_declared``).
+    """
+    module = request.node.module.__name__.rsplit(".", 1)[-1]
+    framework = _FRAMEWORK_OF_MODULE.get(module)
+    if framework is None:
+        return
+    from tests.conformance.environments import loader_graded_elsewhere
+    from tests.native_loaders import ledger
+
+    if loader_graded_elsewhere(framework):
+        ledger.skip_declared("elsewhere", f"{framework}:native", f"{framework} native mode")
+    missing = missing_imports(framework)
+    if missing:
+        ledger.skip_declared("unavailable", f"{framework}:native",
+                             f"{framework} is not installed (no {', '.join(missing)})")
+
+
+def missing_imports(framework: str) -> list:
+    """The top-level imports ``framework`` needs that are not installed. ``find_spec`` of a
+    dotted name imports its parent, so an absent parent (``google`` for ``google.adk``)
+    raises instead of answering None."""
+    import importlib.util
+
+    from tests.native_loaders.loaders import LOADERS_BY_NAME
+
+    out = []
+    for module in LOADERS_BY_NAME[framework].imports:
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            out.append(module)
+    return out
