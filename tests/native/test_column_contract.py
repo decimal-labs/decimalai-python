@@ -32,9 +32,9 @@ def _trace(entry: Dict[str, str], *, offered=True, tools=True) -> Dict[str, Any]
 def good() -> Dict[str, Any]:
     return {"framework": "synthetic", "versions": {}, "na": {}, "notes": {}, "runs": [
         {"traces": [_trace(contract.V1)], "received": [contract.V1_SENTINEL],
-         "target_loads": 2, "error": None},
+         "target_loads": 2, "error": None, "route_calls": 0},
         {"traces": [_trace(contract.V2, tools=False)], "received": [V2_SENTINEL],
-         "target_loads": 1, "error": None},
+         "target_loads": 1, "error": None, "route_calls": 0},
     ]}
 
 
@@ -56,7 +56,15 @@ DEFECTS = {
     "NC5": _set(["runs", 0, "traces", 0, "llm_calls", 0, "tool_calls", 1, "result"], "error"),
     # The model got v2 but the trace says v1: the file-re-read misattribution, inverted.
     "NC6": _set(["runs", 1, "traces", 0, "active_skills"], [contract.V1]),
+    "NC7": _set(["runs", 0, "route_calls"], 1),
 }
+
+
+def test_nc7_also_fails_on_a_routing_id():
+    result = copy.deepcopy(good())
+    result["runs"][1]["traces"][0]["routing_id"] = "rt_" + "a" * 24
+    with pytest.raises(AssertionError, match="routing ids"):
+        contract.grade("NC7", result)
 
 
 @pytest.mark.parametrize("item", contract.ITEMS)

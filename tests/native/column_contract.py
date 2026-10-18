@@ -13,6 +13,10 @@ NC5     a tool call in run 1 ran the target's script through the framework, and 
         holds the script's output
 NC6     after ``skills update``, run 2's activation names the version whose body the model
         actually received (v1 from a loader that cached it, v2 from one that re-read it)
+NC7     the router stays out: with the router holding skills of its own, neither run made a
+        routing request or carries a routing id (the native loader serves the agent, so a
+        second catalog would only compete with it). Where DecimalAI has no router rail at all
+        (Claude Agent SDK, Microsoft Agent Framework, Strands) it holds by construction.
 ======  =======================================================================================
 
 The expected identities come from the lock (``oracle.build``), never from the trace or the
@@ -31,7 +35,7 @@ from tests.native import column
 from tests.native.conftest import V2_SENTINEL, _rows_v2
 from tests.native_loaders import oracle
 
-ITEMS = ("NC1", "NC2", "NC3", "NC4", "NC5", "NC6")
+ITEMS = ("NC1", "NC2", "NC3", "NC4", "NC5", "NC6", "NC7")
 
 #: (framework, item) -> why it cannot apply at the frameworks' current versions. Each entry
 #: is debt with a named way out.
@@ -137,6 +141,14 @@ def grade(item: str, result: Dict[str, Any]) -> None:
         assert [_identity(e) for e in entries] == [want], (
             f"after the update the model received {'v1' if got_v1 else 'v2'}, but run 2 "
             f"recorded {[_identity(e) for e in entries]}; expected {want}")
+    elif item == "NC7":
+        for i in (0, 1):
+            run = _run(result, i)
+            assert run.get("route_calls", 0) == 0, (
+                f"run {i + 1} asked the router to route ({run.get('route_calls')} request(s)) "
+                "though the framework's own loader serves the agent")
+            routed = [t.get("routing_id") for t in run["traces"] if t.get("routing_id")]
+            assert not routed, f"run {i + 1}'s trace carries routing ids {routed}"
     else:
         raise ValueError(f"no item {item!r}; known: {ITEMS}")
 

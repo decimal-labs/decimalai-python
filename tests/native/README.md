@@ -10,7 +10,7 @@ every `pytest tests/` run, offline, with no keys.
 
 ## The native column
 
-`test_native_column.py` grades six items per framework, from one scenario each
+`test_native_column.py` grades seven items per framework, from one scenario each
 (`_scenario_<framework>.py:column`), with every assertion in `column_contract.py`:
 
 | item | asserts |
@@ -21,6 +21,7 @@ every `pytest tests/` run, offline, with no keys.
 | NC4 | a tool call in run 1 read the target's resource through the framework, and its result holds the resource's bytes |
 | NC5 | a tool call in run 1 ran the target's script through the framework, and its result holds the script's output |
 | NC6 | after `decimalai skills update`, run 2's activation names the version whose body the model actually received |
+| NC7 | the router stays out: with the router holding skills of its own, neither run made a routing request or carries a routing id |
 
 The scenario drives the real framework, its own loader (set up with DecimalAI's pointer
 helper), and a scripted model, with `decimalai.init` pointed at the conformance probe

@@ -113,7 +113,12 @@ class Session:
 
         self.framework = framework
         self.distributions = list(distributions)
+        from tests.conformance.isolation import CONFORMANCE_SKILLS
+
         self.probe = Probe().start()
+        # Skills of the router's own, so a router that injected into the run would show:
+        # a routing request and a routing id (NC7). The native loader serves the agent.
+        self.probe.skills = [dict(skill) for skill in CONFORMANCE_SKILLS]
         os.environ["DECIMAL_API_KEY"] = self.probe.api_key
         os.environ["DECIMAL_BASE_URL"] = self.probe.base_url
         decimalai.init(api_key=self.probe.api_key, base_url=self.probe.base_url,
@@ -132,8 +137,10 @@ class Session:
         except Exception as exc:  # noqa: BLE001 - a failed run is a result, graded as such
             error = f"{type(exc).__name__}: {str(exc)[:500]}"
         _flush()
+        requests = self.probe.since(cursor)
         self.runs.append({
-            "traces": _traces(self.probe.since(cursor)),
+            "traces": _traces(requests),
+            "route_calls": sum(1 for r in requests if r.path.split("?")[0].rstrip("/") in _ROUTING),
             "received": run.received,
             "target_loads": run.target_loads,
             "calls": run.calls,
@@ -149,6 +156,10 @@ class Session:
         self.probe.stop()
         return {"framework": self.framework, "versions": _versions(self.distributions),
                 "runs": self.runs, "na": self.na, "notes": self.notes}
+
+
+#: The router's routing endpoints on the probe: a request to either means it routed the run.
+_ROUTING = ("/api/v1/skills/route", "/api/v1/skills/menu")
 
 
 def _flush() -> None:
