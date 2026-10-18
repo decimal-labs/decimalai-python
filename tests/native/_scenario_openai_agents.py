@@ -254,3 +254,86 @@ def symlinked(ctx: dict) -> dict:
 
     sandbox_skills()
     return {"logs": logs.lines}
+
+
+# ── the live check (tests/native/test_native_live.py) ────────────────────────
+
+
+def _call_args(raw: Any) -> Any:
+    """A tool call's arguments as the model sent them: parsed JSON where it is JSON."""
+    import json
+
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _live_hooks(run: col.Run) -> Any:
+    """Run hooks that record, as the run goes, what the model was given and every tool
+    call it made (from each model response), so a run that stops early still reports
+    what it did."""
+    from agents import RunHooks
+
+    class Observe(RunHooks):
+        def __init__(self) -> None:
+            self.prompted = False
+
+        async def on_llm_start(self, context, agent, system_prompt, input_items) -> None:
+            if not self.prompted:
+                self.prompted = True
+                run.saw(system_prompt)
+
+        async def on_llm_end(self, context, agent, response) -> None:
+            for item in response.output:
+                d = item if isinstance(item, dict) else item.model_dump()
+                if d.get("type") in ("message", "reasoning"):
+                    continue
+                run.called(d.get("name") or d.get("type"),
+                           _call_args(d.get("arguments", d.get("input", d.get("action")))))
+
+        async def on_tool_end(self, context, agent, tool, result) -> None:
+            run.saw(str(result))
+
+    return Observe()
+
+
+def live(ctx: dict) -> dict:
+    """Each trial: a fresh ``SandboxAgent`` with ``sandbox_skills()`` and a REAL OpenAI
+    model, asked the live question; every tool call it made, what it was given and its
+    answer (see ``tests/native/live.py``)."""
+    from tests.native import live as lv
+
+    s = col.Session("openai-agents", distributions=DISTRIBUTIONS, openai_agents=True)
+    # One event loop for every trial, as a long-lived app has: the SDK's OpenAI provider
+    # shares one process-wide httpx client, whose pooled connections belong to the loop
+    # that opened them, so an `asyncio.run` per trial failed a later trial with "Event loop
+    # is closed" (seen live, trial 2 of 3).
+    loop = asyncio.new_event_loop()
+
+    def trial(run: col.Run) -> None:
+        from agents import RunConfig, Runner
+        from agents.sandbox import SandboxAgent, SandboxRunConfig
+        from agents.sandbox.capabilities import Shell
+        from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
+
+        from decimalai.openai_agents import sandbox_skills
+
+        the_agent = SandboxAgent(name="live-support", instructions=lv.INSTRUCTIONS,
+                                 model=lv.openai_model(),
+                                 capabilities=[Shell(), sandbox_skills()],
+                                 default_manifest=manifest())
+        config = RunConfig(sandbox=SandboxRunConfig(client=UnixLocalSandboxClient()))
+        result = loop.run_until_complete(Runner.run(
+            the_agent, lv.QUESTION, run_config=config, hooks=_live_hooks(run), max_turns=12))
+        run.answered(result.final_output)
+
+    try:
+        for _ in range(lv.trials(ctx)):
+            s.run(trial)
+    finally:
+        loop.close()
+    s.notes["model"] = lv.openai_model()
+    return s.result()

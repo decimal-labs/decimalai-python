@@ -157,3 +157,72 @@ def user_trace(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     s.run(fn)
     return s.result()
+
+
+# ── the live check (tests/native/test_native_live.py) ────────────────────────
+
+
+def _observer(run: col.Run) -> Any:
+    """Chat middleware recording, per model call, what the model was instructed (first
+    call) and every function call in its response, so a run that stops early still
+    reports what it did."""
+    import json
+
+    from agent_framework import chat_middleware
+
+    state = {"instructed": False}
+
+    @chat_middleware
+    async def observe(context: Any, call_next: Any) -> None:
+        if not state["instructed"]:
+            state["instructed"] = True
+            run.saw(str((context.options or {}).get("instructions", "")))
+        await call_next()
+        for message in getattr(context.result, "messages", None) or []:
+            for c in message.contents:
+                if c.type == "function_call":
+                    args = c.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except ValueError:
+                            pass
+                    run.called(c.name, args)
+
+    return observe
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Each trial: a fresh ``Agent`` with ``skills()`` as the column builds it and a REAL
+    OpenAI model (``OpenAIChatClient``), asked the live question; every tool call it made,
+    what it was given and its answer (see ``tests/native/live.py``)."""
+    s = col.Session("agent-framework", distributions=DISTRIBUTIONS + ["agent-framework-openai"],
+                    otel=True, agent_name=AGENT)
+    from agent_framework import Agent
+    from agent_framework.observability import enable_sensitive_telemetry
+    from agent_framework.openai import OpenAIChatClient
+
+    from decimalai.agent_framework import skills
+    from tests.native import live as lv
+
+    enable_sensitive_telemetry()
+
+    def trial(r: col.Run) -> None:
+        agent = Agent(client=OpenAIChatClient(lv.openai_model()), name=AGENT,
+                      instructions=lv.INSTRUCTIONS,
+                      context_providers=[skills(auto_approve_scripts=True)],
+                      middleware=[_observer(r)])
+        try:
+            response = asyncio.run(agent.run(lv.QUESTION))
+        finally:
+            _flush_spans()
+        for message in response.messages:
+            for c in message.contents:
+                if c.type == "function_result":
+                    r.saw(c.result if c.exception is None else f"EXCEPTION: {c.exception}")
+        r.answered(response.text)
+
+    for _ in range(lv.trials(ctx)):
+        s.run(trial)
+    s.notes["model"] = lv.openai_model()
+    return s.result()

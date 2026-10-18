@@ -202,3 +202,72 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
     out["errors"] = [r["error"] for r in result["runs"]]
     out["logs"] = logs[:60]
     return out
+
+
+# ── the live check (tests/native/test_native_live.py) ────────────────────────
+
+
+def _record_messages(run: Run, messages: List[Any]) -> None:
+    """Every tool call the model made and everything it was handed, from the run's own
+    message history."""
+    from pydantic_ai.messages import (ModelRequest, ModelResponse, RetryPromptPart,
+                                      ToolCallPart, ToolReturnPart)
+
+    instructed = False
+    for m in messages:
+        if isinstance(m, ModelRequest):
+            if not instructed and getattr(m, "instructions", None):
+                instructed = True
+                run.saw(m.instructions)
+            for part in m.parts:
+                if isinstance(part, (ToolReturnPart, RetryPromptPart)):
+                    run.saw(part.model_response_str() if isinstance(part, ToolReturnPart)
+                            else part.model_response())
+        elif isinstance(m, ModelResponse):
+            for part in m.parts:
+                if isinstance(part, ToolCallPart):
+                    try:
+                        args = part.args_as_dict()
+                    except Exception:  # noqa: BLE001 - malformed JSON from the model: keep it raw
+                        args = part.args
+                    run.called(part.tool_name, args)
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Each trial: a fresh harness agent built as the column builds it (the pointer
+    helper's ``Skills`` in a ``LocalWorkspace`` beside ``FileSystem`` and ``Shell``) with a
+    REAL OpenAI model (``openai:<id>``), asked the live question; every tool call it made,
+    what it was given and its answer (see ``tests/native/live.py``)."""
+    import warnings
+
+    from pydantic_ai import Agent, capture_run_messages
+    from pydantic_ai.capabilities import LocalWorkspace
+    from pydantic_ai_harness import FileSystem, Shell
+
+    import decimalai.pydantic_ai_harness
+    from tests.native import live as lv
+
+    s = _session()
+    project = str(col.project().root)
+
+    def trial(run: Run) -> None:
+        agent = Agent(f"openai:{lv.openai_model()}", name="harness-agent",
+                      instructions=lv.INSTRUCTIONS,
+                      capabilities=[LocalWorkspace(project),
+                                    decimalai.pydantic_ai_harness.skills(project),
+                                    FileSystem(), Shell()])
+        with capture_run_messages() as messages:
+            try:
+                with warnings.catch_warnings():
+                    # The harness warns on every run that it ignores `allowed-tools`.
+                    warnings.simplefilter("ignore", UserWarning)
+                    result = agent.run_sync(lv.QUESTION)
+                run.answered(result.output)
+            finally:
+                _record_messages(run, messages)
+                _export_spans()
+
+    for _ in range(lv.trials(ctx)):
+        s.run(trial)
+    s.notes["model"] = lv.openai_model()
+    return s.result()

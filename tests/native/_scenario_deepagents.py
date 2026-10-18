@@ -231,3 +231,69 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
     out["errors"] = [r["error"] for r in result["runs"]]
     out["logs"] = [line for line in logs if "decimalai" in line][:40]
     return out
+
+
+# ── the live check (tests/native/test_native_live.py) ────────────────────────
+
+
+def _text_of(message: Any) -> str:
+    text = getattr(message, "text", "")
+    return text if isinstance(text, str) else text()
+
+
+def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Each trial: a fresh Deep Agents agent built as the column builds it (the pointer
+    helper over a shell backend) with a REAL OpenAI model (``ChatOpenAI``), asked the live
+    question; every tool call it made, what it was given and its answer (see
+    ``tests/native/live.py``)."""
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_openai import ChatOpenAI
+
+    import decimalai.deepagents
+    from deepagents import create_deep_agent
+    from tests.native import live as lv
+
+    s = Session("deepagents", distributions=DISTRIBUTIONS + ["langchain-openai"],
+                langchain=True)
+    project = str(col.project().root)
+
+    class FirstPrompt(BaseCallbackHandler):
+        """The system prompt of the first model call: the skills listing the model got."""
+
+        def __init__(self, run: Run) -> None:
+            self.run, self.done = run, False
+
+        def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+            if not self.done and messages:
+                self.done = True
+                self.run.saw(_system_text(messages[0]))
+
+    def trial(run: Run) -> None:
+        agent = create_deep_agent(model=ChatOpenAI(model=lv.openai_model()),
+                                  system_prompt=lv.INSTRUCTIONS,
+                                  **decimalai.deepagents.skills(backend=_shell_backend(project)))
+        state: Dict[str, Any] = {}
+        try:
+            # Streamed state, so a run that stops early still reports what it did.
+            for state in agent.stream({"messages": [{"role": "user", "content": lv.QUESTION}]},
+                                      config={"callbacks": [FirstPrompt(run)],
+                                              "recursion_limit": 40},
+                                      stream_mode="values"):
+                pass
+        finally:
+            messages = (state or {}).get("messages", [])
+            for m in messages:
+                if isinstance(m, AIMessage):
+                    for call in m.tool_calls or []:
+                        run.called(call.get("name"), call.get("args"))
+                elif isinstance(m, ToolMessage):
+                    run.saw(str(m.content))
+            final = [m for m in messages if isinstance(m, AIMessage) and not m.tool_calls]
+            if final:
+                run.answered(_text_of(final[-1]))
+
+    for _ in range(lv.trials(ctx)):
+        s.run(trial)
+    s.notes["model"] = lv.openai_model()
+    return s.result()
