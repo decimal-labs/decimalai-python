@@ -3,6 +3,7 @@
 Setup::
 
     import decimalai
+    import decimalai.pydantic_ai
     decimalai.init(otel=True)
     decimalai.pydantic_ai.instrument()          # one trace per agent run
     Agent.instrument_all()                      # Pydantic AI's own spans
