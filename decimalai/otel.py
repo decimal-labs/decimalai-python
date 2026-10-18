@@ -343,6 +343,40 @@ def _reset_skill_rails() -> None:
     """Drop every buffered rail. Test seam only."""
     with _skill_rails_lock:
         _skill_rails.clear()
+    with _native_rails_lock:
+        _native_rails.clear()
+
+
+# ── Native loads ──────────────────────────────────────────────
+# A framework's own skill loader (CrewAI's Agent(skills=...), Strands' AgentSkills, ...)
+# loading a skill, as `decimalai._native` resolved it, held for the run whose trace is live
+# when the load happens. Same join key and the same bounds as the skill rail above, but its
+# own store: a run with native loads and no routing decision must not take the rail's
+# routing branch, which assigns every skill list from the rail.
+_native_rails: "OrderedDict[int, Any]" = OrderedDict()
+_native_rails_lock = threading.Lock()
+
+
+def native_loads_for_current_run() -> Optional[Any]:
+    """The :class:`decimalai._native.NativeLoads` of the run whose trace is live now,
+    created on first use; None when no run is live here (see :func:`current_run_key`)."""
+    from ._native import NativeLoads
+
+    key = current_run_key()
+    if key is None:
+        return None
+    with _native_rails_lock:
+        loads = _native_rails.get(key)
+        if loads is None:
+            loads = _native_rails[key] = NativeLoads()
+            while len(_native_rails) > _SKILL_RAIL_MAX:
+                _native_rails.popitem(last=False)
+        return loads
+
+
+def _pop_native_rail(tid: int) -> Optional[Any]:
+    with _native_rails_lock:
+        return _native_rails.pop(tid, None)
 
 
 # ── Run links ─────────────────────────────────────────────────
@@ -1043,6 +1077,12 @@ class DecimalSpanExporter:
                 # the rail's own names are excluded rather than re-inferred,
                 # and so the assignments above cannot clobber the result.
                 self._infer_skill_rungs(run_trace)
+                # Skills the framework's own loader loaded in this run, with the version
+                # the model received. After the inference, so a native activation replaces
+                # an inferred entry of the same name rather than the other way round.
+                native = _pop_native_rail(tid)
+                if native:
+                    native.apply(run_trace)
                 # Who asked for this run, captured when it started (see
                 # "Run links"). LAST, on the finished trace: the parent is part
                 # of what the observer is handed, and the observer must see

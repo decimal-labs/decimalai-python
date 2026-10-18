@@ -127,6 +127,9 @@ class TraceContext:
         # {skill_id?, version_id?, body_sha256?}. Beside `_active_skills`, not in
         # it, so that map keeps its name -> hash shape.
         self._active_skill_ids: Dict[str, Dict[str, str]] = {}
+        # Skills a framework's own loader loaded inside this trace (decimalai._native),
+        # applied onto the finished trace. Created on the first load.
+        self._native: Optional[Any] = None
 
     def log_llm_call(
         self,
@@ -425,7 +428,7 @@ class TraceContext:
             entry.update(self._active_skill_ids.get(name, {}))
             active_skills_list.append(entry)
 
-        return RunTrace(
+        trace = RunTrace(
             id=self._trace_id,
             project=config.project,
             agent_name=self.agent_name,
@@ -453,6 +456,17 @@ class TraceContext:
             manifest_id=_manifest_id,
             parent_trace_id=self.parent_trace_id,
         )
+        if self._native:
+            self._native.apply(trace)
+        return trace
+
+    def _native_loads(self) -> Any:
+        """This trace's :class:`decimalai._native.NativeLoads`, created on first use."""
+        if self._native is None:
+            from ._native import NativeLoads
+
+            self._native = NativeLoads()
+        return self._native
 
     def _send(self) -> None:
         """Send the trace to the DecimalAI backend (via background sender)."""
