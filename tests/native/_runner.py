@@ -52,10 +52,26 @@ def scenario_env(home: Path) -> Dict[str, str]:
     return env
 
 
+def live_env(home: Path) -> Dict[str, str]:
+    """A live scenario's environment: the caller's own, so the provider key and any proxy
+    reach the real model, minus DecimalAI's (the child points DecimalAI at a probe), with a
+    HOME of its own. Tracing on."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("DECIMAL_", "DECIMALAI_"))}
+    for key in _TRACING_OFF:
+        env.pop(key, None)
+    env.update({"HOME": str(home), "CREWAI_DISABLE_TELEMETRY": "true",
+                "CREWAI_TRACING_ENABLED": "false", "DO_NOT_TRACK": "1",
+                "PYTHONPATH": os.pathsep.join([str(REPO)] + [
+                    p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p])})
+    return env
+
+
 def run_scenario(target: str, ctx: Dict[str, Any], *, cwd: Path,
-                 timeout: Optional[int] = None) -> Dict[str, Any]:
+                 timeout: Optional[int] = None, live: bool = False) -> Dict[str, Any]:
     """Run ``target`` (``"tests.native.<module>:<function>"``) with ``ctx`` in a child
-    whose working directory is ``cwd``; return what it returned."""
+    whose working directory is ``cwd``; return what it returned. ``live`` gives the child
+    the caller's network and provider keys (:func:`live_env`) instead of the hermetic
+    environment."""
     cwd = Path(cwd).resolve()
     work = cwd.parent / f".native-child-{os.getpid()}-{abs(hash(target)) % 10**8}"
     home = work / "home"
@@ -66,7 +82,8 @@ def run_scenario(target: str, ctx: Dict[str, Any], *, cwd: Path,
     try:
         proc = subprocess.run(
             [sys.executable, str(CHILD), target, str(ctx_path), str(out_path)],
-            cwd=cwd, env=scenario_env(home), capture_output=True, text=True, timeout=limit)
+            cwd=cwd, env=live_env(home) if live else scenario_env(home),
+            capture_output=True, text=True, timeout=limit)
     except subprocess.TimeoutExpired as exc:
         raise ScenarioError(f"{target} did not finish in {limit}s\n"
                             f"{(exc.stderr or '')[-3000:]}") from None

@@ -75,6 +75,11 @@ class Run:
     def __init__(self) -> None:
         self.received: List[str] = []
         self.target_loads = 0
+        #: ``(tool name, arguments)`` of every tool call the model made, in order (the live
+        #: suite grades whether a real model called the loader).
+        self.calls: List[Dict[str, Any]] = []
+        #: The model's final answer.
+        self.answer: Optional[str] = None
 
     def saw(self, text: Any) -> None:
         """Record a text the model was given (a tool result, a message)."""
@@ -84,6 +89,14 @@ class Run:
 
     def loaded_target(self, times: int = 1) -> None:
         self.target_loads += times
+
+    def called(self, name: Any, args: Any = None) -> None:
+        """Record one tool call the model made."""
+        self.calls.append({"name": str(name), "args": args if isinstance(args, (dict, list, str))
+                           else json.dumps(args, default=str)})
+
+    def answered(self, text: Any) -> None:
+        self.answer = text if isinstance(text, str) or text is None else str(text)
 
 
 class Session:
@@ -123,6 +136,8 @@ class Session:
             "traces": _traces(self.probe.since(cursor)),
             "received": run.received,
             "target_loads": run.target_loads,
+            "calls": run.calls,
+            "answer": run.answer,
             "error": error,
         })
         return run

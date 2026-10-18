@@ -290,6 +290,9 @@ conformance-tests = [
     # rides the default `pytest tests/` run). Each adds packages and moves no pin here.
     "deepagents>=0.7.25",
     "agent-framework-core>=1.21.0",
+    # Its OpenAI chat client, for the live native check (tests/native/test_native_live.py);
+    # 1.16.0 is the newest that accepts agent-framework-core 1.21.
+    "agent-framework-openai>=1.16.0",
     "pydantic-ai-harness>=0.57.0",  # 0.57 keeps a user-only skill out of the model's catalog
 ]
 # HERMETIC conformance, openai 2 world: the drivers whose framework cannot be
