@@ -517,28 +517,93 @@ def _routing_agent_name(config: Any = None) -> Optional[str]:
     install name rather than costing the call its skills.
     """
     try:
-        callbacks = config.get("callbacks") if isinstance(config, dict) else None
-        if callbacks is None:
-            config_var = _lc_config_var()
-            ambient = config_var.get() if config_var is not None else None
-            if isinstance(ambient, dict):
-                callbacks = ambient.get("callbacks")
-        if isinstance(callbacks, (list, tuple)):
-            handlers, parent_run_id = list(callbacks), None
-        else:
-            handlers = list(getattr(callbacks, "handlers", None) or ())
-            parent_run_id = getattr(callbacks, "parent_run_id", None)
-        handler = next((h for h in handlers if isinstance(h, CallbackHandler)), None)
-        if handler is None and _installed:
-            published = _decimal_callback_var.get()
-            if isinstance(published, CallbackHandler):
-                handler = published
+        handler, parent_run_id = _call_handler(config)
         if handler is None:
             return _install_agent_name
         return handler._routing_agent_name(parent_run_id)
     except Exception:
         logger.debug("routing agent-name resolution failed (non-fatal)", exc_info=True)
         return _install_agent_name
+
+
+def _call_handler(config: Any = None) -> tuple:
+    """``(handler, parent_run_id)`` of the model call being made: this adapter's handler
+    LangChain will dispatch the call's callbacks to, and the id of the run calling the
+    model, which that handler has indexed under its root run. See `_routing_agent_name`
+    for the precedence. ``(None, None)`` when no handler of ours is in play."""
+    callbacks = config.get("callbacks") if isinstance(config, dict) else None
+    if callbacks is None:
+        config_var = _lc_config_var()
+        ambient = config_var.get() if config_var is not None else None
+        if isinstance(ambient, dict):
+            callbacks = ambient.get("callbacks")
+    if isinstance(callbacks, (list, tuple)):
+        handlers, parent_run_id = list(callbacks), None
+    else:
+        handlers = list(getattr(callbacks, "handlers", None) or ())
+        parent_run_id = getattr(callbacks, "parent_run_id", None)
+    handler = next((h for h in handlers if isinstance(h, CallbackHandler)), None)
+    if handler is None and _installed:
+        published = _decimal_callback_var.get()
+        if isinstance(published, CallbackHandler):
+            handler = published
+    return handler, parent_run_id
+
+
+# ── a native skill loader on the agent (Deep Agents) ─────────────────────────
+
+_native_router_off_logged = False
+_native_double_catalog_warned = False
+
+
+def _native_loader_serves(config: Any = None) -> bool:
+    """True when the run making this model call has its own skill loader.
+
+    Deep Agents' skills middleware lists the skills in the agent's system prompt and the
+    model reads a ``SKILL.md`` with ``read_file``; the Router's menu on top of that is a
+    second catalog of the same skills. The run is marked by the handler when the
+    middleware's node runs, which is before the agent's first model call (see
+    `CallbackHandler._observe_native_loader`). Never raises: an unanswerable question
+    leaves the Router on, which is what this adapter has always done.
+    """
+    global _native_router_off_logged
+    try:
+        handler, parent_run_id = _call_handler(config)
+        if handler is None or parent_run_id is None:
+            return False
+        with handler._state_lock:
+            root = handler._root_of.get(parent_run_id)
+            state = handler._runs.get(root) if root is not None else None
+        if state is None or not state.native_skills:
+            return False
+    except Exception:  # noqa: BLE001
+        logger.debug("native-loader check failed (non-fatal)", exc_info=True)
+        return False
+    if not _native_router_off_logged:
+        # Not under a lock: two threads racing here log the line twice at worst.
+        _native_router_off_logged = True
+        logger.info(
+            "decimalai: this Deep Agents agent loads its skills itself (its skills "
+            "middleware), so the DecimalAI skill router does not inject its menu into the "
+            "agent's model calls; each skill the agent reads is reported as an activation "
+            "with the version it read. Logged once.")
+    return True
+
+
+def _wire_names(names: List[str]) -> List[str]:
+    """Listed install names as a trace reports them: a DecimalAI-installed skill by its
+    wire name, the name its activation carries, so one skill is one name on the trace."""
+    try:
+        from .skillpkg.identity import current_index
+
+        index = current_index()
+    except Exception:  # noqa: BLE001 - no project here: the names stay as listed
+        return list(names)
+    out = []
+    for name in names:
+        skill = index.by_install_name(name)
+        out.append(skill.wire_name if skill is not None else name)
+    return out
 
 
 # Resolved once. `_ambient_run_scope` runs on every routing call and every
@@ -1102,6 +1167,10 @@ def _inject_skills_into_input(input_value: Any, config: Any = None) -> Any:
     # saw.
     messages = _as_message_list(input_value)
     if messages is None:
+        return input_value
+    # Before the Router is consulted, for the same reason as the shape check: a routing
+    # decision that never reaches the model must not be stamped on the trace.
+    if _native_loader_serves(config):
         return input_value
     if _runtime_policy:
         # Rebuild our context on repeated invocation so old guidance cannot
@@ -1888,7 +1957,8 @@ class _RunState:
         "seen_output_contract", "streaming_buffers", "active_skills",
         "skills_offered_in_prompt", "skills_loaded_by_agent", "skills_delivered",
         "skills_delivered_versions",
-        "routing_id",
+        "routing_id", "router_injected",
+        "native_loads", "native_skills", "native_listing", "skill_reads",
     )
 
     def __init__(
@@ -2003,6 +2073,17 @@ class _RunState:
         # reported a routing_id the router had made for somebody else's
         # prompt — and two traces reported the same one.
         self.routing_id: Optional[str] = None
+        # True once the Router's menu or a body reached one of this run's model calls.
+        self.router_injected = False
+
+        # A framework's own skill loader on this run (Deep Agents' skills middleware):
+        # the loads it delivered, resolved to registry identity (`decimalai._native`);
+        # whether the middleware is on the agent; the listing it parsed (name, path);
+        # and the in-flight `read_file` calls of a SKILL.md, tool run id -> path.
+        self.native_loads: Optional[Any] = None
+        self.native_skills = False
+        self.native_listing: List[Dict[str, str]] = []
+        self.skill_reads: Dict[UUID, str] = {}
 
 
 def _bind_current_run_fields(cls: type) -> type:
@@ -2279,10 +2360,12 @@ class CallbackHandler(_CallbackBase):
         for name in _skills_offered_ctx.get() or ():
             if isinstance(name, str) and name.strip():
                 state.skills_offered_in_prompt.add(name.strip())
+                state.router_injected = True
         for name in _skills_delivered_ctx.get() or ():
             if isinstance(name, str) and name.strip():
                 state.skills_delivered.add(name.strip())
                 state.skills_offered_in_prompt.add(name.strip())
+                state.router_injected = True
         state.skills_delivered_versions = merge_delivered_versions(
             state.skills_delivered_versions, _skills_delivered_versions_ctx.get(),
         )
@@ -2308,6 +2391,103 @@ class CallbackHandler(_CallbackBase):
             self._skills_loaded_by_agent.add(n)
             self._skills_offered_in_prompt.add(n)
             self._skills_delivered.add(n)
+
+    # ── A native skill loader (Deep Agents) ─────────────────
+    #
+    # Deep Agents' skills middleware is the loader: it lists the skills in the system
+    # prompt, and the model reads one with `read_file`. These hooks see both through the
+    # callbacks this handler already gets, and every one swallows its own errors:
+    # observing a load must never cost the run.
+
+    def _observe_native_loader(self, state: _RunState, name: Any, inputs: Any) -> None:
+        """Mark the run when a graph node shows the skills middleware: its own node, or
+        a node whose input state carries the listing it parsed."""
+        try:
+            from . import deepagents as _da
+
+            listed = _da.listing(inputs)
+            if listed is None and not _da.is_skills_node(name):
+                return
+            state.native_skills = True
+            if listed:
+                state.native_listing = listed
+        except Exception:  # noqa: BLE001
+            logger.debug("native loader observation failed (non-fatal)", exc_info=True)
+
+    def _native_loads_of(self, state: _RunState) -> Any:
+        if state.native_loads is None:
+            from ._native import NativeLoads
+
+            state.native_loads = NativeLoads()
+        return state.native_loads
+
+    def _record_native_load(self, state: _RunState, *, name: Optional[str], path: str,
+                            text: Optional[str] = None, body: Optional[str] = None) -> None:
+        """Resolve one delivered skill to its registry identity and keep it on the run."""
+        global _native_double_catalog_warned
+        from ._native import Load, record
+
+        activation = record(Load(framework="deepagents", name=name, text=text, body=body,
+                                 path=path), loads=self._native_loads_of(state))
+        if activation is None or not state.router_injected or _native_double_catalog_warned:
+            return
+        _native_double_catalog_warned = True
+        logger.warning(
+            "decimalai: the agent loaded the skill %s with its own loader, on a run the "
+            "DecimalAI skill router also put its skill menu into, so the model saw two "
+            "catalogs of skills. The router stays off on a Deep Agents agent whose skills "
+            "middleware this adapter can see; here it could not (the middleware ran outside "
+            "the traced graph). Logged once.", activation.name)
+
+    def _observe_native_prompt(self, state: _RunState, messages: List[List[Any]]) -> None:
+        """At a model call of a native-loader run: the listing the model is shown, and any
+        skill the middleware pinned into the conversation."""
+        try:
+            from . import deepagents as _da
+
+            flat = [m for batch in messages for m in batch]
+            if state.native_listing:
+                system = "\n".join(
+                    _content_text(getattr(m, "content", None)) or "" for m in flat
+                    if normalize_role(m) in ("system", "developer"))
+                names = _da.listed_on_prompt(state.native_listing, system)
+                if names:
+                    self._native_loads_of(state).listed(_wire_names(names))
+            for message in flat:
+                pinned = _da.pinned_skill(message)
+                if pinned is not None:
+                    self._record_native_load(state, name=pinned["name"] or None,
+                                             path=pinned["path"], body=pinned["body"])
+        except Exception:  # noqa: BLE001
+            logger.debug("native prompt observation failed (non-fatal)", exc_info=True)
+
+    def _observe_skill_read_start(self, state: _RunState, tool_id: UUID, tool_name: Any,
+                                  inputs: Any) -> None:
+        try:
+            from . import deepagents as _da
+
+            path = _da.skill_read_path(tool_name, inputs)
+            if path is not None:
+                state.skill_reads[tool_id] = path
+        except Exception:  # noqa: BLE001
+            logger.debug("skill-read observation failed (non-fatal)", exc_info=True)
+
+    def _observe_skill_read_end(self, state: _RunState, tool_id: Optional[UUID],
+                                output: Any) -> None:
+        path = state.skill_reads.pop(tool_id, None) if tool_id is not None else None
+        if path is None:
+            return
+        try:
+            from . import deepagents as _da
+
+            text = _da.delivered_text(output)
+            if text is None:
+                return
+            listed = {s["path"]: s["name"] for s in state.native_listing}
+            self._record_native_load(state, name=listed.get(path) or _da.install_name_of(path),
+                                     path=path, text=text)
+        except Exception:  # noqa: BLE001
+            logger.debug("skill-read observation failed (non-fatal)", exc_info=True)
 
     # ── Chain lifecycle (spans) ─────────────────────────────
 
@@ -2353,6 +2533,8 @@ class CallbackHandler(_CallbackBase):
         # counting only the un-skipped ones would leave the balance negative
         # and close the run early.
         state.open_chains += 1
+
+        self._observe_native_loader(state, name, inputs)
 
         # Skip noisy internal LangChain wrappers
         if any(name.startswith(skip) for skip in _SKIP_CHAIN_TYPES):
@@ -2696,6 +2878,8 @@ class CallbackHandler(_CallbackBase):
         params = invocation_params or {}
         state = self._state_for_leaf(call_id, parent_run_id)
         self._capture_call_rails(state)
+        if state.native_skills:
+            self._observe_native_prompt(state, messages)
 
         rendered_input = []
         for msg_list in messages:
@@ -2932,6 +3116,8 @@ class CallbackHandler(_CallbackBase):
         tool_id = run_id or uuid4()
         tool_name = serialized.get("name", "unknown")
         state = self._state_for_leaf(tool_id, parent_run_id)
+        if state.native_skills:
+            self._observe_skill_read_start(state, tool_id, tool_name, kwargs.get("inputs"))
 
         span = TraceSpan(
             id=tool_id,
@@ -2978,6 +3164,8 @@ class CallbackHandler(_CallbackBase):
         state = self._state_for(tool_id, parent_run_id)
         if state is None:
             return
+        if state.skill_reads:
+            self._observe_skill_read_end(state, tool_id, output)
         if tool_id and tool_id in state.spans:
             span = state.spans[tool_id]
             span.status = Status.SUCCESS
@@ -3012,6 +3200,8 @@ class CallbackHandler(_CallbackBase):
         if tool_id and tool_id in state.tool_calls:
             tc = state.tool_calls[tool_id]
             tc.status = Status.ERROR
+        if tool_id is not None:
+            state.skill_reads.pop(tool_id, None)
 
         self._close_if_leaf_root(state, tool_id)
 
@@ -3171,7 +3361,7 @@ class CallbackHandler(_CallbackBase):
         ):
             trace_status = Status.ERROR
 
-        return RunTrace(
+        trace = RunTrace(
             id=state.trace_id,
             project=config.project if config else None,
             agent_name=agent_name,
@@ -3205,6 +3395,11 @@ class CallbackHandler(_CallbackBase):
                 state.skills_delivered_versions, names=state.skills_delivered,
             ),
         )
+        # Skills the agent's own loader delivered (Deep Agents), with the version each
+        # one was. Last, so a native activation replaces a bare entry of the same name.
+        if state.native_loads:
+            state.native_loads.apply(trace)
+        return trace
 
     def _attach_tool_calls(self, state: _RunState) -> None:
         """Hang each ToolCallRecord off the model turn that requested it.

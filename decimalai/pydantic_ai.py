@@ -573,6 +573,8 @@ def _install_skill_loader() -> None:
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        if _has_native_skills(self):
+            return
         try:
             # An instructions function, not a system prompt: see the module
             # docstring for why. Do NOT move the fragment into the caller's
@@ -625,6 +627,46 @@ def _install_skill_loader() -> None:
     Agent.__init__ = patched_init  # type: ignore[method-assign]
     _skill_loader_installed = True
     logger.info("DecimalAI SkillRouter loader installed (Pydantic AI)")
+
+
+#: Which of the two INFO lines below were logged: an observed ``Skills``, a plain one.
+_native_skills_logged: set = set()
+
+
+def _has_native_skills(agent: Any) -> bool:
+    """True when the Agent was built with the harness's ``Skills`` capability.
+
+    That capability is a skill loader of its own: a catalog in the instructions and
+    ``load_capability`` for the bodies. The router's menu and ``load_skill`` beside it
+    would be a second catalog of the same skills, so the skill loader leaves such an
+    Agent alone. Read off the Agent's capability tree, where the harness's own
+    ``Skills`` lives; a ``Skills`` a capability FUNCTION returns per run is not visible
+    here (`decimalai.pydantic_ai_harness` warns once if that run is also routed).
+    Never raises: when the answer is unknown, the router stays on.
+    """
+    try:
+        from . import pydantic_ai_harness as harness
+
+        found: list = []
+        agent.root_capability.apply(
+            lambda capability: found.append(capability) if harness.is_skills(capability) else None)
+        if not found:
+            return False
+        observed = all(harness.is_observed(c) for c in found)
+        if observed not in _native_skills_logged:
+            _native_skills_logged.add(observed)
+            logger.info(
+                "decimalai: the Pydantic AI agent %r loads skills with the harness's Skills "
+                "capability, so the DecimalAI skill router adds neither its skills menu nor "
+                "its load_skill tool to it. %s Logged once.",
+                getattr(agent, "name", None) or "(unnamed)",
+                "Each skill the model loads is reported as an activation." if observed else
+                "Its loads are not reported: build the capability with "
+                "decimalai.pydantic_ai_harness.skills(...) to report them.")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("native-skills check failed (non-fatal)", exc_info=True)
+        return False
 
 
 # ── agent name ──────────────────────────────────────────────
