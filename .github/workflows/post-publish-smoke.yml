@@ -82,7 +82,7 @@ jobs:
   smoke:
     name: Documented quickstart from PyPI (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -156,12 +156,16 @@ jobs:
         # So: require the answer to be STABLE (three consecutive 200s, spaced), and
         # probe the artifact a reader actually downloads rather than only its
         # metadata — the JSON and the files propagate independently.
+        #
+        # The wait starts when the release is published, but the upload comes at the
+        # END of publish.yml, after its test matrix: 9 minutes for 0.16.0, whose smoke
+        # gave up 40 seconds after the files landed. Hence ~25 minutes, not ~10.
         env:
           VERSION: ${{ steps.target.outputs.version }}
         run: |
           set -euo pipefail
           streak=0
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 150); do
             code="$(curl -s -o meta.json -w '%{http_code}' \
               "https://pypi.org/pypi/decimalai/$VERSION/json" || echo 000)"
             wheel_code=000
@@ -182,7 +186,7 @@ jobs:
             echo "attempt $attempt: meta=$code wheel=$wheel_code streak=$streak — waiting 10s"
             sleep 10
           done
-          echo "::error::PyPI never served decimalai $VERSION consistently (60 attempts, ~10 minutes)"
+          echo "::error::PyPI never served decimalai $VERSION consistently (150 attempts, ~25 minutes)"
           exit 1
 
       - name: Assert the artifact backs the documented Python floor
