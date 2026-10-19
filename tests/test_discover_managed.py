@@ -417,6 +417,7 @@ def test_sync_to_platform_never_sends_a_managed_folder(tmp_path, monkeypatch):
             return {"created": 1, "updated": 0, "unchanged": 0}
 
     monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    monkeypatch.chdir(tmp_path)  # the sync stamps the working directory's install identity
     sync_to_platform("dai_sk_test", search_paths=[str(root)])
     assert sent["names"] == ["mine"]
 

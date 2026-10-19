@@ -37,17 +37,6 @@ IMPORT = oracle.ROWS[2]
 IMPORT_NAME = oracle.install_name_for(IMPORT.name, IMPORT.skill_id)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _this_repository_is_never_the_project():
-    """No command here, and no engine call, may write this repository's own ``.decimal/``
-    or ``.agents/`` (``install.json``, ``.gitignore``, a lock): every one runs in a
-    project of its own. The producer checks the same around each production."""
-    before = producer.repo_state()
-    yield
-    changed = producer.repo_changes(before, producer.repo_state())
-    assert not changed, f"a test in this module wrote this repository's own files: {changed}"
-
-
 @pytest.fixture(scope="module")
 def made() -> producer.Production:
     return producer.template()

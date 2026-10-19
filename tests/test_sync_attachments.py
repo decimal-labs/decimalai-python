@@ -74,6 +74,7 @@ def test_sync_to_platform_sends_the_bundle_only_when_there_is_one(tmp_path, monk
             return {"created": 2, "updated": 0, "unchanged": 0}
 
     monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    monkeypatch.chdir(tmp_path)  # the sync stamps the working directory's install identity
     sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)])
 
     assert captured["skills"]["with-bundle"]["attachments"] == {"references/table.csv": "a,b\n1,2\n"}
@@ -114,6 +115,7 @@ def test_sync_to_platform_skips_a_registry_install_and_its_bundle(tmp_path, monk
             return {"created": 1, "updated": 0, "unchanged": 0}
 
     monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    monkeypatch.chdir(tmp_path)  # the sync stamps the working directory's install identity
     sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)])
 
     assert set(captured["skills"]) == {"mine"}

@@ -1102,6 +1102,7 @@ class TestRoundTrip:
                 return {"created": 1, "updated": 0, "unchanged": 0}
 
         monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+        monkeypatch.chdir(project_root)  # the sync stamps this project's install identity
         sync_to_platform(
             "dai_sk_test",
             search_paths=[os.path.join(project_root, ".claude/skills")],

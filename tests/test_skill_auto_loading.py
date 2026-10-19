@@ -67,6 +67,17 @@ def skill_dir(tmp_path):
     return str(base)
 
 
+@pytest.fixture
+def in_tmp_project(tmp_path, monkeypatch):
+    """Run from a project of the test's own. An install that discovers skills syncs
+    them, and the sync records the working directory's install identity: from the
+    repository's directory it would write the repository's own ``.decimal/``."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    return project
+
+
 @pytest.fixture(autouse=True)
 def _reset_sdk():
     """Reset global SDK state before each test."""
@@ -270,7 +281,7 @@ class TestGenericAutoLoading:
 class TestOpenAIAgentsAutoLoading:
     """install() auto-discovers skills and wires to DecimalTracingProcessor."""
 
-    def test_install_auto_discovers_skills(self, skill_dir):
+    def test_install_auto_discovers_skills(self, skill_dir, in_tmp_project):
         """install(skill_dirs=[...]) discovers skills and stores on processor."""
         mock_add = MagicMock()
 
@@ -337,7 +348,7 @@ class TestOpenAIAgentsAutoLoading:
 class TestLangChainAutoLoading:
     """install() auto-discovers skills and stores in _explicit_manifest_config."""
 
-    def test_install_with_skill_dirs_discovers(self, skill_dir):
+    def test_install_with_skill_dirs_discovers(self, skill_dir, in_tmp_project):
         """install(skill_dirs=[...]) auto-discovers skills."""
         with patch.dict("sys.modules", {
             "langchain_core": MagicMock(),

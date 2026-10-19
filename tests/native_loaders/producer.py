@@ -32,7 +32,6 @@ CLI, each served verbatim (``produce_vectors``).
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import os
 import shutil
@@ -50,6 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tests.conformance.probe import InstallRow, Probe
+from tests.repo_state import repo_changes, repo_state
 
 from . import oracle
 
@@ -185,27 +185,6 @@ def tree(project: Path) -> Tree:
             elif stat.S_ISREG(st.st_mode):
                 out[rel] = ("file", stat.S_IMODE(st.st_mode), path.read_bytes())
     return dict(sorted(out.items()))
-
-
-def repo_state(root: Path = SDK_ROOT) -> Dict[str, Tuple[int, str]]:
-    """The repository's own ``.decimal/`` and ``.agents/``: size and sha256 of each file.
-
-    What a command, or an engine call, would change if it took this repository for its
-    project (the working directory, or a missing ``--directory``): ``install.json``,
-    ``.decimal/.gitignore``, a lock, a skills root.
-    """
-    out: Dict[str, Tuple[int, str]] = {}
-    for top in (".decimal", ".agents"):
-        base = Path(root) / top
-        if base.is_dir() and not base.is_symlink():
-            for rel, (_, _, data) in tree(base).items():
-                out[f"{top}/{rel}"] = (len(data), hashlib.sha256(data).hexdigest())
-    return out
-
-
-def repo_changes(before: Mapping[str, Tuple[int, str]],
-                 after: Mapping[str, Tuple[int, str]]) -> List[str]:
-    return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
 
 def stamps(project: Path) -> Dict[str, Tuple[int, int]]:

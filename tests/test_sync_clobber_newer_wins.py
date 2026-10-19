@@ -56,6 +56,7 @@ def test_sync_to_platform_defaults_newer_wins_and_sends_timestamp(tmp_path, monk
             return {"created": 1, "updated": 0, "unchanged": 0}
 
     monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    monkeypatch.chdir(tmp_path)  # the sync stamps the working directory's install identity
 
     sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)])
 
@@ -82,5 +83,6 @@ def test_sync_to_platform_allows_local_wins_override(tmp_path, monkeypatch):
             return {"created": 1}
 
     monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
+    monkeypatch.chdir(tmp_path)  # the sync stamps the working directory's install identity
     sync_to_platform("dai_sk_test", search_paths=[str(tmp_path)], conflict_policy="local_wins")
     assert captured["kwargs"]["conflict_policy"] == "local_wins"

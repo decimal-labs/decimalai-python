@@ -366,7 +366,9 @@ _LIVE_PROVIDERS: "weakref.WeakSet" = weakref.WeakSet()
 
 
 def pytest_sessionstart(session):
-    """Record every TracerProvider built during the session, weakly."""
+    """Record every TracerProvider built during the session, weakly; and fingerprint
+    this repository's own project state before anything runs (section 6)."""
+    _REPO_STATE_AT_START.append(_repo_state())
     try:
         from opentelemetry.sdk.trace import TracerProvider
     except ImportError:  # pragma: no cover - OTel is a core dep
@@ -384,6 +386,67 @@ def pytest_sessionstart(session):
 
     TracerProvider.__init__ = _tracking_init
     TracerProvider._decimalai_tracked = True
+
+
+# ── 6. No test writes this repository's own .decimal/ or .agents/ ──────────────
+#
+# The SDK finds its project by walking up from the working directory, and this
+# repository has a `.decimal/` of its own (its `.gitignore` is tracked). A test that
+# syncs, installs an adapter or runs an engine call from the repository's directory
+# takes the repository for its project: it writes `.decimal/install.json` and appends
+# to the tracked `.decimal/.gitignore`. Where install.json already exists the identity
+# is only read, so a developer's checkout hides the write that a fresh clone (CI, a
+# landing gate) makes. tests/repo_state.py says what is fingerprinted.
+#
+# The fingerprint is taken in `pytest_sessionstart`, before collection, and compared
+# when the session-scoped fixture below tears down, after every other fixture. A
+# difference fails the run and names the paths. A second, per-test comparison names
+# the first test whose run changed them, which a session-wide diff cannot.
+_REPO_STATE_AT_START: list = []   # [fingerprint], taken once per session
+_FIRST_REPO_WRITER: list = []     # [node id] of the first test that changed it
+
+
+def _repo_state():
+    from tests.repo_state import repo_state
+
+    return repo_state()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _repository_project_state_is_untouched():
+    """Fail the session if this repository's ``.decimal/`` or ``.agents/`` changed."""
+    yield
+    if not _REPO_STATE_AT_START:
+        return  # pragma: no cover - sessionstart always runs first
+    from tests.repo_state import SDK_ROOT, repo_changes
+
+    changed = repo_changes(_REPO_STATE_AT_START[0], _repo_state())
+    if changed:
+        who = (f"The first test whose run changed them: {_FIRST_REPO_WRITER[0]}."
+               if _FIRST_REPO_WRITER else
+               "No single test's run changed them: collection or a module- or "
+               "session-scoped fixture did.")
+        pytest.fail(
+            f"the test session changed this repository's own project state under "
+            f"{SDK_ROOT}: {', '.join(changed)}. {who} A test that reaches the SDK's "
+            "project (install identity, sync, an adapter install, an engine call) must "
+            "run in a project of its own: monkeypatch.chdir(tmp_path), or pass the "
+            "project directory. Restore the files (git checkout / git clean) before "
+            "rerunning.",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _note_first_repo_writer(request):
+    """Remember the first test whose run changed the state section 6 guards."""
+    if _FIRST_REPO_WRITER:
+        yield
+        return
+    before = _repo_state()
+    yield
+    if _repo_state() != before:
+        _FIRST_REPO_WRITER.append(request.node.nodeid)
 
 
 @pytest.fixture(autouse=True)
