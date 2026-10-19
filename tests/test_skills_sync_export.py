@@ -1,41 +1,25 @@
 """Tests for Skills Sync & Export features.
 
 Covers:
-- disk_export module: AGENT_PATHS registry, SKILL.md reconstruction, the version 1
-  lockfile, and the deprecated writers (format 1, unmanaged folders)
-- SkillRouter lifecycle: export_to_disk, fork, install, status, update_skills and
-  pull_missing as wrappers over the package manager (decimalai.skillpkg), and search
-- sync_skills integration in instrument() for openai_agents and langchain, which no
-  longer pull anything to disk
+- SkillRouter lifecycle: export, status and update_skills as wrappers over the package
+  manager (decimalai.skillpkg), fork and use, and search
+- discovery and the sync payload: folders you wrote are synced, folders the package
+  manager installed never are
+- sync_skills in instrument() for openai_agents and langchain
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
-import tempfile
-from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch
 
 import pytest
 
-from decimalai.disk_export import (
-    AGENT_PATHS,
-    get_agent_paths,
-    list_supported_agents,
-    _reconstruct_skill_md,
-    _read_lockfile,
-    _write_lockfile,
-    export_skill_to_disk,
-    export_skills_to_disk,
-)
 from decimalai.skill_router import SkillRouter, SkillRouterError
-from decimalai.skillpkg import ops
 from decimalai.skills import (
     discover_skills,
-    parse_skill_md,
     sync_to_platform,
     _read_skill_body,
     _hash_content,
@@ -45,25 +29,7 @@ from decimalai.skills import (
 # ── Fixtures ──────────────────────────────────────────────────
 
 from tests.fakes.fake_registry import FakeRegistry  # noqa: E402
-from tests.test_router_skillpkg_shims import (  # noqa: E402
-    _fresh_once_state,
-    engine_on,
-    no_router_http,
-)
-
-__all__ = ["_fresh_once_state"]  # autouse: every shim warns once per test
-
-
-def _seed_v1_lock(project_root: str) -> None:
-    """A version 1 lock, as an older SDK left it: the only kind of project the
-    deprecated writers still record their folders in."""
-    _write_lockfile(project_root, {"version": 1, "skills": {}})
-
-
-def _ids(n: int) -> dict:
-    """Registry ids for a skill dict: the deprecated writers stamp them."""
-    return {"id": f"00000000-0000-4000-8000-{n:012x}",
-            "latest_version_id": f"00000000-0000-4000-9000-{n:012x}"}
+from tests.test_router_disk_methods import engine_on, no_router_http  # noqa: E402
 
 
 @pytest.fixture
@@ -77,47 +43,14 @@ def registry(monkeypatch):
 
 @pytest.fixture
 def project_root(tmp_path, monkeypatch):
-    """A clean project root directory for testing disk export.
+    """A clean project root directory.
 
-    Also redirects HOME (and Windows ``USERPROFILE``) to the same tmp
-    dir so tests using ``scope="global"`` write to tmp instead of the
-    developer's real ``~/.config/...`` (which would (a) pollute their
-    home, (b) fail on the second run because the file already exists).
-    Two pre-existing tests hit this footgun:
-      - test_lockfile_not_updated_for_global_scope
-      - test_top_five_agent_runtimes_get_their_own_skill_md
+    Also redirects HOME (and Windows ``USERPROFILE``) to the same tmp dir, so
+    nothing a test runs can read or write the developer's real home.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     return str(tmp_path)
-
-
-@pytest.fixture
-def sample_skill():
-    """A sample skill dict as returned by the platform API."""
-    return {
-        **_ids(1),
-        "name": "code-review",
-        "description": "Reviews code for bugs and security",
-        "body_markdown": "# Code Review\n\nWhen reviewing code:\n1. Check for SQL injection\n2. Check for XSS\n3. Validate input sanitization",
-        "version": 3,
-        "license": "MIT",
-        "compatibility": ["python3", "node18+"],
-        "allowed_tools": ["bash", "python"],
-        "source": "registry",
-        "attachments": [
-            {
-                "file_path": "scripts/lint.py",
-                "directory": "scripts",
-                "content_text": "#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(['flake8', '.'])",
-            },
-            {
-                "file_path": "references/owasp-top10.md",
-                "directory": "references",
-                "content_text": "# OWASP Top 10\n- Injection\n- Broken Auth\n- XSS",
-            },
-        ],
-    }
 
 
 @pytest.fixture
@@ -133,506 +66,38 @@ def skill_on_disk(tmp_path):
     return str(tmp_path)
 
 
-# ── AGENT_PATHS Registry ─────────────────────────────────────
-
-
-class TestAgentPathsRegistry:
-    """Tests for the agent path registry."""
-
-    def test_registry_has_minimum_agents(self):
-        assert len(AGENT_PATHS) >= 32
-
-    def test_all_entries_have_project_and_global(self):
-        for agent, paths in AGENT_PATHS.items():
-            assert "project" in paths, f"{agent} missing 'project' key"
-            assert "global" in paths, f"{agent} missing 'global' key"
-
-    def test_major_agents_present(self):
-        major_agents = [
-            "claude-code", "cursor", "github-copilot", "windsurf",
-            "gemini-cli", "codex", "cline", "continue", "universal",
-        ]
-        for agent in major_agents:
-            assert agent in AGENT_PATHS, f"Missing major agent: {agent}"
-
-    def test_claude_code_paths(self):
-        assert AGENT_PATHS["claude-code"]["project"] == ".claude/skills"
-        assert AGENT_PATHS["claude-code"]["global"] == "~/.claude/skills"
-
-    def test_cursor_paths(self):
-        assert AGENT_PATHS["cursor"]["project"] == ".agents/skills"
-
-    def test_windsurf_paths(self):
-        assert AGENT_PATHS["windsurf"]["project"] == ".windsurf/skills"
-
-    def test_universal_fallback(self):
-        assert AGENT_PATHS["universal"]["project"] == ".agents/skills"
-        assert AGENT_PATHS["universal"]["global"] == "~/.config/agents/skills"
-
-
-class TestGetAgentPaths:
-    """Tests for path resolution."""
-
-    def test_project_scope(self, project_root):
-        path = get_agent_paths("claude-code", scope="project", project_root=project_root)
-        assert path == os.path.join(project_root, ".claude/skills")
-
-    def test_global_scope_expands_tilde(self):
-        path = get_agent_paths("claude-code", scope="global")
-        assert path.startswith("/")
-        assert "~" not in path
-
-    def test_unknown_agent_raises(self):
-        with pytest.raises(ValueError, match="Unknown agent 'nonexistent'"):
-            get_agent_paths("nonexistent")
-
-    def test_list_supported_agents(self):
-        agents = list_supported_agents()
-        assert len(agents) >= 32
-        assert agents == sorted(agents)  # Alphabetical
-
-
-# ── SKILL.md Reconstruction ──────────────────────────────────
-
-
-class TestReconstructSkillMd:
-    """Tests for SKILL.md reconstruction from DB fields."""
-
-    def test_minimal_reconstruction(self):
-        result = _reconstruct_skill_md("test", "A test skill", "# Test\nDo things.")
-        assert "name: test" in result
-        assert "description: A test skill" in result
-        assert "# Test\nDo things." in result
-        assert result.startswith("---\n")
-
-    def test_with_license(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            license_info="MIT",
-        )
-        assert "license: MIT" in result
-
-    def test_with_compatibility(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            compatibility=["python3", "node18+"],
-        )
-        # One string, never a YAML list (loaders refuse or drop a list there).
-        assert 'compatibility: "python3; node18+"' in result
-        assert "  - " not in result
-
-    def test_with_allowed_tools(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            allowed_tools=["bash", "python"],
-        )
-        assert "allowed-tools: bash python" in result
-        assert "  - " not in result
-
-    def test_a_string_is_not_split_into_characters(self):
-        result = _reconstruct_skill_md("test", "desc", "# Body", allowed_tools="Read Grep")
-        assert "allowed-tools: Read Grep" in result
-
-    def test_with_taxonomy_labels(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            category="dev-tools",
-            skill_type="capability",
-            skill_scope="private",
-            invocation="model",
-        )
-        assert "category: dev-tools" in result
-        assert "skill-type: capability" in result
-        assert "skill-scope: private" in result
-        assert "invocation: model" in result
-        # Only `invocation: user` earns the Claude-Code spelling.
-        assert "disable-model-invocation" not in result
-
-    def test_preference_public_labels(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            skill_type="preference",
-            skill_scope="public",
-        )
-        assert "skill-type: preference" in result
-        assert "skill-scope: public" in result
-
-    def test_scope_omitted_when_unset(self):
-        """skill-scope is only emitted when set (same as every other field)."""
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            skill_type="capability",
-        )
-        assert "skill-type: capability" in result
-        assert "skill-scope:" not in result
-
-    def test_user_invocation_writes_disable_model_invocation(self):
-        result = _reconstruct_skill_md(
-            "test", "desc", "# Body",
-            invocation="user",
-        )
-        assert "invocation: user" in result
-        assert "disable-model-invocation: true" in result
-
-    def test_absent_labels_add_no_frontmatter_lines(self):
-        """Skills without taxonomy labels re-export byte-stable — no new keys."""
-        result = _reconstruct_skill_md("test", "A test skill", "# Test\nDo things.")
-        assert "category:" not in result
-        assert "skill-type:" not in result
-        assert "skill-scope:" not in result
-        assert "invocation:" not in result
-        assert "disable-model-invocation" not in result
-
-    def test_full_reconstruction_is_parseable(self):
-        """A reconstructed SKILL.md should be parseable by parse_skill_md."""
-        content = _reconstruct_skill_md(
-            "test-roundtrip", "A roundtrip test", "# Test\nCheck if this roundtrips correctly.",
-            license_info="Apache-2.0",
-        )
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, dir=tempfile.gettempdir()
-        ) as f:
-            f.write(content)
-            f.flush()
-            parsed = parse_skill_md(f.name)
-            os.unlink(f.name)
-
-        assert parsed is not None
-        assert parsed["name"] == "test-roundtrip"
-        assert "roundtrip" in parsed["description"].lower()
-
-
-# ── Lockfile ─────────────────────────────────────────────────
-
-
-class TestLockfile:
-    """Tests for the lockfile read/write operations."""
-
-    def test_read_nonexistent_returns_empty(self, project_root):
-        lockdata = _read_lockfile(project_root)
-        assert lockdata == {"version": 1, "skills": {}}
-
-    def test_write_and_read_roundtrip(self, project_root):
-        lockdata = {
-            "version": 1,
-            "skills": {
-                "code-review": {
-                    "version": 2,
-                    "content_hash": "abc123",
-                    "source": "platform",
-                },
-            },
-        }
-        _write_lockfile(project_root, lockdata)
-        read_back = _read_lockfile(project_root)
-        assert read_back["skills"]["code-review"]["version"] == 2
-        assert read_back["skills"]["code-review"]["content_hash"] == "abc123"
-        assert "updated_at" in read_back
-
-    def test_write_creates_directory(self, project_root):
-        assert not os.path.exists(os.path.join(project_root, ".decimal"))
-        _write_lockfile(project_root, {"version": 1, "skills": {}})
-        assert os.path.exists(os.path.join(project_root, ".decimal", "skills.lock"))
-
-    def test_read_corrupted_returns_empty(self, project_root):
-        lockfile_path = os.path.join(project_root, ".decimal", "skills.lock")
-        os.makedirs(os.path.dirname(lockfile_path), exist_ok=True)
-        with open(lockfile_path, "w") as f:
-            f.write("{invalid json")
-        lockdata = _read_lockfile(project_root)
-        assert lockdata == {"version": 1, "skills": {}}
-
-
-# ── Export to Disk ───────────────────────────────────────────
-
-
-class TestExportSkillToDisk:
-    """Tests for single-skill disk export."""
-
-    def test_basic_export(self, project_root, sample_skill):
-        result = export_skill_to_disk(
-            sample_skill,
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-            attachments=sample_skill["attachments"],
-        )
-        assert result["skill_name"] == "code-review"
-        assert len(result["written_paths"]) == 1
-        assert result["attachment_count"] == 2
-
-        # Verify file exists
-        skill_md_path = os.path.join(project_root, ".claude/skills/code-review/SKILL.md")
-        assert os.path.exists(skill_md_path)
-
-        # Verify content
-        with open(skill_md_path) as f:
-            content = f.read()
-        assert "name: code-review" in content
-        assert 'license: "MIT"' in content
-        assert 'decimalai-format: "1"' in content
-        assert "# Code Review" in content
-
-    def test_multi_agent_export(self, project_root, sample_skill):
-        result = export_skill_to_disk(
-            sample_skill,
-            agents=["claude-code", "cursor", "windsurf"],
-            scope="project",
-            project_root=project_root,
-        )
-        assert len(result["written_paths"]) == 3
-
-        # Verify each agent path exists
-        assert os.path.exists(os.path.join(project_root, ".claude/skills/code-review/SKILL.md"))
-        assert os.path.exists(os.path.join(project_root, ".agents/skills/code-review/SKILL.md"))
-        assert os.path.exists(os.path.join(project_root, ".windsurf/skills/code-review/SKILL.md"))
-
-    def test_attachment_writing(self, project_root, sample_skill):
-        export_skill_to_disk(
-            sample_skill,
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-            attachments=sample_skill["attachments"],
-        )
-
-        # Verify attachment files
-        lint_path = os.path.join(project_root, ".claude/skills/code-review/scripts/lint.py")
-        assert os.path.exists(lint_path)
-        with open(lint_path) as f:
-            assert "flake8" in f.read()
-
-        ref_path = os.path.join(project_root, ".claude/skills/code-review/references/owasp-top10.md")
-        assert os.path.exists(ref_path)
-        with open(ref_path) as f:
-            assert "OWASP" in f.read()
-
-    def test_defaults_to_universal_agent(self, project_root, sample_skill):
-        result = export_skill_to_disk(
-            sample_skill, scope="project", project_root=project_root,
-        )
-        assert len(result["written_paths"]) == 1
-        assert os.path.exists(os.path.join(project_root, ".agents/skills/code-review/SKILL.md"))
-
-    def test_does_not_modify_existing_skills(self, project_root, sample_skill):
-        """Exporting a new skill should not modify existing skills."""
-        # Create existing skill
-        existing_dir = os.path.join(project_root, ".claude/skills/existing-skill")
-        os.makedirs(existing_dir, exist_ok=True)
-        existing_path = os.path.join(existing_dir, "SKILL.md")
-        with open(existing_path, "w") as f:
-            f.write("# Existing\nDo not touch.")
-        mtime_before = os.path.getmtime(existing_path)
-
-        # Export new skill
-        export_skill_to_disk(
-            sample_skill,
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-        )
-
-        # Verify existing skill untouched
-        mtime_after = os.path.getmtime(existing_path)
-        assert mtime_before == mtime_after
-        with open(existing_path) as f:
-            assert "Do not touch." in f.read()
-
-
-class TestExportSkillsToDisk:
-    """Tests for batch export + lockfile update."""
-
-    def test_batch_export_with_lockfile(self, project_root):
-        _seed_v1_lock(project_root)
-        skills = [
-            {
-                **_ids(11),
-                "name": "pdf",
-                "description": "PDF skills",
-                "body_markdown": "# PDF\nConvert PDFs.",
-                "version": 2,
-                "source": "registry",
-            },
-            {
-                **_ids(12),
-                "name": "testing",
-                "description": "Testing skills",
-                "body_markdown": "# Testing\nWrite tests.",
-                "version": 1,
-                "source": "platform",
-            },
-        ]
-        result = export_skills_to_disk(
-            skills,
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-        )
-
-        assert result["skills_written"] == 2
-        assert result["scope"] == "project"
-
-        # Verify lockfile updated
-        lockdata = _read_lockfile(project_root)
-        assert "pdf" in lockdata["skills"]
-        assert "testing" in lockdata["skills"]
-        assert lockdata["skills"]["pdf"]["version"] == 2
-        assert lockdata["skills"]["pdf"]["source"] == "registry"
-        assert lockdata["skills"]["testing"]["version"] == 1
-
-    def test_global_scope_is_refused_and_writes_nothing(self, project_root):
-        skills = [{**_ids(13), "name": "global-skill", "description": "X",
-                   "body_markdown": "# X\nDo X.", "version": 1}]
-        with pytest.raises(ValueError) as ei:
-            export_skills_to_disk(
-                skills, agents=["universal"], scope="global", project_root=project_root,
-            )
-        assert "skills pull" in str(ei.value)
-        assert not os.path.exists(os.path.join(project_root, ".decimal", "skills.lock"))
-
-    def test_a_project_without_a_lock_gets_none(self, project_root):
-        """A fresh project never starts with legacy state."""
-        skills = [{**_ids(17), "name": "fresh", "description": "X",
-                   "body_markdown": "# X\nDo X.", "version": 1}]
-        result = export_skills_to_disk(skills, agents=["claude-code"], project_root=project_root)
-        assert result["lockfile"] is None
-        assert not os.path.exists(os.path.join(project_root, ".decimal", "skills.lock"))
-
-    def test_skip_lockfile_if_disabled(self, project_root):
-        _seed_v1_lock(project_root)
-        skills = [{**_ids(14), "name": "no-lock", "description": "X",
-                   "body_markdown": "# X\nDo X.", "version": 1}]
-        export_skills_to_disk(
-            skills, agents=["claude-code"], scope="project",
-            project_root=project_root, update_lockfile=False,
-        )
-        lockdata = _read_lockfile(project_root)
-        assert "no-lock" not in lockdata["skills"]
-
-    def test_lockfile_content_hash_deterministic(self, project_root):
-        """content_hash pins the FULL sha256 of the
-        exact SKILL.md written to disk (frontmatter+body); body_hash carries
-        the platform's body-only axis. The old sha256(body)[:12] pinned a
-        string that was never on disk."""
-        _seed_v1_lock(project_root)
-        skills = [{**_ids(15), "name": "determin", "description": "X",
-                   "body_markdown": "# X\nDo X.", "version": 1}]
-        export_skills_to_disk(
-            skills, agents=["claude-code"], scope="project", project_root=project_root,
-        )
-        lockdata = _read_lockfile(project_root)
-        skill_md = os.path.join(project_root, ".claude", "skills", "determin", "SKILL.md")
-        with open(skill_md, "rb") as f:
-            expected_hash = hashlib.sha256(f.read()).hexdigest()
-        entry = lockdata["skills"]["determin"]
-        assert entry["content_hash"] == expected_hash
-        assert entry["body_hash"] == hashlib.sha256("# X\nDo X.".encode()).hexdigest()
-
-    def test_top_five_agent_runtimes_get_their_own_skill_md(self, project_root):
-        """Exporting to the top-5 agent runtimes drops a
-        SKILL.md at each runtime's canonical path. If any of these break,
-        the install→export pipeline is broken for a major fraction of
-        users — they install a skill, it doesn't appear in the agent.
-        """
-        _seed_v1_lock(project_root)
-        top_five = ["claude-code", "cursor", "windsurf", "github-copilot", "codex"]
-        skills = [{
-            **_ids(16),
-            "name": "code-review",
-            "description": "Reviews code",
-            "body_markdown": "# Code Review\nLook for bugs.",
-            "version": 1,
-            "source": "registry",
-        }]
-        result = export_skills_to_disk(
-            skills,
-            agents=top_five,
-            scope="project",
-            project_root=project_root,
-        )
-
-        # Every agent should have gotten the skill body written.
-        assert result["skills_written"] == 1
-        assert set(result.get("agents") or []) == set(top_five), (
-            f"agents={result.get('agents')}"
-        )
-
-        # Each runtime's path should physically contain SKILL.md.
-        expected_paths = {
-            "claude-code":    ".claude/skills/code-review/SKILL.md",
-            "cursor":         ".agents/skills/code-review/SKILL.md",
-            "windsurf":       ".windsurf/skills/code-review/SKILL.md",
-            "github-copilot": ".agents/skills/code-review/SKILL.md",
-            "codex":          ".agents/skills/code-review/SKILL.md",
-        }
-        for agent, rel in expected_paths.items():
-            full = Path(project_root) / rel
-            assert full.exists(), f"missing SKILL.md for {agent} at {full}"
-            body = full.read_text()
-            assert "code-review" in body
-            assert "Look for bugs" in body
-
-        # Lockfile records the agents it was exported to so `status` and
-        # `update_skills` can target the same set next time.
-        lockdata = _read_lockfile(project_root)
-        assert "code-review" in lockdata["skills"]
-        locked_agents = set(lockdata["skills"]["code-review"].get("agents") or [])
-        assert locked_agents == set(top_five), (
-            f"lockfile agents={locked_agents}, expected={top_five}"
-        )
-
-
 # ── SkillRouter Lifecycle Methods ────────────────────────────
 
 
-class TestSkillRouterExportToDisk:
-    """SkillRouter.export_to_disk() is `decimalai skills add`, once per skill."""
+class TestSkillRouterExport:
+    """SkillRouter.export() is `decimalai skills add`."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
 
     def test_export_adds_and_writes_into_the_one_root(self, project_root, registry):
         registry.add_skill("pdf")
-        result = self._router().export_to_disk(
-            skills=["pdf"], agents=["claude-code"], scope="project", project_root=project_root,
-        )
+        result = self._router().export("pdf", project_root=project_root)
         assert result["skills_written"] == 1
         assert os.path.exists(os.path.join(project_root, ".agents/skills/pdf/SKILL.md"))
         assert not os.path.exists(os.path.join(project_root, ".claude"))
 
-    def test_export_all_skills_when_none_specified(self, project_root, registry):
-        router = self._router()
-        registry.add_skill("a", org="org-test", public=False)
-        registry.add_skill("b", org="org-test", public=False)
-        with patch.object(router, "list_skills", return_value=[{"name": "a"}, {"name": "b"}]):
-            result = router.export_to_disk(project_root=project_root)
-        assert result["skills_written"] == 2
-
-    def test_export_raises_when_all_requested_skills_fail(self, project_root, registry):
-        """Explicitly-requested skills that ALL fail must raise, not return a
-        zero-count summary a caller could mistake for "nothing to do"."""
+    def test_export_raises_when_the_registry_is_unreachable(self, project_root, registry):
+        """A failed export raises: a zero-count summary could pass for "nothing to do"."""
         registry.add_skill("pdf")
         registry.fault("resolve", "connect")
         with pytest.raises(SkillRouterError) as ei:
-            self._router().export_to_disk(skills=["pdf"], project_root=project_root)
+            self._router().export("pdf", project_root=project_root)
         assert "pdf" in str(ei.value)
         assert "could not reach the registry" in str(ei.value)
+        assert not os.path.exists(os.path.join(project_root, ".agents"))
 
 
-class TestSkillRouterInstall:
-    """Tests for SkillRouter.fork() / install() (+ legacy install_skill alias)."""
+class TestSkillRouterForkAndUse:
+    """SkillRouter.fork() and use() are registry calls: neither writes disk."""
 
     def _router(self):
         return SkillRouter(api_key="test", base_url="http://localhost:8000")
-
-    def test_install_adds_and_makes_no_fork_call(self, project_root, registry):
-        registry.add_skill("pdf")
-        result = self._router().install("pdf", agents=["claude-code"],
-                                        project_root=project_root)
-        # The router's own requests fail in this fixture: a fork would have raised.
-        assert result["skill_name"] == "pdf"
-        assert result["fork"] is None
-        assert result["export"]["skills_written"] == 1
 
     def test_fork_is_db_only_no_disk_write(self):
         """fork() forks via the API and must NOT write SKILL.md to disk."""
@@ -647,30 +112,12 @@ class TestSkillRouterInstall:
                 return fork_resp
             raise AssertionError(f"fork() made an unexpected call: {method} {path}")
 
-        with patch.object(router, "export_to_disk") as mock_export:
+        with patch.object(router, "export") as mock_export:
             with patch.object(router, "_request", side_effect=mock_request):
                 out = router.fork("pdf")
 
         mock_export.assert_not_called()
         assert out["skill"]["name"] == "pdf"
-
-    def test_install_skill_alias_warns_and_delegates(self, project_root, monkeypatch):
-        """install_skill is a deprecated alias: it warns and adds the skill."""
-        import warnings as _w
-
-        from decimalai.skillpkg.errors import Result
-
-        calls = []
-        monkeypatch.setattr(ops, "add", lambda *a, **kw: calls.append((a, kw)) or Result(
-            [ops.Change("add", "pdf", "pdf", version=1)]))
-        router = self._router()
-        with _w.catch_warnings(record=True) as caught:
-            _w.simplefilter("always")
-            out = router.install_skill("pdf", agents=["claude-code"], project_root=project_root)
-        assert [a for a, _ in calls] == [("pdf",)]
-        assert out["skill_name"] == "pdf"
-        assert any(issubclass(w.category, DeprecationWarning) for w in caught), \
-            "install_skill() should emit DeprecationWarning"
 
     def test_use_posts_to_use_endpoint_not_fork(self):
         """use() resolves the registry skill then POSTs /use (a linked pointer, no fork)."""
@@ -827,36 +274,33 @@ class TestSkillRouterSearch:
             results = router.search("test")
             assert results == []
 
-    def test_search_registry_alias(self):
-        assert SkillRouter.search is SkillRouter.search_registry
-
-
 # ── Sync on Install ──────────────────────────────────────────
 
 
-class TestSyncOnInstall:
-    """Tests that sync_skills runs during install().
+class TestSyncOnInstrument:
+    """Tests that sync_skills runs during instrument().
 
-    Verifies that the install() code path includes sync_skills logic.
+    Verifies that the instrument() code path includes sync_skills logic.
     We verify structurally by checking the source code contains the
-    sync call, since actually calling install() requires full SDK init.
+    sync call, since actually calling instrument() requires full SDK init.
+    (The behaviour is pinned in tests/test_router_disk_methods.py.)
     """
 
-    def test_openai_agents_install_has_sync_code(self):
-        """Verify openai_agents.install() contains sync_skills logic."""
+    def test_openai_agents_instrument_has_sync_code(self):
+        """Verify openai_agents.instrument() contains sync_skills logic."""
         import inspect
         from decimalai import openai_agents
         source = inspect.getsource(openai_agents.instrument)
-        assert "sync_skills" in source, "install() must call sync_skills"
+        assert "sync_skills" in source, "instrument() must call sync_skills"
         assert "_sync_skills_background" in source, "sync runs in background"
         assert "_sender.submit" in source, "sync uses background thread"
 
-    def test_langchain_install_has_sync_code(self):
-        """Verify langchain.install() contains sync_skills logic."""
+    def test_langchain_instrument_has_sync_code(self):
+        """Verify langchain.instrument() contains sync_skills logic."""
         import inspect
         from decimalai import langchain
         source = inspect.getsource(langchain.instrument)
-        assert "sync_skills" in source, "install() must call sync_skills"
+        assert "sync_skills" in source, "instrument() must call sync_skills"
         assert "_sync_skills_background" in source, "sync runs in background"
         assert "_sender.submit" in source, "sync uses background thread"
 
@@ -867,6 +311,14 @@ class TestSyncOnInstall:
         source = inspect.getsource(openai_agents.instrument)
         # The sync block should be wrapped in exception handling
         assert "except Exception" in source, "sync must be non-fatal"
+
+    @pytest.mark.parametrize("module", ["openai_agents", "langchain"])
+    def test_sync_up_skips_managed_folders(self, module):
+        import importlib
+        import inspect
+
+        source = inspect.getsource(importlib.import_module(f"decimalai.{module}").instrument)
+        assert "_sync_up_items" in source
 
 
 # ── Discovery Paths ──────────────────────────────────────────
@@ -955,122 +407,61 @@ class TestReadSkillBody:
 # ── End-to-End Round-Trip ────────────────────────────────────
 
 
+class _FakeSyncRouter:
+    """Stands in for SkillRouter in sync_to_platform and keeps what it was sent."""
+
+    sent: list = []
+
+    def __init__(self, **kw):
+        pass
+
+    def sync_skills(self, skills, **kwargs):
+        type(self).sent.extend(skills)
+        return {"created": len(skills), "updated": 0, "unchanged": 0}
+
+
 class TestRoundTrip:
-    """Tests for complete export → discover → sync round-trip."""
+    """Export -> discover -> sync, for an installed folder and for one you wrote."""
 
-    def test_export_then_discover(self, project_root, sample_skill):
-        """Skill exported to disk is discoverable by discover_skills."""
-        # Export
-        export_skills_to_disk(
-            [sample_skill],
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-        )
+    def _export(self, project_root, registry):
+        registry.add_skill("code-review", body="# Code Review\n\nCheck for SQL injection.\n")
+        SkillRouter(api_key="test", base_url="http://localhost:8000").export(
+            "code-review", project_root=project_root)
+        return os.path.join(project_root, ".agents", "skills")
 
-        # Discover
-        skills = discover_skills(
-            [os.path.join(project_root, ".claude/skills")],
-            include_global=False,
-        )
+    def test_export_then_discover(self, project_root, registry):
+        """The folder export writes is discovered as managed, with a readable body."""
+        root = self._export(project_root, registry)
+        skills = discover_skills([root], include_global=False)
         assert len(skills) == 1
         assert skills[0]["name"] == "code-review"
         assert skills[0]["hash"].startswith("sha256:")
+        assert skills[0]["managed"] is True
+        assert "SQL injection" in _read_skill_body(skills[0]["source_path"])
 
-    def test_export_then_discover_body_readable(self, project_root, sample_skill):
-        """Body can be read from exported SKILL.md for sync payload."""
-        export_skills_to_disk(
-            [sample_skill],
-            agents=["claude-code"],
-            scope="project",
-            project_root=project_root,
-        )
-
-        skills = discover_skills(
-            [os.path.join(project_root, ".claude/skills")],
-            include_global=False,
-        )
-        body = _read_skill_body(skills[0]["source_path"])
-        assert body is not None
-        assert "SQL injection" in body
+    def test_an_exported_folder_is_never_synced(self, project_root, registry, monkeypatch):
+        """It is a registry skill: uploading it would copy it into your org."""
+        root = self._export(project_root, registry)
+        monkeypatch.setattr(_FakeSyncRouter, "sent", [])
+        monkeypatch.setattr("decimalai.skill_router.SkillRouter", _FakeSyncRouter)
+        monkeypatch.chdir(project_root)
+        sync_to_platform("dai_sk_test", search_paths=[root])
+        assert _FakeSyncRouter.sent == []
 
     def test_version_tracking_via_hash(self, project_root):
         """Editing a skill changes its content hash (auto-versioning)."""
-        v1 = {
-            **_ids(21),
-            "name": "code-review",
-            "description": "Reviews code",
-            "body_markdown": "# V1\nCheck for bugs.",
-            "version": 1,
-        }
-        export_skills_to_disk([v1], agents=["claude-code"], scope="project", project_root=project_root)
+        skill_dir = os.path.join(project_root, ".claude/skills/code-review")
+        os.makedirs(skill_dir)
+        skill_md_path = os.path.join(skill_dir, "SKILL.md")
+        with open(skill_md_path, "w") as f:
+            f.write("---\nname: code-review\ndescription: Reviews code\n---\n\n# V1\nCheck for bugs.\n")
         s1 = discover_skills([os.path.join(project_root, ".claude/skills")], include_global=False)
-        hash_v1 = s1[0]["hash"]
 
-        # Edit skill on disk (simulating user edit)
-        skill_md_path = os.path.join(project_root, ".claude/skills/code-review/SKILL.md")
         with open(skill_md_path, "w") as f:
             f.write("---\nname: code-review\ndescription: Reviews code\n---\n\n# V2\nCheck for bugs AND security.\n")
-
         s2 = discover_skills([os.path.join(project_root, ".claude/skills")], include_global=False)
-        hash_v2 = s2[0]["hash"]
-        assert hash_v1 != hash_v2, "Hash should change when body changes"
 
-    def test_labels_roundtrip_export_discover_and_the_folder_is_never_synced(
-            self, project_root, monkeypatch):
-        """skill-type + skill-scope + invocation survive export -> disk -> discover. The
-        exported folder carries the registry's stamp, so syncing never uploads it: it is
-        a registry skill, and uploading it would copy it into your org."""
-        skill = {
-            **_ids(22),
-            "name": "house-style",
-            "description": "House style conventions",
-            "body_markdown": "# House Style\nFollow the house citation format.",
-            "version": 1,
-            "category": "writing",
-            "skill_type": "preference",
-            "skill_scope": "private",
-            "invocation": "user",
-        }
-        export_skills_to_disk(
-            [skill], agents=["claude-code"], scope="project", project_root=project_root,
-        )
-
-        # Format 1 keeps the labels in the stamp, and Claude Code's spelling of
-        # user-only invocation at the top level.
-        skill_md_path = os.path.join(project_root, ".claude/skills/house-style/SKILL.md")
-        with open(skill_md_path) as f:
-            content = f.read()
-        assert 'decimalai-skill-type: "preference"' in content
-        assert 'decimalai-skill-scope: "private"' in content
-        assert 'decimalai-invocation: "user"' in content
-        assert "disable-model-invocation: true" in content
-
-        discovered = discover_skills(
-            [os.path.join(project_root, ".claude/skills")], include_global=False,
-        )
-        assert discovered[0]["category"] == "writing"
-        assert discovered[0]["skill_type"] == "preference"
-        assert discovered[0]["skill_scope"] == "private"
-        assert discovered[0]["invocation"] == "user"
-        assert discovered[0]["managed"] is True
-
-        captured = {}
-
-        class FakeRouter:
-            def __init__(self, **kw):
-                pass
-
-            def sync_skills(self, skills, **kwargs):
-                captured["skills"] = skills
-                return {"created": 1, "updated": 0, "unchanged": 0}
-
-        monkeypatch.setattr("decimalai.skill_router.SkillRouter", FakeRouter)
-        sync_to_platform(
-            "dai_sk_test",
-            search_paths=[os.path.join(project_root, ".claude/skills")],
-        )
-        assert "skills" not in captured
+        assert s1[0]["hash"] != s2[0]["hash"], "Hash should change when body changes"
 
     def test_legacy_ondisk_skill_type_syncs_as_new_taxonomy(self, project_root, monkeypatch):
         """A legacy on-disk `skill-type: convention` (pre-split spelling) is
@@ -1111,10 +502,9 @@ class TestRoundTrip:
         assert payload["skill_type"] == "preference"
         assert payload["skill_scope"] == "public"
 
-    def test_disable_model_invocation_spelling_roundtrips(self, project_root):
+    def test_disable_model_invocation_imports_as_user_invocation(self, project_root):
         """A Claude-Code-authored `disable-model-invocation: true` (no explicit
-        `invocation` key) imports as invocation=user and re-exports with BOTH
-        spellings, so the file round-trips through either authoring tool."""
+        `invocation` key) imports as invocation=user."""
         skill_dir = os.path.join(project_root, ".claude/skills/on-demand")
         os.makedirs(skill_dir)
         with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
@@ -1129,147 +519,16 @@ class TestRoundTrip:
         )
         assert discovered[0]["invocation"] == "user"
 
-        reexported = _reconstruct_skill_md(
-            "on-demand", "Only when asked", "# On Demand\nRun only when explicitly invoked.",
-            invocation=discovered[0]["invocation"],
-        )
-        assert "invocation: user" in reexported
-        assert "disable-model-invocation: true" in reexported
-
-    def test_unlabeled_skill_roundtrips_without_new_labels(self, project_root):
-        """Absent labels stay absent through export -> discover: no defaults stamped."""
-        skill = {
-            **_ids(23),
-            "name": "plain-skill",
-            "description": "No labels",
-            "body_markdown": "# Plain\nNothing fancy here.",
-            "version": 1,
-        }
-        export_skills_to_disk(
-            [skill], agents=["claude-code"], scope="project", project_root=project_root,
-        )
-        skill_md_path = os.path.join(project_root, ".claude/skills/plain-skill/SKILL.md")
-        with open(skill_md_path) as f:
-            content = f.read()
-        assert "skill-type" not in content
-        assert "skill-scope" not in content
-        assert "decimalai-category" not in content
-        assert "disable-model-invocation" not in content
+    def test_an_unlabeled_skill_gains_no_labels(self, project_root):
+        """Absent labels stay absent through discovery: no defaults stamped."""
+        skill_dir = os.path.join(project_root, ".claude/skills/plain-skill")
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
+            f.write("---\nname: plain-skill\ndescription: No labels\n---\n\n# Plain\nNothing fancy here.\n")
 
         discovered = discover_skills(
             [os.path.join(project_root, ".claude/skills")], include_global=False,
         )
         assert discovered[0]["skill_type"] is None
         assert discovered[0]["skill_scope"] is None
-        assert discovered[0]["invocation"] == "model"   # the format records it
-
-    def test_multi_agent_symmetry(self, project_root, sample_skill):
-        """Same skill exported to multiple agents has identical content."""
-        export_skills_to_disk(
-            [sample_skill],
-            agents=["claude-code", "cursor", "windsurf"],
-            scope="project",
-            project_root=project_root,
-        )
-
-        paths = [
-            os.path.join(project_root, ".claude/skills/code-review/SKILL.md"),
-            os.path.join(project_root, ".agents/skills/code-review/SKILL.md"),
-            os.path.join(project_root, ".windsurf/skills/code-review/SKILL.md"),
-        ]
-        contents = []
-        for p in paths:
-            with open(p) as f:
-                contents.append(f.read())
-
-        assert contents[0] == contents[1] == contents[2], "All agent copies should be identical"
-
-
-# ── Pull Missing (Bidirectional Sync) ────────────────────────
-
-
-class TestPullMissing:
-    """SkillRouter.pull_missing() is `decimalai skills install`, or nothing."""
-
-    def _router(self):
-        return SkillRouter(api_key="test", base_url="http://localhost:8000")
-
-    def _listed(self, project_root, registry, *names):
-        for name in names:
-            registry.add_skill(name)
-            assert ops.add(name, no_install=True, directory=project_root).ok
-
-    def test_pull_missing_installs_what_the_manifest_lists(self, project_root, registry):
-        self._listed(project_root, registry, "code-review")
-        result = self._router().pull_missing(project_root=project_root)
-        assert result["pulled"] == 1
-        assert result["pulled_skills"] == ["code-review"]
-        assert os.path.exists(os.path.join(project_root, ".agents/skills/code-review/SKILL.md"))
-
-    def test_a_second_pull_fetches_nothing(self, project_root, registry):
-        self._listed(project_root, registry, "code-review")
-        router = self._router()
-        router.pull_missing(project_root=project_root)
-        before = len(registry.calls())
-        result = router.pull_missing(project_root=project_root)
-        assert result["pulled"] == 0 and result["skipped"] == 1
-        assert len(registry.calls()) == before
-
-    def test_a_folder_edited_by_hand_is_never_replaced(self, project_root, registry):
-        self._listed(project_root, registry, "code-review")
-        router = self._router()
-        router.pull_missing(project_root=project_root)
-        path = os.path.join(project_root, ".agents/skills/code-review/SKILL.md")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\nMy edit.\n")
-        router.pull_missing(project_root=project_root, disk_wins=False)
-        with open(path, encoding="utf-8") as f:
-            assert "My edit." in f.read()
-
-    def test_without_a_manifest_nothing_is_pulled(self, project_root, registry):
-        registry.add_skill("code-review")
-        result = self._router().pull_missing(local_skill_names=set(), agents=["claude-code"],
-                                             project_root=project_root)
-        assert result == {"pulled": 0, "updated": 0, "skipped": 0}
-        assert not os.path.exists(os.path.join(project_root, ".agents"))
-        assert registry.calls() == []
-
-    def test_a_network_failure_is_a_warning_with_the_error(self, project_root, registry, caplog):
-        """Defense in depth: callers ran this as a best-effort sync, so a failure is a
-        WARNING and the result carries the error — never an ERROR-level record."""
-        import logging
-
-        self._listed(project_root, registry, "code-review")
-        registry.fault("resolve", "connect")
-        with caplog.at_level(logging.DEBUG, logger="decimalai.skill_router"):
-            result = self._router().pull_missing(project_root=project_root)
-
-        assert result["pulled"] == 0
-        assert "could not reach the registry" in result["error"]
-        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
-        assert any(r.levelno == logging.WARNING and "pull_missing" in r.getMessage()
-                   for r in caplog.records)
-
-
-class TestNoPullOnInstall:
-    """instrument() no longer pulls platform skills to disk: no background pull, no
-    disk writer, on either adapter. (Structural: these read the source; the behaviour
-    is pinned in tests/test_router_skillpkg_shims.py.)"""
-
-    @pytest.mark.parametrize("module", ["openai_agents", "langchain"])
-    def test_instrument_has_no_pull_leg(self, module):
-        import importlib
-        import inspect
-
-        source = inspect.getsource(importlib.import_module(f"decimalai.{module}").instrument)
-        for gone in ("_pull_missing_background", "pull_missing", "export_to_disk",
-                     "should_auto_pull_to_disk", "disk_wins"):
-            assert gone not in source, gone
-
-    @pytest.mark.parametrize("module", ["openai_agents", "langchain"])
-    def test_sync_up_skips_managed_folders(self, module):
-        import importlib
-        import inspect
-
-        source = inspect.getsource(importlib.import_module(f"decimalai.{module}").instrument)
-        assert "_sync_up_items" in source
+        assert discovered[0]["invocation"] is None

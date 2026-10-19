@@ -19,10 +19,8 @@ so they observe the two effects a user actually cares about:
 The control asks for disk sync explicitly (``skill_authority="harness"``), and it
 now also pins what changed in 0.15: even asked, and even with the fake platform
 serving a skill the project does not have, no adapter writes a skill to disk.
-Registry skills reach disk only when ``decimalai skills`` runs; an explicit
-``SkillRouter.pull_missing()`` in a project with a manifest runs ``skills install``
-(``tests/test_router_skillpkg_shims.py``). What this file tests about ``enabled``
-is unchanged.
+Registry skills reach disk only when ``decimalai skills`` runs. What this file
+tests about ``enabled`` is unchanged.
 """
 from __future__ import annotations
 

@@ -15,9 +15,7 @@ import pytest
 from decimalai.skill_router import SkillRouterError
 from decimalai.skillpkg.errors import ExitCode
 from tests.fakes.fake_registry import OTHER_ORG, OWNER_ORG, FakeRegistry
-from tests.test_router_skillpkg_shims import _fresh_once_state, engine_on, no_router_http, router
-
-__all__ = ["_fresh_once_state"]
+from tests.test_router_disk_methods import engine_on, no_router_http, router
 
 BODY = "# Migration review\n\nCheck for ACCESS EXCLUSIVE locks.\n"
 FILES = ({"path": "scripts/check.py", "content": "print('lock check')\n", "executable": True},)

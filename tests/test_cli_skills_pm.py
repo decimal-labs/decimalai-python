@@ -159,11 +159,6 @@ class TestHelp:
             assert f"  {code}  " in result.output, (command, code)
         assert "--directory" in result.output
 
-    def test_deprecated_layout_flags_are_hidden_from_install(self):
-        result = CliRunner().invoke(cli, ["skills", "install", "--help"])
-        assert "--frozen" in result.output and "--offline" in result.output
-        assert "--agent" not in result.output and "--scope" not in result.output
-
 
 # ── add ────────────────────────────────────────────────────────────────────
 
@@ -364,10 +359,6 @@ class TestInstall:
         result = env.run("install", "--offline")
         assert result.exit_code == 8, result.output
 
-    def test_legacy_layout_flags_without_a_reference_are_a_usage_error(self, env):
-        result = env.run("install", "--agent", "claude-code")
-        assert result.exit_code == 2, result.output
-
 
 class TestInstallFrozen:
     def test_clean_costs_no_network_and_writes_neither_manifest_nor_lock(self, env):
@@ -457,74 +448,6 @@ class TestInstallFrozen:
         result = env.run("install", "--frozen")
         assert result.exit_code == 0, result.output
         assert "my-own" in result.output
-
-
-class TestPositionalInstallIsAdd:
-    def test_it_adds_and_makes_no_fork_call(self, env):
-        env.skill()
-        result = env.run("install", REFUND)
-        assert result.exit_code == 0, result.output
-        assert env.folder().is_dir()
-        assert env.manifest()[REFUND].spec == "latest"
-        # Only the install routes: no registry search, and no POST /registry/skills/{id}/fork,
-        # which is what the 0.14 command sent.
-        assert set(env.routes()) <= {"resolve", "bundle"}, env.routes()
-        assert not any(r.method == "POST" and r.path.endswith(("/fork", "/install"))
-                       for r in env.registry.requests)
-
-    def test_it_warns_and_names_the_fork_routes(self, env):
-        env.skill()
-        result = env.run("install", REFUND)
-        assert "deprecated" in result.stderr
-        assert f"decimalai skills add {REFUND}" in result.stderr
-        assert "router.fork()" in result.stderr
-        assert "/skills/" in result.stderr  # the dashboard, for an editable copy
-
-    def test_frozen_with_a_reference_is_a_usage_error(self, env):
-        result = env.run("install", REFUND, "--frozen")
-        assert result.exit_code == 2, result.output
-
-    def test_scope_global_is_a_usage_error_naming_pull(self, env):
-        env.skill()
-        result = env.run("install", REFUND, "--scope", "global")
-        assert result.exit_code == 2, result.output
-        assert "skills pull" in result.output and "--out ~/.claude/skills" in result.output
-        assert not env.registry.requests
-
-    def test_agent_is_ignored_with_a_warning(self, env):
-        env.skill()
-        result = env.run("install", REFUND, "--agent", "claude-code")
-        assert result.exit_code == 0, result.output
-        assert "--agent is ignored" in result.stderr
-        # The repository-root form: a relative `.agents` fails silently from a subdirectory.
-        assert 'claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"' in result.stderr
-        assert env.folder().is_dir()
-        assert not (env.dir / ".claude").exists()
-
-
-class TestExport:
-    def test_export_warns_and_adds(self, env):
-        env.skill()
-        result = env.run("export", REFUND)
-        assert result.exit_code == 0, result.output
-        assert "deprecated" in result.stderr and "decimalai skills add" in result.stderr
-        assert env.folder().is_dir()
-        assert env.manifest()[REFUND].spec == "latest"
-
-    def test_export_scope_global_is_2_and_names_pull(self, env):
-        env.skill()
-        result = env.run("export", REFUND, "--scope", "global")
-        assert result.exit_code == 2, result.output
-        assert f"decimalai skills pull {REFUND} --out ~/.claude/skills" in result.output
-        assert not env.folder().exists()
-
-    def test_export_out_is_the_project_directory(self, env, tmp_path):
-        env.skill()
-        result = CliRunner().invoke(cli, [
-            "skills", "export", REFUND, "--out", str(env.dir),
-            "--base-url", env.url, "--api-key", OWNER_KEY])
-        assert result.exit_code == 0, result.output
-        assert env.folder().is_dir()
 
 
 # ── update ─────────────────────────────────────────────────────────────────

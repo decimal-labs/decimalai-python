@@ -1006,11 +1006,6 @@ class TestModule:
     def test_migrate_is_the_package_export(self):
         assert skillpkg.migrate is migration.migrate
 
-    def test_the_agent_folders_are_the_ones_the_old_writer_used(self):
-        from decimalai.disk_export import AGENT_PATHS
-
-        assert migration.V1_AGENT_DIRS == {a: p["project"] for a, p in AGENT_PATHS.items()}
-
     def test_the_table_names_each_skill_its_claim_version_and_old_folder(
             self, tmp_path, registry, client):
         data = _fixture("fleet_v1_lock.json")

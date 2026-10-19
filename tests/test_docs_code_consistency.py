@@ -1,20 +1,19 @@
 """Consistency between what we SHIP and what we SAY about it.
 
-Four drifts this file locks down, the first three of which were live in the tree:
+Drifts this file locks down, the first two of which were live in the tree:
 
-  1. `SkillExportFileExistsError` told users to run `decimal registry
-     install --force`. There is no `decimal` binary (pyproject declares
-     exactly one console script, `decimalai`) and no `registry` command
-     group. A user following the message hits "command not found".
+  1. An error told users to run `decimal registry install --force`. There is
+     no `decimal` binary (pyproject declares exactly one console script,
+     `decimalai`) and no `registry` command group. A user following the
+     message hits "command not found".
   2. examples/demo_real_agent.py imported `decimalai.langchain.install`,
      which is a deprecation shim that emits DeprecationWarning — while the
      comment above it advertised the "NEW SDK SETUP".
   3. The CI langchain-compat matrix pinned a langchain-core floor
      (0.3.84) that `pip install -e ".[dev]"` can no longer resolve,
      because the pyproject extra floors it at 1.3.0.
-  4. The deprecated disk verbs (SkillRouter.export_to_disk/install/pull_missing,
-     disk_export.export_*) tell the user what to run instead. Every command and
-     function those messages name must exist, or the replacement is a dead end.
+  4. Every `decimalai skills <verb>` and `decimalai.skillpkg.<fn>()` the SDK's
+     messages and docstrings name must exist, or the advice is a dead end.
 
 These are cheap string/AST assertions on purpose: they cost nothing to run
 and they catch the class of bug where the code moves and the prose doesn't.
@@ -40,30 +39,12 @@ def _console_scripts() -> list[str]:
     return re.findall(r"^([A-Za-z0-9_.-]+)\s*=", block.group(1), re.MULTILINE)
 
 
-# ── 1. The overwrite error names a command that actually exists ──────
+# ── 1. The SDK has exactly one console script ──────────────────────
 
 
-def test_overwrite_error_names_a_real_console_script():
-    from decimalai.disk_export import SkillExportFileExistsError
-
-    msg = str(SkillExportFileExistsError("/tmp/x/SKILL.md"))
-    scripts = _console_scripts()
-    assert scripts == ["decimalai"], (
-        f"expected exactly one console script `decimalai`; got {scripts}. "
-        "If this changed deliberately, update the user-facing strings too."
-    )
-    # The message shows an example invocation; it must use the real binary.
-    example = re.search(r"\(e\.g\., ([^)]+)\)", msg)
-    assert example, f"no `(e.g., ...)` example in the message: {msg!r}"
-    argv0 = example.group(1).split()[0]
-    assert argv0 in scripts, (
-        f"error message tells the user to run {argv0!r}, which is not a "
-        f"declared console script ({scripts}); message={msg!r}"
-    )
-    # `registry` was never a command group — `skills` is.
-    assert "registry install" not in msg, (
-        f"message names the non-existent `registry` command group: {msg!r}"
-    )
+def test_the_one_console_script_is_decimalai():
+    """Messages tell users to run `decimalai ...`; there is no other binary."""
+    assert _console_scripts() == ["decimalai"]
 
 
 # ── 2. Examples use instrument(), not the deprecated install() shim ──
@@ -126,29 +107,26 @@ def test_ci_langchain_matrix_tests_the_declared_floor():
     assert "latest" in matrix, f"CI matrix should also test `latest`; got {matrix}"
 
 
-# ── 4. The disk shims name commands and functions that exist ─────────
+# ── 4. The SDK names commands and functions that exist ──────────────
 
 #: The `decimalai skills` verbs of the package manager.
-SKILLS_VERBS = {"add", "install", "update", "remove", "status", "verify", "migrate", "pull"}
+SKILLS_VERBS = {"add", "install", "update", "remove", "status", "verify", "migrate", "pull",
+                "list", "sync", "scan", "review", "benchmark", "push"}
 
 
-def _shim_sources() -> str:
-    return "".join((REPO_ROOT / "decimalai" / name).read_text(encoding="utf-8")
-                   for name in ("skill_router.py", "disk_export.py"))
+def _sdk_sources() -> str:
+    return "".join(path.read_text(encoding="utf-8")
+                   for path in sorted((REPO_ROOT / "decimalai").rglob("*.py")))
 
 
-def test_disk_shims_name_real_skills_verbs():
-    named = set(re.findall(r"`decimalai skills ([a-z-]+)", _shim_sources()))
-    assert {"add", "install", "update", "pull"} <= named, named
+def test_messages_name_real_skills_verbs():
+    named = set(re.findall(r"`decimalai skills ([a-z][a-z-]*)", _sdk_sources()))
+    assert {"add", "install", "update", "migrate"} <= named, named
     assert named <= SKILLS_VERBS, named - SKILLS_VERBS
 
 
-def test_disk_shims_name_real_python_functions():
-    import decimalai
+def test_messages_name_real_python_functions():
     from decimalai import skillpkg
 
-    src = _shim_sources()
-    for name in set(re.findall(r"decimalai\.skillpkg\.(\w+)\(", src)):
-        assert callable(getattr(skillpkg, name)), name
-    for name in set(re.findall(r"decimalai\.(\w+)\(\)", src)) - {"skillpkg"}:
-        assert callable(getattr(decimalai, name)), name
+    for name in set(re.findall(r"decimalai\.skillpkg\.(\w+)\(", _sdk_sources())):
+        assert callable(getattr(skillpkg, name, None)), name

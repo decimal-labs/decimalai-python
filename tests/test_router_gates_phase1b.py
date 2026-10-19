@@ -413,11 +413,11 @@ class TestFetchesOutsideARunAreUnchanged:
         router.get_skill_body_record("tone-guide")
         assert "routing_id" not in _params(platform.body_calls("tone-guide")[0])
 
-    def test_disk_export_makes_no_body_call_even_after_a_routed_run(self, monkeypatch, tmp_path):
+    def test_export_makes_no_body_call_even_after_a_routed_run(self, monkeypatch, tmp_path):
         """No `/body` request, so no routing decision to name: the export is the
         package manager's, through its own resolve and bundle routes."""
         from tests.fakes.fake_registry import FakeRegistry
-        from tests.test_router_skillpkg_shims import engine_on
+        from tests.test_router_disk_methods import engine_on
 
         platform = _install(monkeypatch, FakePlatform())
         registry = FakeRegistry(keys={"dai_sk_test": "org-test"})
@@ -513,7 +513,7 @@ class TestPerSkillPathsAreEncoded:
         """The attachments arrive in the bundle, hashed; the per-id attachment routes
         (owned, then public registry) the export once walked are not called."""
         from tests.fakes.fake_registry import FakeRegistry
-        from tests.test_router_skillpkg_shims import engine_on
+        from tests.test_router_disk_methods import engine_on
 
         platform = _install(monkeypatch, FakePlatform())
         registry = FakeRegistry(keys={"dai_sk_test": "org-test"})

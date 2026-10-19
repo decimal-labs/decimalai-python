@@ -1743,10 +1743,6 @@ def instrument(
     # — router-authoritative installs (loader active) default to NOT reading
     # local skills, so the router is the one source of skills in the prompt.
     # An explicit disk_sync=... always wins.
-    # Asking for skills on disk (disk_sync=True, or the harness authority) used to
-    # mirror every platform skill here; it writes nothing now, so say so once.
-    from .skill_router import _note_disk_sync_writes_nothing
-    _note_disk_sync_writes_nothing(disk_sync)
     if disk_sync is None:
         try:
             from ._config import _get_config

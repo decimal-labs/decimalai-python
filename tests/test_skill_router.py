@@ -353,8 +353,7 @@ class TestSkillRouterAnalytics:
         assert snap is None
 
     def test_preview_does_not_call_install_endpoint(self):
-        """Critical contract: preview must NEVER POST to /install — that would fork.
-        Guardrail against accidental coupling to install_skill()."""
+        """Critical contract: preview must NEVER POST to /install — that would fork."""
         router = self._router()
         with patch.object(
             router, "_request",
@@ -369,19 +368,6 @@ class TestSkillRouterAnalytics:
             assert method == "GET", f"preview issued a non-GET: {method} {url}"
             assert url.startswith("/api/v1/registry/skills"), f"unexpected URL: {url}"
             assert "/install" not in url, f"preview must never POST /install — saw {url}"
-
-    def test_pull_skill_alias_warns_and_delegates(self):
-        """`pull_skill` is a deprecated alias for `preview`."""
-        import warnings as _w
-        router = self._router()
-        with patch.object(router, "preview", return_value={"name": "pdf"}) as mock_prev:
-            with _w.catch_warnings(record=True) as caught:
-                _w.simplefilter("always")
-                out = router.pull_skill("pdf")
-        mock_prev.assert_called_once_with("pdf")
-        assert out == {"name": "pdf"}
-        assert any(issubclass(w.category, DeprecationWarning) for w in caught), \
-            "pull_skill() should emit DeprecationWarning"
 
 
 class TestSkillRouterInjectBody:

@@ -218,12 +218,12 @@ class TestInTurnBodyFetchIsAHotPath:
         assert st.healthy is False
         assert st.timeouts == 1
 
-    def test_disk_export_makes_no_body_call(self, monkeypatch, tmp_path):
+    def test_export_makes_no_body_call(self, monkeypatch, tmp_path):
         """Export is `decimalai skills add`: the engine's own client and routes, so no
         `/body` request, no hot-path budget, and nothing that could open the breaker
         agents depend on."""
         from tests.fakes.fake_registry import FakeRegistry
-        from tests.test_router_skillpkg_shims import engine_on
+        from tests.test_router_disk_methods import engine_on
 
         platform = FakePlatform()
         monkeypatch.setattr(httpx, "request", platform)
@@ -641,7 +641,7 @@ class TestSkillNameIsUrlEncoded:
         """Export reads no per-skill path at all: the name travels in the resolve
         request's JSON body, exactly as given."""
         from tests.fakes.fake_registry import FakeRegistry
-        from tests.test_router_skillpkg_shims import engine_on
+        from tests.test_router_disk_methods import engine_on
 
         platform = FakePlatform(bodies={"weird#name": BODY})
         monkeypatch.setattr(httpx, "request", platform)

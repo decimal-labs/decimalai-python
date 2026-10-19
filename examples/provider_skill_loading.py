@@ -1,8 +1,8 @@
 """DecimalAI Provider-Specific Skill Loading Example
 
-Demonstrates the ``install(enable_skill_loader=True)`` option across
+Demonstrates the ``instrument(enable_skill_loader=True)`` option across
 different LLM provider integrations, and how the ``load_skill`` tool is
-controlled: it is NOT an ``install()`` flag on the tool-loop adapters —
+controlled: it is NOT an ``instrument()`` flag on the tool-loop adapters —
 it registers automatically with the loader and is config-driven via
 ``decimalai.init(load_skill_tool=...)`` / ``DECIMALAI_LOAD_SKILL_TOOL``.
 
@@ -40,10 +40,10 @@ def example_anthropic_skill_loader():
     try:
         import anthropic
 
-        from decimalai.anthropic import install, skill_system
+        from decimalai.anthropic import instrument, skill_system
 
-        # Install skill loader — skills will auto-inject into system prompts
-        install(enable_skill_loader=True)
+        # Turn on the skill loader — skills will auto-inject into system prompts
+        instrument(enable_skill_loader=True)
 
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -119,7 +119,7 @@ async def example_pydantic_ai_skill_loading():
     The enable_skill_loader=True option:
     1. Registers a system prompt function that injects skills
     2. Registers a load_skill tool on each Agent (automatic — controlled by
-       init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL, not an install() flag)
+       init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL, not an instrument() flag)
 
     Skills are injected before every agent.run() call, and the model can
     call load_skill to fetch full skill bodies.
@@ -134,10 +134,10 @@ async def example_pydantic_ai_skill_loading():
     try:
         from pydantic_ai import Agent
 
-        from decimalai.pydantic_ai import install
+        from decimalai.pydantic_ai import instrument
 
-        # Install skill loader — this patches Agent.__init__
-        install(enable_skill_loader=True)
+        # Turn on the skill loader — this patches Agent.__init__
+        instrument(enable_skill_loader=True)
 
         # Every new Agent will have:
         # 1. A system_prompt function that injects skills
@@ -200,7 +200,7 @@ def main():
     print("DecimalAI Provider-Specific Skill Loading Examples")
     print("="*70)
     print("\nThis script demonstrates the provider skill-loading options:")
-    print("  - install(enable_skill_loader=True): Auto-inject skills into prompts")
+    print("  - instrument(enable_skill_loader=True): Auto-inject skills into prompts")
     print("  - load_skill tool: auto-registered with the loader on pydantic_ai;")
     print("    config-driven via init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL")
     print("  - OpenAI Agents SDK: decimalai.openai_agents.load_agent(name)")
@@ -238,8 +238,8 @@ def main():
 Provider-specific options summary:
 
 1. ANTHROPIC SDK (decimalai.anthropic)
-   - install(enable_skill_loader=True) → skills injected into system prompts
-   - load_skill tool: NOT available. install() accepts an
+   - instrument(enable_skill_loader=True) → skills injected into system prompts
+   - load_skill tool: NOT available. instrument() accepts an
      enable_load_skill_tool parameter but it is dormant — there is no tool
      loop to route the result back, so passing True only logs a warning and
      stays on prompt injection.
@@ -250,9 +250,9 @@ Provider-specific options summary:
      Nothing is installed or patched for this framework.
 
 3. PYDANTIC AI (decimalai.pydantic_ai)
-   - install(enable_skill_loader=True) → skills injected into system_prompt
+   - instrument(enable_skill_loader=True) → skills injected into system_prompt
      AND the load_skill tool registers automatically (same config switch,
-     also not an install() parameter).
+     also not an instrument() parameter).
 
 For more information:
   📖 DecimalAI Skills: https://docs.decimal.ai/guides/skills

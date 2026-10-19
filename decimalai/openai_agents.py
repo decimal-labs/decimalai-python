@@ -1212,10 +1212,7 @@ def instrument(
     # An OpenAI agent's skills come from DecimalAI's router, through load_agent(),
     # so "auto" is router authority: local SKILL.md files are read only when asked
     # (disk_sync=True, skill_dirs=, or the harness authority). An explicit
-    # disk_sync=... always wins. Asking for skills on disk used to mirror every
-    # platform skill here; it writes nothing now, so say so once.
-    from .skill_router import _note_disk_sync_writes_nothing
-    _note_disk_sync_writes_nothing(disk_sync)
+    # disk_sync=... always wins.
     if disk_sync is None:
         if skill_dirs:
             disk_sync = True

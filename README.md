@@ -143,7 +143,7 @@ the menu holds before every model call. `{{placeholders}}` in the prompt are fil
 `Runner.run(..., context=...)`; a missing value stops the run before the model call. Nothing in the
 OpenAI SDK is patched and other agents in the process are untouched. Each run is traced with its
 prompt version and the skills offered, loaded and delivered. `init(openai_agents=True)` (or
-`instrument()`) traces runs and changes no agent; since 0.18 it no longer delivers skills.
+`instrument()`) traces runs and changes no agent; skills come only from `load_agent()`.
 
 `init(langchain=True)`, `init(adk=True)` and `init(crewai=True)` install the same thing as that adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both.
 
@@ -176,7 +176,7 @@ export DECIMAL_AUTO_TRACE=langchain   # or "openai-agents", "adk", "crewai", "ll
 python app.py
 ```
 
-`DECIMAL_AUTO_TRACE=<framework>` runs the matching `decimalai.init()` framework flag at import. On `langchain`, `openai-agents`, `adk` and `crewai` that includes the skill loader: each turn's message (on CrewAI, the task description) goes to the platform's router, and a skills menu (plus, on the injecting adapters, a skill body) is added to the prompt. Through 0.13.9 this path was tracing only. `DECIMALAI_SKILLS=0` (or `false`/`no`/`off`) keeps it to tracing; it is the default of `init(skills=...)`, so it applies to the flags in code too, and an explicit `skills=` argument wins over it.
+`DECIMAL_AUTO_TRACE=<framework>` runs the matching `decimalai.init()` framework flag at import. On `langchain`, `adk` and `crewai` that includes the skill loader: each turn's message (on CrewAI, the task description) goes to the platform's router, and a skills menu (plus a skill body) is added to the prompt. `openai-agents` traces only; an OpenAI agent gets its skills from `load_agent()`. `DECIMALAI_SKILLS=0` (or `false`/`no`/`off`) keeps it to tracing; it is the default of `init(skills=...)`, so it applies to the flags in code too, and an explicit `skills=` argument wins over it.
 
 ## What It Does
 
@@ -290,7 +290,7 @@ options = ClaudeAgentOptions(plugins=[skills_plugin()])
 
 The other seven have one too: `decimalai.adk.skills()`, `decimalai.crewai.skills()` (plus `skill_tools()`, the resource reader and script runner CrewAI lacks), `decimalai.openai_agents.sandbox_skills()`, `decimalai.deepagents.skills()`, `decimalai.agent_framework.skills()`, `decimalai.pydantic_ai_harness.skills()` and `decimalai.strands.skills()`; import the module first. The skill router stays out of an agent whose own loader serves its skills. Each framework's setup, and which loaders keep serving the old version after `decimalai skills update`, is in [Native Skill Loaders](https://docs.decimal.ai/guides/native-skill-loaders). From the Claude Code CLI: `claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"`. `decimalai.skills_dir()` (or `skills_dir(relative_to=...)`) gives the folder itself.
 
-No adapter writes skills to disk on its own. Upgrading from 0.14: run `decimalai skills migrate` once in a project whose `.decimal/skills.lock` 0.14 wrote. `decimalai skills export`, `decimalai skills install <name>`, `SkillRouter.install()`, `SkillRouter.pull_missing()` and the `disk_export` writers are deprecated wrappers of these commands (`install` no longer forks) and stop working in 0.17; see the [changelog](https://github.com/decimal-labs/decimalai-python/blob/main/CHANGELOG.md).
+No adapter writes skills to disk on its own: `decimalai skills add` (or `router.export(name)`) is the one way a registry skill gets there. A project whose `.decimal/skills.lock` decimalai 0.14 wrote is refused until you run `decimalai skills migrate` in it once.
 
 ### Skill Delivery at Runtime (`enable_skill_loader`)
 

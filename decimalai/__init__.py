@@ -1169,12 +1169,11 @@ def init(
     _self._global_client = _cfg._client
 
     # Framework auto-install is gated on `enabled`. This is the kill switch:
-    # an adapter's instrument() is not a passive no-op — it monkey-patches the
-    # framework, calls the DecimalAI API to sync/pull skills, and writes skill
-    # files into the caller's working tree. Running any of that after the
-    # caller said enabled=False is exactly the behaviour the flag exists to
-    # prevent, so the whole block is skipped: no adapter installed, no HTTP
-    # call, nothing written to disk.
+    # an adapter's instrument() is not a passive no-op — it patches the
+    # framework and calls the DecimalAI API to register the agent and sync the
+    # skills you wrote. Running any of that after the caller said enabled=False
+    # is exactly the behaviour the flag exists to prevent, so the whole block is
+    # skipped: no adapter installed, no HTTP call, nothing written to disk.
     if not enabled:
         if langchain or openai_agents or adk or llamaindex or claude_agent_sdk \
                 or otel or crewai or autogen:
@@ -1184,9 +1183,7 @@ def init(
             )
     else:
         # The flag form is what the quickstart teaches, so it installs what the
-        # agent needs: tracing AND the skill loader. Through 0.13.9 it called
-        # instrument() with the loader off, and a user who followed the docs got
-        # good traces and zero skills, with nothing saying so. `skills=False` is
+        # agent needs: tracing AND the skill loader. `skills=False` is
         # the tracing-only install, and so is `DECIMALAI_SKILLS=0` when the
         # argument is left unset — the opt-out for `DECIMAL_AUTO_TRACE`, which
         # calls these flags with no `init()` line anyone could add it to.

@@ -17,9 +17,7 @@ every change and notice the engine returns, and exits with the engine's document
 (:data:`decimalai.skillpkg.errors.EXIT_CODE_MEANINGS`). The engine is imported only when a
 command runs, so ``decimalai --help`` loads none of it.
 
-The 0.14 verbs still work, with a warning: ``skills export <ref>`` and the positional
-``skills install <ref>`` are ``skills add``, which no longer forks the skill. They stop
-working in 0.18. ``skills status DIR`` stays: it prints the authored section for DIR alone.
+``skills status DIR`` prints the authored section for DIR alone.
 """
 from __future__ import annotations
 
@@ -59,7 +57,7 @@ _CLUTTER_DIRS = ("__pycache__",)
 def register(group: click.Group) -> None:
     """Add the package-manager commands to the ``skills`` group."""
     for command in (skills_add, skills_install, skills_update, skills_remove, skills_status,
-                    skills_verify, skills_migrate, skills_pull, skills_export):
+                    skills_verify, skills_migrate, skills_pull):
         group.add_command(command)
 
 
@@ -220,7 +218,6 @@ def _add(ref: str, *, yes: bool, force: bool, no_install: bool, directory: Optio
 
 
 @click.command("install", epilog=_EXIT_CODES)
-@click.argument("ref", required=False)
 @click.option("--frozen", is_flag=True, default=False,
               help="CI and Docker: install exactly what .decimal/skills.lock records. "
                    "Nothing is resolved, and the manifest and the lock are never written.")
@@ -230,19 +227,15 @@ def _add(ref: str, *, yes: bool, force: bool, no_install: bool, directory: Optio
               help="Replace folders with local edits by their locked files; each is "
                    "copied to .decimal/backup/ first.")
 @_yes_option
-@click.option("--agent", "agents", multiple=True, hidden=True)   # 0.14, ignored
-@click.option("--scope", type=click.Choice(["project", "global"]), default=None, hidden=True)
-@click.option("--out", "out_dir", default=None, hidden=True)     # 0.14: the project root
 @_directory_option
 @_registry_options
-def skills_install(ref, frozen, offline, force, yes, agents, scope, out_dir, directory,
-                   api_key, base_url, project):
+def skills_install(frozen, offline, force, yes, directory, api_key, base_url, project):
     """Make .agents/skills match the manifest and the lock.
 
     New entries of .decimal/skills.toml are resolved and installed, entries it no longer
     lists are removed, and missing folders are fetched at their locked version. A version
     is never moved: that is `decimalai skills update`. When every folder matches the lock
-    nothing is fetched.
+    nothing is fetched. To add a skill, run `decimalai skills add <ref>`.
 
     With --frozen (CI and Docker) the lock must agree with the manifest; missing folders
     are fetched by their exact lock entry and every byte is checked against it.
@@ -253,51 +246,13 @@ def skills_install(ref, frozen, offline, force, yes, agents, scope, out_dir, dir
         $ decimalai skills install --frozen          # in CI, or a Dockerfile
         $ decimalai skills install --frozen --offline
     """
-    if ref is None:
-        if agents or scope or out_dir:
-            raise click.UsageError(
-                "--agent, --scope and --out belong to `decimalai skills install <ref>`, "
-                "which is now `decimalai skills add <ref>`")
-        from .. import skillpkg
+    from .. import skillpkg
 
-        result = skillpkg.install(frozen=frozen, force=force, offline=offline, yes=yes,
-                                  directory=directory, api_key=api_key or None,
-                                  base_url=base_url, **_gate())
-        _print_result(result, nothing="every skill matches the lock; up to date")
-        _exit(result)
-
-    if frozen or offline:
-        raise click.UsageError(
-            "`decimalai skills install <ref>` adds a skill; --frozen and --offline install "
-            "the lock as it is. Run `decimalai skills add <ref>`, then "
-            "`decimalai skills install --frozen` with no reference.")
-    from .main import _dashboard_url
-
-    word = shlex.quote(ref)
-    click.echo(f"  ⚠ `decimalai skills install <ref>` is deprecated and stops working in "
-               f"0.18: run `decimalai skills add {word}`.", err=True)
-    click.echo("    It no longer forks the skill into your workspace. For an editable copy, "
-               "fork it with `router.fork()` or in the dashboard: "
-               f"{_dashboard_url(base_url)}/skills/{urllib.parse.quote(ref, safe='/')}",
-               err=True)
-    _legacy_layout(ref, agents, scope)
-    _add(ref, yes=yes, force=force, no_install=False, directory=directory or out_dir,
-         api_key=api_key, base_url=base_url)
-
-
-def _legacy_layout(ref: str, agents: Tuple[str, ...], scope: Optional[str]) -> None:
-    """The 0.14 ``--agent`` and ``--scope`` flags: one root now, inside the project."""
-    if scope == "global":
-        click.echo(
-            "  ✗ --scope global is gone: a project has one skills root, .agents/skills. For a "
-            "copy in your home directory, run "
-            f"`decimalai skills pull {shlex.quote(ref)} --out ~/.claude/skills`", err=True)
-        raise SystemExit(int(ExitCode.USAGE))
-    if agents:
-        click.echo(
-            "  ⚠ --agent is ignored: there is one root, .agents/skills, for every agent "
-            "(Claude Code loads it with "
-            '`claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"`)', err=True)
+    result = skillpkg.install(frozen=frozen, force=force, offline=offline, yes=yes,
+                              directory=directory, api_key=api_key or None,
+                              base_url=base_url, **_gate())
+    _print_result(result, nothing="every skill matches the lock; up to date")
+    _exit(result)
 
 
 # ── update ──────────────────────────────────────────────────────────────────
@@ -874,30 +829,3 @@ def _print_quality(url: str) -> None:
             efficiency.append(f"{'+' if value >= 0 else ''}{value:.0f}% {label}")
     if efficiency:
         click.echo(f"\n  Efficiency vs no skill: {' · '.join(efficiency)}")
-
-
-# ── export (deprecated) ─────────────────────────────────────────────────────
-
-
-@click.command("export", epilog=_EXIT_CODES)
-@click.argument("ref")
-@click.option("--agent", "agents", multiple=True, help="(deprecated, ignored: one root for every agent)")
-@click.option("--scope", type=click.Choice(["project", "global"]), default=None,
-              help="(deprecated) --scope global is refused; use `skills pull --out`.")
-@click.option("--out", "out_dir", default=None, help="(deprecated) the project directory; use --directory.")
-@_yes_option
-@click.option("--force", is_flag=True, default=False,
-              help="Replace an unmanaged folder that already uses the skill's name.")
-@_directory_option
-@_registry_options
-def skills_export(ref, agents, scope, out_dir, yes, force, directory, api_key, base_url, project):
-    """Deprecated: `decimalai skills add` does this now.
-
-    Adds the skill to the project as `decimalai skills add REF` does. Stops working in
-    0.18.
-    """
-    click.echo("  ⚠ `decimalai skills export` is deprecated and stops working in 0.18: run "
-               f"`decimalai skills add {shlex.quote(ref)}`", err=True)
-    _legacy_layout(ref, agents, scope)
-    _add(ref, yes=yes, force=force, no_install=False, directory=directory or out_dir,
-         api_key=api_key, base_url=base_url)

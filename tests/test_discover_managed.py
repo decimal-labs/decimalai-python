@@ -20,7 +20,7 @@ import pytest
 from skillevaluation import skillfmt
 
 from decimalai import skills as sk
-from decimalai.disk_export import AGENT_PATHS
+from decimalai.skillpkg.migration import V1_AGENT_DIRS
 from decimalai.skills import (
     DEFAULT_SKILL_PATHS,
     discover_skills,
@@ -129,8 +129,8 @@ class TestStamp:
 
 class TestSearchPaths:
     def test_default_paths_cover_every_agent_project_dir(self):
-        """Every project directory an export can write to is one discovery reads."""
-        project_dirs = {paths["project"] for paths in AGENT_PATHS.values()}
+        """Every project folder a 0.14 SDK wrote skills to is one discovery reads."""
+        project_dirs = set(V1_AGENT_DIRS.values())
         assert project_dirs <= set(DEFAULT_SKILL_PATHS), sorted(
             project_dirs - set(DEFAULT_SKILL_PATHS)
         )

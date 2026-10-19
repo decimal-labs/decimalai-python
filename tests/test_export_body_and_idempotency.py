@@ -5,9 +5,9 @@ Two ways an install once reported success and left the user with nothing:
 * an empty body: the export read a route that served no ``body_markdown`` and wrote a
   SKILL.md around nothing. Now the registry renders the folder and refuses a skill
   with no body (``render_invalid``), so the export fails loudly and writes nothing;
-* a skipped export: ``install()`` forked first, and a fork 409 ("already forked")
-  skipped the disk write. ``install()`` no longer forks, so there is no 409 to read;
-  re-running it, or ``export()``, leaves the installed folder as it is.
+* a skipped export: the old ``install()`` forked first, and a fork 409 ("already
+  forked") skipped the disk write. ``export()`` never forks, so there is no 409 to
+  read; re-running it leaves the installed folder as it is.
 """
 
 from __future__ import annotations
@@ -20,9 +20,7 @@ import pytest
 from decimalai.skill_router import SkillRouter, SkillRouterError
 from decimalai.skillpkg.errors import ExitCode
 from tests.fakes.fake_registry import OWNER_ORG, FakeRegistry
-from tests.test_router_skillpkg_shims import _fresh_once_state, engine_on, no_router_http, router
-
-__all__ = ["_fresh_once_state"]
+from tests.test_router_disk_methods import engine_on, no_router_http, router
 
 
 def _read_skill_md(root, dirname: str) -> str:
@@ -67,29 +65,22 @@ class TestTheBodyIsTheRegistrys:
         assert ei.value.result.exit_code == ExitCode.UNAVAILABLE
         assert not os.path.exists(tmp_path / ".agents" / "skills" / "pdf" / "SKILL.md")
 
-    def test_partial_failure_writes_good_and_reports_bad(self, tmp_path, registry):
-        registry.add_skill("good", body="# Good body\n")
-        summary = router().export_to_disk(skills=["good", "bad"], project_root=str(tmp_path))
-        assert summary["skills_written"] == 1
-        assert [e["skill"] for e in summary["errors"]] == ["bad"]
-        assert "# Good body" in _read_skill_md(tmp_path, "good")
-
 
 # ── re-running converges ────────────────────────────────────
 
 
-class TestInstallConverges:
-    def test_a_second_install_leaves_the_folder_and_reports_it_installed(self, tmp_path, registry):
+class TestExportConverges:
+    def test_a_second_export_leaves_the_folder_and_reports_it_installed(self, tmp_path, registry):
         registry.add_skill("pdf")
         r = router()
-        first = r.install("pdf", project_root=str(tmp_path))
+        first = r.export("pdf", project_root=str(tmp_path))
         before = _read_skill_md(tmp_path, "pdf")
 
-        second = r.install("pdf", project_root=str(tmp_path))
+        second = r.export("pdf", project_root=str(tmp_path))
 
-        assert first["export"]["skills_written"] == 1
-        assert second["export"]["skills_written"] == 0
-        assert second["skill_name"] == "pdf" and second["export"]["errors"] == []
+        assert first["skills_written"] == 1
+        assert second["skills_written"] == 0
+        assert second["skill_name"] == "pdf" and second["errors"] == []
         assert _read_skill_md(tmp_path, "pdf") == before
 
     def test_a_hand_written_folder_of_that_name_is_not_overwritten(self, tmp_path, registry):

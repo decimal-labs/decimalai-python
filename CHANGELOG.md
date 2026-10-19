@@ -22,9 +22,9 @@ and patch releases are fixes.
   `Agent.get_all_tools`, `agents.run_internal.turn_resolution.check_for_final_output_from_tools`
   and the sandbox `Skills.load_skill` / `Skills.instructions`. They gave every agent in the
   process skills and relied on SDK internals that may change in any patch release.
-- `init(openai_agents=True)` and `instrument()` now trace only. `instrument(enable_skill_loader=True)`
-  and `init(openai_agents=True, skills=True)` raise with the migration below; with `skills` left
-  at its default, `init(openai_agents=True)` warns once.
+- `init(openai_agents=True)` and `instrument()` now trace only. `openai_agents.instrument()` no
+  longer takes `enable_skill_loader`, and `init()`'s `skills=` applies to the `langchain`, `adk`
+  and `crewai` flags only.
 - DecimalAI's skills turn off for one agent, with one warning, when its `tool_use_behavior`
   is `"stop_on_first_tool"` (a skill's text would become the answer), it loads skills with the
   sandbox `Skills` capability, it has another tool named `load_skill`, or its instructions are
@@ -34,9 +34,9 @@ and patch releases are fixes.
   the instructions instead (`inject_skill_body`, which defaults to on once the tool is off).
 - `init(enabled=False)` after `load_agent()` stops routing and skills for that config; the
   prompt it read keeps running.
-- `init(openai_agents=True)` still leaves local `SKILL.md` files unread and un-uploaded, as
-  when it turned the loader on; `skills=False`, the harness skill authority and a direct
-  `instrument()` read them as before.
+- `init(openai_agents=True)` and `instrument()` read the project's own `SKILL.md` files (and
+  sync the ones you wrote) only when asked: `disk_sync=True`, `skill_dirs=`, or the harness
+  skill authority.
 - `sandbox_skills()` still records what it lists and loads, in its own `Skills` subclass; a
   plain `Skills(...)` is no longer observed.
 - `decimalai init --framework openai-agents` writes the new shape.
@@ -55,6 +55,34 @@ support = load_agent("support", fallback=BASE_INSTRUCTIONS)
 agent = Agent(name=support.name, instructions=support.instructions,
               tools=[lookup_order, *support.tools])
 ```
+
+### Removed (breaking): what only existed to ease the move from older releases
+
+- **`install()`**, the deprecated alias of `instrument()`, in all nine framework modules
+  (`adk`, `anthropic`, `autogen`, `claude_agent_sdk`, `langchain`, `llamaindex`,
+  `openai_agents`, `otel`, `pydantic_ai`). Call `instrument()`.
+- **The 0.14 disk verbs**, deprecated since 0.15. There is one way a registry skill reaches
+  disk: `decimalai skills add` (`router.export(name)` in Python).
+
+  | removed | use |
+  |---|---|
+  | `decimalai skills export <ref>`, `decimalai skills install <ref>` | `decimalai skills add <ref>` |
+  | `SkillRouter.install()`, `install_skill()`, `export_to_disk()` | `router.export(name)` |
+  | `SkillRouter.pull_missing()` | `decimalai skills install` |
+  | `SkillRouter.pull_skill()` | `router.preview(name)` |
+  | `export(agents=..., scope=...)` | nothing: there is one root, `.agents/skills` |
+  | `decimalai.disk_export` (`export_skill_to_disk()`, `export_skills_to_disk()`, `AGENT_PATHS`) | `decimalai skills add` |
+
+  `decimalai skills install` with no name is unchanged; its hidden 0.14 options `--agent`,
+  `--scope` and `--out` are gone.
+- **The version 1 lock fallback.** `router.export()` and `router.update_skills()` refuse a
+  project whose `.decimal/skills.lock` decimalai 0.14 wrote, as every `decimalai skills`
+  command already did, and name the fix: run `decimalai skills migrate` once.
+- `SkillRouter.search_registry`, a second name for `search()`.
+- `skill_router.should_auto_pull_to_disk()`, which nothing called, and the one-time warning
+  that `instrument(disk_sync=True)` no longer writes skills to disk. `disk_sync` decides
+  whether the project's own `SKILL.md` files are read and synced; it never wrote registry
+  skills in 0.15 or later.
 
 ## [0.17.0] — 2026-10-19
 

@@ -1119,7 +1119,7 @@ def skills():
     pass
 
 
-# add, install, update, remove, status, verify, migrate, pull and the deprecated export.
+# add, install, update, remove, status, verify, migrate and pull.
 skills_pm.register(skills)
 
 
@@ -1417,27 +1417,20 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
                 # Backend pulled a skill we don't have locally; create
                 # <skills_dir>/<name>/SKILL.md.
                 #
-                # `name` is SERVER-supplied, so it goes through the same guard the
-                # pull path uses (see `_safe_skill_dirname` below, and the
-                # path-traversal rationale in disk_export.py). Without it this line wrote
+                # `name` is SERVER-supplied, so it goes through the traversal guard
+                # (`decimalai._safe_paths`). Without it this line wrote
                 # `base / name / SKILL.md` unchecked — a traversal or a namespaced
                 # `owner/skill` name silently nested a directory outside the
                 # intended layout. Skip the item rather than abort the whole sync;
                 # one bad row must not strand the other pulled results.
-                from ..disk_export import (
-                    SkillExportUnsafePathError,
-                    _safe_skill_dirname,
-                )
+                from .._safe_paths import UnsafeSkillPathError, safe_skill_dirname
 
                 try:
                     # url_slug first — a namespaced name is a legitimate identity
-                    # that simply cannot be a directory component (see the pull
-                    # path and disk_export). Falls back to `name` for older
-                    # backends, where it behaves exactly as before.
-                    safe_name = _safe_skill_dirname(
-                        item.get("url_slug") or name or ""
-                    )
-                except SkillExportUnsafePathError as e:
+                    # that simply cannot be a directory component. Falls back to
+                    # `name` for older backends, where it behaves exactly as before.
+                    safe_name = safe_skill_dirname(item.get("url_slug") or name or "")
+                except UnsafeSkillPathError as e:
                     click.echo(f"    ✗ {name}: {e}", err=True)
                     continue
                 target = base / safe_name / "SKILL.md"

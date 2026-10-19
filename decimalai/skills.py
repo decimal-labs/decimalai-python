@@ -45,8 +45,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("decimalai.skills")
 
 # Default scan paths for SKILL.md auto-discovery, relative to the project root.
-# Covers the project directory of every agent runtime in `disk_export.AGENT_PATHS`
-# (a test keeps the two in step). Deduplicated — many agents share `.agents/skills/`.
+# Covers the project directory every agent runtime reads SKILL.md files from.
+# Deduplicated — many agents share `.agents/skills/`.
 DEFAULT_SKILL_PATHS = [
     # Primary agent skill directories
     ".agents/skills",          # universal, cursor, copilot, cline, warp, etc.; the managed root

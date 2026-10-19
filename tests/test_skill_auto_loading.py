@@ -79,21 +79,31 @@ def in_tmp_project(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_sdk():
-    """Reset global SDK state before each test."""
+def _reset_sdk(monkeypatch):
+    """Reset global SDK state before each test, and put it back after.
+
+    The background sender is a mock. An install that discovers skills submits a
+    sync, and a real sender would make that HTTP call from a worker thread. Inside
+    a test's ``patch.dict("sys.modules", ...)`` it is the call that first imports
+    ``httpcore``; the block's exit drops that module again while httpx keeps
+    mapping errors against its classes, so a later test's connection error
+    escapes as a raw ``httpcore`` exception.
+    """
     import decimalai._config as cfg
     from decimalai._config import DecimalConfig
 
-    cfg._config = DecimalConfig(
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(
         api_key="dai_sk_test",
         base_url="http://localhost:8000",
         enabled=True,
-    )
-    cfg._client = MagicMock()
-    cfg._client.register_manifest.return_value = {
+    ))
+    client = MagicMock()
+    client.register_manifest.return_value = {
         "manifest_id": "test-manifest-id",
         "status": "active",
     }
+    monkeypatch.setattr(cfg, "_client", client)
+    monkeypatch.setattr(cfg, "_sender", MagicMock())
 
     # Reset module-level state to prevent leaks between tests
     try:
@@ -648,72 +658,6 @@ class TestAutoLoadE2E:
         assert "code-review" in acc.skills_offered_in_prompt
         assert acc.skills_delivered == set()
         assert acc.active_skills == {}
-
-
-class TestInstrumentPullsNothing:
-    """instrument()/instrument() used to hand the agent name to a background
-    `pull_missing`, which mirrored every org skill into that runtime's folder (and a
-    trace label such as 'acme-support-agent' was not even a runtime). There is no
-    background pull now, whatever the agent is called: registry skills reach disk only
-    when `decimalai skills` runs."""
-
-    def _synchronous_sender(self):
-        sender = MagicMock()
-        sender.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
-        return sender
-
-    def _mock_router(self):
-        router = MagicMock()
-        router.pull_missing.return_value = {"pulled": 0, "updated": 0, "skipped": 0}
-        return router
-
-    def _run_openai_install(self, agent_name):
-        router = self._mock_router()
-        with patch.dict("sys.modules", {
-            "agents": MagicMock(),
-            "agents.tracing": MagicMock(
-                add_trace_processor=MagicMock(),
-                set_trace_processors=MagicMock(),
-            ),
-        }):
-            with patch("decimalai.skills.discover_skills", return_value=[]), \
-                    patch("decimalai.skill_router.SkillRouter", MagicMock(return_value=router)), \
-                    patch("decimalai._config._sender", self._synchronous_sender()):
-                from decimalai.openai_agents import instrument
-                instrument(agent_name=agent_name, disk_sync=True)
-        return router
-
-    def _run_langchain_install(self, agent_name):
-        router = self._mock_router()
-        with patch.dict("sys.modules", {
-            "langchain_core": MagicMock(),
-            "langchain_core.tracers": MagicMock(),
-            "langchain_core.tracers.context": MagicMock(
-                register_configure_hook=MagicMock(),
-            ),
-        }):
-            import decimalai.langchain as lc
-            lc._installed = False
-            lc._explicit_manifest_config = None
-
-            with patch("decimalai.skills.discover_skills", return_value=[]), \
-                    patch("decimalai.skill_router.SkillRouter", MagicMock(return_value=router)), \
-                    patch("decimalai._config._sender", self._synchronous_sender()):
-                from decimalai.langchain import instrument
-                instrument(agent_name=agent_name, disk_sync=True)
-        return router
-
-    @pytest.mark.parametrize("agent_name", ["acme-support-agent", "claude-code", None])
-    def test_openai_agents_never_pulls(self, agent_name):
-        router = self._run_openai_install(agent_name)
-        router.pull_missing.assert_not_called()
-        router.export_to_disk.assert_not_called()
-
-    @pytest.mark.parametrize("agent_name", ["acme-support-agent", "claude-code", None])
-    def test_langchain_never_pulls(self, agent_name):
-        router = self._run_langchain_install(agent_name)
-        router.pull_missing.assert_not_called()
-        router.export_to_disk.assert_not_called()
 
 
 if __name__ == "__main__":
