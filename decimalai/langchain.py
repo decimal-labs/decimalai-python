@@ -2118,6 +2118,45 @@ def _bind_current_run_fields(cls: type) -> type:
     return cls
 
 
+def _record_model_name(
+    params: Dict[str, Any], serialized: Optional[Dict[str, Any]]
+) -> str:
+    """The model name an LLM call record carries. Ingest rejects a trace whose LLM call has none
+    (``llm_calls[i]: 'model_name' is required``), so a chat model whose invocation params name no
+    model (a custom model class, or a wrapper that drops the field) lost every trace it was in.
+    The model's class name stands in for it."""
+    name = extract_model_name(params)
+    if name:
+        return str(name)
+    serialized = serialized or {}
+    ids = serialized.get("id")
+    cls = serialized.get("name") or (ids[-1] if isinstance(ids, list) and ids else None)
+    return str(cls) if cls else "unknown"
+
+
+def _tool_output_text(output: Any) -> str:
+    """What a tool returned, as text. LangChain hands ``on_tool_end`` a ``ToolMessage`` (or a
+    LangGraph ``Command``) from tool nodes, and ``str()`` of that is its repr
+    (``content='...' name=... tool_call_id=...``), not what the tool said: the message's
+    content is, with a list of content blocks joined by their text."""
+    content = getattr(output, "content", None)
+    if content is None:
+        return str(output)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
 @_bind_current_run_fields
 class CallbackHandler(_CallbackBase):
     """LangChain/LangGraph callback handler that captures traces for DecimalAI.
@@ -2852,7 +2891,7 @@ class CallbackHandler(_CallbackBase):
             span_id=parent_run_id,
             agent_name=self._resolve_agent_name(parent_run_id, state),
             provider=provider,
-            model_name=model_name,
+            model_name=_record_model_name(params, serialized),
             temperature=params.get("temperature"),
             max_output_tokens=params.get("max_tokens"),
             rendered_input=rendered_input,
@@ -2904,7 +2943,7 @@ class CallbackHandler(_CallbackBase):
             span_id=parent_run_id,
             agent_name=self._resolve_agent_name(parent_run_id, state),
             provider=extract_provider(params, serialized),
-            model_name=extract_model_name(params),
+            model_name=_record_model_name(params, serialized),
             temperature=params.get("temperature"),
             max_output_tokens=params.get("max_tokens"),
             rendered_input=rendered_input,
@@ -3180,12 +3219,12 @@ class CallbackHandler(_CallbackBase):
             span = state.spans[tool_id]
             span.status = Status.SUCCESS
             span.ended_at = datetime.now(timezone.utc)
-            span.output_preview = str(output)[:200]
+            span.output_preview = _tool_output_text(output)[:200]
 
         if tool_id and tool_id in state.tool_calls:
             tc = state.tool_calls[tool_id]
             tc.status = Status.SUCCESS
-            tc.result = str(output)[:1000]
+            tc.result = _tool_output_text(output)[:1000]
 
         self._close_if_leaf_root(state, tool_id)
 
