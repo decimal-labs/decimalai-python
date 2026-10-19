@@ -252,7 +252,7 @@ class TestDecimalSpanExporter:
         assert "SECOND" not in contents
 
     def test_explicit_prompts_override_harvested(self):
-        """install(prompts=...) / DecimalSpanExporter(prompts=...) wins over the
+        """instrument(prompts=...) / DecimalSpanExporter(prompts=...) wins over the
         rendered prompt auto-harvested from spans."""
         from decimalai.otel import DecimalSpanExporter
 
@@ -598,10 +598,10 @@ class TestDecimalSpanExporter:
 
 
 class TestOtelInstall:
-    """Tests for the install() function."""
+    """Tests for the instrument() function."""
 
     def test_install_creates_provider(self):
-        """install() should set up a TracerProvider with our exporter."""
+        """instrument() should set up a TracerProvider with our exporter."""
         mock_provider_cls = MagicMock()
         mock_batch_cls = MagicMock()
         mock_trace_api = MagicMock()
@@ -620,14 +620,14 @@ class TestOtelInstall:
                 BatchSpanProcessor=mock_batch_cls
             ),
         }):
-            from decimalai.otel import install
-            install(agent_name="my-agent", service_name="test-svc")
+            from decimalai.otel import instrument
+            instrument(agent_name="my-agent", service_name="test-svc")
 
             mock_provider_cls.assert_called_once()
             mock_batch_cls.assert_called_once()
 
     def test_install_without_otel_raises(self):
-        """install() should raise ImportError if opentelemetry-sdk is missing."""
+        """instrument() should raise ImportError if opentelemetry-sdk is missing."""
         saved = {}
         for key in list(sys.modules.keys()):
             if "opentelemetry" in key:
@@ -639,9 +639,9 @@ class TestOtelInstall:
                 "opentelemetry.sdk": None,
                 "opentelemetry.sdk.trace": None,
             }):
-                from decimalai.otel import install
+                from decimalai.otel import instrument
                 with pytest.raises(ImportError, match="opentelemetry-sdk"):
-                    install()
+                    instrument()
         finally:
             sys.modules.update(saved)
 
@@ -702,7 +702,7 @@ class TestInitOtelIntegration:
     """Test that init(otel=True) works."""
 
     def test_init_with_otel_flag(self):
-        """init(otel=True) should call otel.install()."""
+        """init(otel=True) should call otel.instrument()."""
         mock_provider_cls = MagicMock()
         mock_batch_cls = MagicMock()
         mock_trace_api = MagicMock()

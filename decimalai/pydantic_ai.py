@@ -79,7 +79,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import warnings
 import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -868,24 +867,3 @@ def instrument(
         enable_skill_loader,
         trace_runs,
     )
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.pydantic_ai.install() is deprecated; use "
-        "decimalai.pydantic_ai.instrument() instead. It turns on tracing for pydantic_ai "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

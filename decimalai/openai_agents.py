@@ -45,7 +45,6 @@ import logging
 import re
 import threading
 import time
-import warnings
 import weakref
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -593,38 +592,6 @@ def _query_from_input_items(raw: Any) -> Optional[str]:
     return fallback
 
 
-def _extract_query(ctx: Any) -> Optional[str]:
-    """Pull the turn's user input out of an ``agents.RunContextWrapper``.
-
-    The runner stamps the turn's input items on ``ctx.turn_input``
-    immediately before awaiting ``get_system_prompt`` (which is what calls
-    us), so that attribute is the supported seam. It was previously probed
-    for ``ctx.input`` / ``ctx.user_input`` / ``ctx.query`` — none of which
-    the wrapper has ever defined (its public fields are ``context``,
-    ``usage``, ``turn_input``, ``tool_input``) — so every call fell through
-    to ``query=None`` and semantic routing never engaged: the platform
-    logged ``strategy: full_menu`` and dumped the entire catalogue into the
-    prompt instead of the one skill the turn called for.
-
-    The legacy attribute probes are kept AFTER ``turn_input`` for callers
-    who hand us their own duck-typed context object.
-    """
-    query = _query_from_input_items(getattr(ctx, "turn_input", None))
-    if query:
-        return query
-    for attr in ("input", "user_input", "query"):
-        val = getattr(ctx, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val
-    inner = getattr(ctx, "context", None)
-    if inner is not None:
-        for attr in ("input", "user_input", "query"):
-            val = getattr(inner, attr, None)
-            if isinstance(val, str) and val.strip():
-                return val
-    return None
-
-
 def _note_user_input(acc: Any, raw: Any) -> None:
     """Record the run's ORIGINAL ask as ``user_input_preview``, once.
 
@@ -714,13 +681,11 @@ def _handle_load_skill(name: str, *, agent_name: Optional[str] = None) -> str:
 
 _SKILL_TOOL_AGENT_ATTR = "__decimalai_skill_agent_name__"
 
-#: The name DecimalAI's tool normally has.
+#: The name of `load_agent()`'s tool.
 _TOOL_NAME = "load_skill"
-#: The name older releases gave it beside a sandbox's own `load_skill`.
-_NAMESPACED_TOOL_NAME = "decimalai_load_skill"
 #: Every name this adapter's own tool can have. An SDK affordance, not part of
 #: the agent's declared contract, so the manifest never lists it.
-_SKILL_TOOL_NAMES = frozenset({_TOOL_NAME, _NAMESPACED_TOOL_NAME})
+_SKILL_TOOL_NAMES = frozenset({_TOOL_NAME})
 
 
 def _has_native_skills(agent: Any) -> bool:
@@ -1087,14 +1052,11 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
     return result
 
 
-#: The ONE `DecimalTracingProcessor` this process registers. Every
-#: `instrument()` call used to add a fresh one, and the ordinary sequence
-#: through 0.17 — `init(openai_agents=True)`, then
-#: `instrument(enable_skill_loader=True)` to add skills — left two on the
-#: provider: each run was sent twice, under two
-#: trace ids, and only the copy that ended first carried the routing id and the
-#: loads (it pops the run's rail). Double the trace volume, and per-skill rates
-#: computed over a population half of which could never show an activation.
+#: The ONE `DecimalTracingProcessor` this process registers, shared by every
+#: `instrument()` and `load_agent()` call. Two on the provider would send each
+#: run twice, and only the copy that ended first would carry the routing id and
+#: the loads (it pops the run's rail): double the trace volume, and per-skill
+#: rates computed over a population half of which could never show an activation.
 _tracing_processor: Optional["DecimalTracingProcessor"] = None
 #: Whether `_tracing_processor` was ever handed to the provider. Consulted only
 #: when the provider's own list cannot be read (a custom TraceProvider).
@@ -1176,7 +1138,6 @@ def instrument(
     exclusive: bool = False,
     skills: Optional[List[Dict[str, Any]]] = None,
     skill_dirs: Optional[List[str]] = None,
-    enable_skill_loader: bool = False,
     disk_sync: Optional[bool] = None,
 ) -> None:
     """Register DecimalAI as a trace processor for OpenAI Agents SDK.
@@ -1186,15 +1147,14 @@ def instrument(
     and gives no agent a prompt or skills. For those, use :func:`load_agent`.
 
     Args:
-        agent_name: The DecimalAI agent: the name traces are filed under AND
-            turns are routed for, over the Agent's own ``name=`` — it is the
-            agent the skills are attached to. Given with ``agent=``, it is that
-            Agent's (and any Agent of the same ``name=``); every other Agent
-            keeps its own. Given alone, it is every Agent's, and so is the
-            agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``) when
-            no call names one; a later call that names none keeps it. With no
-            DecimalAI name at all, a trace is named by its root Agent's
-            ``name=``, and each Agent's turns are routed for its own.
+        agent_name: The DecimalAI agent traces are filed under, over the Agent's
+            own ``name=``. Given with ``agent=``, it is that Agent's (and any
+            Agent of the same ``name=``); every other Agent keeps its own. Given
+            alone, it is every Agent's, and so is the agent ``decimalai.init()``
+            named (or ``DECIMAL_AGENT_NAME``) when no call names one; a later
+            call that names none keeps it. A run of an agent built from
+            :func:`load_agent` is always filed under that config's name. With no
+            DecimalAI name at all, a trace is named by its root Agent's ``name=``.
         agent: Optional ``agents.Agent`` instance. If provided, DecimalAI
             will introspect it for full tool schemas, instructions, model,
             and handoffs to register a manifest immediately. This gives
@@ -1205,8 +1165,14 @@ def instrument(
         exclusive: If True, replaces ALL existing trace processors (including
             OpenAI's default). If False (default), adds alongside existing
             processors so traces still go to the OpenAI dashboard too.
-        enable_skill_loader: Removed in 0.18; ``True`` raises. Use
-            :func:`load_agent`.
+        skills: Skill descriptors to declare for the agent's manifest (and to
+            sync to the platform when ``disk_sync`` is on).
+        skill_dirs: Folders to read ``SKILL.md`` files from. Naming them asks
+            for them to be read: ``disk_sync`` then defaults to on.
+        disk_sync: Read the project's ``SKILL.md`` files and sync the ones you
+            wrote to the platform. Off by default, because an OpenAI agent's
+            skills come from DecimalAI through :func:`load_agent`; on with
+            ``skill_dirs``, or with ``init(skill_authority="harness")``.
 
     Safe to call more than once. There is only ever one DecimalAI processor,
     so each run is sent once; a later call replaces the skills registry and
@@ -1214,7 +1180,6 @@ def instrument(
 
     Raises:
         ImportError: If ``openai-agents`` is not installed.
-        ValueError: ``enable_skill_loader=True``.
 
     Example::
 
@@ -1232,17 +1197,6 @@ def instrument(
     """
     global _manifest_id
 
-    if enable_skill_loader:
-        raise ValueError(
-            "instrument(enable_skill_loader=True) was removed in decimalai 0.18. It patched the "
-            "OpenAI Agents SDK so every agent in the process got skills. Give an agent its "
-            "DecimalAI prompt and skills explicitly instead:\n"
-            "    from decimalai.openai_agents import load_agent\n"
-            "    support = load_agent(\"<agent name>\")\n"
-            "    agent = Agent(name=support.name, instructions=support.instructions,\n"
-            "                  tools=[*your_tools, *support.tools])"
-        )
-
     try:
         from agents.tracing import (
             add_trace_processor,
@@ -1255,23 +1209,22 @@ def instrument(
             "pip install \"decimalai[openai-agents]\""
         )
 
-    # Router authority (skill_authority): when None, derive disk_sync from config
-    # — router-authoritative installs default to NOT reading local skills, so the
-    # router is the one source of skills in the prompt. This call installs no
-    # loader (load_agent() is the skills path since 0.18), so "auto" reads them,
-    # as a direct instrument() always has; init(openai_agents=True) passes False
-    # when skills are on, as its loader did through 0.17.
-    # An explicit disk_sync=... always wins.
-    # Asking for skills on disk (disk_sync=True, or the harness authority) used to
-    # mirror every platform skill here; it writes nothing now, so say so once.
+    # An OpenAI agent's skills come from DecimalAI's router, through load_agent(),
+    # so "auto" is router authority: local SKILL.md files are read only when asked
+    # (disk_sync=True, skill_dirs=, or the harness authority). An explicit
+    # disk_sync=... always wins. Asking for skills on disk used to mirror every
+    # platform skill here; it writes nothing now, so say so once.
     from .skill_router import _note_disk_sync_writes_nothing
     _note_disk_sync_writes_nothing(disk_sync)
     if disk_sync is None:
-        try:
-            from ._config import _get_config
-            disk_sync = _get_config().resolve_disk_sync(loader_active=False)
-        except Exception:
+        if skill_dirs:
             disk_sync = True
+        else:
+            try:
+                from ._config import _get_config
+                disk_sync = _get_config().resolve_disk_sync(loader_active=True)
+            except Exception:
+                disk_sync = False
 
     # A name given WITH an Agent is that Agent's DecimalAI name, not the
     # process's; the Agent's own name= is only ever a fallback. Either one
@@ -2359,10 +2312,10 @@ class _TraceAccumulator:
     def live_agent(self) -> Any:
         """The `agents.Agent` object this run is executing, if we saw it.
 
-        Recorded by the `get_system_prompt` hook, which the runner calls on
-        every turn — including turns that go on to fail. It is the only
-        source of the agent's declared model and tool schemas for runs whose
-        spans carry neither.
+        Recorded by a `load_agent()` config's instructions, which the runner
+        calls on every turn — including turns that go on to fail. It is the
+        only source of the agent's declared model and tool schemas for runs
+        whose spans carry neither.
         """
         with _run_rails_lock:
             rail = _run_rails.get(self.trace_id)
@@ -3352,9 +3305,9 @@ class DecimalTracingProcessor:
 
         Three sources, in descending order of authority:
 
-        1. The live ``Agent`` object, captured by the `get_system_prompt`
-           hook. It carries the declared model and full tool schemas even
-           when the run produced no successful model call.
+        1. The live ``Agent`` object, recorded by a `load_agent()` config's
+           instructions. It carries the declared model and full tool schemas
+           even when the run produced no successful model call.
         2. Span data — model from the response/generation span, tool names
            from the agent span.
         3. Whatever this process already declared for this agent
@@ -3768,24 +3721,3 @@ def _infer_provider(model: Optional[str]) -> Optional[str]:
         return "meta"
     # Default for OpenAI Agents SDK — it's OpenAI
     return "openai"
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.openai_agents.install() is deprecated; use "
-        "decimalai.openai_agents.instrument() instead. It turns on tracing for openai_agents "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

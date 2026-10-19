@@ -49,7 +49,6 @@ this lands on.
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import Any, Optional
 
 logger = logging.getLogger("decimalai.autogen")
@@ -119,24 +118,3 @@ def instrument(
     # so buffering avoids fragmenting one run into many traces.
     provider.add_span_processor(BatchSpanProcessor(exporter))
     return provider
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.autogen.install() is deprecated; use "
-        "decimalai.autogen.instrument() instead. It turns on tracing for autogen "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

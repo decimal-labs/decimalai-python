@@ -30,7 +30,6 @@ import json
 import logging
 import re
 import threading
-import warnings
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import (
@@ -1149,7 +1148,7 @@ class DecimalSpanExporter:
     def _infer_skill_rungs(self, run_trace: RunTrace) -> None:
         """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
 
-        ``self._skills`` is disk-derived (``install(skills=...)`` else
+        ``self._skills`` is disk-derived (``instrument(skills=...)`` else
         ``discover_skills()``), so it describes skills a harness may have put
         in the prompt itself. Prompt text establishes that the skill was put in
         front of the model, never that the model reached for it — so
@@ -1419,7 +1418,7 @@ class DecimalSpanExporter:
                 # Capture only the FIRST system prompt per trace: it's the
                 # RENDERED prompt, so re-capturing a later (dynamically-built)
                 # one would flip the manifest hash mid-trace. Pass an explicit
-                # static template via install(prompts=...) to override.
+                # static template via instrument(prompts=...) to override.
                 if "system" not in seen_prompts:
                     sys_prompt = _extract_system_prompt(attrs)
                     if sys_prompt:
@@ -2442,24 +2441,3 @@ def _infer_provider(model: Optional[str]) -> Optional[str]:
     if "command" in m or "coral" in m:
         return "cohere"
     return None
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.otel.install() is deprecated; use "
-        "decimalai.otel.instrument() instead. It turns on tracing for otel "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

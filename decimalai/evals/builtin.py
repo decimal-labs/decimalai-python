@@ -3,7 +3,7 @@
 These are free, structural checks — no LLM calls required.
 Category: ``quality:deterministic``
 
-Disabled via ``install(agent_name="...", builtin_evals=False)``.
+Disabled via ``instrument(agent_name="...", builtin_evals=False)``.
 """
 
 from __future__ import annotations

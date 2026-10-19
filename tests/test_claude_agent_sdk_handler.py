@@ -255,7 +255,7 @@ class TestTraceStream:
         assert trace.llm_calls[0].output["content"] == "answer"
 
     def test_default_agent_name(self):
-        """No agent_name and no install() name → the 'claude-agent' default."""
+        """No agent_name and no instrument() name → the 'claude-agent' default."""
         _drive([
             SystemMessage(data={"session_id": "s"}),
             ResultMessage(result="x", session_id="s"),
@@ -377,12 +377,12 @@ class TestInstall:
         return fake, fake_query
 
     def test_install_patches_query(self, monkeypatch):
-        """install() replaces claude_agent_sdk.query with a tracing wrapper that
+        """instrument() replaces claude_agent_sdk.query with a tracing wrapper that
         captures the agent_name and prompt."""
         import decimalai.claude_agent_sdk as cas
         fake, original = self._inject_fake_sdk(monkeypatch)
 
-        cas.install(agent_name="installed-agent")
+        cas.instrument(agent_name="installed-agent")
         assert fake.query is not original  # patched
 
         async def run():
@@ -396,13 +396,13 @@ class TestInstall:
         assert len(trace.llm_calls) == 2
 
     def test_install_is_idempotent(self, monkeypatch):
-        """A second install() doesn't double-wrap query."""
+        """A second instrument() doesn't double-wrap query."""
         import decimalai.claude_agent_sdk as cas
         fake, _ = self._inject_fake_sdk(monkeypatch)
 
-        cas.install(agent_name="a")
+        cas.instrument(agent_name="a")
         once = fake.query
-        cas.install(agent_name="b")
+        cas.instrument(agent_name="b")
         assert fake.query is once
 
     def test_traced_query_wraps(self, monkeypatch):

@@ -280,11 +280,6 @@ class TestInstrumentIsIdempotent:
         assert len(traces) == 1
         assert traces[0].routing_id == ROUTING_ID
 
-    def test_the_removed_skill_loader_says_where_skills_went(self, sdk):
-        with pytest.raises(ValueError, match="load_agent"):
-            oa.instrument(enable_skill_loader=True, disk_sync=False)
-        assert _ours() == []
-
 
 # ── 2. SandboxAgent ──────────────────────────────────────────────────────────
 

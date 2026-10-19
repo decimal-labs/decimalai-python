@@ -13,7 +13,7 @@ is deterministic regardless of the (random) embedding vectors. Only the
 adapter must capture.
 
 Two cells:
-  * native — ``decimalai.llamaindex.install()`` registers the span handler on
+  * native — ``decimalai.llamaindex.instrument()`` registers the span handler on
     LlamaIndex's root dispatcher. Runs on all three providers, because the
     synthesis LLM is provider-specific and the handler must classify each
     vendor's LlamaIndex LLM class (OpenAI / Anthropic / GoogleGenAI) as an LLM
@@ -129,17 +129,17 @@ def test_llamaindex_query_engine_native(provider, model):
     pytest.importorskip(_LLM_IMPORT[provider])
 
     from llama_index.core.instrumentation import get_dispatcher
-    from decimalai.llamaindex import install
+    from decimalai.llamaindex import instrument
 
     agent_name = h.unique_agent(f"llamaindex-{provider}-rag")
 
-    # install() appends a handler to the *global* root dispatcher and there's no
+    # instrument() appends a handler to the *global* root dispatcher and there's no
     # public uninstall, so snapshot the handler list and restore it after — keeps
     # this cell's handler from capturing the next cell's spans under the wrong
     # agent_name.
     dispatcher = get_dispatcher()
     saved_handlers = list(dispatcher.span_handlers)
-    install(agent_name=agent_name)
+    instrument(agent_name=agent_name)
     try:
         llm = _make_llamaindex_llm(provider, model)
         query_engine = _build_query_engine(llm)

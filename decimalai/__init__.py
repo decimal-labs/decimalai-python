@@ -777,27 +777,6 @@ class _SkillsFromEnv:
 _SKILLS_FROM_ENV: Any = _SkillsFromEnv()
 
 
-_openai_agents_skills_note_emitted = False
-
-
-def _note_openai_agents_skills_moved(*, loud: bool) -> None:
-    """Say once that `init(openai_agents=True)` traces only, and where skills went.
-
-    Through 0.17 the flag also delivered skills by patching the Agents SDK. A
-    program written for that would now run without skills and nothing would
-    say why, so the first such init() says so.
-    """
-    global _openai_agents_skills_note_emitted
-    if _openai_agents_skills_note_emitted:
-        return
-    _openai_agents_skills_note_emitted = True
-    (logger.warning if loud else logger.info)(
-        "DecimalAI: init(openai_agents=True) traces runs but no longer gives agents "
-        "skills. Use `support = decimalai.openai_agents.load_agent(\"<agent name>\")` "
-        "and pass instructions=support.instructions, tools=[..., *support.tools] to "
-        "your Agent(...). Set DECIMALAI_SKILLS=0 or skills=False to silence this."
-    )
-
 
 def _skills_from_env() -> bool:
     """``init(skills=...)`` left unset: what ``DECIMALAI_SKILLS`` says.
@@ -862,13 +841,15 @@ def init(
         decimalai.init(crewai=True)          # CrewAI
         decimalai.init(otel=True)            # Any OpenTelemetry framework
 
-    On the four frameworks with a skill loader — ``langchain``,
-    ``openai_agents``, ``adk`` and ``crewai`` — the flag both traces and
-    delivers the agent's skills, so ``init(langchain=True, agent_name="support")``
-    is the whole setup. It is the same install as calling that adapter's
+    On the three frameworks with a skill loader — ``langchain``, ``adk`` and
+    ``crewai`` — the flag both traces and delivers the agent's skills, so
+    ``init(langchain=True, agent_name="support")`` is the whole setup. It is the
+    same install as calling that adapter's
     ``instrument(agent_name=..., enable_skill_loader=True)`` after a bare
     ``init()``; do one or the other, not both. ``skills=False``, or
     ``DECIMALAI_SKILLS=0`` in the environment, keeps the flag to tracing only.
+    ``openai_agents`` traces only: an OpenAI agent gets its prompt and skills
+    from ``decimalai.openai_agents.load_agent(name)``.
 
     ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
     a supported integration: the flag is now an alias for ``otel=True`` that
@@ -905,10 +886,9 @@ def init(
         langchain: If ``True``, instrument LangChain / LangGraph, and deliver
             skills into every chat-model call (see ``skills``).
         openai_agents: If ``True``, trace the OpenAI Agents SDK. Tracing only:
-            since 0.18 an agent gets its DecimalAI prompt and skills from
+            an agent gets its DecimalAI prompt and skills from
             ``decimalai.openai_agents.load_agent(name)``, which you pass into
-            your own ``Agent(...)``. An explicit ``skills=True`` with this
-            flag raises.
+            your own ``Agent(...)``. ``skills`` does not apply to it.
         adk: If ``True``, instrument Google ADK (Agent Development Kit) via a
             native ADK plugin, and deliver skills into each model request's
             system instruction (see ``skills``). ADK is Gemini-native.
@@ -951,10 +931,9 @@ def init(
             Falls back to the ``DECIMAL_AGENT_NAME`` env var. It is the
             default wherever a name is not given: the framework flags above,
             a later ``instrument()`` of any adapter, ``start_trace()``,
-            ``@trace`` and ``SkillRouter``. On OpenAI Agents it wins over
-            ``Agent(name=...)``, for the trace and for routing alike: it is
-            the agent the skills are attached to. An explicit name passed to
-            any of those still wins over this one.
+            ``@trace`` and ``SkillRouter``. On OpenAI Agents it names the trace
+            of an agent no ``load_agent()`` config built, over ``Agent(name=...)``.
+            An explicit name passed to any of those still wins over this one.
         verify: If ``True`` (default), synchronously probe the backend
             during init to (a) validate the API key, (b) detect a
             wrong/unreachable ``base_url``, and (c) cache the backend's
@@ -968,9 +947,9 @@ def init(
         verify_timeout: Seconds before the verify probe gives up.
             On timeout, init() logs a warning and continues (does not
             raise) so a transiently slow backend doesn't break startup.
-        skills: Whether a framework flag above also turns on that adapter's
-            skill loader. ``True`` makes the flag form deliver the agent's
-            skills; ``False`` installs tracing only, exactly as
+        skills: Whether the ``langchain``, ``adk`` or ``crewai`` flag also turns
+            on that adapter's skill loader. ``True`` makes the flag form deliver
+            the agent's skills; ``False`` installs tracing only, exactly as
             ``instrument()`` does without ``enable_skill_loader``. Left unset,
             it falls back to the ``DECIMALAI_SKILLS`` env var (``0``/``false``/
             ``no``/``off`` is ``False``; a value it does not recognise is
@@ -982,10 +961,11 @@ def init(
             when no skill-capable framework flag is set, and when ``enabled``
             is ``False``. With the loader on, the default ``skill_authority``
             ("auto") treats the router as the skills channel, so the LangChain
-            and OpenAI Agents adapters stop reading local SKILL.md files and
-            syncing them to the platform; pass ``skill_authority="harness"`` to
-            keep that. No adapter writes skills to disk either way: registry
-            skills get there through ``decimalai skills add``.
+            adapter stops reading local SKILL.md files and syncing them to the
+            platform (the OpenAI Agents adapter reads them only when asked);
+            pass ``skill_authority="harness"`` to keep that. No adapter writes
+            skills to disk either way: registry skills get there through
+            ``decimalai skills add``.
 
     Re-initializing with a different key, base URL, ``inject_skill_body`` or
     ``load_skill_tool`` drops every adapter's cached ``SkillRouter``, so the
@@ -1213,7 +1193,7 @@ def init(
         if skills_from_env:
             skills = (
                 _skills_from_env()
-                if (langchain or openai_agents or adk or crewai)
+                if (langchain or adk or crewai)
                 else True
             )
             if not skills:
@@ -1228,33 +1208,7 @@ def init(
 
         if openai_agents:
             from .openai_agents import instrument as _oai_install
-            if not skills_from_env and skills:
-                raise ValueError(
-                    "init(openai_agents=True, skills=True) no longer delivers skills: since "
-                    "0.18 nothing patches the OpenAI Agents SDK. Give an agent its prompt and "
-                    "skills with decimalai.openai_agents.load_agent(name) and pass "
-                    "instructions=... and tools=[..., *config.tools] into your Agent(...)."
-                )
-            oai_disk_sync = None
-            if skills:
-                # Loud when an agent is named, which is how the skills setup read
-                # through 0.17; a bare tracing setup never had skills to lose.
-                _note_openai_agents_skills_moved(
-                    loud=bool(agent_name or os.environ.get("DECIMAL_AGENT_NAME")),
-                )
-                # Through 0.17 this form turned the loader on, which made DecimalAI's
-                # router the skills' source and left local SKILL.md files unread
-                # (and un-uploaded). The skills still come from DecimalAI, through
-                # load_agent(), so an upgrade keeps that; the harness authority
-                # still reads them.
-                try:
-                    from ._config import _get_config as _cfg
-
-                    if not _cfg().resolve_disk_sync(loader_active=True):
-                        oai_disk_sync = False
-                except Exception:
-                    pass
-            _oai_install(agent_name=agent_name, disk_sync=oai_disk_sync)
+            _oai_install(agent_name=agent_name)
 
         if adk:
             from .adk import instrument as _adk_install

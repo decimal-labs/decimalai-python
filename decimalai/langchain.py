@@ -30,7 +30,6 @@ import logging
 import sys
 import threading
 import time
-import warnings
 import weakref
 from contextvars import Context, ContextVar, copy_context
 from datetime import datetime, timezone
@@ -1124,7 +1123,7 @@ def _system_prefix_len(messages: List[Any]) -> int:
 # the caller's own prompts and wrong for ours — the skill prefix and the routing
 # hint are two system messages BY DESIGN, so every call tripped the check and
 # emitted "Auto-detected system prompt changed within trace", advising a fix
-# (`install(prompts=...)`) that cannot possibly help, because the message that
+# (`instrument(prompts=...)`) that cannot possibly help, because the message that
 # "changed" is one the SDK injected. Measured before this: a bare invoke went
 # from 0 warnings to 1, and a three-turn conversation from 3 to 6.
 _INJECTED_MARK = {"decimalai_injected": True}
@@ -1586,7 +1585,7 @@ def instrument(
 ) -> None:
     """Register DecimalAI tracing globally for all LangChain calls.
 
-    After calling ``install()``, every ``chain.invoke()``, ``agent.invoke()``,
+    After calling ``instrument()``, every ``chain.invoke()``, ``agent.invoke()``,
     and ``llm.invoke()`` call will be automatically traced and sent to the
     DecimalAI backend. No per-call ``config={"callbacks": [...]}`` needed.
 
@@ -3002,7 +3001,7 @@ class CallbackHandler(_CallbackBase):
         # If prompts include dynamic content (RAG chunks, dates, few-shot
         # examples), the hash will change on every run, causing false drift.
         # Users with dynamic prompts should use:
-        #   install(prompts={"system": "Your static template text..."})
+        #   instrument(prompts={"system": "Your static template text..."})
         for msg_list in messages:
             for msg in msg_list:
                 # Skip what WE put there. The skill prefix and the routing hint
@@ -3024,7 +3023,7 @@ class CallbackHandler(_CallbackBase):
                         logger.warning(
                             "Auto-detected %s prompt changed within trace. "
                             "If your prompts include dynamic content (RAG, dates, "
-                            "few-shot), pass static templates via install(prompts=...) "
+                            "few-shot), pass static templates via instrument(prompts=...) "
                             "to avoid false manifest drift.",
                             role,
                         )
@@ -3889,24 +3888,3 @@ def _preview(obj: Any, max_len: int = 2000) -> str:
     except Exception:
         s = str(obj)
         return s[:max_len]
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.langchain.install() is deprecated; use "
-        "decimalai.langchain.instrument() instead. It turns on tracing for langchain "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

@@ -675,7 +675,7 @@ class TestAnExplicitDiskSyncIsToldNothingIsWritten:
     def test_nobody_asked_means_no_warning(self, adapter, kwargs, project, platform,
                                            monkeypatch, caplog):
         if adapter == "openai_agents" and kwargs.get("enable_skill_loader"):
-            pytest.skip("the OpenAI Agents skill loader is gone: load_agent() delivers skills")
+            pytest.skip("openai_agents.instrument() has no skill loader: load_agent() delivers skills")
         monkeypatch.chdir(project)
         monkeypatch.setattr("decimalai.langchain._install_skill_loader", lambda: None)
         with caplog.at_level(logging.WARNING):

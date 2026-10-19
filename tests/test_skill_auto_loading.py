@@ -1,13 +1,13 @@
-"""Tests for skill auto-loading during install() / initialization.
+"""Tests for skill auto-loading during instrument() / initialization.
 
-Verifies the gap: install() → discover_skills() → skills_registry wired into
+Verifies the gap: instrument() → discover_skills() → skills_registry wired into
 processor/handler/exporter → auto-detected during agent runs.
 
 Covers:
   1. Generic tracer: start_trace() auto-discovers SKILL.md files
-  2. OpenAI Agents: install() auto-discovers and wires to processor
-  3. LangChain: install() auto-discovers and stores in _explicit_manifest_config
-  4. OTEL: install() auto-discovers and passes to exporter
+  2. OpenAI Agents: instrument() auto-discovers and wires to processor
+  3. LangChain: instrument() auto-discovers and stores in _explicit_manifest_config
+  4. OTEL: instrument() auto-discovers and passes to exporter
   5. End-to-end: auto-discovered skills are used for detection during runs
 """
 
@@ -279,10 +279,15 @@ class TestGenericAutoLoading:
 
 
 class TestOpenAIAgentsAutoLoading:
-    """install() auto-discovers skills and wires to DecimalTracingProcessor."""
+    """instrument() reads local skills when asked, and wires them to the processor.
+
+    An OpenAI agent's skills come from DecimalAI through `load_agent()`, so the
+    project's SKILL.md files are read only when asked: `skill_dirs=`,
+    `disk_sync=True`, or the harness skill authority.
+    """
 
     def test_install_auto_discovers_skills(self, skill_dir, in_tmp_project):
-        """install(skill_dirs=[...]) discovers skills and stores on processor."""
+        """instrument(skill_dirs=[...]) discovers skills and stores on processor."""
         mock_add = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -292,16 +297,16 @@ class TestOpenAIAgentsAutoLoading:
                 set_trace_processors=MagicMock(),
             ),
         }):
-            from decimalai.openai_agents import install
-            install(skill_dirs=[skill_dir])
+            from decimalai.openai_agents import instrument
+            instrument(skill_dirs=[skill_dir])
 
             processor = mock_add.call_args[0][0]
             assert len(processor._skills_registry) == 2
             names = {s["name"] for s in processor._skills_registry}
             assert names == {"code-review", "test-generator"}
 
-    def test_install_no_skills_calls_discover(self):
-        """install() without skills= triggers discover_skills()."""
+    def test_install_reads_no_local_skills_unless_asked(self):
+        """instrument() with neither skills= nor skill_dirs= reads none."""
         mock_add = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -315,13 +320,15 @@ class TestOpenAIAgentsAutoLoading:
                 mock_discover.return_value = [
                     {"name": "discovered-skill", "hash": "sha256:disc123"},
                 ]
-                from decimalai.openai_agents import install
-                install()
+                from decimalai.openai_agents import instrument
+                instrument()
+                mock_discover.assert_not_called()
 
+                instrument(disk_sync=True)
                 mock_discover.assert_called_once()
 
     def test_install_explicit_skills_skip_discovery(self):
-        """install(skills=[...]) skips auto-discovery."""
+        """instrument(skills=[...]) skips auto-discovery."""
         mock_add = MagicMock()
         explicit = [{"name": "explicit-only", "hash": "sha256:exp"}]
 
@@ -333,8 +340,8 @@ class TestOpenAIAgentsAutoLoading:
             ),
         }):
             with patch("decimalai.skills.discover_skills") as mock_discover:
-                from decimalai.openai_agents import install
-                install(skills=explicit)
+                from decimalai.openai_agents import instrument
+                instrument(skills=explicit)
 
                 mock_discover.assert_not_called()
                 processor = mock_add.call_args[0][0]
@@ -346,10 +353,10 @@ class TestOpenAIAgentsAutoLoading:
 
 
 class TestLangChainAutoLoading:
-    """install() auto-discovers skills and stores in _explicit_manifest_config."""
+    """instrument() auto-discovers skills and stores in _explicit_manifest_config."""
 
     def test_install_with_skill_dirs_discovers(self, skill_dir, in_tmp_project):
-        """install(skill_dirs=[...]) auto-discovers skills."""
+        """instrument(skill_dirs=[...]) auto-discovers skills."""
         with patch.dict("sys.modules", {
             "langchain_core": MagicMock(),
             "langchain_core.tracers": MagicMock(),
@@ -361,8 +368,8 @@ class TestLangChainAutoLoading:
             lc._installed = False
             lc._explicit_manifest_config = None
 
-            from decimalai.langchain import install
-            install(skill_dirs=[skill_dir])
+            from decimalai.langchain import instrument
+            instrument(skill_dirs=[skill_dir])
 
             assert lc._explicit_manifest_config is not None
             skills = lc._explicit_manifest_config.get("skills")
@@ -372,7 +379,7 @@ class TestLangChainAutoLoading:
             assert names == {"code-review", "test-generator"}
 
     def test_install_with_tools_and_no_skills_auto_discovers(self):
-        """install(tools=[...]) without skills= still triggers skill discovery."""
+        """instrument(tools=[...]) without skills= still triggers skill discovery."""
         with patch.dict("sys.modules", {
             "langchain_core": MagicMock(),
             "langchain_core.tracers": MagicMock(),
@@ -388,15 +395,15 @@ class TestLangChainAutoLoading:
                 mock_discover.return_value = [
                     {"name": "auto-skill", "hash": "sha256:auto"},
                 ]
-                from decimalai.langchain import install
-                install(tools=[{"name": "search"}])
+                from decimalai.langchain import instrument
+                instrument(tools=[{"name": "search"}])
 
                 mock_discover.assert_called_once()
                 assert lc._explicit_manifest_config["skills"] is not None
                 assert lc._explicit_manifest_config["skills"][0]["name"] == "auto-skill"
 
     def test_install_explicit_skills_skip_discovery(self):
-        """install(skills=[...]) does not call discover_skills."""
+        """instrument(skills=[...]) does not call discover_skills."""
         with patch.dict("sys.modules", {
             "langchain_core": MagicMock(),
             "langchain_core.tracers": MagicMock(),
@@ -411,8 +418,8 @@ class TestLangChainAutoLoading:
             explicit = [{"name": "my-skill", "hash": "sha256:mine"}]
 
             with patch("decimalai.skills.discover_skills") as mock_discover:
-                from decimalai.langchain import install
-                install(skills=explicit)
+                from decimalai.langchain import instrument
+                instrument(skills=explicit)
 
                 mock_discover.assert_not_called()
                 assert lc._explicit_manifest_config["skills"] == explicit
@@ -422,10 +429,10 @@ class TestLangChainAutoLoading:
 
 
 class TestOTELAutoLoading:
-    """install() auto-discovers skills and passes to DecimalSpanExporter."""
+    """instrument() auto-discovers skills and passes to DecimalSpanExporter."""
 
     def test_install_auto_discovers_skills(self, skill_dir):
-        """install(skill_dirs=[...]) discovers skills and passes to exporter."""
+        """instrument(skill_dirs=[...]) discovers skills and passes to exporter."""
         mock_provider_cls = MagicMock()
         mock_batch_cls = MagicMock()
         mock_trace_api = MagicMock()
@@ -444,8 +451,8 @@ class TestOTELAutoLoading:
                 BatchSpanProcessor=mock_batch_cls
             ),
         }):
-            from decimalai.otel import install
-            install(skill_dirs=[skill_dir])
+            from decimalai.otel import instrument
+            instrument(skill_dirs=[skill_dir])
 
             # The BatchSpanProcessor was called with a DecimalSpanExporter
             exporter = mock_batch_cls.call_args[0][0]
@@ -455,7 +462,7 @@ class TestOTELAutoLoading:
             assert names == {"code-review", "test-generator"}
 
     def test_install_no_skills_calls_discover(self):
-        """install() without skills= triggers discover_skills()."""
+        """instrument() without skills= triggers discover_skills()."""
         mock_provider_cls = MagicMock()
         mock_batch_cls = MagicMock()
         mock_trace_api = MagicMock()
@@ -478,13 +485,13 @@ class TestOTELAutoLoading:
                 mock_discover.return_value = [
                     {"name": "otel-skill", "hash": "sha256:otel123"},
                 ]
-                from decimalai.otel import install
-                install()
+                from decimalai.otel import instrument
+                instrument()
 
                 mock_discover.assert_called_once()
 
     def test_install_explicit_skills_skip_discovery(self):
-        """install(skills=[...]) skips auto-discovery."""
+        """instrument(skills=[...]) skips auto-discovery."""
         mock_provider_cls = MagicMock()
         mock_batch_cls = MagicMock()
         mock_trace_api = MagicMock()
@@ -505,8 +512,8 @@ class TestOTELAutoLoading:
             ),
         }):
             with patch("decimalai.skills.discover_skills") as mock_discover:
-                from decimalai.otel import install
-                install(skills=explicit)
+                from decimalai.otel import instrument
+                instrument(skills=explicit)
 
                 mock_discover.assert_not_called()
                 exporter = mock_batch_cls.call_args[0][0]
@@ -616,7 +623,7 @@ class TestAutoLoadE2E:
         from decimalai.schema.trace import LlmCallRecord
         from decimalai.schema.common import Status
 
-        # Simulate what install(skill_dirs=[...]) does
+        # Simulate what instrument(skill_dirs=[...]) does
         registry = discover_skills([skill_dir], include_global=False)
         processor = DecimalTracingProcessor(
             agent_name="test-agent",
@@ -644,7 +651,7 @@ class TestAutoLoadE2E:
 
 
 class TestInstrumentPullsNothing:
-    """install()/instrument() used to hand the agent name to a background
+    """instrument()/instrument() used to hand the agent name to a background
     `pull_missing`, which mirrored every org skill into that runtime's folder (and a
     trace label such as 'acme-support-agent' was not even a runtime). There is no
     background pull now, whatever the agent is called: registry skills reach disk only
@@ -672,8 +679,8 @@ class TestInstrumentPullsNothing:
             with patch("decimalai.skills.discover_skills", return_value=[]), \
                     patch("decimalai.skill_router.SkillRouter", MagicMock(return_value=router)), \
                     patch("decimalai._config._sender", self._synchronous_sender()):
-                from decimalai.openai_agents import install
-                install(agent_name=agent_name, disk_sync=True)
+                from decimalai.openai_agents import instrument
+                instrument(agent_name=agent_name, disk_sync=True)
         return router
 
     def _run_langchain_install(self, agent_name):
@@ -692,8 +699,8 @@ class TestInstrumentPullsNothing:
             with patch("decimalai.skills.discover_skills", return_value=[]), \
                     patch("decimalai.skill_router.SkillRouter", MagicMock(return_value=router)), \
                     patch("decimalai._config._sender", self._synchronous_sender()):
-                from decimalai.langchain import install
-                install(agent_name=agent_name, disk_sync=True)
+                from decimalai.langchain import instrument
+                instrument(agent_name=agent_name, disk_sync=True)
         return router
 
     @pytest.mark.parametrize("agent_name", ["acme-support-agent", "claude-code", None])

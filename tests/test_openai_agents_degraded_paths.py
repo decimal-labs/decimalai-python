@@ -18,10 +18,11 @@ before the fix:
    `load_agent()` hands its pieces to the developer's own Agent, so the
    class here now checks the one thing that path still owes the manifest,
    the agent's prompt.
-4. EXTRACTION — `_extract_query` probed `ctx.input` / `user_input` /
+4. EXTRACTION — the query was probed from `ctx.input` / `user_input` /
    `query`, none of which `RunContextWrapper` defines; the turn is on
-   `ctx.turn_input`. Routing logged `strategy: full_menu`, 30 skills
-   offered, an empty query.
+   `ctx.turn_input`, which `load_agent()` reads through
+   `_query_from_input_items`. Routing logged `strategy: full_menu`, 30
+   skills offered, an empty query.
 
 Plus the two smaller ones in the same file: Responses-API input items
 flattened to `{"role": "user", "content": ""}`, and a `_manifest_id`
@@ -114,72 +115,52 @@ def _ingested(client):
 # ── 4. Query extraction ─────────────────────────────────────
 
 
-class TestExtractQueryFromTurnInput:
+class TestQueryFromTurnInput:
+    """The message a `load_agent()` run is routed on, from ``turn_input``."""
+
     def test_reads_turn_input_the_runner_actually_stamps(self):
-        from decimalai.openai_agents import _extract_query
+        from decimalai.openai_agents import _query_from_input_items
 
-        ctx = types.SimpleNamespace(
-            context=None,
-            usage=None,
-            turn_input=[{"role": "user", "content": "Review this SQL query"}],
-        )
-        assert _extract_query(ctx) == "Review this SQL query"
-
-    def test_pre_fix_attributes_are_absent_on_a_real_wrapper_shape(self):
-        """The old probe list (input/user_input/query) finds nothing on a
-        wrapper carrying only the fields the SDK defines — which is why
-        routing fell through to full_menu on every single call."""
-        from decimalai.openai_agents import _extract_query
-
-        ctx = types.SimpleNamespace(context=None, usage=None, tool_input=None)
-        assert _extract_query(ctx) is None
+        assert _query_from_input_items(
+            [{"role": "user", "content": "Review this SQL query"}]) == "Review this SQL query"
 
     def test_multi_turn_history_routes_on_the_LATEST_user_message(self):
         """`turn_input` is the whole conversation, not just this turn's ask.
         Routing on the first item would pin every turn to the opening line."""
-        from decimalai.openai_agents import _extract_query
+        from decimalai.openai_agents import _query_from_input_items
 
-        ctx = types.SimpleNamespace(turn_input=[
+        assert _query_from_input_items([
             {"role": "user", "content": "What is 2+2?"},
             {"role": "assistant", "content": [{"type": "output_text", "text": "4"}]},
             {"role": "user", "content": "Now help me tune this Postgres index."},
-        ])
-        assert _extract_query(ctx) == "Now help me tune this Postgres index."
+        ]) == "Now help me tune this Postgres index."
 
     def test_skips_tool_plumbing_items_to_find_the_user_turn(self):
-        from decimalai.openai_agents import _extract_query
+        from decimalai.openai_agents import _query_from_input_items
 
-        ctx = types.SimpleNamespace(turn_input=[
+        assert _query_from_input_items([
             {"role": "user", "content": "Weather in Paris?"},
             {"type": "function_call", "name": "get_weather", "arguments": '{"city":"Paris"}'},
             {"type": "function_call_output", "call_id": "c1", "output": "sunny"},
             {"type": "reasoning", "id": "r1", "summary": []},
-        ])
-        assert _extract_query(ctx) == "Weather in Paris?"
+        ]) == "Weather in Paris?"
 
     def test_flattens_content_parts(self):
-        from decimalai.openai_agents import _extract_query
+        from decimalai.openai_agents import _query_from_input_items
 
-        ctx = types.SimpleNamespace(turn_input=[{
+        assert _query_from_input_items([{
             "role": "user",
             "content": [
                 {"type": "input_text", "text": "Summarize "},
                 {"type": "input_image", "image_url": "http://x/y.png"},
                 {"type": "input_text", "text": "this chart."},
             ],
-        }])
-        assert _extract_query(ctx) == "Summarize this chart."
+        }]) == "Summarize this chart."
 
     def test_bare_string_turn_input(self):
-        from decimalai.openai_agents import _extract_query
+        from decimalai.openai_agents import _query_from_input_items
 
-        assert _extract_query(types.SimpleNamespace(turn_input="hello")) == "hello"
-
-    def test_legacy_duck_typed_contexts_still_work(self):
-        from decimalai.openai_agents import _extract_query
-
-        ctx = types.SimpleNamespace(turn_input=[], user_input="from a custom wrapper")
-        assert _extract_query(ctx) == "from a custom wrapper"
+        assert _query_from_input_items("hello") == "hello"
 
 
 # ── Responses-API input items ───────────────────────────────

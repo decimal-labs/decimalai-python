@@ -101,7 +101,6 @@ import logging
 import os
 import re
 import threading
-import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -2035,24 +2034,3 @@ def instrument(
         Runner.__init__ = patched_init  # type: ignore[method-assign]
         _runner_patched = True
     logger.info("DecimalAI ADK tracing installed globally (agent_name=%s)", agent_name)
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.adk.install() is deprecated; use "
-        "decimalai.adk.instrument() instead. It turns on tracing for adk "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

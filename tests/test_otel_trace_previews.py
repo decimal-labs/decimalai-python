@@ -2,7 +2,7 @@
 
 Deep-audit finding (sdk-integrations): _assemble_trace initialized
 ``user_input``/``final_output`` to None and NEVER assigned them, so every
-trace from ``decimalai.otel.install()`` had empty previews even though the
+trace from ``decimalai.otel.instrument()`` had empty previews even though the
 span attributes carried input/output. The fix derives the trace-level
 previews from the root span (preferred) or the LLM spans (fallback).
 

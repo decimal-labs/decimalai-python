@@ -325,7 +325,7 @@ class TestCallbackHandler:
 
 
 class TestLangchainInstall:
-    """Tests for decimalai.langchain.install() — global tracing registration."""
+    """Tests for decimalai.langchain.instrument() — global tracing registration."""
 
     def setup_method(self):
         import decimalai._config as cfg
@@ -343,7 +343,7 @@ class TestLangchainInstall:
         lc_mod._installed = False
 
     def test_install_registers_hook(self):
-        """install() should call register_configure_hook with the callback var.
+        """instrument() should call register_configure_hook with the callback var.
 
         `handle_class` is load-bearing, not decoration. LangChain installs the
         hooked handler whenever `context_var.get()` is non-None, and since the
@@ -360,7 +360,7 @@ class TestLangchainInstall:
             "decimalai.langchain.register_configure_hook",
             create=True,
         ) as mock_hook:
-            # Patch the import inside install()
+            # Patch the import inside instrument()
             with patch.dict("sys.modules", {
                 "langchain_core": MagicMock(),
                 "langchain_core.tracers": MagicMock(),
@@ -371,16 +371,16 @@ class TestLangchainInstall:
                 from decimalai.langchain import (
                     CallbackHandler,
                     _decimal_callback_var,
-                    install,
+                    instrument,
                 )
-                install()
+                instrument()
 
                 mock_hook.assert_called_once_with(
                     _decimal_callback_var, True, handle_class=CallbackHandler
                 )
 
     def test_install_is_idempotent(self):
-        """Calling install() twice should only register once."""
+        """Calling instrument() twice should only register once."""
         mock_hook = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -390,14 +390,14 @@ class TestLangchainInstall:
                 register_configure_hook=mock_hook
             ),
         }):
-            from decimalai.langchain import install
-            install()
-            install()  # second call should be no-op
+            from decimalai.langchain import instrument
+            instrument()
+            instrument()  # second call should be no-op
 
             mock_hook.assert_called_once()
 
     def test_install_sets_auto_send_handler(self):
-        """install() should create a CallbackHandler with auto_send=True."""
+        """instrument() should create a CallbackHandler with auto_send=True."""
         mock_hook = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -407,8 +407,8 @@ class TestLangchainInstall:
                 register_configure_hook=mock_hook
             ),
         }):
-            from decimalai.langchain import install, _decimal_callback_var
-            install(agent_name="global-agent")
+            from decimalai.langchain import instrument, _decimal_callback_var
+            instrument(agent_name="global-agent")
 
             handler = _decimal_callback_var.get()
             assert handler is not None
@@ -416,7 +416,7 @@ class TestLangchainInstall:
             assert handler.agent_name == "global-agent"
 
     def test_install_without_langchain_raises(self):
-        """install() should raise ImportError if langchain-core is not installed."""
+        """instrument() should raise ImportError if langchain-core is not installed."""
         import sys
 
         # Remove langchain_core from sys.modules to simulate it not being installed
@@ -427,8 +427,8 @@ class TestLangchainInstall:
 
         try:
             with patch.dict("sys.modules", {"langchain_core.tracers.context": None}):
-                from decimalai.langchain import install
+                from decimalai.langchain import instrument
                 with pytest.raises(ImportError, match="langchain-core"):
-                    install()
+                    instrument()
         finally:
             sys.modules.update(saved)

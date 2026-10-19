@@ -5,7 +5,7 @@ pydantic-ai install required — so these run in PR CI alongside the other
 framework introspection/handler tests.
 
 Adapter contract under test (decimalai/pydantic_ai.py):
-  - ``install(enable_skill_loader=True)`` monkey-patches
+  - ``instrument(enable_skill_loader=True)`` monkey-patches
     ``pydantic_ai.Agent.__init__`` so every newly constructed Agent gets
     the DecimalAI skills function registered via ``self.instructions(...)``
     (see _install_skill_loader / patched_init). Instructions, not a system
@@ -87,7 +87,7 @@ def fake_pydantic_ai(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pydantic_ai", mod)
     # Force a fresh install in every test (the adapter is install-once). The
-    # run scope and name capture are installed by the same `install()` call, so
+    # run scope and name capture are installed by the same `instrument()` call, so
     # they are reset with it: left True, they would skip this fake class, and
     # left True by THIS test, they would skip the next test's class.
     monkeypatch.setattr(pa, "_skill_loader_installed", False)
@@ -109,11 +109,11 @@ def fake_pydantic_ai(monkeypatch):
 
 class TestSkillLoaderInstall:
     def test_install_registers_skills_prompt_on_new_agent(self, fake_pydantic_ai):
-        """After install(enable_skill_loader=True), constructing an Agent
+        """After instrument(enable_skill_loader=True), constructing an Agent
         registers the DecimalAI skills instructions function."""
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
 
         agent = Agent("openai:gpt-4o", system_prompt="You are helpful")
 
@@ -127,18 +127,18 @@ class TestSkillLoaderInstall:
         user's base system_prompt survives."""
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
         agent = Agent("openai:gpt-4o", system_prompt="BASE PROMPT")
 
         assert agent.base_system_prompt == "BASE PROMPT"
         assert agent.model == "openai:gpt-4o"
 
     def test_no_loader_when_disabled(self, fake_pydantic_ai):
-        """install() with the default (enable_skill_loader=False) must NOT
+        """instrument() with the default (enable_skill_loader=False) must NOT
         patch Agent — constructing one registers nothing."""
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install()  # enable_skill_loader defaults False
+        pa.instrument()  # enable_skill_loader defaults False
 
         agent = Agent("openai:gpt-4o")
         assert agent.registered_instructions == []
@@ -149,8 +149,8 @@ class TestSkillLoaderInstall:
         exactly one registration)."""
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
 
         agent = Agent("openai:gpt-4o")
         assert agent.registered_instructions.count(pa._skills_system_prompt) == 1

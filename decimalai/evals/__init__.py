@@ -12,9 +12,9 @@ Usage::
     def check_citation(trace: TraceData) -> bool:
         return "[source:" in trace.output
 
-    # Register with install()
-    from decimalai.langchain import install
-    install(agent_name="my-bot", evals=[check_citation])
+    # Register with instrument()
+    from decimalai.langchain import instrument
+    instrument(agent_name="my-bot", evals=[check_citation])
 """
 
 from __future__ import annotations

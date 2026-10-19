@@ -54,7 +54,6 @@ import asyncio
 import functools
 import inspect
 import logging
-import warnings
 from contextvars import Context, ContextVar, copy_context
 from typing import Any, Callable, List, Optional, Union
 
@@ -598,20 +597,3 @@ def instrument(
         "DecimalAI Anthropic integration installed (skill_loader=%s)",
         enable_skill_loader,
     )
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# `instrument()` is the current name. Behaviour is unchanged and this alias is
-# not going away soon; it warns so the docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.anthropic.install() is deprecated; use "
-        "decimalai.anthropic.instrument() instead. It installs the SkillRouter "
-        "prompt-injection loader for the Anthropic SDK only when "
-        "enable_skill_loader=True (default False), and has never added a "
-        "skill to a workspace the way SkillRouter.install() does.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

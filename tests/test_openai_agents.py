@@ -402,10 +402,10 @@ class TestDecimalTracingProcessor:
 
 
 class TestInstall:
-    """Tests for the install() function."""
+    """Tests for the instrument() function."""
 
     def test_install_calls_add_trace_processor(self):
-        """install() should call add_trace_processor by default."""
+        """instrument() should call add_trace_processor by default."""
         mock_add = MagicMock()
         mock_set = MagicMock()
 
@@ -416,8 +416,8 @@ class TestInstall:
                 set_trace_processors=mock_set,
             ),
         }):
-            from decimalai.openai_agents import install
-            install()
+            from decimalai.openai_agents import instrument
+            instrument()
 
             mock_add.assert_called_once()
             mock_set.assert_not_called()
@@ -428,7 +428,7 @@ class TestInstall:
             assert isinstance(processor, DecimalTracingProcessor)
 
     def test_install_exclusive_calls_set_trace_processors(self):
-        """install(exclusive=True) should call set_trace_processors."""
+        """instrument(exclusive=True) should call set_trace_processors."""
         mock_add = MagicMock()
         mock_set = MagicMock()
 
@@ -439,14 +439,14 @@ class TestInstall:
                 set_trace_processors=mock_set,
             ),
         }):
-            from decimalai.openai_agents import install
-            install(exclusive=True)
+            from decimalai.openai_agents import instrument
+            instrument(exclusive=True)
 
             mock_set.assert_called_once()
             mock_add.assert_not_called()
 
     def test_install_passes_agent_name(self):
-        """install(agent_name=...) should set the processor's default_agent_name."""
+        """instrument(agent_name=...) should set the processor's default_agent_name."""
         mock_add = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -456,14 +456,14 @@ class TestInstall:
                 set_trace_processors=MagicMock(),
             ),
         }):
-            from decimalai.openai_agents import install
-            install(agent_name="my-custom-agent")
+            from decimalai.openai_agents import instrument
+            instrument(agent_name="my-custom-agent")
 
             processor = mock_add.call_args[0][0]
             assert processor.default_agent_name == "my-custom-agent"
 
     def test_install_without_openai_agents_raises(self):
-        """install() should raise ImportError if openai-agents is not installed."""
+        """instrument() should raise ImportError if openai-agents is not installed."""
         saved = {}
         # Only the third-party `agents` package — a substring match also swept
         # out `decimalai.openai_agents`, and re-importing THAT under the patch
@@ -477,9 +477,9 @@ class TestInstall:
 
         try:
             with patch.dict("sys.modules", {"agents.tracing": None}):
-                from decimalai.openai_agents import install
+                from decimalai.openai_agents import instrument
                 with pytest.raises(ImportError, match="openai-agents"):
-                    install()
+                    instrument()
         finally:
             sys.modules.update(saved)
 

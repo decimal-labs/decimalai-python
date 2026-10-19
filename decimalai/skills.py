@@ -14,7 +14,7 @@ FRONT of the model. It cannot establish that the model reached for it.
 2. **Prompt-presence detection** — matches rendered prompts against known
    skill content and reports which rung the evidence supports: a name pattern
    alone is *offered*, body-content overlap is *delivered*.
-3. **Explicit declaration** — ``install(skills=[...])`` or
+3. **Explicit declaration** — ``instrument(skills=[...])`` or
    ``log_skill_activation()``.
 
 ACTIVATION is deliberately not in that list. It comes only from a direct

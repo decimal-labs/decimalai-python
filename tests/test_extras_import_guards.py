@@ -4,7 +4,7 @@ Frameworks ARE installed in the dev venv, so each test simulates absence by
 poisoning sys.modules with None (the import system raises ImportError when it
 finds None under a module's name — blocking the top-level package blocks all
 submodule imports too). Idempotency globals are reset via monkeypatch so
-install() actually reaches its import guard.
+instrument() actually reaches its import guard.
 """
 
 import sys
@@ -22,7 +22,7 @@ def _block(monkeypatch, *names):
 
 
 class TestRaisingGuards:
-    """install() paths that hard-require the framework raise, naming the extra."""
+    """instrument() paths that hard-require the framework raise, naming the extra."""
 
     def test_langchain_install_names_extra(self, monkeypatch):
         import decimalai.langchain as lc
@@ -30,21 +30,21 @@ class TestRaisingGuards:
         _block(monkeypatch, "langchain_core")
         monkeypatch.setattr(lc, "_installed", False)
         with pytest.raises(ImportError, match=r'decimalai\[langchain\]'):
-            lc.install()
+            lc.instrument()
 
     def test_openai_agents_install_names_extra(self, monkeypatch):
         import decimalai.openai_agents as oa
 
         _block(monkeypatch, "agents")
         with pytest.raises(ImportError, match=r'decimalai\[openai-agents\]'):
-            oa.install()
+            oa.instrument()
 
     def test_llamaindex_install_names_extra(self, monkeypatch):
         import decimalai.llamaindex as li
 
         _block(monkeypatch, "llama_index")
         with pytest.raises(ImportError, match=r'decimalai\[llamaindex\]'):
-            li.install()
+            li.instrument()
 
     def test_evals_llm_call_names_extra(self, monkeypatch):
         from decimalai.evals import llm_evaluators
@@ -63,7 +63,7 @@ class TestWarningGuards:
         _block(monkeypatch, "claude_agent_sdk")
         monkeypatch.setattr(cas, "_query_patched", False)
         with caplog.at_level("WARNING"):
-            cas.install()
+            cas.instrument()
         assert 'decimalai[claude-agent-sdk]' in caplog.text
 
     def test_adk_install_warns_with_extra(self, monkeypatch, caplog):
@@ -72,7 +72,7 @@ class TestWarningGuards:
         _block(monkeypatch, "google.adk")
         monkeypatch.setattr(adk, "_runner_patched", False)
         with caplog.at_level("WARNING"):
-            adk.install()
+            adk.instrument()
         assert 'decimalai[adk]' in caplog.text
 
     def test_pydantic_ai_loader_warns_with_extra(self, monkeypatch, caplog):

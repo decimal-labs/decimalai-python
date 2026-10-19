@@ -15,7 +15,7 @@ and still run. Two things must hold, and this file holds them:
 
 These tests use the REAL opentelemetry-sdk (a hard dependency of this
 package, so always present in PR CI) — no AutoGen install needed. They
-assert the actual observable wiring: install() registers a span
+assert the actual observable wiring: instrument() registers a span
 processor whose exporter is our ``DecimalSpanExporter``, not that a
 delegate function was merely invoked.
 """
@@ -28,13 +28,13 @@ import pytest
 from opentelemetry.sdk.trace import TracerProvider
 
 import decimalai.autogen as da
-from decimalai.autogen import install
+from decimalai.autogen import instrument
 from decimalai.otel import DecimalSpanExporter
 
 
 @pytest.fixture(autouse=True)
 def _reset_sdk():
-    """Set a known SDK config so install() / the exporter run cleanly."""
+    """Set a known SDK config so instrument() / the exporter run cleanly."""
     import decimalai._config as cfg
     from decimalai._config import DecimalConfig
 
@@ -67,27 +67,27 @@ def _decimal_exporters(provider: TracerProvider):
 
 class TestAutogenInstall:
     def test_install_returns_tracer_provider(self):
-        provider = install(agent_name="my-autogen-agent")
+        provider = instrument(agent_name="my-autogen-agent")
         assert isinstance(provider, TracerProvider)
 
     def test_install_registers_decimal_exporter(self):
-        """install() must wire a DecimalSpanExporter onto the provider —
+        """instrument() must wire a DecimalSpanExporter onto the provider —
         not a no-op delegation."""
-        provider = install(agent_name="my-autogen-agent")
+        provider = instrument(agent_name="my-autogen-agent")
 
         exporters = _decimal_exporters(provider)
         assert len(exporters) == 1, (
-            "install() did not register exactly one DecimalSpanExporter; "
+            "instrument() did not register exactly one DecimalSpanExporter; "
             f"found {len(exporters)}"
         )
         # The agent_name flows through to the exporter (and thus onto traces).
         assert exporters[0].default_agent_name == "my-autogen-agent"
 
     def test_install_adds_to_existing_provider(self):
-        """When passed an existing provider, install() adds the exporter to
+        """When passed an existing provider, instrument() adds the exporter to
         it and returns that same provider (no new global provider)."""
         provider = TracerProvider()
-        returned = install(agent_name="x", provider=provider)
+        returned = instrument(agent_name="x", provider=provider)
 
         assert returned is provider
         exporters = _decimal_exporters(provider)
@@ -102,7 +102,7 @@ class TestAutogenInstall:
         import decimalai._config as cfg
 
         provider = TracerProvider()
-        install(agent_name="autogen-e2e", provider=provider)
+        instrument(agent_name="autogen-e2e", provider=provider)
 
         tracer = provider.get_tracer("autogen-test")
         with tracer.start_as_current_span("chat") as span:

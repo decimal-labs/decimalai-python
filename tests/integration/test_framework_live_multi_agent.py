@@ -186,7 +186,7 @@ def test_openai_agents_multi_agent_handoff(provider, model):
     pytest.importorskip("agents")
     from agents import Agent, Runner, function_tool
     from agents.tracing import flush_traces
-    from decimalai.openai_agents import install as install_oai_processor
+    from decimalai.openai_agents import instrument as instrument_oai
 
     agent_name = h.unique_agent(f"openai-agents-{provider}-handoff")
     specialist_name = h.unique_agent(f"openai-agents-{provider}-specialist")
@@ -226,11 +226,11 @@ def test_openai_agents_multi_agent_handoff(provider, model):
         handoffs=[refund_specialist],
     )
 
-    # Use install(agent=...) so `_introspect_agent` runs and registers a
+    # Use instrument(agent=...) so `_introspect_agent` runs and registers a
     # manifest with the handoffs as subagent components — required for the
     # backend to mark the specialist `is_subagent=True` and for the
     # topology endpoint to return non-empty data.
-    install_oai_processor(agent=orchestrator, agent_name=agent_name, exclusive=True)
+    instrument_oai(agent=orchestrator, agent_name=agent_name, exclusive=True)
 
     result = Runner.run_sync(orchestrator, h.SUPPORT_QUERY)
     answer = str(result.final_output).lower()

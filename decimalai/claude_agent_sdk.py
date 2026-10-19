@@ -53,7 +53,6 @@ import logging
 import os
 import re
 import threading
-import warnings
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, NamedTuple, Optional, Tuple
 from uuid import UUID, uuid4
@@ -1118,24 +1117,3 @@ def instrument(agent_name: Optional[str] = None) -> None:
         "DecimalAI Claude Agent SDK tracing installed globally (agent_name=%s)",
         agent_name,
     )
-
-
-# ── Deprecated: install() ────────────────────────────────────────────────────
-#
-# Renamed to `instrument()` 2026-08-11. "install" was doing double duty across
-# this SDK: here it turned on TRACING for a framework, while
-# `SkillRouter.install()` added a SKILL to a workspace. Two unrelated actions
-# under one word, in one package — and the skill sense is the one users arrive
-# with, because it is what every extension marketplace means by install.
-#
-# Behaviour is unchanged and this alias is not going away soon; it warns so the
-# docs and the code agree on one name.
-def install(*args, **kwargs):  # pragma: no cover - thin deprecation shim
-    warnings.warn(
-        "decimalai.claude_agent_sdk.install() is deprecated; use "
-        "decimalai.claude_agent_sdk.instrument() instead. It turns on tracing for claude_agent_sdk "
-        "and has never had anything to do with installing a skill.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return instrument(*args, **kwargs)

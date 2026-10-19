@@ -84,7 +84,7 @@ def _wait_for_new_trace(
 ) -> Optional[str]:
     """Wait for a trace NEWER than ``baseline_trace_id`` to appear.
 
-    Replaying re-runs the agent, which (via install()) exports a fresh
+    Replaying re-runs the agent, which (via instrument()) exports a fresh
     trace asynchronously. Naively taking ``list_traces(limit=1)[0]`` after
     a fixed sleep is racy: a concurrent trace for the same agent, or an
     export slower than the sleep, makes us link the WRONG trace and
@@ -322,8 +322,8 @@ def run(
     4. Returns a summary of results
 
     **Important:** Your agent must be instrumented with DecimalAI's
-    ``install()`` so that new traces are auto-captured. Call
-    ``decimalai.init()`` and your framework's ``install()`` before
+    ``instrument()`` so that new traces are auto-captured. Call
+    ``decimalai.init()`` and your framework's ``instrument()`` before
     calling ``replay.run()``.
 
     Args:
@@ -456,7 +456,7 @@ def run(
                 results.completed += 1
             else:
                 task_result.status = "failed"
-                task_result.error = "No trace captured — is install() configured?"
+                task_result.error = "No trace captured — is instrument() configured?"
                 results.failed += 1
                 results.completed += 1
 
@@ -631,7 +631,7 @@ def run_sessions(
                     results.completed += 1
                 else:
                     task_result.status = "failed"
-                    task_result.error = "No trace captured — is install() configured?"
+                    task_result.error = "No trace captured — is instrument() configured?"
                     results.failed += 1
                     results.completed += 1
 

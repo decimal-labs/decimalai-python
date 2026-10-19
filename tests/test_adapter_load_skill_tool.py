@@ -12,7 +12,7 @@ exercised, only our adapter surface:
   - openai_agents patches nothing since 0.18: ``load_agent()`` hands the tool
     to the developer, and tests/test_openai_agents_load_agent.py drives it
     through the real Agents SDK.
-  - anthropic + langchain: install(enable_load_skill_tool=True) is
+  - anthropic + langchain: instrument(enable_load_skill_tool=True) is
     accepted but DORMANT — logs a warning, does not raise.
 """
 
@@ -101,7 +101,7 @@ def fake_pydantic_ai(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pydantic_ai", mod)
     monkeypatch.setattr(pa, "_skill_loader_installed", False)
-    # `install()` also installs the run scope and name capture on this class;
+    # `instrument()` also installs the run scope and name capture on this class;
     # reset them with the loader so each test patches its own fake.
     monkeypatch.setattr(pa, "_run_scope_installed", False)
     monkeypatch.setattr(pa, "_name_capture_installed", False)
@@ -119,7 +119,7 @@ class TestPydanticAiLoadSkillTool:
     def test_tool_registered_via_tool_plain(self, fake_pydantic_ai):
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
         agent = Agent("openai:gpt-4o", system_prompt="BASE")
 
         assert len(agent.registered_tools) == 1
@@ -139,7 +139,7 @@ class TestPydanticAiLoadSkillTool:
     def test_registered_tool_calls_router_load_skill(self, fake_pydantic_ai):
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
         agent = Agent("openai:gpt-4o")
         tool_fn = agent.registered_tools[0]
 
@@ -162,7 +162,7 @@ class TestPydanticAiLoadSkillTool:
     def test_registered_tool_names_the_bound_agent(self, fake_pydantic_ai):
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(agent_name="support", enable_skill_loader=True)
+        pa.instrument(agent_name="support", enable_skill_loader=True)
         agent = Agent("openai:gpt-4o")
         tool_fn = agent.registered_tools[0]
         fake_router = MagicMock()
@@ -177,7 +177,7 @@ class TestPydanticAiLoadSkillTool:
         """The tool must always return a string the model can act on."""
         _, Agent, pa = fake_pydantic_ai
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
         agent = Agent("openai:gpt-4o")
         tool_fn = agent.registered_tools[0]
 
@@ -193,7 +193,7 @@ class TestPydanticAiLoadSkillTool:
         _, Agent, pa = fake_pydantic_ai
         _fresh_config(monkeypatch, load_skill_tool_env="0")
 
-        pa.install(enable_skill_loader=True)
+        pa.instrument(enable_skill_loader=True)
         agent = Agent("openai:gpt-4o")
 
         assert agent.registered_tools == []
@@ -233,7 +233,7 @@ class TestDormantAdapters:
         import decimalai.anthropic as an
 
         with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
-            an.install(enable_load_skill_tool=True)  # must not raise
+            an.instrument(enable_load_skill_tool=True)  # must not raise
 
         assert any(
             "enable_load_skill_tool is not supported" in rec.getMessage()
@@ -245,7 +245,7 @@ class TestDormantAdapters:
     ):
         import decimalai.langchain as lc
 
-        # install() early-returns when already installed — force a fresh
+        # instrument() early-returns when already installed — force a fresh
         # pass so the dormancy warning path actually runs. disk_sync=False
         # keeps the install away from disk discovery / background sync.
         # The global handler this publishes is torn down by the autouse
@@ -253,7 +253,7 @@ class TestDormantAdapters:
         monkeypatch.setattr(lc, "_installed", False)
 
         with caplog.at_level(logging.WARNING, logger="decimalai.langchain"):
-            lc.install(enable_load_skill_tool=True, disk_sync=False)  # must not raise
+            lc.instrument(enable_load_skill_tool=True, disk_sync=False)  # must not raise
 
         assert any(
             "enable_load_skill_tool is not supported" in rec.getMessage()
