@@ -596,7 +596,7 @@ class TestCacheTokensReachTheRecord:
         from decimalai.schema.trace import LlmCallRecord
 
         state = cas._RunState(
-            agent_name="cache-agent", project=None, parent_trace_id=None,
+            agent_name="cache-agent", parent_trace_id=None,
             user_input="hi", options=None,
         )
         # Blocks are matched by class NAME, so reuse the module's fake TextBlock.
@@ -627,7 +627,7 @@ class TestCacheTokensReachTheRecord:
         from decimalai.schema.trace import LlmCallRecord
 
         state = cas._RunState(
-            agent_name="cache-agent", project=None, parent_trace_id=None,
+            agent_name="cache-agent", parent_trace_id=None,
             user_input="hi", options=None,
         )
         state.llm_calls.append(LlmCallRecord(model_name="claude-sonnet-4-5"))

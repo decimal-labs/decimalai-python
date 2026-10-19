@@ -24,7 +24,7 @@ def cli():
 
 # ── Shared helper ──────────────────────────────────────────
 
-def _make_client(api_key, base_url, project):
+def _make_client(api_key, base_url):
     """Create a client, raising a helpful error if api_key is missing."""
     from .._client import DecimalAIClient
     if not api_key:
@@ -37,7 +37,7 @@ def _make_client(api_key, base_url, project):
         click.echo(f"  Get one at {_dashboard_url(base_url)}/settings")
         click.echo("  Or run `decimalai init` to verify your setup.")
         raise SystemExit(1)
-    return DecimalAIClient(api_key=api_key, project=project, base_url=base_url)
+    return DecimalAIClient(api_key=api_key, base_url=base_url)
 
 
 # ── Common options ─────────────────────────────────────────
@@ -54,13 +54,6 @@ _common_options = [
         default="https://api.decimal.ai",
         show_envvar=True,
         help="Platform URL",
-    ),
-    # Deprecated and inert: the platform never read the project label. Kept so
-    # existing scripts passing --project don't start failing; it does nothing.
-    click.option(
-        "--project",
-        default="default",
-        help="(deprecated, no effect — traces are scoped by your API key)",
     ),
 ]
 
@@ -696,7 +689,7 @@ def _resolve_skill_id(http, ref):
 @click.option("--description", default=None, help="A note on what this agent does.")
 @common_options
 def agents_create(agent_name, pack, prompt_file, skill_refs, no_starters, description,
-                  api_key, base_url, project):
+                  api_key, base_url):
     """Create an agent, from a role pack or from skills you pick.
 
     \b
@@ -718,7 +711,7 @@ def agents_create(agent_name, pack, prompt_file, skill_refs, no_starters, descri
     if prompt_file and not system_prompt.strip():
         raise click.UsageError("--prompt-file is empty.")
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         skill_ids = []
         if pack and not no_starters:
@@ -800,9 +793,9 @@ def traces():
 @click.option("--limit", default=20, help="Max results to return")
 @click.option("--status", default=None, help="Filter by status")
 @common_options
-def traces_list(limit, status, api_key, base_url, project):
+def traces_list(limit, status, api_key, base_url):
     """List traces for a project."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.list_traces(limit=limit, status=status)
         traces_data = result.get("traces", [])
@@ -821,10 +814,10 @@ def traces_list(limit, status, api_key, base_url, project):
 @traces.command("show")
 @click.argument("trace_id")
 @common_options
-def traces_show(trace_id, api_key, base_url, project):
+def traces_show(trace_id, api_key, base_url):
     """Show detail for a specific trace."""
     import json
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.get_trace(trace_id)
         click.echo(json.dumps(result, indent=2, default=str))
@@ -835,9 +828,9 @@ def traces_show(trace_id, api_key, base_url, project):
 @traces.command("stats")
 @click.option("--agent-name", default=None, help="Filter by agent name")
 @common_options
-def traces_stats(agent_name, api_key, base_url, project):
+def traces_stats(agent_name, api_key, base_url):
     """Show trace statistics."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         params = {}
         if agent_name:
@@ -862,12 +855,12 @@ def traces_stats(agent_name, api_key, base_url, project):
     ),
 )
 @common_options
-def traces_import(file_path, fmt, agent_name, api_key, base_url, project):
+def traces_import(file_path, fmt, agent_name, api_key, base_url):
     """Import traces from a JSON or JSONL file."""
     import json as json_mod
 
     import httpx
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
 
     # Auto-detect format
     if fmt == "auto":
@@ -956,9 +949,9 @@ def eval():
 @click.option("--score", multiple=True, help="Score in name=value format (e.g. quality=0.9)")
 @click.option("--source", default="cli", help="Score source label")
 @common_options
-def eval_push(trace_id, score, source, api_key, base_url, project):
+def eval_push(trace_id, score, source, api_key, base_url):
     """Push evaluation scores to a trace."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         scores = []
         for s in score:
@@ -984,9 +977,9 @@ def evaluators():
 @evaluators.command("list")
 @click.option("--agent", "agent_name", help="List only evaluators for this agent")
 @common_options
-def evaluators_list(agent_name, api_key, base_url, project):
+def evaluators_list(agent_name, api_key, base_url):
     """List configured evaluators."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.list_evaluators(agent_name=agent_name)
         evals = result.get("evaluators", [])
@@ -1007,9 +1000,9 @@ def evaluators_list(agent_name, api_key, base_url, project):
 
 @evaluators.command("templates")
 @common_options
-def evaluators_templates(api_key, base_url, project):
+def evaluators_templates(api_key, base_url):
     """List available evaluator templates (pre-built deterministic + LLM judge)."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.list_evaluator_templates()
         for t in result.get("templates", []):
@@ -1037,7 +1030,7 @@ def evaluators_templates(api_key, base_url, project):
 @click.option("--description", help="One-line description")
 @common_options
 def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_template,
-                   threshold, display_name, description, api_key, base_url, project):
+                   threshold, display_name, description, api_key, base_url):
     """Add an evaluator.
 
     \b
@@ -1073,7 +1066,7 @@ def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_te
         )
         raise SystemExit(1)
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.add_evaluator(
             agent_name=agent_name,
@@ -1095,9 +1088,9 @@ def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_te
 @evaluators.command("remove")
 @click.argument("evaluator_id")
 @common_options
-def evaluators_remove(evaluator_id, api_key, base_url, project):
+def evaluators_remove(evaluator_id, api_key, base_url):
     """Remove an evaluator by id."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         client.remove_evaluator(evaluator_id)
         click.echo(f"✓ Removed evaluator {evaluator_id[:8]}")
@@ -1126,9 +1119,9 @@ skills_pm.register(skills)
 @skills.command("list")
 @click.option("--limit", default=50, help="Max results")
 @common_options
-def skills_list(limit, api_key, base_url, project):
+def skills_list(limit, api_key, base_url):
     """List skills in your workspace."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         resp = client._http.get("/api/v1/skills", params={"limit": limit})
         resp.raise_for_status()
@@ -1173,7 +1166,7 @@ def _registry_stamped(frontmatter) -> bool:
     help="Walk and hash but don't POST. Useful for previewing what would change.",
 )
 @common_options
-def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
+def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
     """Sync local SKILL.md files at SKILLS_DIR with the platform registry.
 
     Walks SKILLS_DIR (default ./skills) for SKILL.md files, hashes each
@@ -1338,7 +1331,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url, project):
     if install_id:
         click.echo(f"  Install: {identity.get('install_label') or install_id[:8]}")
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         sync_body = {
             "skills": skills_payload,
@@ -1478,7 +1471,7 @@ _STATUS_ORDER = {
 AUTHORED_DRIFT = ("local_ahead", "remote_ahead", "conflict")
 
 
-def _authored_status(skills_dir, api_key, base_url, project, *, project_root=None,
+def _authored_status(skills_dir, api_key, base_url, *, project_root=None,
                      combined=False):
     """The authored section of `decimalai skills status`: per-install sync divergence.
 
@@ -1560,7 +1553,7 @@ def _authored_status(skills_dir, api_key, base_url, project, *, project_root=Non
         click.echo("  ✗ Could not determine install id", err=True)
         raise SystemExit(1)
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         report_body = {"install_id": install_id, "skills": items}
         if identity.get("install_label"):
@@ -1697,7 +1690,7 @@ def skills_scan(skills_dir, fmt, fail_on):
 @skills.command("review")
 @click.argument("skill_name")
 @common_options
-def skills_review(skill_name, api_key, base_url, project):
+def skills_review(skill_name, api_key, base_url):
     """Run a SkillSafety DEEP review (LLM Tier-2 intent + Tier-3 content) on a skill.
 
     Unlike `skills scan` (free, local, Tier-1 only), this runs the LLM tiers server-side
@@ -1708,7 +1701,7 @@ def skills_review(skill_name, api_key, base_url, project):
     """
     import sys
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         resp = client._http.post(f"/api/v1/skills/{skill_name}/checks/run?deep=true")
         resp.raise_for_status()
@@ -1770,7 +1763,7 @@ def skills_review(skill_name, api_key, base_url, project):
     help="Removed — use --runs N (run-level repetition, mean-averaged).",
 )
 @common_options
-def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials):
+def skills_benchmark(skill_dir, api_key, base_url, model, runs, trials):
     """Run the A/B benchmark suite for a skill defined in ``skill_dir``.
 
     This is the HOSTED, **verified** path: the platform runner executes
@@ -1841,7 +1834,7 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
         click.echo(f"  ✗ {skill_md} has an empty body", err=True)
         raise SystemExit(1)
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         # 1. Sync this skill body + (optionally) eval.yaml so the backend
         #    has the latest test cases before running.
@@ -2013,7 +2006,7 @@ def skills_benchmark(skill_dir, api_key, base_url, project, model, runs, trials)
     help="Skill name to attach the run to (default: skill.name from the results file).",
 )
 @common_options
-def skills_push(results_file, skill_name, api_key, base_url, project):
+def skills_push(results_file, skill_name, api_key, base_url):
     """Upload a local ``skillevaluation run`` result as an UNVERIFIED run.
 
     RESULTS_FILE is the ``results.json`` the open-source runner wrote
@@ -2047,7 +2040,7 @@ def skills_push(results_file, skill_name, api_key, base_url, project):
         )
         raise SystemExit(1)
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         resp = client._http.post(
             f"/api/v1/skills/{name}/benchmark/import", json=payload
@@ -2106,9 +2099,9 @@ def manifests():
 @click.option("--agent-name", default=None, help="Filter by agent name")
 @click.option("--limit", default=20, help="Max results")
 @common_options
-def manifests_list(agent_name, limit, api_key, base_url, project):
+def manifests_list(agent_name, limit, api_key, base_url):
     """List manifests."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.list_manifests(limit=limit, agent_name=agent_name)
         manifests_data = result.get("manifests", [])
@@ -2135,9 +2128,9 @@ def datasets():
 @click.option("--limit", default=20, help="Max results")
 @click.option("--agent-name", default=None, help="Filter by target agent")
 @common_options
-def datasets_list(limit, agent_name, api_key, base_url, project):
+def datasets_list(limit, agent_name, api_key, base_url):
     """List datasets in the workspace."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         result = client.list_datasets(limit=limit)
         ds_list = result.get("datasets", [])
@@ -2160,14 +2153,14 @@ def datasets_list(limit, agent_name, api_key, base_url, project):
 @datasets.command("show")
 @click.argument("dataset_id")
 @common_options
-def datasets_show(dataset_id, api_key, base_url, project):
+def datasets_show(dataset_id, api_key, base_url):
     """Show dataset detail with version history.
 
     \b
     Example:
         $ decimalai datasets show ds_abc123
     """
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         ds = client.get_dataset(dataset_id)
         click.echo("")
@@ -2203,9 +2196,9 @@ def datasets_show(dataset_id, api_key, base_url, project):
 @click.argument("dataset_id")
 @click.option("--verdict", default=None, help="Filter traces by verdict (keep, repair)")
 @common_options
-def datasets_build(dataset_id, verdict, api_key, base_url, project):
+def datasets_build(dataset_id, verdict, api_key, base_url):
     """Build a new dataset version from traces."""
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         filters = {}
         if verdict:
@@ -2232,7 +2225,7 @@ def datasets_build(dataset_id, verdict, api_key, base_url, project):
     help="Export format (default: inferred from file extension)",
 )
 @common_options
-def datasets_pull(dataset_id, output, version_spec, fmt, api_key, base_url, project):
+def datasets_pull(dataset_id, output, version_spec, fmt, api_key, base_url):
     """Pull a dataset to a local file for training.
 
     Downloads a dataset version and writes it to disk in a training-ready format.
@@ -2249,7 +2242,7 @@ def datasets_pull(dataset_id, output, version_spec, fmt, api_key, base_url, proj
         # Pull as Parquet
         $ decimalai datasets pull ds_abc123 -o ./data.parquet
     """
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         version_label = version_spec or "latest"
         click.echo(f"  Pulling dataset {dataset_id} (version: {version_label})...")
@@ -2286,7 +2279,7 @@ def datasets_pull(dataset_id, output, version_spec, fmt, api_key, base_url, proj
 )
 @click.option("--output", "-o", default=None, help="Output file path (prints to stdout if omitted)")
 @common_options
-def datasets_export(dataset_id, version_spec, fmt, output, api_key, base_url, project):
+def datasets_export(dataset_id, version_spec, fmt, output, api_key, base_url):
     """Export a dataset version for training.
 
     Prints to stdout by default (for piping), or writes to a file with -o.
@@ -2302,7 +2295,7 @@ def datasets_export(dataset_id, version_spec, fmt, output, api_key, base_url, pr
         # Pipe to another tool
         $ decimalai datasets export ds_abc123 | head -5
     """
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         data = client.export_dataset(dataset_id, version_spec, format=fmt)
 
@@ -2349,7 +2342,7 @@ def _format_bytes(n: int) -> str:
 @click.option("--public/--private", "is_public", default=False, help="Create as public or private (default: private)")
 @click.option("--split", default="train", help="Dataset split name (default: train)")
 @common_options
-def datasets_push_to_hub(dataset_id, repo_id, version_spec, token, is_public, split, api_key, base_url, project):
+def datasets_push_to_hub(dataset_id, repo_id, version_spec, token, is_public, split, api_key, base_url):
     """Push a dataset to HuggingFace Hub.
 
     Makes the dataset loadable by Axolotl, Unsloth, TRL, and any tool
@@ -2374,7 +2367,7 @@ def datasets_push_to_hub(dataset_id, repo_id, version_spec, token, is_public, sp
         ds = load_dataset("my-org/support-agent-sft")
     """
     import decimalai as sdk
-    sdk.init(api_key=api_key, base_url=base_url, project=project)
+    sdk.init(api_key=api_key, base_url=base_url)
 
     version_label = version_spec or "latest"
     click.echo(f"  Pushing dataset {dataset_id} (version: {version_label}) to {repo_id}...")
@@ -2422,7 +2415,7 @@ def replay():
 @click.option("--dry-run", is_flag=True, help="Show what would be done without executing")
 @click.option("--no-skip-failed", is_flag=True, help="Stop on first failure")
 @common_options
-def replay_run(batch_id, agent_fn, api_key, base_url, project, dry_run, no_skip_failed):
+def replay_run(batch_id, agent_fn, api_key, base_url, dry_run, no_skip_failed):
     """Execute the pending tasks in a replay batch.
 
     BATCH_ID is the replay batch to execute. Each pending task is re-run
@@ -2446,7 +2439,7 @@ def replay_run(batch_id, agent_fn, api_key, base_url, project, dry_run, no_skip_
 
     # Initialize the SDK
     import decimalai
-    decimalai.init(api_key=api_key, project=project, base_url=base_url)
+    decimalai.init(api_key=api_key, base_url=base_url)
 
     # Load the agent function
     try:
@@ -2544,7 +2537,7 @@ def replay_run(batch_id, agent_fn, api_key, base_url, project, dry_run, no_skip_
 )
 @click.option("--recompute", is_flag=True, help="Force a fresh compatibility analysis")
 @common_options
-def compat_check(agent_name, fmt, recompute, api_key, base_url, project):
+def compat_check(agent_name, fmt, recompute, api_key, base_url):
     """Check dataset compatibility after a manifest change.
 
     Compares the latest two manifests for an agent and reports how many
@@ -2561,7 +2554,7 @@ def compat_check(agent_name, fmt, recompute, api_key, base_url, project):
     """
     import json as json_mod
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         data = client.compat_check(agent_name, recompute=recompute)
     except Exception as e:
@@ -2672,11 +2665,11 @@ def repair():
 @click.option("--sample-size", default=5, type=int, help="How many traces to preview (1-50)")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json"]), help="Output format")
 @common_options
-def repair_preview_cmd(old_manifest_id, new_manifest_id, sample_size, fmt, api_key, base_url, project):
+def repair_preview_cmd(old_manifest_id, new_manifest_id, sample_size, fmt, api_key, base_url):
     """Preview the repair rules generated for an old→new manifest transition."""
     import json as json_mod
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         data = client.repair_preview(old_manifest_id, new_manifest_id, sample_size=sample_size)
     except Exception as e:
@@ -2711,12 +2704,12 @@ def repair_preview_cmd(old_manifest_id, new_manifest_id, sample_size, fmt, api_k
 @click.option("--rule-index", "rule_indices", multiple=True, type=int, help="Apply only this preview rule index (repeatable). Omit to apply all.")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json"]), help="Output format")
 @common_options
-def repair_apply_cmd(old_manifest_id, new_manifest_id, rule_indices, fmt, api_key, base_url, project):
+def repair_apply_cmd(old_manifest_id, new_manifest_id, rule_indices, fmt, api_key, base_url):
     """Apply repairs (all eligible rules, or only the --rule-index ones)."""
     import json as json_mod
 
     indices = list(rule_indices) or None
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         data = client.repair_apply(old_manifest_id, new_manifest_id, approved_rule_indices=indices)
     except Exception as e:
@@ -2784,7 +2777,6 @@ def regression_check(
     dry_run,
     api_key,
     base_url,
-    project,
 ):
     """Run a manifest impact analysis for a candidate manifest.
 
@@ -2832,7 +2824,7 @@ def regression_check(
     pr_context = decimalai._read_github_pr_context() or None
 
     # 3. Call the API
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         report = client.run_regression_check(
             agent_name=agent_name,
@@ -3076,7 +3068,7 @@ def demo():
 )
 @click.option("--web", default=None, help="Frontend base URL for the printed link.")
 @common_options
-def demo_regression(reset, web, api_key, base_url, project):
+def demo_regression(reset, web, api_key, base_url):
     """Seed the "Your agent changed" demo and open the impact report.
 
     Seeds a v1→v2 agent (model swap, tool rename/removal, prompt rewrite)
@@ -3086,7 +3078,7 @@ def demo_regression(reset, web, api_key, base_url, project):
     repair→build→export flow.
     """
 
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     web_url = _demo_web_url(base_url, web)
     report = None
     try:
@@ -3157,7 +3149,7 @@ def demo_regression(reset, web, api_key, base_url, project):
 )
 @click.option("--web", default=None, help="Frontend base URL for the printed links.")
 @common_options
-def demo_skills(reset, web, api_key, base_url, project):
+def demo_skills(reset, web, api_key, base_url):
     """Seed the "Find skills that work" demo and open the ranked registry.
 
     Seeds three demo skills into your workspace (org-scoped — other orgs
@@ -3166,7 +3158,7 @@ def demo_skills(reset, web, api_key, base_url, project):
     top skill's detail page, which shows per-model pass rates and the
     cross-org router activation rate.
     """
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     web_url = _demo_web_url(base_url, web)
     try:
         click.echo("")
@@ -3217,7 +3209,7 @@ def demo_skills(reset, web, api_key, base_url, project):
 
 @demo.command("reset")
 @common_options
-def demo_reset(api_key, base_url, project):
+def demo_reset(api_key, base_url):
     """Remove ALL demo data (both demos) for this workspace.
 
     Deletes the seeded demo agent, its manifests, traces, and datasets AND
@@ -3225,7 +3217,7 @@ def demo_reset(api_key, base_url, project):
     traces. Exact-name matched, so your own skills/agents that merely start
     with "[Demo] " are left untouched.
     """
-    client = _make_client(api_key, base_url, project)
+    client = _make_client(api_key, base_url)
     try:
         resp = client._http.delete(
             "/api/v1/demo/cleanup", timeout=_DEMO_HTTP_TIMEOUT

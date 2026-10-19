@@ -143,7 +143,7 @@ class UserMessage:
 def _feed(*messages: Any):
     from decimalai import claude_agent_sdk as cas
 
-    state = cas._RunState(agent_name="t", project=None, parent_trace_id=None,
+    state = cas._RunState(agent_name="t", parent_trace_id=None,
                           user_input="q", options=None)
     for m in messages:
         cas._ingest_message(state, m)

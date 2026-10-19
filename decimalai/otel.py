@@ -1205,7 +1205,6 @@ class DecimalSpanExporter:
         if not _config._is_enabled():
             return None
 
-        config = _config._config
         trace_spans: List[TraceSpan] = []
         llm_calls: List[LlmCallRecord] = []
         agent_name = self.default_agent_name
@@ -1525,7 +1524,6 @@ class DecimalSpanExporter:
 
         return RunTrace(
             id=uuid4(),
-            project=config.project if config else None,
             agent_name=agent_name or "otel-agent",
             status=trace_status,
             source_type="production",

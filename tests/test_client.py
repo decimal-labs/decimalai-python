@@ -21,14 +21,12 @@ class TestDecimalAIClient:
     def _make_client(self):
         return DecimalAIClient(
             api_key="dai_sk_test",
-            project="test-project",
             base_url="http://localhost:8000",
         )
 
     def test_client_initialization(self):
         client = self._make_client()
         assert client.api_key == "dai_sk_test"
-        assert client.project == "test-project"
         assert client.base_url == "http://localhost:8000"
 
     def test_config_headers(self):
@@ -36,15 +34,11 @@ class TestDecimalAIClient:
         headers = dict(client._http.headers)
         assert headers["authorization"] == "Bearer dai_sk_test"
 
-    def test_project_is_not_sent_as_a_header(self):
-        """`project` must not reach the wire — the platform never read it.
-
-        The SDK used to send `X-Decimal-Project`, which the backend ignores
-        entirely (a trace's project_id comes only from a project-scoped API
-        key), so passing project= silently grouped nothing."""
-        client = self._make_client()
-        assert client.project == "test-project"  # still recorded locally
-        assert "x-decimal-project" not in dict(client._http.headers)
+    def test_there_is_no_project_setting(self):
+        """Traces are scoped by the API key; `project=` never grouped anything and is gone."""
+        with pytest.raises(TypeError):
+            DecimalAIClient(api_key="dai_sk_test", project="test-project")
+        assert "x-decimal-project" not in dict(self._make_client()._http.headers)
 
     def test_buffer_under_threshold(self):
         client = self._make_client()
@@ -124,7 +118,6 @@ class TestClientAuth:
     def test_verify_auth_sends_correct_headers(self):
         client = DecimalAIClient(
             api_key="dai_sk_my_key",
-            project="my-project",
             base_url="http://localhost:8000",
         )
         # The HTTP client stores the headers
@@ -145,7 +138,6 @@ class TestImpactReport:
     def _make_client(self):
         return DecimalAIClient(
             api_key="dai_sk_test",
-            project="test-project",
             base_url="http://localhost:8000",
         )
 
@@ -183,7 +175,7 @@ class TestRepair:
 
     def _make_client(self):
         return DecimalAIClient(
-            api_key="dai_sk_test", project="test-project", base_url="http://localhost:8000"
+            api_key="dai_sk_test", base_url="http://localhost:8000"
         )
 
     def test_repair_preview_posts_correct_payload(self):

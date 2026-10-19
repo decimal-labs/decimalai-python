@@ -126,23 +126,20 @@ class TestTraceModels:
 class TestConfig:
     def test_defaults(self):
         config = DecimalConfig()
-        assert config.project is None
+        assert not hasattr(config, "project")
         assert config.enabled is True
         assert config.base_url == "https://api.decimal.ai"
 
     def test_api_headers(self):
         import decimalai
 
-        config = DecimalConfig(api_key="dai_sk_test", project="my-project")
+        config = DecimalConfig(api_key="dai_sk_test")
         headers = config.api_headers
         assert headers["Authorization"] == "Bearer dai_sk_test"
         assert headers["Content-Type"] == "application/json"
         # Every request identifies its SDK version — see
         # tests/test_sdk_version_header.py for why and for the full contract.
         assert headers["User-Agent"].startswith(f"decimalai-sdk/{decimalai.__version__} ")
-        # `project` is deprecated and inert: the platform reads no such header,
-        # so emitting it made project= look like it grouped traces when it did
-        # nothing. Must not appear on the wire.
         assert "X-Decimal-Project" not in headers
 
 

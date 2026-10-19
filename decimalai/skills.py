@@ -593,41 +593,6 @@ def detect_skills_present_in_prompt(
     return present
 
 
-def detect_skill_activations(
-    rendered_input: Any,
-    skill_registry: List[Dict[str, Any]],
-    *,
-    fuzzy_match: bool = True,
-    fuzzy_threshold: float = 0.6,
-) -> List[str]:
-    """Deprecated alias for :func:`detect_skills_present_in_prompt`.
-
-    The name is a misnomer kept for backward compatibility: matching prompt
-    text establishes PRESENCE (offered or delivered), never activation. It
-    returns the same skill names, in the same order, as it always has — only
-    the evidence tier is dropped. Prefer
-    :func:`detect_skills_present_in_prompt`, which reports the rung, or
-    :func:`infer_prompt_rungs`, which routes the rungs for you.
-
-    Returns:
-        List of skill names whose text is present in the prompt.
-    """
-    # Deduped: the underlying function reports name-evidence and
-    # body-evidence independently, so a SKILL.md pasted whole yields the same
-    # name twice. This alias has always returned each name once.
-    seen = set()
-    names = []
-    for name, _evidence in detect_skills_present_in_prompt(
-        rendered_input,
-        skill_registry,
-        fuzzy_match=fuzzy_match,
-        fuzzy_threshold=fuzzy_threshold,
-    ):
-        if name not in seen:
-            seen.add(name)
-            names.append(name)
-    return names
-
 def infer_prompt_rungs(
     rendered_inputs: Iterable[Any],
     skill_registry: Optional[Sequence[Dict[str, Any]]],

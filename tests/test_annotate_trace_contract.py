@@ -1,8 +1,8 @@
 """annotate_trace must match the backend CreateAnnotationRequest.
 
 The endpoint uses extra="forbid", so the SDK must send ONLY allowed fields (never
-text/annotation_type/span_id), map the legacy `text` arg to `notes`, and reject an
-empty annotation locally instead of letting the backend 422.
+text/annotation_type/span_id, which it does not take either), and reject an empty
+annotation locally instead of letting the backend 422.
 """
 
 from unittest.mock import MagicMock, patch
@@ -38,21 +38,14 @@ def test_notes_only_sends_allowed_fields():
     assert not (_FORBIDDEN & body.keys())
 
 
-def test_legacy_text_maps_to_notes():
+@pytest.mark.parametrize("kwargs", [{"text": "a note"}, {"annotation_type": "note"},
+                                    {"span_id": "s1"}])
+def test_the_fields_the_endpoint_forbids_are_not_arguments(kwargs):
     c = _client()
-    with patch.object(c, "_request_with_retry", return_value=_ok_resp()) as m:
-        c.annotate_trace("t1", text="legacy note")
-    assert m.call_args.kwargs["json"] == {"notes": "legacy note"}
-
-
-def test_deprecated_kwargs_ignored_with_warning():
-    c = _client()
-    with patch.object(c, "_request_with_retry", return_value=_ok_resp()) as m:
-        with pytest.warns(DeprecationWarning):
-            c.annotate_trace("t1", notes="x", annotation_type="note", span_id="s1")
-    body = m.call_args.kwargs["json"]
-    assert not (_FORBIDDEN & body.keys())
-    assert body == {"notes": "x"}
+    with patch.object(c, "_request_with_retry") as m:
+        with pytest.raises(TypeError):
+            c.annotate_trace("t1", notes="x", **kwargs)
+    m.assert_not_called()
 
 
 def test_empty_annotation_raises_locally():

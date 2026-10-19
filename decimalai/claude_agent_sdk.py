@@ -290,7 +290,7 @@ class _RunState:
     """Per-stream trace accumulator. One ``query()`` invocation → one RunTrace."""
 
     __slots__ = (
-        "trace_id", "agent_name", "project", "parent_trace_id",
+        "trace_id", "agent_name", "parent_trace_id",
         "started_at", "ended_at", "user_input_preview", "final_output_preview",
         "llm_calls", "spans", "pending_tools", "transcript", "root_span",
         "saw_turn_usage",
@@ -302,7 +302,6 @@ class _RunState:
         self,
         *,
         agent_name: Optional[str],
-        project: Optional[str],
         parent_trace_id: Optional[str],
         user_input: Optional[str],
         options: Any,
@@ -313,7 +312,6 @@ class _RunState:
         self.agent_name = (
             agent_name or _install_agent_name or default_agent_name() or "claude-agent"
         )
-        self.project = project
         self.parent_trace_id = parent_trace_id
         self.started_at = _now()
         self.ended_at: Optional[datetime] = None
@@ -913,11 +911,9 @@ def _finalize(state: _RunState) -> None:
     manifest_id = _maybe_register_manifest(state)
     try:
         client = _config._get_client()
-        config = _config._get_config()
         spans = _closed_spans(state)
         trace = RunTrace(
             id=state.trace_id,
-            project=state.project or (config.project if config else None),
             agent_name=state.agent_name,
             parent_trace_id=state.parent_trace_id,
             session_id=state.session_id,
@@ -988,7 +984,6 @@ async def trace_stream(
     *,
     agent_name: Optional[str] = None,
     user_input: Optional[str] = None,
-    project: Optional[str] = None,
     parent_trace_id: Optional[str] = None,
     options: Any = None,
 ) -> AsyncIterator[Any]:
@@ -1005,13 +1000,12 @@ async def trace_stream(
             ``instrument()`` name, then the agent ``decimalai.init()`` named
             (or ``DECIMAL_AGENT_NAME``), then ``"claude-agent"``.
         user_input: The prompt text, for ``user_input_preview``.
-        project: Optional project grouping.
         parent_trace_id: Link this run to a parent orchestrator trace.
         options: The ``ClaudeAgentOptions`` used for the run — read for manifest
             extraction (model / system_prompt / allowed_tools / agents).
     """
     state = _RunState(
-        agent_name=agent_name, project=project, parent_trace_id=parent_trace_id,
+        agent_name=agent_name, parent_trace_id=parent_trace_id,
         user_input=user_input, options=options,
     )
     try:
@@ -1039,7 +1033,6 @@ def traced_query(
     prompt: Any,
     options: Any = None,
     agent_name: Optional[str] = None,
-    project: Optional[str] = None,
     parent_trace_id: Optional[str] = None,
 ) -> AsyncIterator[Any]:
     """Convenience wrapper around ``claude_agent_sdk.query`` with tracing.
@@ -1060,7 +1053,6 @@ def traced_query(
         stream,
         agent_name=agent_name,
         user_input=prompt if isinstance(prompt, str) else None,
-        project=project,
         parent_trace_id=parent_trace_id,
         options=options,
     )

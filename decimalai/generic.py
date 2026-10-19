@@ -415,10 +415,6 @@ class TraceContext:
 
     def build_trace(self) -> RunTrace:
         """Assemble the collected data into a RunTrace."""
-        from . import _config
-
-        config = _config._get_config()
-
         # Build active_skills list from collected activations
         active_skills_list = []
         for name, h in self._active_skills.items():
@@ -430,7 +426,6 @@ class TraceContext:
 
         trace = RunTrace(
             id=self._trace_id,
-            project=config.project,
             agent_name=self.agent_name,
             session_id=self.session_id,
             status=self._status,

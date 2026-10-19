@@ -13,7 +13,13 @@ from uuid import uuid4
 
 from decimalai.schema.trace import RunTrace, TraceSpan, LlmCallRecord
 from decimalai.schema.common import SpanType, Status
-from decimalai.skills import detect_skill_activations, _fuzzy_body_match
+from decimalai.skills import detect_skills_present_in_prompt, _fuzzy_body_match
+
+
+def detect_present_names(rendered_input, registry, **kwargs):
+    """The skills present in the prompt, by name, each once, in first-seen order."""
+    return list(dict.fromkeys(
+        name for name, _ in detect_skills_present_in_prompt(rendered_input, registry, **kwargs)))
 
 
 # ── Fixtures ──────────────────────────────────────────────
@@ -56,67 +62,65 @@ SYSTEM_PROMPT_WITHOUT_SKILL = [
 # ── prompt-presence detection tests ──────────────────────
 
 
-class TestDetectSkillActivations:
-    """Tests for the ``detect_skill_activations`` compatibility alias.
+class TestPresentNames:
+    """Which skills a prompt shows, by name (``detect_skills_present_in_prompt``).
 
-    The alias must keep returning the same NAMES in the same order as it
-    always has — that is the whole point of keeping it. The rung each name
-    lands on is now decided by ``infer_prompt_rungs`` and covered in
-    ``TestPromptRungInference``; nothing below claims these names were
-    activated.
+    The rung each name lands on is decided by ``infer_prompt_rungs`` and
+    covered in ``TestPromptRungInference``; nothing below claims these names
+    were activated.
     """
 
     def test_name_pattern_match(self):
         """Skills referenced by name in system prompt are detected."""
-        activated = detect_skill_activations(SYSTEM_PROMPT_WITH_SKILL, SKILL_REGISTRY)
+        activated = detect_present_names(SYSTEM_PROMPT_WITH_SKILL, SKILL_REGISTRY)
         assert "code-review" in activated
         assert "test-generator" not in activated
 
     def test_multiple_skills_detected(self):
         """Multiple skills in same prompt are all detected."""
-        activated = detect_skill_activations(SYSTEM_PROMPT_WITH_TWO_SKILLS, SKILL_REGISTRY)
+        activated = detect_present_names(SYSTEM_PROMPT_WITH_TWO_SKILLS, SKILL_REGISTRY)
         assert "code-review" in activated
         assert "test-generator" in activated
 
     def test_no_match_returns_empty(self):
         """Prompt without skill references returns empty list."""
-        activated = detect_skill_activations(SYSTEM_PROMPT_WITHOUT_SKILL, SKILL_REGISTRY)
+        activated = detect_present_names(SYSTEM_PROMPT_WITHOUT_SKILL, SKILL_REGISTRY)
         assert activated == []
 
     def test_empty_registry_returns_empty(self):
         """Empty registry always returns empty."""
-        activated = detect_skill_activations(SYSTEM_PROMPT_WITH_SKILL, [])
+        activated = detect_present_names(SYSTEM_PROMPT_WITH_SKILL, [])
         assert activated == []
 
     def test_empty_input_returns_empty(self):
         """Empty input always returns empty."""
-        activated = detect_skill_activations(None, SKILL_REGISTRY)
+        activated = detect_present_names(None, SKILL_REGISTRY)
         assert activated == []
 
     def test_fuzzy_match_disabled(self):
         """When fuzzy_match=False, only name patterns are used."""
         prompt = [{"role": "system", "content": "Check for SQL injection vulnerabilities.\nCheck for XSS vulnerabilities.\nCheck for CSRF vulnerabilities.\nVerify proper input validation.\nReport all findings with severity levels."}]
-        activated = detect_skill_activations(prompt, SKILL_REGISTRY, fuzzy_match=False)
+        activated = detect_present_names(prompt, SKILL_REGISTRY, fuzzy_match=False)
         assert "security-audit" not in activated
 
     def test_fuzzy_match_enabled(self):
         """With fuzzy_match=True, body content matching catches injected skill bodies."""
         # Prompt contains most of the security-audit skill body but no header
         prompt = [{"role": "system", "content": "You are a security auditor.\nCheck for SQL injection vulnerabilities.\nCheck for XSS vulnerabilities.\nCheck for CSRF vulnerabilities.\nVerify proper input validation.\nReport all findings with severity levels."}]
-        activated = detect_skill_activations(prompt, SKILL_REGISTRY, fuzzy_match=True)
+        activated = detect_present_names(prompt, SKILL_REGISTRY, fuzzy_match=True)
         assert "security-audit" in activated
 
     def test_fuzzy_threshold_configurable(self):
         """Higher fuzzy thresholds require more body lines to match."""
         # Only 2 of 5 significant lines match — below 0.6 threshold
         prompt = [{"role": "system", "content": "Check for SQL injection vulnerabilities.\nCheck for XSS vulnerabilities.\nDo other stuff."}]
-        activated = detect_skill_activations(
+        activated = detect_present_names(
             prompt, SKILL_REGISTRY, fuzzy_match=True, fuzzy_threshold=0.6
         )
         assert "security-audit" not in activated
 
         # But passes with a lower threshold
-        activated_low = detect_skill_activations(
+        activated_low = detect_present_names(
             prompt, SKILL_REGISTRY, fuzzy_match=True, fuzzy_threshold=0.3
         )
         assert "security-audit" in activated_low

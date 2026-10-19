@@ -474,7 +474,6 @@ def main():
 
     client = DecimalAIClient(
         api_key=API_KEY,
-        project="demo",
         base_url=BASE_URL,
     )
 

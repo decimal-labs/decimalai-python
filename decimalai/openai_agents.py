@@ -3050,8 +3050,6 @@ class DecimalTracingProcessor:
         # Auto-register manifest from span data + the live Agent object
         manifest_id = self._maybe_register_manifest(acc, agent_name)
 
-        config = _config._config
-
         # This run's own rail — routing decision, delivered bodies, loads —
         # keyed by the trace id both the instructions callable and this
         # method see. Popped, so it can't leak into a later trace.
@@ -3183,7 +3181,6 @@ class DecimalTracingProcessor:
 
         trace = RunTrace(
             id=uuid4(),
-            project=config.project if config else None,
             agent_name=agent_name,
             status=acc.status,
             source_type="production",

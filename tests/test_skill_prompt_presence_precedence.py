@@ -22,7 +22,6 @@ import pytest
 from decimalai.skills import (
     EVIDENCE_BODY,
     EVIDENCE_NAME,
-    detect_skill_activations,
     detect_skills_present_in_prompt,
     infer_prompt_rungs,
     _skill_appears_in_text,
@@ -112,24 +111,6 @@ class TestEvidenceTier:
             _sys("Never use [refund-policy] for this task."), DISK_REGISTRY
         )
         assert got == [("refund-policy", EVIDENCE_NAME)]
-
-    def test_alias_returns_the_same_names_in_the_same_order(self):
-        """``detect_skill_activations`` is kept only for backward
-        compatibility; it must not drift from the function it now wraps."""
-        prompt = _sys(f"## Skill: refund-policy\n{BODY}\n\n[tone-guide]")
-        # Deduped: the wrapped function reports name- and body-evidence
-        # independently, so one skill can appear twice. The alias has always
-        # returned each name once, and must keep doing so.
-        seen, expected = set(), []
-        for name, _ in detect_skills_present_in_prompt(prompt, DISK_REGISTRY):
-            if name not in seen:
-                seen.add(name)
-                expected.append(name)
-        assert detect_skill_activations(prompt, DISK_REGISTRY) == expected
-        assert detect_skill_activations(prompt, DISK_REGISTRY) == [
-            "refund-policy",
-            "tone-guide",
-        ]
 
 
 # ── the precedence rule ──────────────────────────────────────

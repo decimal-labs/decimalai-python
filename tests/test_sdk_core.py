@@ -68,13 +68,10 @@ class TestInit:
         config = _get_config()
         assert config.base_url == "https://api.decimal.ai"
 
-    def test_init_with_project(self):
+    def test_init_has_no_project_setting(self):
         import decimalai
-        decimalai.init(api_key="dai_sk_test", project="my-project")
-
-        from decimalai._config import _get_config
-        config = _get_config()
-        assert config.project == "my-project"
+        with pytest.raises(TypeError):
+            decimalai.init(api_key="dai_sk_test", project="my-project")
 
 
 class TestTrace:

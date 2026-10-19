@@ -803,7 +803,6 @@ def _skills_from_env() -> bool:
 def init(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
-    project: Optional[str] = None,
     enabled: bool = True,
     langchain: bool = False,
     openai_agents: bool = False,
@@ -870,10 +869,6 @@ def init(
             this one.
         base_url: Backend URL. Falls back to ``DECIMAL_BASE_URL``, then
             ``https://api.decimal.ai``.
-        project: DEPRECATED and inert — the platform never read it, so it has
-            never grouped anything. Accepted for back-compat; emits a
-            ``DeprecationWarning`` and will be removed. Use workspaces (scoped
-            by the API key) to group traces.
         enabled: Set ``False`` to disable all tracing. This is a real kill
             switch: no client is created, and the framework flags below
             (``langchain``/``openai_agents``/``adk``/``llamaindex``/
@@ -1040,31 +1035,12 @@ def init(
         os.environ.get("DECIMALAI_MODE", "").strip().lower() == "manifest_only"
     )
 
-    # `project` has never done anything. The SDK sent it as an X-Decimal-Project
-    # header; the platform reads no such header, and a trace's project_id is set
-    # only for a project-scoped API key. So a caller who passed project= got
-    # silent no-grouping — the exact "silent no-op" failure the docs warn about
-    # elsewhere. The header is gone as of 0.10.0; warn rather than raise so
-    # existing code keeps running while the kwarg is retired.
-    if project is not None:
-        import warnings
-
-        warnings.warn(
-            "decimalai.init(project=...) is deprecated and has no effect — the "
-            "platform never read it, so it has never grouped traces. Remove the "
-            "argument; use workspaces (scoped by your API key) to group traces. "
-            "The parameter will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
     # explicit param → env var → default. Omit when None so DecimalConfig's
     # env-reading default_factory runs (DECIMALAI_SKILL_AUTHORITY /
     # DECIMALAI_INJECT_SKILL_BODY).
     _config_kwargs = dict(
         api_key=resolved_key,
         base_url=resolved_url.rstrip("/"),
-        project=project,
         enabled=enabled,
         manifest_only=manifest_only,
     )
@@ -1097,7 +1073,6 @@ def init(
         _cfg._client = DecimalAIClient(
             api_key=config.api_key,
             base_url=config.base_url,
-            project=config.project,
         )
         if evidence and not manifest_only:
             try:
@@ -1156,9 +1131,8 @@ def init(
             )
         else:
             logger.info(
-                "DecimalAI SDK initialized: base_url=%s project=%s",
+                "DecimalAI SDK initialized: base_url=%s",
                 config.base_url,
-                config.project,
             )
     else:
         _cfg._client = None

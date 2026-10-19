@@ -9,13 +9,19 @@ import pytest
 
 from decimalai.skills import (
     SkillRegistry,
-    detect_skill_activations,
+    detect_skills_present_in_prompt,
     discover_skills,
     parse_skill_md,
     _split_frontmatter,
     _skill_appears_in_text,
     _hash_content,
 )
+
+
+def detect_present_names(rendered_input, registry, **kwargs):
+    """The skills present in the prompt, by name, each once, in first-seen order."""
+    return list(dict.fromkeys(
+        name for name, _ in detect_skills_present_in_prompt(rendered_input, registry, **kwargs)))
 
 
 # ── Fixtures ──────────────────────────────────────────────
@@ -474,16 +480,16 @@ class TestSkillRegistry:
         assert registry.names == ["a", "b"]
 
 
-# ── detect_skill_activations ─────────────────────────────
+# ── the skills present in a prompt, by name ─────────────
 
 
-class TestDetectSkillActivations:
+class TestPresentNames:
     def test_detects_skill_header(self):
         rendered_input = [
             {"role": "system", "content": "You are helpful.\n\n## Skill: code-review\nReview code for security..."},
         ]
         registry = [{"name": "code-review", "hash": "sha256:abc"}]
-        activated = detect_skill_activations(rendered_input, registry)
+        activated = detect_present_names(rendered_input, registry)
         assert "code-review" in activated
 
     def test_detects_active_skill_header(self):
@@ -494,7 +500,7 @@ class TestDetectSkillActivations:
             {"name": "code-review", "hash": "sha256:abc"},
             {"name": "sql-optimizer", "hash": "sha256:def"},
         ]
-        activated = detect_skill_activations(rendered_input, registry)
+        activated = detect_present_names(rendered_input, registry)
         assert "sql-optimizer" in activated
         assert "code-review" not in activated
 
@@ -503,21 +509,21 @@ class TestDetectSkillActivations:
             {"role": "system", "content": "You are a helpful assistant."},
         ]
         registry = [{"name": "code-review", "hash": "sha256:abc"}]
-        activated = detect_skill_activations(rendered_input, registry)
+        activated = detect_present_names(rendered_input, registry)
         assert activated == []
 
     def test_string_input(self):
-        activated = detect_skill_activations(
+        activated = detect_present_names(
             "## Skill: code-review\nDo review.",
             [{"name": "code-review", "hash": "sha256:abc"}],
         )
         assert "code-review" in activated
 
     def test_empty_registry(self):
-        assert detect_skill_activations("some input", []) == []
+        assert detect_present_names("some input", []) == []
 
     def test_empty_input(self):
-        assert detect_skill_activations(None, [{"name": "x", "hash": "y"}]) == []
+        assert detect_present_names(None, [{"name": "x", "hash": "y"}]) == []
 
 
 # ── Internal helpers ──────────────────────────────────────

@@ -192,7 +192,6 @@ class DecimalConfig:
 
     api_key: str = ""
     base_url: str = "https://api.decimal.ai"
-    project: Optional[str] = None
     enabled: bool = True
     # The agent this process traces and routes for when a call does not name
     # one: init(agent_name=...), else DECIMAL_AGENT_NAME. Read it through
@@ -280,14 +279,8 @@ class DecimalConfig:
 
     @property
     def api_headers(self) -> dict[str, str]:
-        # DEPRECATED (0.10.0): `project` no longer emits an `X-Decimal-Project`
-        # header. The platform never read it — trace scoping is resolved from
-        # the API key alone, and a trace's project_id is set only for a
-        # project-scoped key — so every value sent here was discarded on
-        # arrival. Sending a header the server ignores made `project=` look
-        # like it grouped traces when it did nothing at all.
-        # Grouping that actually works: workspaces (resolved from the key, or
-        # the X-Workspace-Id header the dashboard sends).
+        # Traces are scoped by the API key alone; group them with workspaces
+        # (resolved from the key, or the X-Workspace-Id header the dashboard sends).
         return sdk_headers(self.api_key)
 
     def resolve_disk_sync(self, loader_active: bool) -> bool:

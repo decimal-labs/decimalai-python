@@ -1113,7 +1113,6 @@ def _plugin_class() -> Any:
             agent_name: Optional[str] = None,
             *,
             name: str = "decimalai",
-            project: Optional[str] = None,
             parent_trace_id: Optional[str] = None,
             enable_skill_loader: Optional[bool] = None,
             enable_load_skill_tool: bool = False,
@@ -1129,7 +1128,6 @@ def _plugin_class() -> Any:
             if enable_load_skill_tool:
                 logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
             self.agent_name = agent_name
-            self.project = project
             self.parent_trace_id = parent_trace_id
             self.on_trace = on_trace
             self._follow_instrument_config = False
@@ -1698,10 +1696,8 @@ def _plugin_class() -> Any:
                 )
             try:
                 client = _config._get_client()
-                config = _config._get_config()
                 trace = RunTrace(
                     id=state.trace_id,
-                    project=self.project or (config.project if config else None),
                     agent_name=state.agent_name,
                     parent_trace_id=state.parent_trace_id,
                     status=state.status,
@@ -1824,7 +1820,6 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     agent_name: Optional[str] = None,
     *,
     name: str = "decimalai",
-    project: Optional[str] = None,
     parent_trace_id: Optional[str] = None,
     enable_skill_loader: Optional[bool] = None,
     enable_load_skill_tool: bool = False,
@@ -1835,7 +1830,6 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     Args:
         agent_name: Fallback agent name when the ADK agent doesn't supply one.
         name: ADK plugin name (must be unique among a Runner's plugins).
-        project: Optional project grouping for the traces.
         parent_trace_id: When this Runner runs as a sub-agent of another,
             the parent's trace id — links the child traces in the backend.
         on_trace: Optional observer called once on the exporter worker thread
@@ -1869,7 +1863,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     item from green to "the documented snippet ran and NOTHING was POSTed".
     """
     return _plugin_class()(
-        agent_name=agent_name, name=name, project=project,
+        agent_name=agent_name, name=name,
         parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,
         enable_load_skill_tool=enable_load_skill_tool, on_trace=on_trace,
     )

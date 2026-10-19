@@ -9,10 +9,12 @@ The prompt comes back as data and the caller passes it to their framework
 themselves::
 
     config = decimalai.load_agent("refund-bot")
-    agent = Agent(name="refund-bot", instructions=config.system_prompt)
+    system_prompt = config.system_prompt  # given to the framework's agent
 
-Skills ARE auto-injected, and that asymmetry is the deliberate part. A skill
-menu is ADDITIVE — worst case it costs a few hundred tokens the model ignores.
+The framework adapters' skill loaders DO inject skills, and that asymmetry is
+the deliberate part. (On the OpenAI Agents SDK both arrive through one explicit
+call instead: ``decimalai.openai_agents.load_agent()`` returns the prompt and
+the skills for the caller's own ``Agent(...)``.) A skill menu is ADDITIVE — worst case it costs a few hundred tokens the model ignores.
 A system prompt is the agent's core instruction, and injecting it silently
 means their repo reads "Never issue refunds over $500" while the model was
 handed "You are a helpful assistant". There is no way for the customer to see
@@ -263,11 +265,15 @@ def load_agent(
         decimalai.init()
 
         config = decimalai.load_agent("refund-bot")
-        agent = Agent(name="refund-bot", instructions=config.system_prompt)
+        system_prompt = config.system_prompt  # give it to your framework's agent
 
     `config.system_prompt` is `None` when the agent has no prompt set. Send no
     system message in that case; do not substitute one, or the agent silently
     starts following instructions nobody wrote.
+
+    On the OpenAI Agents SDK, use :func:`decimalai.openai_agents.load_agent`
+    instead: it returns this prompt together with the agent's skills, for your
+    ``Agent(...)``.
 
     Args:
         agent_name: The agent as it exists on DecimalAI. A renamed agent still

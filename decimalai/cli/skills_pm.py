@@ -76,9 +76,6 @@ def _directory_option(func):
 
 def _registry_options(func):
     """``--api-key`` and ``--base-url``, read from the environment as every command does."""
-    # Deprecated and inert everywhere: the platform never read the project label.
-    func = click.option("--project", default="default", hidden=True,
-                        help="(deprecated, no effect)")(func)
     func = click.option(
         "--base-url", envvar=["DECIMAL_BASE_URL", "DECIMALAI_BASE_URL"],
         default=_DEFAULT_BASE_URL, show_envvar=True, help="Platform URL",
@@ -179,7 +176,7 @@ def _next_steps() -> None:
                    "`decimalai skills install` fetches it.")
 @_directory_option
 @_registry_options
-def skills_add(ref, yes, force, no_install, directory, api_key, base_url, project):
+def skills_add(ref, yes, force, no_install, directory, api_key, base_url):
     """Add a registry skill to the project and install it.
 
     REF is a registry name, url_slug, install name or skill id, optionally with @N to pin
@@ -229,7 +226,7 @@ def _add(ref: str, *, yes: bool, force: bool, no_install: bool, directory: Optio
 @_yes_option
 @_directory_option
 @_registry_options
-def skills_install(frozen, offline, force, yes, directory, api_key, base_url, project):
+def skills_install(frozen, offline, force, yes, directory, api_key, base_url):
     """Make .agents/skills match the manifest and the lock.
 
     New entries of .decimal/skills.toml are resolved and installed, entries it no longer
@@ -270,7 +267,7 @@ def skills_install(frozen, offline, force, yes, directory, api_key, base_url, pr
               help="Print the result as JSON (with --dry-run: the plan, for scripts).")
 @_directory_option
 @_registry_options
-def skills_update(name, force, dry_run, yes, as_json, directory, api_key, base_url, project):
+def skills_update(name, force, dry_run, yes, as_json, directory, api_key, base_url):
     """Move skills to newer versions.
 
     With no NAME, every `latest` entry moves to the registry's current version, and pinned
@@ -349,7 +346,7 @@ _STATE_GLYPH = {
               help="Print the installed section as JSON.")
 @_directory_option
 @_registry_options
-def skills_status(skills_dir, remote, check, as_json, directory, api_key, base_url, project):
+def skills_status(skills_dir, remote, check, as_json, directory, api_key, base_url):
     """Show the installed skills, and how your own skills compare with the platform.
 
     Installed: each folder of .agents/skills against the lock (clean, modified, missing,
@@ -375,7 +372,7 @@ def skills_status(skills_dir, remote, check, as_json, directory, api_key, base_u
             raise click.UsageError(
                 "`decimalai skills status DIR` prints the authored skills in DIR only; drop "
                 "DIR to use --remote, --check, --json or --directory")
-        _authored_status(skills_dir, api_key, base_url, project)
+        _authored_status(skills_dir, api_key, base_url)
         return
 
     from .. import skillpkg
@@ -402,7 +399,7 @@ def skills_status(skills_dir, remote, check, as_json, directory, api_key, base_u
         click.echo("")
         click.echo(f"  Authored skills ({authored if directory else './skills'}):")
         if api_key:
-            counts = _authored_status(str(authored), api_key, base_url, project,
+            counts = _authored_status(str(authored), api_key, base_url,
                                       project_root=directory, combined=True)
             code = _check_code(code, counts, check=check)
         else:
@@ -521,7 +518,7 @@ def skills_verify(path, strict, as_json, directory):
               help="Migrate the entries that resolve even when others do not.")
 @_directory_option
 @_registry_options
-def skills_migrate(yes, directory, api_key, base_url, project):
+def skills_migrate(yes, directory, api_key, base_url):
     """Move a project from a version 1 lock (decimalai 0.14 and older) or an npx lock.
 
     Writes .decimal/skills.toml and a version 2 lock, and installs every skill again from

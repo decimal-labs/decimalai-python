@@ -204,7 +204,7 @@ def test_an_empty_activation_set_passes_and_says_only_what_it_graded() -> None:
 
 def test_a_delivered_body_in_the_system_prompt_is_not_an_activation() -> None:
     """The live defect: SkillRouter renders an injected body as '## Skill: X'
-    into the SYSTEM message, and detect_skill_activations matches it."""
+    into the SYSTEM message, and prompt-presence detection matches it."""
     t = _trace(
         messages=[{"role": "system", "content": f"{MENU}\n## Skill: {ALPHA}\n\n{ALPHA_BODY}"}],
         active_skills=[{"name": ALPHA}],

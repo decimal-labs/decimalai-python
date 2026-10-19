@@ -367,7 +367,7 @@ class TestInstrumentDefaults:
         configured(NAME)
         # A stream wrapped with no instrument() at all still files under it.
         state = cas._RunState(
-            agent_name=None, project=None, parent_trace_id=None, user_input=None, options=None,
+            agent_name=None, parent_trace_id=None, user_input=None, options=None,
         )
         assert state.agent_name == NAME
         monkeypatch.setattr(cas, "_query_patched", True)  # configure only; patch nothing

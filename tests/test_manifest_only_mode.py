@@ -178,7 +178,6 @@ class TestTraceIngestionBouncer:
         from decimalai._client import DecimalAIClient
         return DecimalAIClient(
             api_key="dai_sk_test",
-            project="test",
             base_url="http://localhost:8000",
         )
 

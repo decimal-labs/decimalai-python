@@ -1,6 +1,6 @@
 """Lock in: Tier-2 fuzzy body matching works for auto-discovered skills.
 
-``detect_skill_activations`` Tier-2 reads
+Prompt-presence Tier-2 (``detect_skills_present_in_prompt``) reads
 ``skill.get('body') or skill.get('body_markdown')`` and only fuzzy-matches
 when non-empty — but parse_skill_md / discover_skills descriptors carried
 NO body, so Tier-2 could never fire for the SDK's own auto-discovery.
@@ -15,7 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from decimalai.skills import detect_skill_activations, parse_skill_md
+from decimalai.skills import detect_skills_present_in_prompt, parse_skill_md
+
+
+def detect_present_names(rendered_input, registry, **kwargs):
+    """The skills present in the prompt, by name, each once, in first-seen order."""
+    return list(dict.fromkeys(
+        name for name, _ in detect_skills_present_in_prompt(rendered_input, registry, **kwargs)))
 
 
 _SKILL_MD = textwrap.dedent(
@@ -70,7 +76,7 @@ def test_tier2_fuzzy_activation_fires_for_discovered_skill(tmp_path):
         }
     ]
 
-    activated = detect_skill_activations(prompt, registry)
+    activated = detect_present_names(prompt, registry)
     assert "codebase-conventions" in activated, (
         "Tier-2 fuzzy body matching must activate the auto-discovered skill; "
         "pre-fix the descriptor had no body so Tier-2 was dead code."
@@ -91,5 +97,5 @@ def test_tier2_disabled_when_fuzzy_match_off(tmp_path):
             ),
         }
     ]
-    activated = detect_skill_activations(prompt, [descriptor], fuzzy_match=False)
+    activated = detect_present_names(prompt, [descriptor], fuzzy_match=False)
     assert "codebase-conventions" not in activated

@@ -2193,7 +2193,6 @@ class CallbackHandler(_CallbackBase):
         agent_name: Optional[str] = None,
         auto_send: bool = True,
         session_id: Optional[str] = None,
-        project: Optional[str] = None,
         parent_trace_id: Optional[str] = None,
         subagents: Optional[List[Dict[str, Any]]] = None,
     ):
@@ -2213,7 +2212,6 @@ class CallbackHandler(_CallbackBase):
         self._explicit_agent_name: Optional[str] = agent_name
         self.auto_send = auto_send
         self.session_id = session_id
-        self.project = project
         self.parent_trace_id = parent_trace_id
         self.subagents = list(subagents) if subagents else None
         self.on_trace: Optional[Callable[[RunTrace], None]] = None
@@ -3267,9 +3265,6 @@ class CallbackHandler(_CallbackBase):
 
     def build_trace(self, state: Optional[_RunState] = None) -> RunTrace:
         """Assemble one run's spans and LLM calls into a RunTrace."""
-        from . import _config
-
-        config = _config._config
         state = state or self._current
 
         self._attach_tool_calls(state)
@@ -3407,7 +3402,6 @@ class CallbackHandler(_CallbackBase):
 
         trace = RunTrace(
             id=state.trace_id,
-            project=config.project if config else None,
             agent_name=agent_name,
             session_id=self.session_id,
             # An explicit sub-agent parent always wins; the enclosing generic

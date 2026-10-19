@@ -83,6 +83,17 @@ agent = Agent(name=support.name, instructions=support.instructions,
   that `instrument(disk_sync=True)` no longer writes skills to disk. `disk_sync` decides
   whether the project's own `SKILL.md` files are read and synced; it never wrote registry
   skills in 0.15 or later.
+- **`project=`**, deprecated since 0.10.0 and never read by the platform (traces are scoped
+  by the API key; group them with workspaces): on `decimalai.init()`, `DecimalAIClient()`, the
+  LangChain `CallbackHandler`, ADK's `DecimalaiPlugin()`, and the Claude Agent SDK's
+  `trace_stream()` and `traced_query()`, plus the CLI's hidden `--project` option.
+  (`decimalai init --project <dir>`, which writes a Support project, is unchanged.) The trace
+  schema keeps its `project` field, unset.
+- `annotate_trace()`'s `text=` (pass `notes=`), and `annotation_type=` and `span_id=`, which
+  the endpoint never accepted.
+- `decimalai.skills.detect_skill_activations()`, the deprecated alias of
+  `detect_skills_present_in_prompt()`: matching prompt text shows a skill was present, not
+  that it was activated.
 
 ## [0.17.0] — 2026-10-19
 

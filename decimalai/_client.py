@@ -359,16 +359,11 @@ class DecimalAIClient:
         self,
         api_key: str,
         base_url: str = "https://api.decimal.ai",
-        project: Optional[str] = None,
         timeout: float = 30.0,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.project = project
 
-        # DEPRECATED (0.10.0): `project` no longer emits an `X-Decimal-Project`
-        # header — the platform never read it. See DecimalConfig.api_headers.
-        #
         # Built by the shared builder so trace ingest identifies the SDK. Before
         # this change the dict set no User-Agent, so httpx supplied its own default
         # and every ingested trace arrived stamped `python-httpx/<x.y.z>` — the
@@ -1439,9 +1434,6 @@ class DecimalAIClient:
         score: Optional[float] = None,
         flagged_for_review: Optional[bool] = None,
         add_to_dataset: Optional[bool] = None,
-        text: Optional[str] = None,
-        annotation_type: Optional[str] = None,
-        span_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add a human annotation to a trace.
 
@@ -1455,29 +1447,13 @@ class DecimalAIClient:
 
         Args:
             trace_id: The trace to annotate.
-            notes: Free-text note (the old ``text`` argument maps here).
+            notes: Free-text note.
             label, rating, correctness, error_categories, corrected_output,
             tags, score, flagged_for_review, add_to_dataset: see above.
 
         Returns:
             The created annotation (id, timestamp, and the fields you set).
         """
-        # Back-compat: the old signature was annotate_trace(trace_id, text, ...).
-        if text is not None and notes is None:
-            notes = text
-        # annotation_type/span_id were never accepted by the backend (the
-        # endpoint 422'd on them via extra="forbid"); accept-and-ignore for one
-        # release so old call sites don't TypeError, but warn.
-        if annotation_type is not None or span_id is not None:
-            import warnings
-
-            warnings.warn(
-                "annotate_trace(): 'annotation_type' and 'span_id' are no longer "
-                "supported (annotations are trace-scoped) and are ignored; they "
-                "will be removed in a future release.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         candidates: Dict[str, Any] = {
             "label": label,
             "rating": rating,
