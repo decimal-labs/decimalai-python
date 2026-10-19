@@ -308,6 +308,12 @@ conformance-tests-openai2 = [
     # reaches the stub through google.adk.models.lite_llm.LiteLlm, which is why
     # google-adk is graded here rather than in the openai 3 environment.
     "decimalai[evals]",
+    # litellm 1.106.0 imports mcp on every completion() that carries tools and needs
+    # mcp>=2.2 to do it (mcp is only in its own extras), while crewai pins mcp~=1.28.
+    # Every tool call then raises ImportError, with no DecimalAI code involved. The ADK
+    # driver's stub model sends tools through litellm; the evaluators send none. Drop
+    # the exclusion once a release after 1.106.0 completes a tool call beside mcp 1.28.
+    "litellm!=1.106.0",
     "decimalai[adk]",
     "decimalai[llamaindex]",
     "llama-index-llms-openai>=0.8.3",
