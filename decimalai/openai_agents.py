@@ -35,9 +35,12 @@ import json
 import logging
 import re
 import threading
+import time
 import warnings
 import weakref
 from collections import OrderedDict
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -350,6 +353,9 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 # model was shown; the server's own echo is preferred when the
                 # Responses API returns one. See `_attach_system_prompts`.
                 "system_prompts": [],
+                # Agent `name=` -> the prompt record `load_agent()` made for
+                # that agent on this run (version, variables, source).
+                "decimal_prompts": {},
             }
             _run_rails[run_key] = rail
             while len(_run_rails) > _RUN_RAILS_MAX:
@@ -369,6 +375,7 @@ def _record_run_rail(
     agent: Any = None,
     user_input: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    prompt: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Stamp routing/loading telemetry onto the CURRENT run's rail.
 
@@ -406,6 +413,9 @@ def _record_run_rail(
             prompts = rail.setdefault("system_prompts", [])
             if system_prompt not in prompts:
                 prompts.append(system_prompt)
+        # First record per agent wins: a run reads its prompt once.
+        if isinstance(prompt, dict) and prompt.get("agent"):
+            rail.setdefault("decimal_prompts", {}).setdefault(prompt["agent"], dict(prompt))
     return True
 
 
@@ -2149,6 +2159,509 @@ def instrument(
     )
 
 
+# ── load_agent(): an agent's DecimalAI prompt and skills, attached by you ───
+#
+# The supported way to give an OpenAI Agents SDK agent its DecimalAI prompt and
+# skills. Nothing in the OpenAI SDK is patched: the developer puts the two pieces
+# into their own Agent(...), using features OpenAI documents —
+#
+#     support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+#     agent = Agent(name=support.name, instructions=support.instructions,
+#                   tools=[lookup_order, *support.tools])
+#
+# `support.instructions` is a dynamic-instructions function (OpenAI calls it
+# before each model request): the agent's saved prompt with any {{placeholders}}
+# filled from `Runner.run(context=...)`, then the agent's skill list. The prompt
+# and the list come from a local copy, so a run never waits on DecimalAI after
+# startup; each run sends one background request that records that run's own
+# routing decision and refreshes the copy (the prompt at most every
+# `_PROMPT_REFRESH_SECONDS`). `support.tools` is one `load_skill` FunctionTool.
+# Each run's record (prompt version, variable names, skills offered / loaded /
+# delivered) goes on the run rail, which `DecimalTracingProcessor` sends.
+
+_TEMPLATE_PLACEHOLDER = re.compile(
+    r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\}\}"
+)
+
+#: How old the local copy of a prompt may get before a run refreshes it.
+_PROMPT_REFRESH_SECONDS = 60.0
+
+#: Runs whose per-run state a config keeps (instructions text, loaded skills).
+_MAX_CONFIG_RUNS = 256
+
+_config_pool: Optional[ThreadPoolExecutor] = None
+_config_pool_lock = threading.Lock()
+
+
+class MissingPromptVariable(KeyError):
+    """The saved prompt has a ``{{placeholder}}`` the run's context does not supply."""
+
+    def __str__(self) -> str:  # KeyError would quote the whole message
+        return str(self.args[0]) if self.args else ""
+
+
+def template_variables(text: Optional[str]) -> List[str]:
+    """The ``{{name}}`` / ``{{a.b}}`` placeholders in a prompt, sorted and unique."""
+    return sorted(set(_TEMPLATE_PLACEHOLDER.findall(text or "")))
+
+
+def _fill_template(text: str, values: Any, *, where: str) -> str:
+    """Fill placeholders from ``values``' attributes or keys, dotted paths included.
+
+    A missing value raises `MissingPromptVariable` naming every gap, before any
+    model call: a half-filled prompt is a prompt nobody wrote.
+    """
+    missing: List[str] = []
+
+    def lookup(match: "re.Match[str]") -> str:
+        current = values
+        for part in match.group(1).split("."):
+            if isinstance(current, Mapping) and part in current:
+                current = current[part]
+            elif current is not None and not isinstance(current, Mapping) and hasattr(current, part):
+                current = getattr(current, part)
+            else:
+                missing.append(match.group(1))
+                return match.group(0)
+        return str(current)
+
+    filled = _TEMPLATE_PLACEHOLDER.sub(lookup, text)
+    if missing:
+        raise MissingPromptVariable(
+            f"{where} needs {', '.join(sorted(set(missing)))}. Pass them in "
+            "Runner.run(..., context=...), as attributes or dict keys."
+        )
+    return filled
+
+
+def _in_background(fn: Any, *args: Any) -> Any:
+    """Run ``fn(*args)`` on a small worker pool, in a copy of this context.
+
+    The copy carries the current trace, so `_current_run_key` and
+    `_record_run_rail` still name the run that scheduled the work.
+    """
+    global _config_pool
+    with _config_pool_lock:
+        if _config_pool is None:
+            _config_pool = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="decimalai-agent-config",
+            )
+        pool = _config_pool
+    return pool.submit(contextvars.copy_context().run, fn, *args)
+
+
+def _ensure_initialized() -> None:
+    """`decimalai.init()` from the environment when nothing initialized the SDK yet."""
+    from . import _config
+
+    if _config._client is None:
+        import decimalai
+
+        decimalai.init()
+
+
+def _ensure_tracing() -> None:
+    """Register this process's trace processor; no Agents SDK class is touched."""
+    try:
+        from agents.tracing import add_trace_processor, set_trace_processors
+    except ImportError:
+        raise ImportError(
+            "load_agent() needs the OpenAI Agents SDK: "
+            "pip install \"decimalai[openai-agents]\""
+        ) from None
+    if _tracing_processor is not None and _processor_is_registered(_tracing_processor):
+        return
+    _register_processor(
+        None, None, exclusive=False,
+        add_trace_processor=add_trace_processor,
+        set_trace_processors=set_trace_processors,
+    )
+
+
+class OpenAIAgentConfig:
+    """One agent's prompt and skills in DecimalAI, for an OpenAI Agents SDK ``Agent``.
+
+    Made by :func:`load_agent`. Put its pieces into your own agent::
+
+        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        agent = Agent(name=support.name, instructions=support.instructions,
+                      tools=[lookup_order, *support.tools])
+
+    Attributes:
+        name: The agent's canonical DecimalAI name.
+        instructions: Pass as ``Agent(instructions=...)``. OpenAI calls it before
+            each model request; it returns the agent's prompt (placeholders
+            filled from ``Runner.run(context=...)``), then its skill list.
+        tools: The tools DecimalAI adds — today one, ``load_skill``.
+        load_skill: That tool.
+    """
+
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+        self.name: str = prompt.agent_name
+        self._fallback = fallback
+        self._on_unavailable = on_unavailable
+        self._lock = threading.Lock()
+        self._prompt = prompt
+        self._prompt_read_at = time.monotonic()
+        self._prompt_refreshing = False
+        self._menu_prefix = ""
+        self._menu_names: List[str] = []
+        self._menu_unavailable: Optional[str] = "not loaded yet"
+        self._unclaimed_routing_id: Optional[str] = None
+        self._runs: "OrderedDict[Tuple[Any, Any], Dict[str, Any]]" = OrderedDict()
+        self._warned: Set[Tuple[str, str]] = set()
+        self.load_skill = self._build_tool()
+        self.tools: List[Any] = [self.load_skill]
+
+    def __repr__(self) -> str:
+        return (
+            f"OpenAIAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"skills={self.skill_names!r})"
+        )
+
+    # ── what the agent currently gets ────────────────────────
+    @property
+    def prompt_version(self) -> Optional[int]:
+        """The saved prompt version in use, or None for the fallback text."""
+        return getattr(self._prompt, "version_number", None)
+
+    @property
+    def variables(self) -> List[str]:
+        """The placeholders the prompt in use needs from ``Runner.run(context=...)``."""
+        return template_variables(self._template())
+
+    @property
+    def skill_names(self) -> List[str]:
+        """The skills on the agent's list, in menu order."""
+        with self._lock:
+            return list(self._menu_names)
+
+    def _template(self) -> str:
+        text = getattr(self._prompt, "system_prompt", None)
+        return text if text is not None else (self._fallback or "")
+
+    # ── the dynamic instructions ────────────────────────────
+    async def instructions(self, context: Any, agent: Any) -> str:
+        """The agent's instructions for this run. OpenAI calls it; you don't."""
+        run_key = _current_run_key()
+        key = (run_key, getattr(agent, "name", None))
+        if run_key is not None:
+            with self._lock:
+                state = self._runs.get(key)
+            if state is not None:
+                return state["text"]
+        state = self._start_run(context, agent, run_key)
+        if run_key is not None:
+            with self._lock:
+                self._runs[key] = state
+                while len(self._runs) > _MAX_CONFIG_RUNS:
+                    self._runs.popitem(last=False)
+        return state["text"]
+
+    def _start_run(self, context: Any, agent: Any, run_key: Optional[str]) -> Dict[str, Any]:
+        self._refresh_prompt_if_stale()
+        with self._lock:
+            prompt = self._prompt
+            prefix, names = self._menu_prefix, list(self._menu_names)
+            unavailable = self._menu_unavailable
+            claimed, self._unclaimed_routing_id = self._unclaimed_routing_id, None
+        if unavailable and self._on_unavailable == "fail":
+            raise RuntimeError(
+                f"DecimalAI skills for agent {self.name!r} are unavailable ({unavailable}) "
+                "and load_agent(on_unavailable='fail') was set."
+            )
+        template = self._template()
+        text = template
+        if template_variables(template):
+            version = getattr(prompt, "version_number", None)
+            where = f"Prompt version {version} of {self.name!r}" if version else f"The fallback prompt of {self.name!r}"
+            text = _fill_template(template, getattr(context, "context", None), where=where)
+        if prefix:
+            from .skill_router import LOAD_SKILL_PROMPT_HINT
+
+            menu = f"{prefix}\n{LOAD_SKILL_PROMPT_HINT}"
+            text = f"{text}\n\n{menu}" if text else menu
+        self._bind_agent_name(agent)
+        _record_run_rail(
+            agent=agent, system_prompt=text, offered=names, routing_id=claimed,
+            prompt=self._prompt_record(prompt, template, unavailable, agent),
+        )
+        if not claimed:
+            # The startup decision went to the first run; every later run gets
+            # its own, recorded in the background so it never waits on it.
+            _in_background(self._route_run, run_key, names)
+        return {"text": text, "loaded": set()}
+
+    def _prompt_record(self, prompt: Any, template: str, unavailable: Optional[str], agent: Any) -> Dict[str, Any]:
+        if getattr(prompt, "system_prompt", None) is None:
+            source = "code"
+        elif getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
+            source = "fallback"
+        elif getattr(prompt, "is_fallback", False):
+            source = "decimal (cached copy)"
+        else:
+            source = "decimal"
+        return {
+            "agent": getattr(agent, "name", None) or self.name,
+            "decimal_agent": self.name,
+            "source": source,
+            "version": getattr(prompt, "version_number", None),
+            "content_hash": getattr(prompt, "content_hash", None),
+            "variables": template_variables(template),
+            "skills_unavailable": unavailable,
+        }
+
+    def _bind_agent_name(self, agent: Any) -> None:
+        """File this Agent's runs under the DecimalAI name, whatever its ``name=``."""
+        own = getattr(agent, "name", None)
+        processor = _tracing_processor
+        if own and processor is not None and processor.agent_names.get(own) != self.name:
+            processor.agent_names[own] = self.name
+
+    # ── the local copy ──────────────────────────────────────
+    def _route(self, scope: Optional[str]) -> Tuple[str, List[str], Optional[str]]:
+        """One routing decision for this agent: (menu text, offered names, routing id)."""
+        router = _get_skill_router()
+        if router is None:
+            return "", [], None
+        from .skill_router import (
+            _release_scoped_routing_rail,
+            consume_last_delivered_names,
+            consume_last_delivered_versions,
+            consume_last_offered_names,
+        )
+        try:
+            prefix, _tail, routing_id = router.build_prompt_parts(
+                None, agent_name=self.name, inject_body=False, scope=scope,
+            )
+        finally:
+            _release_scoped_routing_rail(router, scope)
+        offered = _clean_names(consume_last_offered_names())
+        # No bodies are injected on this path; drain the rails so nothing leaks.
+        consume_last_delivered_names()
+        consume_last_delivered_versions()
+        return prefix or "", offered, routing_id
+
+    def _store_menu(self, prefix: str, offered: List[str], routing_id: Optional[str]) -> None:
+        with self._lock:
+            if not prefix and not routing_id:
+                # No answer. Keep serving the last good list rather than none.
+                if self._menu_unavailable == "not loaded yet":
+                    self._menu_unavailable = "DecimalAI did not return this agent's skills"
+                return
+            self._menu_prefix, self._menu_names, self._menu_unavailable = prefix, list(offered), None
+            names = list(offered)
+        self.load_skill.params_json_schema = self._tool_schema(names)
+
+    def _load_menu(self) -> None:
+        """The startup read. Its decision is claimed by the first run."""
+        prefix, offered, routing_id = self._route(None)
+        self._store_menu(prefix, offered, routing_id)
+        with self._lock:
+            self._unclaimed_routing_id = routing_id if prefix or offered else None
+
+    def _route_run(self, run_key: Optional[str], shown: List[str]) -> None:
+        """Background: this run's own routing decision, and a fresh copy for later runs."""
+        traced = run_key is not None and not isinstance(run_key, _UntracedRunKey)
+        try:
+            prefix, offered, routing_id = self._route(run_key if traced else None)
+        except Exception:
+            logger.debug("background skill routing failed (non-fatal)", exc_info=True)
+            return
+        self._store_menu(prefix, offered, routing_id)
+        # Stamp the run only when the decision offered exactly what it was shown;
+        # otherwise the offer/activation join would describe another list.
+        if traced and routing_id and sorted(offered) == sorted(shown):
+            _record_run_rail(routing_id=routing_id)
+
+    def _refresh_prompt_if_stale(self) -> None:
+        with self._lock:
+            due = (
+                not self._prompt_refreshing
+                and time.monotonic() - self._prompt_read_at > _PROMPT_REFRESH_SECONDS
+            )
+            if due:
+                self._prompt_refreshing = True
+        if due:
+            _in_background(self._refresh_prompt)
+
+    def _refresh_prompt(self) -> None:
+        from ._agent import load_agent as _load_prompt
+        from ._client import AgentNotFoundError
+
+        try:
+            fresh = _load_prompt(self.name, fallback=self._fallback)
+            with self._lock:
+                self._prompt = fresh
+        except AgentNotFoundError:
+            logger.warning(
+                "DecimalAI: agent %r no longer exists; still serving the prompt read earlier.",
+                self.name,
+            )
+        except Exception:
+            logger.debug("prompt refresh failed (non-fatal); keeping the last copy", exc_info=True)
+        finally:
+            with self._lock:
+                self._prompt_read_at = time.monotonic()
+                self._prompt_refreshing = False
+
+    # ── the load_skill tool ─────────────────────────────────
+    @staticmethod
+    def _tool_schema(names: List[str]) -> Dict[str, Any]:
+        name_schema: Dict[str, Any] = {
+            "type": "string",
+            "description": "The exact name of one skill listed under Available Skills.",
+        }
+        if names:
+            name_schema["enum"] = list(names)
+        return {
+            "type": "object",
+            "properties": {"name": name_schema},
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+
+    def _build_tool(self) -> Any:
+        try:
+            from agents import FunctionTool
+        except ImportError:
+            raise ImportError(
+                "load_agent() needs the OpenAI Agents SDK: "
+                "pip install \"decimalai[openai-agents]\""
+            ) from None
+        from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
+
+        async def invoke(tool_context: Any, raw_arguments: str) -> str:
+            try:
+                name = str((json.loads(raw_arguments or "{}") or {}).get("name") or "").strip()
+            except (ValueError, AttributeError):
+                name = ""
+            return await self._load(name)
+
+        tool = FunctionTool(
+            name=_TOOL_NAME,
+            description=LOAD_SKILL_TOOL_DESCRIPTION,
+            params_json_schema=self._tool_schema([]),
+            on_invoke_tool=invoke,
+            strict_json_schema=True,
+            is_enabled=self._tool_enabled,
+        )
+        setattr(tool, _SKILL_TOOL_AGENT_ATTR, self.name)
+        return tool
+
+    async def _load(self, name: str) -> str:
+        run_key = _current_run_key()
+        loaded: Optional[Set[str]] = None
+        if run_key is not None:
+            with self._lock:
+                for (key_run, _agent), state in self._runs.items():
+                    if key_run == run_key:
+                        loaded = state["loaded"]
+                        break
+        if loaded is not None and name in loaded:
+            return (
+                f"{name!r} is already loaded earlier in this run. Follow those "
+                "instructions; do not load it again."
+            )
+        result = await asyncio.to_thread(_handle_load_skill, name, agent_name=self.name)
+        if loaded is not None and isinstance(result, str) and result.startswith(f"## Skill: {name}"):
+            with self._lock:
+                loaded.add(name)
+        return result
+
+    def _warn_once(self, agent: Any, message: str) -> None:
+        key = (getattr(agent, "name", "") or "", message)
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.warning("DecimalAI (%s): %s", key[0] or self.name, message)
+
+    async def _tool_enabled(self, context: Any, agent: Any) -> bool:
+        behavior = getattr(agent, "tool_use_behavior", None)
+        if behavior == "stop_on_first_tool":
+            self._warn_once(agent, (
+                "load_skill is off for this agent: with tool_use_behavior='stop_on_first_tool' "
+                "a skill's text would become the answer. Use StopAtTools([...your tools]) instead."
+            ))
+            return False
+        if _has_native_skills(agent):
+            self._warn_once(agent, (
+                "load_skill is off for this agent: it loads skills with the sandbox Skills "
+                "capability. Use decimalai.openai_agents.sandbox_skills() there instead."
+            ))
+            return False
+        if callable(behavior) and not isinstance(behavior, str):
+            self._warn_once(agent, (
+                "this agent's tool_use_behavior function also receives load_skill results; "
+                "ignore them there, or a skill's text could become the answer."
+            ))
+        if getattr(agent, "instructions", None) != self.instructions:
+            self._warn_once(agent, (
+                "load_skill is on this agent, but its instructions are not "
+                f"load_agent({self.name!r}).instructions, so the model gets no skill list."
+            ))
+        with self._lock:
+            return bool(self._menu_names)
+
+
+def load_agent(
+    agent_name: str,
+    *,
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+) -> OpenAIAgentConfig:
+    """Pull an agent's prompt and skills from DecimalAI, for an OpenAI Agents SDK agent.
+
+    ::
+
+        from agents import Agent, Runner
+        from decimalai.openai_agents import load_agent
+
+        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        agent = Agent(
+            name=support.name,
+            instructions=support.instructions,
+            tools=[lookup_order, *support.tools],
+        )
+        result = await Runner.run(agent, question, context=Customer(...))
+
+    Reads the agent's saved prompt and skill list once, here, and keeps a local
+    copy that later runs refresh in the background, so a run never waits on
+    DecimalAI. Nothing in the OpenAI SDK is patched and no other agent in the
+    process is affected. Initializes the SDK from ``DECIMAL_API_KEY`` when
+    ``decimalai.init()`` has not been called.
+
+    Args:
+        agent_name: The agent's name in DecimalAI.
+        fallback: Instructions to use when the agent has no saved prompt, or
+            when DecimalAI cannot be reached at startup. Without one, an
+            unreachable DecimalAI raises here rather than starting an agent
+            with no instructions.
+        on_unavailable: ``"continue"`` (default) runs without skills when
+            DecimalAI never returned them, and the run's record says so;
+            ``"fail"`` raises before the model call instead.
+
+    Raises:
+        AgentNotFoundError: DecimalAI has no agent by this name.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
+    """
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
+    _ensure_initialized()
+    from ._agent import load_agent as _load_prompt
+
+    prompt = _load_prompt(agent_name, fallback=fallback)
+    config = OpenAIAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
+    try:
+        config._load_menu()
+    except Exception:
+        logger.warning(
+            "DecimalAI: could not read the skills of agent %r at startup; runs will "
+            "retry in the background.", config.name, exc_info=True,
+        )
+    _ensure_tracing()
+    return config
+
+
 def _declare(
     agent_name: str,
     *,
@@ -3296,6 +3809,8 @@ class DecimalTracingProcessor:
                 entry["hash"] = h
             active_skills_list.append(entry)
 
+        _attach_prompt_records(acc.spans, run_rail.get("decimal_prompts"))
+
         trace = RunTrace(
             id=uuid4(),
             project=config.project if config else None,
@@ -3704,6 +4219,39 @@ def _attach_system_prompts(
         if text in already:
             continue
         messages.insert(0, {"role": "system", "content": text})
+
+
+def _attach_prompt_records(spans: List[TraceSpan], records: Any) -> None:
+    """Put each `load_agent()` prompt record on its agent's span, as attributes.
+
+    The backend stores span attributes as they come, so a trace says which
+    prompt version a run used, with which placeholder NAMES (never values:
+    those are often personal data), without a column of its own. An agent with
+    no span of its own gets a span named ``decimalai.prompt``.
+    """
+    if not isinstance(records, dict) or not records:
+        return
+    for agent_name, record in records.items():
+        attributes = {
+            "decimal.agent": record.get("decimal_agent"),
+            "decimal.prompt.source": record.get("source"),
+            "decimal.prompt.version": record.get("version"),
+            "decimal.prompt.content_hash": record.get("content_hash"),
+            "decimal.prompt.variables": list(record.get("variables") or []),
+        }
+        if record.get("skills_unavailable"):
+            attributes["decimal.skills.unavailable"] = record["skills_unavailable"]
+        target = next(
+            (s for s in spans if s.span_type == SpanType.AGENT and s.name == agent_name),
+            None,
+        )
+        if target is None:
+            spans.append(TraceSpan(
+                span_type=SpanType.OTHER, name="decimalai.prompt",
+                attributes={**attributes, "decimal.prompt.agent": agent_name},
+            ))
+        else:
+            target.attributes.update(attributes)
 
 
 def _normalize_messages(raw: Any) -> Optional[List[Dict[str, Any]]]:
