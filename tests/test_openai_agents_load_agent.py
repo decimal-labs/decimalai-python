@@ -17,7 +17,7 @@ import pytest
 
 agents = pytest.importorskip("agents")
 
-from agents import Agent, Model, ModelResponse, RunConfig, Runner, Usage, function_tool  # noqa: E402
+from agents import Agent, Model, ModelResponse, Runner, Usage, function_tool  # noqa: E402
 from agents.tracing import get_trace_provider, set_trace_processors  # noqa: E402
 from openai.types.responses import (  # noqa: E402
     ResponseFunctionToolCall,
@@ -62,7 +62,14 @@ class FakeDecimal:
         self.prompt = {"system_prompt": BASE, "version_number": 2, "content_hash": "c" * 64}
         self.skills = ["damaged-item", "order-support"]
         self.menu_down = False
+        #: A catalog bigger than the menu: which skills make it depends on the message.
+        self.truncated = False
+        #: ...answered as the platform does over its caps: by retrieval, with
+        #: strategy "smart_routing" and no `truncated` field at all.
+        self.smart_routing = False
+        self.ranking = {"cracked": ["damaged-item"], "where": ["order-support"]}
         self.requests: list = []
+        self.queries: dict = {}  # routing id -> the message it was minted for
         self._next = 0
 
     def prompt_payload(self, agent_name, version=None):
@@ -85,15 +92,31 @@ class FakeDecimal:
 
     def request(self, method, path, json=None, params=None, **kwargs):
         self.requests.append((method, path, dict(params or {})))
-        if path == "/api/v1/skills/menu":
+        if path in ("/api/v1/skills/menu", "/api/v1/skills/route"):
             if self.menu_down:
                 raise sr.SkillRouterError("transport error: timed out")
+            query = (json or {}).get("query") if path.endswith("/route") else None
+            shown = list(self.skills)
+            if self.truncated:
+                words = (query or "").lower()
+                shown = next((names for word, names in self.ranking.items() if word in words), shown[:1])
+            routing_id = self.routing_id()
+            self.queries[routing_id] = query
+            if self.truncated and self.smart_routing:
+                return {
+                    "skills": [{"name": n, "description": n} for n in shown],
+                    "stable_menu": stable_menu(shown), "menu_instruction": MENU_INSTRUCTION,
+                    "routing_hint": "", "stable_menu_skills": shown, "routing_id": routing_id,
+                    "strategy": "smart_routing", "query_ranked": bool(shown),
+                }
             return {
-                "skills": [{"name": n, "description": n} for n in self.skills],
-                "stable_menu": stable_menu(self.skills),
-                "menu_instruction": MENU_INSTRUCTION if self.skills else "",
-                "routing_hint": "", "stable_menu_skills": list(self.skills),
-                "routing_id": self.routing_id(), "strategy": "full_menu", "query_ranked": False,
+                "skills": [{"name": n, "description": n} for n in shown],
+                "stable_menu": stable_menu(shown),
+                "menu_instruction": MENU_INSTRUCTION if shown else "",
+                "routing_hint": "", "stable_menu_skills": shown,
+                "routing_id": routing_id, "strategy": "full_menu" if not query else "semantic",
+                "query_ranked": bool(query), "truncated": self.truncated,
+                "rows_total": len(self.skills), "skill_count": len(shown),
             }
         if path.startswith("/api/v1/skills/") and path.endswith("/body"):
             name = path.split("/")[-2]
@@ -105,7 +128,8 @@ class FakeDecimal:
         raise AssertionError(f"unexpected DecimalAI request {method} {path}")
 
     def menu_calls(self):
-        return [r for r in self.requests if r[1] == "/api/v1/skills/menu"]
+        """Every routing request: the agent's menu, or a route on a message."""
+        return [r for r in self.requests if r[1] in ("/api/v1/skills/menu", "/api/v1/skills/route")]
 
     def body_calls(self):
         return [r for r in self.requests if r[1].endswith("/body")]
@@ -171,6 +195,7 @@ def decimal(monkeypatch):
     monkeypatch.setattr(oa, "_tracing_processor_added", False, raising=False)
     monkeypatch.setattr(oa, "_run_rails", OrderedDict())
     monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(oa, "_config_pool", None)
     provider = get_trace_provider()
     saved = list(provider._multi_processor._processors)
     set_trace_processors([])
@@ -179,6 +204,10 @@ def decimal(monkeypatch):
         yield fake
     finally:
         set_trace_processors(saved)
+
+
+def trace_routing_id(fake) -> str:
+    return "rt_" + f"{1:024x}"
 
 
 def sent(fake) -> list:
@@ -208,7 +237,8 @@ def test_one_run_gets_prompt_skill_list_tool_and_a_full_record(decimal):
     assert tool.params_json_schema["properties"]["name"]["enum"] == ["damaged-item", "order-support"]
     assert any(BODIES["damaged-item"] in str(item.get("output", ""))
                for item in model.inputs[1] if isinstance(item, dict))
-    assert len(decimal.menu_calls()) == 1, "the startup decision is the first run's"
+    assert len(decimal.menu_calls()) == 1, "the first run routes; nothing was read at startup"
+    assert decimal.queries[trace_routing_id(decimal)] == QUESTION, "routed on the run's own message"
 
     [trace] = sent(decimal)
     assert trace.agent_name == "support"
@@ -340,6 +370,21 @@ def test_the_tool_without_the_instructions_warns(decimal, caplog):
     assert any("no skill list" in r.getMessage() for r in caplog.records)
 
 
+def test_the_instructions_without_the_tool_get_the_prompt_alone_and_a_warning(decimal, caplog):
+    """The likeliest slip in the pull shape: ``*support.tools`` left out. A
+    skill list would tell the model to call a tool it does not have, and the
+    Agents SDK ends the run with "tool not found" when it tries."""
+    support = oa.load_agent("support")
+    model = ScriptedModel(["answer", "answer"])
+    agent = Agent(name="support", instructions=support.instructions, tools=[lookup_order], model=model)
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        Runner.run_sync(agent, QUESTION)
+        Runner.run_sync(agent, QUESTION)
+    assert model.instructions[0] == BASE
+    assert decimal.menu_calls() == []
+    assert sum("*support.tools" in r.getMessage() for r in caplog.records) == 1
+
+
 def test_an_agent_with_another_name_is_filed_under_the_decimal_name(decimal):
     support = oa.load_agent("support")
     agent = Agent(name="Assistant", instructions=support.instructions, tools=[*support.tools],
@@ -391,8 +436,138 @@ def test_the_background_decision_reaches_its_own_run_from_a_worker_thread(decima
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     Runner.run_sync(build(support, WaitingModel(decimal, 2)), "Hi")
     oa._config_pool.shutdown(wait=True)
-    monkeypatch.setattr(oa, "_config_pool", None)
     assert [t.routing_id for t in sent(decimal)] == ["rt_" + f"{n:024x}" for n in (1, 2)]
 
 
+def test_a_run_faster_than_its_routing_request_still_ships_its_routing_id(decimal, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(oa, "_in_background", ORIGINAL_IN_BACKGROUND)
+    support = oa.load_agent("support")
+    release = threading.Event()
+    answer = decimal.request
+
+    def slow_menu(method, path, **kwargs):
+        if path.endswith(("/skills/menu", "/skills/route")) and len(decimal.menu_calls()) >= 1:
+            release.wait(0.3)  # the run ends long before this returns
+        return answer(method, path, **kwargs)
+
+    monkeypatch.setattr(oa._skill_router_singleton, "_request", slow_menu)
+    Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
+    Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
+    oa._config_pool.shutdown(wait=True)
+    assert [t.routing_id for t in sent(decimal)] == ["rt_" + f"{n:024x}" for n in (1, 2)]
+    assert not oa._run_rails, "a late routing result must not leave a rail behind"
+
+
+def test_a_shut_down_worker_pool_never_fails_a_run(decimal, monkeypatch):
+    monkeypatch.setattr(oa, "_in_background", ORIGINAL_IN_BACKGROUND)
+    support = oa.load_agent("support")
+    for _ in range(2):  # the second run is the first with background work
+        Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
+    oa._config_pool.shutdown(wait=True)  # e.g. torn down at interpreter exit
+    Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
+    oa._config_pool.shutdown(wait=True)
+    assert len(sent(decimal)) == 3
+
+
+def test_every_run_is_routed_on_its_own_message(decimal):
+    support = oa.load_agent("support")
+    messages = ["Where is ORD-1001?", "My keyboard from ORD-1002 arrived cracked.", "Thanks!"]
+    for message in messages:
+        Runner.run_sync(build(support, ScriptedModel(["answer"])), message)
+    traces = sent(decimal)
+    assert [decimal.queries[t.routing_id] for t in traces] == messages
+    assert all(t.skills_offered_in_prompt == ["damaged-item", "order-support"] for t in traces)
+
+
+@pytest.mark.parametrize("answer", ["whole_menu_cut", "smart_routing"])
+def test_a_catalog_bigger_than_the_menu_is_routed_before_each_model_call(decimal, answer):
+    """Either way the platform says it: a whole-menu answer marked `truncated`,
+    or (over its caps) a `smart_routing` answer, which carries no such field."""
+    decimal.truncated = True
+    decimal.smart_routing = answer == "smart_routing"
+    support = oa.load_agent("support")
+    cracked, where = ScriptedModel(["answer"]), ScriptedModel(["answer"])
+    Runner.run_sync(build(support, cracked), "My keyboard arrived cracked.")
+    Runner.run_sync(build(support, where), "Where is my order?")
+    assert "| damaged-item |" in cracked.instructions[0] and "| order-support |" not in cracked.instructions[0]
+    assert "| order-support |" in where.instructions[0] and "| damaged-item |" not in where.instructions[0]
+    assert "enum" not in where.tools[0]["load_skill"].params_json_schema["properties"]["name"], (
+        "one tool serves every run, so a per-message list must not be its name list")
+    traces = sent(decimal)
+    assert [decimal.queries[t.routing_id] for t in traces] == ["My keyboard arrived cracked.", "Where is my order?"]
+    assert len(decimal.menu_calls()) == 2, "no background request: each run's route was its own"
+
+
+def test_without_turn_input_skills_keep_a_fixed_order_and_it_says_so_once(decimal, caplog):
+    from types import SimpleNamespace
+
+    support = oa.load_agent("support")
+    agent = build(support, ScriptedModel(["answer"]))
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        assert support._message(SimpleNamespace(context=None), agent) is None
+        assert support._message(SimpleNamespace(context=None), agent) is None
+    assert sum("turn_input" in r.getMessage() for r in caplog.records) == 1
+    assert support._message(SimpleNamespace(turn_input=[{"role": "user", "content": "Hi there"}]), agent) == "Hi there"
+
+
 ORIGINAL_IN_BACKGROUND = oa._in_background
+
+
+# ── the documented channel settings ──────────────────────────────────────────
+
+
+def configure(monkeypatch, **settings):
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(
+        api_key="dai_sk_test", base_url="http://127.0.0.1:9", enabled=True, **settings))
+
+
+def test_with_the_tool_switched_off_each_run_gets_its_skills_text_in_the_instructions(decimal, monkeypatch):
+    """The tool's kill switch (DECIMALAI_LOAD_SKILL_TOOL=0 / init(load_skill_tool=False))
+    leaves pasted text as the channel: every run is routed on its own message
+    and the picked skill's text follows the list. Delivered, never "loaded"."""
+    configure(monkeypatch, load_skill_tool=False)
+    support = oa.load_agent("support")
+    model = ScriptedModel(["answer", "answer"])
+    Runner.run_sync(build(support, model), QUESTION)
+    Runner.run_sync(build(support, model), "Where is ORD-1003?")
+
+    assert all("load_skill" not in tools for tools in model.tools)
+    first = model.instructions[0]
+    assert first.startswith(f"{BASE}\n\n{PREFIX}")
+    assert f"## Skill: damaged-item\n\n{BODIES['damaged-item']}" in first
+    assert LOAD_SKILL_PROMPT_HINT not in first, "the usage sentence names a tool this agent lacks"
+    assert len(decimal.menu_calls()) == 2, "each run routed on its own message"
+    for trace in sent(decimal):
+        assert trace.skills_delivered == ["damaged-item"]
+        assert trace.skills_loaded_by_agent == []
+        assert [v["name"] for v in trace.skills_delivered_versions] == ["damaged-item"]
+
+
+def test_with_the_tool_and_pasting_both_off_skills_are_off_and_it_says_so(decimal, monkeypatch, caplog):
+    configure(monkeypatch, load_skill_tool=False, inject_skill_body=False)
+    support = oa.load_agent("support")
+    model = ScriptedModel(["answer"])
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        Runner.run_sync(build(support, model), QUESTION)
+    assert model.instructions[0] == BASE
+    assert "load_skill" not in model.tools[0]
+    assert decimal.menu_calls() == []
+    assert sum("inject_skill_body" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_text_pasted_into_the_instructions_is_not_sent_again_by_the_tool(decimal, monkeypatch):
+    """Both channels on, by asking for both: the tool answers for a skill whose
+    text is already in the instructions without fetching it again."""
+    configure(monkeypatch, inject_skill_body=True)
+    support = oa.load_agent("support")
+    model = ScriptedModel([LOAD, "answer"])
+    Runner.run_sync(build(support, model), QUESTION)
+    assert BODIES["damaged-item"] in model.instructions[0]
+    assert "load_skill" in model.tools[0]
+    assert "already loaded" in str(model.inputs[1][-1].get("output"))
+    assert len(decimal.body_calls()) == 1

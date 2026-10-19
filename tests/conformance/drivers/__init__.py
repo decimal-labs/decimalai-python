@@ -483,6 +483,11 @@ class Driver:
     run_conversation: Optional[FanoutFn] = None
     #: Second documented shapes, each its own phase — see ``Shape``.
     shapes: Tuple[Shape, ...] = ()
+    #: The documented snippet loads its agent FROM DecimalAI (``load_agent(name)``),
+    #: which fails fast on an agent the workspace does not hold. So, as for a user
+    #: who created the agent in the dashboard, each phase's agent exists there
+    #: first: the harness registers it on the probe with ``SYSTEM_PROMPT`` saved.
+    loads_agent_from_platform: bool = False
     #: The framework distributions whose SDK floor gates this driver: one
     #: installed below the floor ``pyproject.toml`` declares makes the driver
     #: unavailable, with the reason (see ``floors.py``). Name the framework

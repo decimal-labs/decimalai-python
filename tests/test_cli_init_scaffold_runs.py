@@ -14,10 +14,10 @@ the real code path — the real imports, the real `instrument()`, the real
 `Agent(...)` / `init_chat_model(...)`, the real entry point.
 
 A subprocess and not an in-process exec, because `instrument()` is a
-process-wide install: it monkey-patches `Agent.__init__` (openai-agents) and
-`BaseChatModel.invoke` (langchain) and registers a global trace processor.
-Running that inside pytest would leak those patches into every test that came
-after it.
+process-wide install: it monkey-patches `BaseChatModel.invoke` (langchain) and
+registers a global trace processor (every framework, `load_agent()` on
+openai-agents included). Running that inside pytest would leak those into every
+test that came after it.
 
 `decimalai.init()` is the one other stub. It is not what is under test here,
 and left alone it makes a real network call to verify the (fake) key.
@@ -56,37 +56,74 @@ NO_PROMPT = None
 RUNTIMES = {
     "openai-agents": {
         "requires": "agents",
+        # The model, and only the model: the real Runner loop runs around it,
+        # so the load_skill result is fed back exactly as it is to a real model.
+        # Patching `Runner.run_sync` instead removed the loop, and on this
+        # framework the loop is the body channel.
         "stub": """
-import agents
-class _Result:
-    final_output = "stubbed answer"
-_stack.enter_context(patch.object(agents.Runner, "run_sync", return_value=_Result()))
+import json as _json
+from agents.items import ModelResponse
+from agents.models.interface import Model
+from agents.models.multi_provider import MultiProvider
+from agents.tracing import set_trace_processors
+from agents.usage import Usage
+from openai.types.responses import (
+    ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText,
+)
+
+# The SDK's own exporter would send this run's trace to OpenAI with a stub key.
+set_trace_processors([])
+_sent = []
+
+
+class _Scripted(Model):
+    async def get_response(self, system_instructions, input, model_settings, tools,
+                           *args, **kwargs):
+        _sent.append({"instructions": system_instructions or "", "input": input,
+                      "tools": [t.name for t in tools]})
+        if "load_skill" in _sent[-1]["tools"] and len(_sent) == 1:
+            call = ResponseFunctionToolCall(
+                id="fc_1", call_id="call_1", type="function_call", name="load_skill",
+                arguments=_json.dumps({"name": "restocking-policy"}),
+            )
+            return ModelResponse(output=[call], usage=Usage(), response_id=None)
+        message = ResponseOutputMessage(
+            id="msg_1", type="message", role="assistant", status="completed",
+            content=[ResponseOutputText(type="output_text", text="stubbed answer",
+                                        annotations=[])],
+        )
+        return ModelResponse(output=[message], usage=Usage(), response_id=None)
+
+    def stream_response(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+_stack.enter_context(patch.object(MultiProvider, "get_model", lambda self, name: _Scripted()))
 """,
         "probe": """
-# What the Agent will actually be run with. `Runner.run_sync` is stubbed, so
-# the Agent's own instructions are the last observable before the model — and
-# they are the exact value the runner passes as `system_instructions`. The
-# skill loader wraps a string into a per-run callable, so unwrap it first;
-# reading the wrapper would print a function and prove nothing.
-from decimalai.openai_agents import _BASE_INSTRUCTIONS_ATTR
-_instr = _mod["agent"].instructions
-if callable(_instr):
-    _instr = getattr(_instr, _BASE_INSTRUCTIONS_ATTR, None)
-print("PROMPT_SEEN:", _instr if _instr else "<none>")
+# What the model was handed, call by call. The Agent's instructions are
+# load_agent()'s function, resolved by the real runner, so the first call's
+# system_instructions is the agent's prompt followed by its skill list.
+_first = _sent[0]["instructions"] if _sent else ""
+_prompt = _first.split("## Available Skills")[0].strip()
+print("PROMPT_SEEN:", _prompt or "<none>")
+# The skills reach this agent only through load_agent()'s two pieces in
+# Agent(...): the list in its instructions and the load_skill tool.
+print("LOADER:", bool(_sent) and "load_skill" in _sent[0]["tools"])
+print("TURNS:", len(_sent))
 
-import decimalai.openai_agents as adapter
-print("LOADER:", adapter._skill_loader_installed)
-# Read the name off the processor the adapter actually registered. The
-# earlier version of this probe printed the literal "refund-bot", which
-# made the assertion below unfalsifiable — it passed whatever instrument()
-# did with the name. openai-agents has no module-level equivalent of
-# langchain's _install_agent_name; the name lives on the processor as
-# default_agent_name, so that is what gets read.
+# Read the name off the processor the adapter actually registered, for the
+# Agent the template built: the literal "refund-bot" would make the assertion
+# below unfalsifiable.
 from agents.tracing import get_trace_provider
 _procs = get_trace_provider()._multi_processor._processors
 _ours = [p for p in _procs if hasattr(p, "default_agent_name")]
 print("PROCESSORS:", len(_ours))
-print("BOUND:", _ours[0].default_agent_name if _ours else "<no processor>")
+print("BOUND:", _ours[0].decimal_name_for(_mod["agent"].name) if _ours else "<no processor>")
+
+_all = "\\n".join([_first] + [_json.dumps(c["input"], default=str) for c in _sent[1:]])
+print("SKILL_OFFERED:", "restocking-policy" in _first)
+print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
 """,
     },
     "pydantic-ai": {
@@ -250,6 +287,10 @@ CANARY_SKILL = "restocking-policy"
 #: A dict rather than a set because the failure message has to name the channel:
 #: "the body never arrived" is a different investigation on each.
 BODY_CHANNEL_OBSERVABLE = {
+    "openai-agents": (
+        "load_agent() hands the Agent a real load_skill tool and the Agents SDK "
+        "owns the loop, so the body should have come back as a tool result mid-turn."
+    ),
     "langchain": (
         "On an adapter with no tool loop, prompt injection is the only body "
         "channel."
@@ -283,6 +324,8 @@ DRIVER = """\
 import contextlib, runpy
 from unittest.mock import patch
 
+from unittest.mock import MagicMock
+
 from decimalai import AgentConfig
 
 _stack = contextlib.ExitStack()
@@ -312,7 +355,11 @@ _flush = _stack.enter_context(patch("decimalai.flush"))
 # name, so a template that read `config.system_prmopt` would sail through this
 # test and ship a file that dies for the user on line one.
 _config = AgentConfig(agent_name={agent!r}, system_prompt={prompt!r})
-_load = _stack.enter_context(patch("decimalai.load_agent", return_value=_config))
+_load = MagicMock(return_value=_config)
+# The templates call decimalai.load_agent(); OpenAI's load_agent() reads the same
+# prompt through decimalai._agent.load_agent. One stub answers both.
+_stack.enter_context(patch("decimalai.load_agent", _load))
+_stack.enter_context(patch("decimalai._agent.load_agent", _load))
 
 with _stack:
     _mod = runpy.run_path({path!r}, run_name="__main__")
@@ -426,11 +473,9 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     # separately: a test that only checked "the skill was mentioned" would have
     # passed against the bug.
     #
-    # Asserted for every framework whose stub keeps the model on the call path.
-    # openai-agents is the exception and it is a limit of ITS STUB, not of the
-    # adapter: replacing `Runner.run_sync` removes the loop, and on that
-    # framework the loop IS the body channel. Named here rather than left as a
-    # silent gap in an `if`.
+    # Asserted for every framework whose stub keeps the model on the call path,
+    # which is every framework here since openai-agents stopped stubbing
+    # `Runner.run_sync` (that removed the loop, its body channel).
     if framework in BODY_CHANNEL_OBSERVABLE:
         assert "SKILL_OFFERED: True" in out, out
         assert "SKILL_BODY_DELIVERED: True" in out, (
@@ -450,6 +495,8 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     # produces, and the reason the template passes init() no framework flag.
     if framework == "openai-agents":
         assert "PROCESSORS: 1" in out, out
+        # Two model requests: ask for the body, then answer with it.
+        assert "TURNS: 2" in out, out
 
     if framework == "pydantic-ai":
         # The tool is the body channel here, so its absence explains a missing

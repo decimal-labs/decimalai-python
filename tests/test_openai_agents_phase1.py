@@ -1,24 +1,21 @@
-"""Phase 1 of the 2026-10-13 integration audit, OpenAI Agents SDK adapter.
+"""OpenAI Agents SDK adapter: one tracing processor, and `load_agent()` agents in
+the places the old process-wide skill loader broke.
 
-Three silent failures, each driven through the REAL Agents SDK (no stand-in
-``agents`` module) with a scripted in-process model, so nothing here contacts a
-provider or the DecimalAI backend:
+Driven through the REAL Agents SDK (no stand-in ``agents`` module) with a
+scripted in-process model, so nothing here contacts a provider or the DecimalAI
+backend. Until 0.18 the adapter patched the Agents SDK; the 2026-10-13 audit
+found three silent failures in that loader (``SandboxAgent`` got no skills, a
+second ``instrument()`` sent every run twice, routing ran on the event loop).
+These tests keep the guarantees, for the explicit `load_agent()` shape:
 
-1. ``SandboxAgent`` got no skills at all. It is a ``@dataclass`` subclass with
-   its own generated ``__init__``, so the loader's ``Agent.__init__`` patch never
-   ran on it; and at run time the sandbox executes a CLONE whose
-   ``instructions`` is the sandbox's own builder callable, which the run-time
-   retrofit mistook for "a callable the user wrote". Router calls: zero. With a
-   lazy native ``Skills`` capability the sandbox also registers its OWN tool
-   called ``load_skill``, so DecimalAI either backed off entirely or, had both
-   been registered, lost dispatch to the native one (last name wins, no error).
-2. ``instrument()`` stacked a second ``DecimalTracingProcessor`` on every call.
-   ``init(openai_agents=True)`` followed by ``instrument(enable_skill_loader=True)``
-   -- the only way to add skills after the documented one-liner -- sent every
-   run twice, with the skill telemetry on only one of the two copies.
-3. The routing call -- a blocking HTTP request -- ran ON the event loop, from
-   the async ``get_system_prompt``. In an async server that stalls every other
-   conversation in the process while the platform answers.
+1. ``instrument()`` is idempotent: one ``DecimalTracingProcessor`` however often
+   it is called, and beside ``load_agent()``.
+2. ``SandboxAgent``: a ``load_agent()`` menu reaches a sandbox run; an agent
+   whose own ``Skills`` capability serves its skills gets no second catalog.
+3. Routing never runs on the event loop.
+4. ``tool_use_behavior`` stays the developer's: ``stop_on_first_tool`` turns
+   DecimalAI's skills off for that agent (a skill's text would be the answer),
+   and a tool of the developer's own named ``load_skill`` is never shadowed.
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ import asyncio
 import json
 import logging
 import threading
-import types
 from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
@@ -61,7 +57,7 @@ MENU = f"## Recommended Skills\n| {SKILL} | how refunds are handled |"
 BODY = f"## Skill: {SKILL}\n\nREFUND BODY SENTINEL"
 ROUTING_ID = "rt_0123456789abcdef01234567"
 QUESTION = "how do refunds work?"
-NAMESPACED = "decimalai_load_skill"
+PROMPT = "You are helpful."
 
 
 # ── a scripted model ─────────────────────────────────────────────────────────
@@ -81,6 +77,17 @@ def _call(name: str, arguments: dict) -> ModelResponse:
         name=name, arguments=json.dumps(arguments),
     )
     return ModelResponse(output=[call], usage=Usage(), response_id=None)
+
+
+def _turn(*calls: tuple) -> ModelResponse:
+    """One model turn that calls each ``(name, arguments)`` in order."""
+    return ModelResponse(output=[
+        ResponseFunctionToolCall(
+            id=f"fc_{i}", call_id=f"call_{name}_{i}", type="function_call",
+            name=name, arguments=json.dumps(arguments),
+        )
+        for i, (name, arguments) in enumerate(calls)
+    ], usage=Usage(), response_id=None)
 
 
 class _ScriptedModel(Model):
@@ -123,6 +130,10 @@ class _Router:
         sr._last_offered_names_ctx.set([SKILL])
         return MENU, ROUTING_ID
 
+    def build_prompt_parts(self, query=None, **kwargs):
+        fragment, routing_id = self.build_prompt_fragment(query, **kwargs)
+        return fragment, "", routing_id
+
     def load_skill(self, name, *, scope=None, agent_name=None):
         self.loads.append({"name": name, "scope": scope, "agent_name": agent_name,
                            "thread": threading.get_ident()})
@@ -153,8 +164,8 @@ class _Router:
 
 @pytest.fixture
 def sdk(monkeypatch):
-    """A configured SDK whose client is a mock, and an adapter with nothing
-    installed. Every patch the loader makes to the Agent classes is undone."""
+    """A configured SDK whose client is a mock (saved prompt: ``PROMPT``), no
+    router, no processor, and inline background work."""
     import decimalai._config as cfg
     from decimalai._config import DecimalConfig
     from decimalai.schema.manifest import ManifestTracker
@@ -165,45 +176,27 @@ def sdk(monkeypatch):
     ))
     client = MagicMock()
     client.register_manifest.return_value = {"manifest_id": "m-1", "status": "active"}
+    client.get_agent_prompt.side_effect = lambda name, version=None: {
+        "agent_name": name, "system_prompt": PROMPT, "version_number": 1, "content_hash": "h" * 64,
+    }
     monkeypatch.setattr(cfg, "_client", client)
-
-    for method in ("__init__", "get_system_prompt", "get_all_tools"):
-        monkeypatch.setattr(agents.Agent, method, getattr(agents.Agent, method))
     for name, value in (
-        ("_skill_loader_installed", False),
-        ("_agent_hooks_installed", False),
-        ("_retrofit_notice_emitted", False),
         ("_skill_router_singleton", None),
-        ("_load_skill_tool_registration_failed", False),
         ("_manifest_id", None),
         ("_manifest_tracker", ManifestTracker()),
+        ("_tracing_processor", None),
+        ("_tracing_processor_added", False),
+        ("_run_rails", OrderedDict()),
+        ("_config_pool", None),
     ):
         monkeypatch.setattr(oa, name, value)
-    # Introduced by the fix; absent before it, hence raising=False.
-    monkeypatch.setattr(oa, "_namespace_notice_emitted", False, raising=False)
-    # The native-skills hook (phase 3): the notice, and the class patch on `Skills`.
-    monkeypatch.setattr(oa, "_native_skills_notice_emitted", False, raising=False)
-    monkeypatch.setattr(oa, "_native_hook_installed", False, raising=False)
+    monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
     monkeypatch.setattr(oa, "_two_catalogs_warned", False, raising=False)
-    for method in ("load_skill", "instructions"):
-        monkeypatch.setattr(Skills, method, getattr(Skills, method))
-    monkeypatch.setattr(oa, "_final_output_guard_installed", False, raising=False)
-    from agents.run_internal import turn_resolution
-
-    monkeypatch.setattr(
-        turn_resolution, "check_for_final_output_from_tools",
-        turn_resolution.check_for_final_output_from_tools,
-    )
-    monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
-    monkeypatch.setattr(oa, "_run_rails", OrderedDict())
-    monkeypatch.setattr(oa, "_load_skill_tool_enabled", lambda: True)
 
     provider = get_trace_provider()
     saved = list(provider._multi_processor._processors)
     set_trace_processors([])
     sr._last_offered_names_ctx.set(None)
-    oa._routing_id_ctx.set(None)
-    oa._skills_offered_ctx.set(None)
     try:
         yield client
     finally:
@@ -239,178 +232,26 @@ def lazy_skills_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
-# ── 1. SandboxAgent ──────────────────────────────────────────────────────────
+@pytest.fixture
+def router(sdk):
+    router = _Router()
+    oa._skill_router_singleton = router
+    return router
 
 
-class TestSandboxAgentGetsSkills:
-    @pytest.mark.parametrize("built", ["before_instrument", "after_instrument"])
-    def test_a_sandbox_run_routes_and_shows_the_menu(self, sdk, built):
-        router = _Router()
-        oa._skill_router_singleton = router
-        model = _ScriptedModel([_text("ok")])
-
-        def build():
-            return SandboxAgent(name="sbx", instructions="You are helpful.", model=model)
-
-        agent = build() if built == "before_instrument" else None
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        agent = agent or build()
-        _sandbox_run(agent)
-
-        assert [r["agent_name"] for r in router.routes] == ["sbx"]
-        assert router.routes[0]["query"] == QUESTION
-        shown = model.calls[0]["instructions"]
-        assert shown.count(MENU) == 1
-        assert "You are helpful." in shown
-        # The menu points at a tool that is really there, and it is ours.
-        assert "call the load_skill tool" in shown
-        tools = [t for t in model.calls[0]["tools"] if t.name == "load_skill"]
-        assert len(tools) == 1 and hasattr(tools[0], oa._SKILL_TOOL_AGENT_ATTR)
-        # The user's declaration is untouched: the skills arrive per run.
-        assert agent.instructions == "You are helpful."
-
-    def test_a_native_lazy_skills_capability_turns_the_router_off(
-        self, sdk, lazy_skills_dir, caplog,
-    ):
-        """CONTRACT CHANGED (phase 3, D7; was "ours is namespaced"). The sandbox's
-        lazy ``Skills`` lists its skills and registers its own ``load_skill``; a routed
-        menu and ``decimalai_load_skill`` beside them were a second catalog. Now the
-        agent gets neither, no routing call is made, and the reason is said once."""
-        router = _Router()
-        oa._skill_router_singleton = router
-        model = _ScriptedModel([_text("ok")])
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        agent = SandboxAgent(
-            name="sbx", instructions="You are helpful.", model=model,
-            capabilities=[Skills(lazy_from=LocalDirLazySkillSource(
-                source=LocalDir(src=lazy_skills_dir)))],
-        )
-
-        with caplog.at_level(logging.INFO, logger="decimalai.openai_agents"):
-            _sandbox_run(agent)
-
-        tools = [t for t in model.calls[0]["tools"] if t.name in ("load_skill", NAMESPACED)]
-        assert [t.name for t in tools] == ["load_skill"]
-        assert not hasattr(tools[0], oa._SKILL_TOOL_AGENT_ATTR)  # the sandbox's own
-        shown = model.calls[0]["instructions"]
-        assert MENU not in shown and NAMESPACED not in shown
-        assert router.routes == []
-        notices = [r for r in caplog.records if "sandbox Skills capability" in r.getMessage()]
-        assert [r.levelno for r in notices] == [logging.INFO]
-
-    def test_eager_native_skills_turn_the_router_off_too(self, sdk):
-        """``Skills(skills=[...])`` registers no tool, but it is still the agent's skill
-        loader (the skills are mounted and listed): no menu, no DecimalAI tool."""
-        from agents.sandbox.capabilities import Skill
-
-        router = _Router()
-        oa._skill_router_singleton = router
-        model = _ScriptedModel([_text("ok")])
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        _sandbox_run(SandboxAgent(
-            name="sbx", instructions="You are helpful.", model=model,
-            capabilities=[Skills(skills=[Skill(
-                name="native-skill", description="mounted by the sandbox",
-                content="---\nname: native-skill\ndescription: d\n---\nbody\n",
-            )])],
-        ))
-
-        names = [t.name for t in model.calls[0]["tools"]]
-        assert "load_skill" not in names and NAMESPACED not in names
-        assert MENU not in model.calls[0]["instructions"]
-        assert router.routes == []
-
-    def test_the_router_off_notice_is_emitted_once_per_process(self, sdk, lazy_skills_dir, caplog):
-        oa._skill_router_singleton = _Router()
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        caps = [Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=lazy_skills_dir)))]
-        with caplog.at_level(logging.INFO, logger="decimalai.openai_agents"):
-            for _ in range(2):
-                _sandbox_run(SandboxAgent(name="sbx", instructions="x",
-                                          model=_ScriptedModel([_text("ok")]),
-                                          capabilities=caps))
-        assert len([r for r in caplog.records
-                    if "sandbox Skills capability" in r.getMessage()]) == 1
-
-    def test_a_user_written_sandbox_instructions_callable_is_routed(self, sdk):
-        """CONTRACT CHANGED (was "is left alone": no routing, no menu). Same
-        policy as a plain Agent, which phase 1d reversed: the user's callable
-        still runs and leads, and the routed menu trails it. The sync, async
-        and callable-object shapes are in test_openai_agents_phase1d.py."""
-        router = _Router()
-        oa._skill_router_singleton = router
-        model = _ScriptedModel([_text("ok")])
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        _sandbox_run(SandboxAgent(name="sbx", instructions=lambda ctx, agent: "MINE",
-                                  model=model))
-
-        assert [r["agent_name"] for r in router.routes] == ["sbx"]
-        shown = model.calls[0]["instructions"]
-        assert shown.count(MENU) == 1
-        assert shown.index("MINE") < shown.index(MENU)
-
-    def test_a_plain_agent_keeps_the_plain_tool_name(self, sdk):
-        router = _Router()
-        oa._skill_router_singleton = router
-        loop_threads = []
-
-        class _Recording(_ScriptedModel):
-            async def get_response(self, *args, **kwargs):
-                loop_threads.append(threading.get_ident())
-                return await super().get_response(*args, **kwargs)
-
-        model = _Recording([_call("load_skill", {"name": SKILL}), _text("ok")])
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        Runner.run_sync(agents.Agent(name="plain", instructions="You are helpful.",
-                                     model=model), QUESTION)
-
-        assert "load_skill" in [t.name for t in model.calls[0]["tools"]]
-        assert NAMESPACED not in [t.name for t in model.calls[0]["tools"]]
-        assert "call the load_skill tool" in model.calls[0]["instructions"]
-        assert [load["name"] for load in router.loads] == [SKILL]
-        # The SDK runs a sync function tool on a worker thread; the body fetch
-        # must stay off the loop too.
-        assert router.loads[0]["thread"] not in loop_threads
-        (trace,) = _sent(sdk)
-        assert trace.skills_loaded_by_agent == [SKILL]
-
-    def test_the_namespaced_tool_stays_out_of_the_manifest(self, sdk):
-        """Like `load_skill`, it is this adapter's affordance, not the agent's
-        declared contract: listing it would version the agent on whether the
-        loader was on."""
-        declared = types.SimpleNamespace(name="lookup", params_json_schema={"type": "object"})
-        agent = types.SimpleNamespace(tools=[declared, types.SimpleNamespace(name=NAMESPACED)])
-        assert [t["name"] for t in oa._introspect_agent(agent)["tools"]] == ["lookup"]
-
-        processor = oa.DecimalTracingProcessor(agent_name="sbx")
-        trace = types.SimpleNamespace(trace_id="trace_ns", name="w")
-        processor.on_trace_start(trace)
-        span_data = types.SimpleNamespace(type="agent", name="sbx", output_type=None,
-                                          tools=["lookup", NAMESPACED, "load_skill"], handoffs=[])
-        processor.on_span_end(types.SimpleNamespace(
-            trace_id="trace_ns", span_id="span_1", parent_id=None, span_data=span_data,
-            started_at=None, ended_at=None, error=None,
-        ))
-        assert list(processor._traces["trace_ns"].seen_tools) == ["lookup"]
-
-
-# ── 2. instrument() is idempotent ────────────────────────────────────────────
+# ── 1. instrument() is idempotent ────────────────────────────────────────────
 
 
 class TestInstrumentIsIdempotent:
-    def test_init_flag_then_skill_loader_leaves_one_processor(self, sdk):
-        """``init(openai_agents=True)`` runs ``instrument(agent_name=...)``; the
-        documented way to add skills afterwards is a second ``instrument``."""
+    def test_instrument_then_load_agent_leaves_one_processor(self, router):
         other = MagicMock(name="users-own-processor")
         set_trace_processors([other])
 
         oa.instrument(agent_name="support", disk_sync=False)        # what init() does
-        oa.instrument(enable_skill_loader=True, disk_sync=False)
+        oa.load_agent("support")
 
         assert len(_ours()) == 1
         assert other in get_trace_provider()._multi_processor._processors
-        assert oa._skill_loader_installed is True
-        # A second call that names no agent keeps the name the first one set.
         assert _ours()[0].default_agent_name == "support"
 
     def test_no_mix_of_calls_stacks_a_second_processor(self, sdk):
@@ -427,103 +268,87 @@ class TestInstrumentIsIdempotent:
         oa.instrument(disk_sync=False)
         assert len(_ours()) == 1
 
-    def test_one_run_sends_one_trace_after_two_instrument_calls(self, sdk):
-        router = _Router()
-        oa._skill_router_singleton = router
+    def test_one_run_sends_one_trace_after_instrument_and_load_agent(self, router, sdk):
         oa.instrument(agent_name="support", disk_sync=False)
-        oa.instrument(enable_skill_loader=True, disk_sync=False)
+        support = oa.load_agent("support")
 
-        Runner.run_sync(agents.Agent(name="support", instructions="You are helpful.",
+        Runner.run_sync(agents.Agent(name=support.name, instructions=support.instructions,
+                                     tools=[*support.tools],
                                      model=_ScriptedModel([_text("ok")])), QUESTION)
 
         traces = _sent(sdk)
         assert len(traces) == 1
         assert traces[0].routing_id == ROUTING_ID
 
+    def test_the_removed_skill_loader_says_where_skills_went(self, sdk):
+        with pytest.raises(ValueError, match="load_agent"):
+            oa.instrument(enable_skill_loader=True, disk_sync=False)
+        assert _ours() == []
 
-# ── 3. the routing call is made off the event loop ───────────────────────────
+
+# ── 2. SandboxAgent ──────────────────────────────────────────────────────────
 
 
-async def _prompt_while_the_loop_is_needed(agent, router):
-    """Resolve ``agent``'s prompt while another coroutine must run to release
-    the router. Returns (prompt, loop thread id)."""
-    async def release():
-        await asyncio.sleep(0)
-        router.wait.set()
+class TestSandboxAgents:
+    def test_a_sandbox_run_shows_the_menu_and_can_load(self, router):
+        support = oa.load_agent("support")
+        model = _ScriptedModel([_call("load_skill", {"name": SKILL}), _text("ok")])
+        _sandbox_run(SandboxAgent(name="support", instructions=support.instructions,
+                                  tools=[*support.tools], model=model))
 
-    ctx = agents.RunContextWrapper(context=None, turn_input=[{"role": "user", "content": QUESTION}])
-    prompt, _ = await asyncio.gather(agent.get_system_prompt(ctx), release())
-    return prompt, threading.get_ident()
+        assert [r["agent_name"] for r in router.routes] == ["support"]
+        shown = model.calls[0]["instructions"]
+        assert PROMPT in shown and shown.count(MENU) == 1
+        assert "load_skill" in [t.name for t in model.calls[0]["tools"]]
+        assert [load["name"] for load in router.loads] == [SKILL]
+
+    def test_an_agent_with_its_own_skills_capability_gets_no_second_catalog(
+        self, router, lazy_skills_dir, caplog,
+    ):
+        support = oa.load_agent("support")
+        model = _ScriptedModel([_text("ok")])
+        agent = SandboxAgent(
+            name="support", instructions=support.instructions, tools=[*support.tools],
+            model=model, capabilities=[Skills(lazy_from=LocalDirLazySkillSource(
+                source=LocalDir(src=str(lazy_skills_dir))))],
+        )
+        with caplog.at_level(logging.WARNING, logger="decimalai"):
+            _sandbox_run(agent)
+            _sandbox_run(agent)
+
+        assert router.routes == [], "the sandbox's own catalog serves this agent"
+        assert MENU not in model.calls[0]["instructions"]
+        assert [t.name for t in model.calls[0]["tools"]].count("load_skill") == 1  # the sandbox's
+        assert sum("sandbox Skills capability" in r.getMessage() for r in caplog.records) == 1
+
+
+# ── 3. routing is never made on the event loop ───────────────────────────────
 
 
 class TestRoutingDoesNotBlockTheEventLoop:
-    @pytest.mark.parametrize("built", ["before_instrument", "after_instrument"])
-    def test_get_system_prompt_routes_on_a_worker_thread(self, sdk, built):
+    def test_the_first_runs_routing_is_made_on_a_worker_thread(self, sdk):
         router = _Router(wait=threading.Event())
         oa._skill_router_singleton = router
-        agent = agents.Agent(name="a", instructions="be terse") if built == "before_instrument" else None
-        oa._install_skill_loader()
-        agent = agent or agents.Agent(name="a", instructions="be terse")
-
-        prompt, loop_thread = asyncio.run(_prompt_while_the_loop_is_needed(agent, router))
-
-        assert MENU in prompt and prompt.startswith("be terse")
-        assert router.routes[0]["thread"] != loop_thread
-        assert router.released_while_routing is True
-
-    def test_a_sandbox_run_routes_on_a_worker_thread(self, sdk):
-        router = _Router()
-        oa._skill_router_singleton = router
-        oa.instrument(enable_skill_loader=True, disk_sync=False, exclusive=True)
-        loop_threads = []
-
-        class _Recording(_ScriptedModel):
-            async def get_response(self, *args, **kwargs):
-                loop_threads.append(threading.get_ident())
-                return await super().get_response(*args, **kwargs)
-
-        _sandbox_run(SandboxAgent(name="sbx", instructions="x", model=_Recording([_text("ok")])))
-        assert router.routes and router.routes[0]["thread"] not in loop_threads
-
-    def test_the_callers_context_sees_what_an_inline_call_left(self, sdk):
-        """Off the loop, but not off the books: the context-variable rails the
-        routing call writes still land in the awaiting coroutine's context."""
-        oa._skill_router_singleton = _Router()
-        oa._install_skill_loader()
-        agent = agents.Agent(name="a", instructions="be terse")
+        support = oa.load_agent("support")
+        agent = agents.Agent(name="support", instructions=support.instructions, tools=[*support.tools])
 
         async def resolve():
-            await agent.get_system_prompt(agents.RunContextWrapper(context=None))
-            return oa._consume_routing_id(), oa._consume_skills_offered()
+            async def release():
+                await asyncio.sleep(0)
+                router.wait.set()
 
-        assert asyncio.run(resolve()) == (ROUTING_ID, [SKILL])
+            ctx = agents.RunContextWrapper(context=None, turn_input=[{"role": "user", "content": QUESTION}])
+            text, _ = await asyncio.gather(support.instructions(ctx, agent), release())
+            return text, threading.get_ident()
 
-    def test_called_without_a_running_loop_it_still_returns_a_string(self, sdk):
-        oa._skill_router_singleton = _Router()
-        oa._install_skill_loader()
-        agent = agents.Agent(name="a", instructions="be terse")
-        out = agent.instructions(agents.RunContextWrapper(context=None), agent)
-        assert isinstance(out, str) and MENU in out
-
-
-# ── 4. tool_use_behavior: DecimalAI's tool is never the agent's answer ───────
-#
-# ``init(openai_agents=True)`` turns the skill loader on, which puts
-# ``load_skill`` on every Agent — and the menu hint tells the model to call it
-# FIRST. An agent built with ``tool_use_behavior="stop_on_first_tool"`` ends its
-# run with the first tool's output, so it answered the user with the skill
-# body. A ``ToolsToFinalOutputFunction`` was handed a tool it never declared.
+        text, loop_thread = asyncio.run(resolve())
+        assert router.released_while_routing is True, "the routing call held the event loop"
+        assert router.routes[0]["thread"] != loop_thread
+        assert router.routes[0]["query"] == QUESTION
+        assert MENU in text
 
 
-def _turn(*calls: tuple) -> ModelResponse:
-    """One model turn that calls each ``(name, arguments)`` in order."""
-    return ModelResponse(output=[
-        ResponseFunctionToolCall(
-            id=f"fc_{i}", call_id=f"call_{name}_{i}", type="function_call",
-            name=name, arguments=json.dumps(arguments),
-        )
-        for i, (name, arguments) in enumerate(calls)
-    ], usage=Usage(), response_id=None)
+# ── 4. tool_use_behavior stays the developer's ───────────────────────────────
 
 
 ORDER = "ORDER 42: refunded"
@@ -538,49 +363,45 @@ def _lookup_order():
     return lookup_order
 
 
-class TestToolUseBehaviorIgnoresTheSkillTool:
-    def _agent(self, script, behavior, *, tools=None):
+class TestToolUseBehavior:
+    def _agent(self, support, script, behavior, *, tools=None):
         return agents.Agent(
-            name="support", instructions="Answer with the tool result.",
-            model=_ScriptedModel(script), tools=tools if tools is not None else [_lookup_order()],
+            name="support", instructions=support.instructions,
+            model=_ScriptedModel(script),
+            tools=(tools if tools is not None else [_lookup_order()]) + list(support.tools),
             tool_use_behavior=behavior,
         )
 
-    @pytest.fixture
-    def router(self, sdk):
-        router = _Router()
-        oa._skill_router_singleton = router
-        oa.instrument(enable_skill_loader=True, disk_sync=False)
-        return router
+    def test_stop_on_first_tool_turns_skills_off_for_that_agent(self, router, caplog):
+        support = oa.load_agent("support")
+        agent = self._agent(support, [_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
+        with caplog.at_level(logging.WARNING, logger="decimalai"):
+            result = Runner.run_sync(agent, "refund status for order 42?")
+        assert result.final_output == ORDER
+        assert [t.name for t in agent.model.calls[0]["tools"]] == ["lookup_order"]
+        assert MENU not in agent.model.calls[0]["instructions"]
+        assert router.routes == []
+        assert sum("StopAtTools" in r.getMessage() for r in caplog.records) == 1
 
-    @pytest.mark.parametrize("built", ["after_instrument", "before_instrument"])
-    def test_stop_on_first_tool_answers_with_the_agents_own_tool(self, sdk, built):
-        router = _Router()
-        oa._skill_router_singleton = router
-        script = [_turn(("load_skill", {"name": SKILL})),
-                  _turn(("lookup_order", {"order_id": "42"}))]
-        agent = self._agent(script, "stop_on_first_tool") if built == "before_instrument" else None
-        oa.instrument(enable_skill_loader=True, disk_sync=False)
-        agent = agent or self._agent(script, "stop_on_first_tool")
+    def test_run_llm_again_reads_the_body_then_answers(self, router):
+        support = oa.load_agent("support")
+        agent = self._agent(support, [_turn(("load_skill", {"name": SKILL})), _text("final answer")],
+                            "run_llm_again")
+        assert Runner.run_sync(agent, QUESTION).final_output == "final answer"
+        assert "REFUND BODY SENTINEL" in json.dumps(agent.model.calls[1]["input"], default=str)
 
-        result = Runner.run_sync(agent, "refund status for order 42?")
-
-        assert [t.name for t in agent.model.calls[0]["tools"]] == ["lookup_order", "load_skill"]
-        assert result.final_output == ORDER, (
-            "the skill body DecimalAI loaded was taken as the agent's final answer"
-        )
-        assert [load["name"] for load in router.loads] == [SKILL]
-        # The body still reached the model: it was asked again after the load.
-        assert len(agent.model.calls) == 2
-
-    def test_skill_and_own_tool_in_one_turn(self, router):
+    def test_stop_at_tool_names_still_stops_at_the_named_tool(self, router):
+        support = oa.load_agent("support")
         agent = self._agent(
-            [_turn(("load_skill", {"name": SKILL}), ("lookup_order", {"order_id": "42"}))],
-            "stop_on_first_tool",
+            support,
+            [_turn(("load_skill", {"name": SKILL})), _turn(("lookup_order", {"order_id": "42"}))],
+            {"stop_at_tool_names": ["lookup_order"]},
         )
-        assert Runner.run_sync(agent, "refund status for order 42?").final_output == ORDER
+        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
+        assert [load["name"] for load in router.loads] == [SKILL]
 
-    def test_a_custom_function_never_sees_the_skill_tool(self, router):
+    def test_a_custom_function_is_warned_that_it_sees_load_skill(self, router, caplog):
+        support = oa.load_agent("support")
         seen: List[List[str]] = []
 
         def first_order_lookup(context, tool_results):
@@ -591,62 +412,29 @@ class TestToolUseBehaviorIgnoresTheSkillTool:
             return agents.ToolsToFinalOutputResult(is_final_output=False, final_output=None)
 
         agent = self._agent(
-            [_turn(("load_skill", {"name": SKILL})),
-             _turn(("load_skill", {"name": SKILL}), ("lookup_order", {"order_id": "42"}))],
+            support,
+            [_turn(("load_skill", {"name": SKILL})), _turn(("lookup_order", {"order_id": "42"}))],
             first_order_lookup,
         )
-        assert Runner.run_sync(agent, "refund status for order 42?").final_output == ORDER
-        assert seen == [["lookup_order"]], (
-            "the user's ToolsToFinalOutputFunction was handed DecimalAI's tool"
-        )
+        with caplog.at_level(logging.WARNING, logger="decimalai"):
+            assert Runner.run_sync(agent, "refund status for order 42?").final_output == ORDER
+        assert seen == [["load_skill"], ["lookup_order"]]
+        assert any("tool_use_behavior function" in r.getMessage() for r in caplog.records)
 
-    # ── the paths that already worked, unchanged ────────────────────────────
+    def test_the_developers_own_load_skill_tool_is_never_shadowed(self, router, caplog):
+        support = oa.load_agent("support")
 
-    def test_run_llm_again_still_reads_the_body_then_answers(self, router):
-        agent = self._agent(
-            [_turn(("load_skill", {"name": SKILL})), _text("final answer")], "run_llm_again",
-        )
-        assert Runner.run_sync(agent, QUESTION).final_output == "final answer"
-        assert "REFUND BODY SENTINEL" in json.dumps(agent.model.calls[1]["input"], default=str)
-
-    def test_stop_at_tool_names_still_stops_at_the_named_tool(self, router):
-        agent = self._agent(
-            [_turn(("load_skill", {"name": SKILL})), _turn(("lookup_order", {"order_id": "42"}))],
-            {"stop_at_tool_names": ["lookup_order"]},
-        )
-        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
-
-    def test_stop_on_first_tool_with_only_the_agents_tool_is_unchanged(self, router):
-        agent = self._agent([_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
-        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
-        assert len(agent.model.calls) == 1
-
-    def test_the_users_own_load_skill_tool_still_stops_the_run(self, router):
-        """Only DecimalAI's tool is set aside: a tool the user wrote and named
-        ``load_skill`` is theirs, and stop_on_first_tool honours it."""
         @agents.function_tool
         def load_skill(name: str) -> str:
-            """The user's own loader."""
+            """The developer's own loader."""
             return f"USER LOADER: {name}"
 
-        agent = self._agent([_turn(("load_skill", {"name": "x"}))], "stop_on_first_tool",
-                            tools=[load_skill])
-        assert Runner.run_sync(agent, QUESTION).final_output == "USER LOADER: x"
-
-    def test_without_the_skill_loader_nothing_is_filtered(self, sdk):
-        oa.instrument(disk_sync=False)  # tracing only
-        agent = self._agent([_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
-        assert Runner.run_sync(agent, QUESTION).final_output == ORDER
-
-    def test_the_guard_is_in_place_once_the_loader_is(self, router):
-        """A canary for the next floor bump: the guard wraps one function inside
-        the Agents SDK, and if that function moves, this goes red rather than
-        stop_on_first_tool agents quietly answering with skill bodies again."""
-        from agents.run_internal import turn_resolution
-
-        assert oa._final_output_guard_installed is True
-        assert getattr(turn_resolution.check_for_final_output_from_tools, oa._HOOK_MARKER, False)
-        oa._install_skill_loader()
-        oa._install_final_output_guard()
-        inner = turn_resolution.check_for_final_output_from_tools.__wrapped__
-        assert not getattr(inner, oa._HOOK_MARKER, False), "the guard wrapped itself twice"
+        agent = self._agent(support, [_turn(("load_skill", {"name": "x"})), _text("done")],
+                            "run_llm_again", tools=[load_skill])
+        with caplog.at_level(logging.WARNING, logger="decimalai"):
+            Runner.run_sync(agent, QUESTION)
+        tools = [t.name for t in agent.model.calls[0]["tools"]]
+        assert tools.count("load_skill") == 1
+        assert "USER LOADER: x" in json.dumps(agent.model.calls[1]["input"], default=str)
+        assert MENU not in agent.model.calls[0]["instructions"]
+        assert any("already has a tool named load_skill" in r.getMessage() for r in caplog.records)

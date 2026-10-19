@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from .delivery import DEFAULT as DELIVERY_DEFAULT
-from .drivers import Ctx, Driver, observed_mark, observed_since
+from .drivers import SYSTEM_PROMPT, Ctx, Driver, observed_mark, observed_since
 from .probe import Probe, Recorded
 
 #: Lanes used by the concurrency phase.
@@ -216,6 +216,9 @@ def _run_phase(
 
     import decimalai
 
+    if probe.platform_agent_prompt is not None:
+        for c in ctxs:
+            probe.register_agent(c.agent_name, system_prompt=probe.platform_agent_prompt)
     workdir = tempfile.mkdtemp(prefix=f"conformance-{name}-")
     cursor = probe.mark()
     observed_cursor = observed_mark()
@@ -301,6 +304,7 @@ def observe(
         )
 
     probe.skills = [dict(s) for s in skills] if caps.has_skills_rail else []
+    probe.platform_agent_prompt = SYSTEM_PROMPT if driver.loads_agent_from_platform else None
 
     prev_env = {k: os.environ.get(k) for k in ("DECIMAL_API_KEY", "DECIMAL_BASE_URL")}
     os.environ["DECIMAL_API_KEY"] = probe.api_key

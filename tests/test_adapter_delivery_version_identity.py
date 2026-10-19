@@ -50,8 +50,8 @@ def sdk(monkeypatch):
         for field in ("_manifest_ids", "_manifest_hashes", "_pending_manifests", "_pending_snapshots"):
             if hasattr(module, field):
                 monkeypatch.setattr(module, field, {})
-        for field in ("_skills_delivered_ctx", "_skills_offered_ctx", "_skills_delivered_versions_ctx", "_routing_id_ctx"):
-            getattr(module, field).set(None)
+    for field in ("_skills_delivered_ctx", "_skills_offered_ctx", "_skills_delivered_versions_ctx", "_routing_id_ctx"):
+        getattr(lc, field).set(None)
     monkeypatch.setattr(lc, "_manifest_adoption_probed", set())
     monkeypatch.setattr(lc, "_explicit_manifest_config", None)
     oa._run_rails.clear()
@@ -66,9 +66,8 @@ def sdk(monkeypatch):
     otel._reset_run_links()
     sr._body_budget_ctx.set(None)
     sr._last_delivered_versions_ctx.set(None)
-    for module in (lc, oa):
-        for field in ("_skills_delivered_ctx", "_skills_offered_ctx", "_skills_delivered_versions_ctx", "_routing_id_ctx"):
-            getattr(module, field).set(None)
+    for field in ("_skills_delivered_ctx", "_skills_offered_ctx", "_skills_delivered_versions_ctx", "_routing_id_ctx"):
+        getattr(lc, field).set(None)
 
 
 def router(monkeypatch, *, concurrent=True):
@@ -263,7 +262,9 @@ def test_real_langchain_calls_keep_exact_witnesses_for_same_name_concurrently(mo
     assert_versions(sent(sdk), parents, observed=observed, loaded=loaded)
 
 
-@pytest.mark.parametrize("loaded", [False, True], ids=["prompt", "tool"])
+# Since 0.18 a body reaches an OpenAI agent only through load_skill: load_agent()
+# never puts one in the instructions, so there is no "prompt" case to prove here.
+@pytest.mark.parametrize("loaded", [True], ids=["tool"])
 def test_openai_copied_callback_uses_its_run_witness_not_shared_current_hash(monkeypatch, sdk, loaded):
     import decimalai.openai_agents as oa
     from decimalai.generic import start_trace
@@ -283,11 +284,7 @@ def test_openai_copied_callback_uses_its_run_witness_not_shared_current_hash(mon
             processor.on_trace_start(trace)
 
             def deliver():
-                if loaded:
-                    return oa._handle_load_skill(NAME)
-                return oa._make_skill_aware_instructions("caller")(
-                    SimpleNamespace(turn_input=f"request-{index}"), SimpleNamespace(name=f"child-{index}", tools=[]),
-                )
+                return oa._handle_load_skill(NAME)
 
             body = contextvars.copy_context().run(deliver)
             assert BODIES[index] in body and BODIES[1 - index] not in body
@@ -324,7 +321,8 @@ def test_partial_or_noncanonical_pair_preserves_legacy_hash_only(pair):
     assert copy_delivered_versions([witness]) == [{"name": NAME, "hash": HASHES[0]}]
 
 
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "pydantic_ai", "langchain", "openai_agents", "adk"])
+# Not openai_agents: since 0.18 it never builds a body into a prompt (load_skill only).
+@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "pydantic_ai", "langchain", "adk"])
 @pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
 def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapter, failure):
     import decimalai.otel as otel
@@ -357,8 +355,6 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
     monkeypatch.setattr(module, "_skill_router_singleton", FailedThenLegacyRouter())
     if failure == "stale-before-fails":
         sr._last_delivered_versions_ctx.set([dict(stale)])
-    if adapter == "openai_agents":
-        monkeypatch.setattr(module, "_current_run_key", lambda: "run-" + str(current[0]))
 
     def build():
         if adapter == "anthropic":
@@ -369,10 +365,6 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
                 executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
             ))
             return "\n".join(message["content"] for message in messages)
-        if adapter == "openai_agents":
-            return module._make_skill_aware_instructions("caller")(
-                SimpleNamespace(turn_input="synthetic request"), SimpleNamespace(name="child", tools=[]),
-            )
         if adapter == "adk":
             class Request:
                 def __init__(self):
@@ -416,9 +408,5 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
     assert BODIES[1] in prompt
     if adapter in {"anthropic", "crewai", "pydantic_ai"}:
         rail = otel._pop_skill_rail(42)
-        assert rail["delivered"] == [NAME]
-        assert rail["delivered_versions"] == []
-    elif adapter == "openai_agents":
-        rail = module._pop_run_rail("run-42")
         assert rail["delivered"] == [NAME]
         assert rail["delivered_versions"] == []

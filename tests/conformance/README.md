@@ -424,7 +424,7 @@ fixes and green after them, run with the same task environments:
 | `pydantic-ai:C19` | the second turn of a `message_history=` conversation was never routed |
 | `adk:S1[app_runner]` | `Runner(app=App(...))`, the `adk web` shape, raised `ValueError` after the global install |
 | `openai-agents:S1[sandbox_agent]` | a `SandboxAgent` run made zero router calls |
-| `openai-agents:S1[init_flag_then_instrument]` | `init(openai_agents=True)` then `instrument()` shipped every run three times |
+| `openai-agents:S1[init_flag_then_instrument]` (`init_flag_then_load_agent` since 0.18) | `init(openai_agents=True)` then `instrument()` shipped every run three times |
 | `anthropic:S1[messages_stream]` | `messages.stream()` got no skills |
 
 **C17** reads every `llm_calls[].tool_calls[]` entry in every phase. A record
@@ -466,7 +466,7 @@ with no second shape has no cell rather than an N/A.
 Today's shapes: `adk:app_runner` (`InMemoryRunner(app=App(...))` as `adk web`
 builds it, then `Runner(app=App(..., plugins=[DecimalaiPlugin(...)]))`, both
 after the global install), `openai-agents:sandbox_agent`,
-`openai-agents:init_flag_then_instrument` and `anthropic:messages_stream`.
+`openai-agents:init_flag_then_load_agent` and `anthropic:messages_stream`.
 
 ### The delivery axis (D1)
 

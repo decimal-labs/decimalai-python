@@ -22,7 +22,7 @@ pydantic_ai, and in openai_agents' loaded rail too. All five now release through
 
 Every test here runs ``_MAX_SCOPED_RAILS + 4`` runs through the adapter's own
 entry point — ADK's plugin callbacks, Anthropic's patched ``messages.create``,
-the openai_agents instructions callable and trace processor, the pydantic_ai
+a `load_agent()` config and the openai_agents trace processor, the pydantic_ai
 system-prompt hook, CrewAI's ``before_llm_call`` hook — against a REAL
 ``SkillRouter`` whose two network calls are stubbed. The adapters' delivery
 tests use a stand-in router, which has no slots to leak; that is how this went
@@ -327,8 +327,10 @@ class TestOpenAIAgents:
     def test_runs_past_the_cap_hold_no_slot(
         self, monkeypatch, router, client, overflow_warnings,
     ):
-        """Both rails: the routing decision the instructions callable files, and
-        the load the ``load_skill`` tool files, each under the Agents-SDK trace id."""
+        """Both rails: the routing decision a `load_agent()` config files (before
+        the model call on the first run, then for each later run), and the load
+        its ``load_skill`` tool files, each under the Agents-SDK trace id."""
+        pytest.importorskip("agents")
         import decimalai.openai_agents as oa
 
         current: dict = {"trace_id": None}
@@ -337,24 +339,33 @@ class TestOpenAIAgents:
         # The Agents SDK's own `get_current_trace()`, faked: the run key is
         # all the adapter reads off it.
         monkeypatch.setattr(oa, "_current_run_key", lambda: current["trace_id"])
+        # A later run's own decision is made in the background; here, inline.
+        monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
 
         processor = oa.DecimalTracingProcessor(agent_name="support")
-        instructions = oa._make_skill_aware_instructions(CALLER_PROMPT)
-        agent = SimpleNamespace(name="support", tools=[])
-        ctx = SimpleNamespace(turn_input=[{"role": "user", "content": QUESTION}])
-        prompt = loaded = ""
-        for i in range(RUNS):
-            trace = MagicMock(trace_id=f"trace_{i:032x}")
-            trace.name = "Agent workflow"
-            current["trace_id"] = trace.trace_id
-            processor.on_trace_start(trace)
-            prompt = instructions(ctx, agent)
-            loaded = oa._handle_load_skill("refund-policy")
-            processor.on_trace_end(trace)
-            current["trace_id"] = None
+        saved = SimpleNamespace(agent_name="support", system_prompt=CALLER_PROMPT,
+                                version_number=1, content_hash=None, is_fallback=False)
+        config = oa.OpenAIAgentConfig(saved, fallback=None, on_unavailable="continue")
+        agent = SimpleNamespace(name="support", tools=list(config.tools))
+        ctx = SimpleNamespace(context=None, turn_input=[{"role": "user", "content": QUESTION}])
 
-        assert SENTINEL in prompt and prompt.startswith(CALLER_PROMPT)
-        assert loaded.startswith("## Skill: refund-policy")
+        async def runs() -> tuple:
+            prompt = loaded = ""
+            for i in range(RUNS):
+                trace = MagicMock(trace_id=f"trace_{i:032x}")
+                trace.name = "Agent workflow"
+                current["trace_id"] = trace.trace_id
+                processor.on_trace_start(trace)
+                prompt = await config.instructions(ctx, agent)
+                loaded = await config._load("refund-policy")
+                processor.on_trace_end(trace)
+                current["trace_id"] = None
+            return prompt, loaded
+
+        prompt, loaded = asyncio.run(runs())
+
+        assert prompt.startswith(CALLER_PROMPT) and "refund-policy" in prompt
+        assert loaded.startswith("## Skill: refund-policy") and SENTINEL in loaded
         assert client.traces == RUNS
         assert client.last.routing_id == ROUTING_ID
         assert client.last.skills_loaded_by_agent == ["refund-policy"]

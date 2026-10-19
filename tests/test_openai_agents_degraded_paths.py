@@ -14,7 +14,10 @@ before the fix:
    agent's earlier run*.
 3. CONSTRUCTOR — the skill loader patched `Agent.__init__`, so an Agent
    built before `instrument()` (i.e. any module-level agent) got 0 skills
-   offered and no `load_skill` tool.
+   offered and no `load_skill` tool. Since 0.18 nothing is patched:
+   `load_agent()` hands its pieces to the developer's own Agent, so the
+   class here now checks the one thing that path still owes the manifest,
+   the agent's prompt.
 4. EXTRACTION — `_extract_query` probed `ctx.input` / `user_input` /
    `query`, none of which `RunContextWrapper` defines; the turn is on
    `ctx.turn_input`. Routing logged `strategy: full_menu`, 30 skills
@@ -27,9 +30,6 @@ global shared by every agent in the process.
 
 from __future__ import annotations
 
-import asyncio
-import inspect
-import sys
 import types
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -535,154 +535,35 @@ class TestRailsArePerRun:
         assert list(router._budget_for("run_b").loaded) == ["s2"]
 
 
-# ── 3. Constructor / retrofit ───────────────────────────────
+# ── 3. A load_agent() agent still declares its prompt ───────
 
 
-def _fake_agents_module_with_class_hooks():
-    """An `agents` stand-in whose Agent has the two async class methods the
-    real SDK resolves per turn."""
-    mod = types.ModuleType("agents")
+class TestALoadAgentPromptIsDeclared:
+    @pytest.mark.parametrize("saved, expected", [
+        ("You are a careful reviewer.", "You are a careful reviewer."),
+        (None, "BASE INSTRUCTIONS"),           # no saved prompt: the fallback runs
+    ])
+    def test_the_prompt_in_use_is_the_agents_prompt_component(self, saved, expected):
+        """`load_agent()` instructions are a method, not a string, and
+        `_introspect_agent` used to record only `isinstance(..., str)`: the
+        prompt component would vanish from the manifest, and prompt-drift
+        detection go blind, for exactly the agents whose prompt DecimalAI serves."""
+        agents = pytest.importorskip("agents")
+        import decimalai.openai_agents as oa
 
-    class Agent:
-        def __init__(self, name=None, instructions=None, tools=None):
-            self.name = name
-            self.instructions = instructions
-            self.tools = list(tools or [])
-
-        async def get_system_prompt(self, run_context):
-            # The real SDK's contract (agents/agent.py, `get_system_prompt`):
-            # call the instructions callable once and await what it returns
-            # when that is awaitable. The adapter's wrapper returns an
-            # awaitable on a running loop, so it can route off the loop.
-            if callable(self.instructions):
-                result = self.instructions(run_context, self)
-                return await result if inspect.isawaitable(result) else result
-            return self.instructions
-
-        async def get_all_tools(self, run_context):
-            return list(self.tools)
-
-    def function_tool(fn):
-        return types.SimpleNamespace(name=fn.__name__, fn=fn)
-
-    mod.Agent = Agent
-    mod.function_tool = function_tool
-    mod.tracing = types.ModuleType("agents.tracing")
-    mod.tracing.get_current_trace = lambda: None
-    return mod, Agent
-
-
-@pytest.fixture
-def fake_agents(monkeypatch):
-    import decimalai.openai_agents as oa
-    from decimalai import skill_router as sr
-
-    mod, Agent = _fake_agents_module_with_class_hooks()
-    monkeypatch.setitem(sys.modules, "agents", mod)
-    monkeypatch.setitem(sys.modules, "agents.tracing", mod.tracing)
-    monkeypatch.setattr(oa, "_skill_loader_installed", False)
-    monkeypatch.setattr(oa, "_agent_hooks_installed", False)
-    monkeypatch.setattr(oa, "_retrofit_notice_emitted", False)
-    monkeypatch.setattr(oa, "_skill_router_singleton", None)
-    sr._last_offered_names_ctx.set(None)
-    sr._last_delivered_names_ctx.set(None)
-    yield mod, Agent, oa
-
-
-class TestRetrofitsAgentsBuiltBeforeInstrument:
-    def test_a_pre_existing_agent_gets_skills_and_the_tool(self, fake_agents):
-        """The failing shape from the audit: an agent defined at module
-        level, i.e. before `instrument()` ran. `Agent.__init__` patching
-        can only reach objects built after the patch, so this agent got 0
-        skills offered and no load_skill tool — silently."""
-        _, Agent, oa = fake_agents
-
-        prebuilt = Agent(name="early", instructions="be terse")  # BEFORE install
-
-        router = MagicMock()
-        router.build_prompt_fragment.return_value = ("## Recommended Skills\n| a |", "rt_1")
-        oa._install_skill_loader()
-        oa._skill_router_singleton = router
-
-        prompt = asyncio.run(prebuilt.get_system_prompt(types.SimpleNamespace()))
-        tools = asyncio.run(prebuilt.get_all_tools(types.SimpleNamespace()))
-
-        assert "## Recommended Skills" in prompt
-        # CONTRACT CHANGED (was `prompt.endswith("be terse")`): the retrofit
-        # used to put the routed fragment in FRONT of the agent's declared
-        # instructions. The fragment is rebuilt per query, so leading with it
-        # pushed the agent's stable instructions off the provider's cacheable
-        # prefix and cost a cache miss on every turn. The declared
-        # instructions now lead and the fragment trails.
-        assert prompt.startswith("be terse")
-        assert prompt.index("be terse") < prompt.index("## Recommended Skills")
-        assert [t.name for t in tools] == ["load_skill"]
-        # The retrofit must not mutate what the user declared.
-        assert prebuilt.instructions == "be terse"
-        assert prebuilt.tools == []
-
-    def test_agents_built_after_install_are_not_double_injected(self, fake_agents):
-        """Both layers are live at once; the fragment must appear once."""
-        _, Agent, oa = fake_agents
-
-        router = MagicMock()
-        router.build_prompt_fragment.return_value = ("## Recommended Skills\n| a |", "rt_1")
-        oa._install_skill_loader()
-        oa._skill_router_singleton = router
-
-        later = Agent(name="late", instructions="be terse")
-        prompt = asyncio.run(later.get_system_prompt(types.SimpleNamespace()))
-
-        assert prompt.count("## Recommended Skills") == 1
-        tools = asyncio.run(later.get_all_tools(types.SimpleNamespace()))
-        assert [t.name for t in tools] == ["load_skill"]
-
-    def test_a_user_written_instructions_callable_runs_and_the_menu_trails_it(self, fake_agents):
-        """CONTRACT CHANGED (was "is left alone": the prompt equalled the
-        callable's output). An agent whose instructions are the user's own
-        function got `load_skill` but no routing decision, so its loads named
-        none. The function still runs, and its output still leads; the routed
-        menu is appended after it."""
-        _, Agent, oa = fake_agents
-
-        def mine(ctx, agent):
-            return "MY PROMPT"
-
-        prebuilt = Agent(name="early", instructions=mine)
-        router = MagicMock()
-        router.build_prompt_fragment.return_value = ("## Recommended Skills\n| a |", "rt_1")
-        oa._skill_router_singleton = router
-        oa._install_skill_loader()
-
-        prompt = asyncio.run(prebuilt.get_system_prompt(types.SimpleNamespace()))
-        assert prompt.startswith("MY PROMPT")
-        assert prompt.count("## Recommended Skills") == 1
-        assert prompt.index("MY PROMPT") < prompt.index("## Recommended Skills")
-        assert prebuilt.instructions is mine
-
-    def test_plain_instrument_hooks_the_class_without_loading_skills(self, fake_agents):
-        """The observer hook is always on — it is what hands the trace
-        processor the live Agent — but it must not inject skills."""
-        _, Agent, oa = fake_agents
-
-        prebuilt = Agent(name="early", instructions="be terse")
-        assert oa._install_agent_hooks() is True
-
-        assert asyncio.run(prebuilt.get_system_prompt(types.SimpleNamespace())) == "be terse"
-        assert asyncio.run(prebuilt.get_all_tools(types.SimpleNamespace())) == []
-
-
-class TestSkillLoaderKeepsThePromptComponent:
-    def test_wrapped_instructions_still_yield_a_prompt_component(self, fake_agents):
-        """Turning the loader on replaced `instructions` with a callable,
-        and `_introspect_agent` only recorded `isinstance(..., str)` — so
-        the prompt component vanished from the manifest and prompt-drift
-        detection went blind for exactly the installs using skills."""
-        _, Agent, oa = fake_agents
-
-        oa._install_skill_loader()
-        agent = Agent(name="a", instructions="You are a careful reviewer.")
-        assert callable(agent.instructions)
+        prompt = types.SimpleNamespace(agent_name="reviewer", system_prompt=saved,
+                                       version_number=3 if saved else None,
+                                       content_hash=None, is_fallback=saved is None)
+        support = oa.OpenAIAgentConfig(prompt, fallback="BASE INSTRUCTIONS", on_unavailable="continue")
+        agent = agents.Agent(name="reviewer", instructions=support.instructions, tools=[*support.tools])
 
         data = oa._introspect_agent(agent)
-        assert data["prompts"] == {"system": "You are a careful reviewer."}
+        assert data["prompts"] == {"system": expected}
+        assert "load_skill" not in str(data.get("tools"))
+
+    def test_a_function_of_your_own_is_not_guessed_at(self):
+        agents = pytest.importorskip("agents")
+        import decimalai.openai_agents as oa
+
+        agent = agents.Agent(name="a", instructions=lambda ctx, agent: "MINE")
+        assert "prompts" not in oa._introspect_agent(agent)

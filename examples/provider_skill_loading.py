@@ -64,22 +64,18 @@ def example_anthropic_skill_loader():
 
 
 def example_openai_agents_skill_loading():
-    """OpenAI Agents SDK example with live load_skill tool.
+    """OpenAI Agents SDK: the agent's prompt and skills from load_agent().
 
-    The enable_skill_loader=True option:
-    1. Wraps Agent.instructions to inject skills into prompts
-    2. Registers a load_skill tool so the model can fetch skill bodies mid-turn
+    Since 0.18 nothing is installed or patched for this framework. load_agent()
+    returns the two pieces you put into your own Agent(...):
+    1. ``instructions`` — the agent's saved prompt, then its skill list
+    2. ``tools`` — the load_skill tool the model fetches a skill's body with
 
-    Since OpenAI Agents owns the tool loop, skill results route back
-    automatically for the model to act on.
-
-    Note: install() here takes no enable_load_skill_tool parameter. The
-    tool registers automatically whenever the loader is enabled; the
-    kill switch is decimalai.init(load_skill_tool=False) or the env var
-    DECIMALAI_LOAD_SKILL_TOOL=0.
+    The OpenAI Agents SDK owns the tool loop, so a load_skill result goes back to
+    the model mid-turn.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 2: OpenAI Agents SDK with Skill Tool")
+    print("EXAMPLE 2: OpenAI Agents SDK with load_agent()")
     print("="*70)
 
     import decimalai
@@ -88,31 +84,32 @@ def example_openai_agents_skill_loading():
     try:
         from agents import Agent, function_tool
 
-        from decimalai.openai_agents import install
-
-        # Install skill loader — the load_skill tool registers automatically
-        # (config-driven: init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL,
-        # on by default; NOT an install() parameter on this adapter)
-        install(enable_skill_loader=True)
+        from decimalai.openai_agents import load_agent
 
         @function_tool
         def check_account_status(customer_id: str) -> str:
             """Check the status of a customer account."""
             return f"Account {customer_id}: Active, good standing"
 
+        support = load_agent(
+            "support-agent",
+            fallback="You are a helpful customer support agent. Use tools to help.",
+        )
         agent = Agent(
-            name="support-agent",
-            instructions="You are a helpful customer support agent. Use tools to help.",
-            tools=[check_account_status],
+            name=support.name,
+            instructions=support.instructions,
+            tools=[check_account_status, *support.tools],
             model="gpt-4o",
         )
 
-        print("✅ OpenAI Agents skill loader installed")
+        print("✅ OpenAI Agents agent configured from DecimalAI")
         print(f"Agent '{agent.name}' is ready with:")
-        print("  - Skills auto-injected into instructions")
+        print(f"  - prompt version {support.prompt_version} and skills {support.skill_names}")
         print("  - load_skill tool available for fetching skill bodies\n")
 
     except ImportError as e:
+        print(f"⚠️  OpenAI Agents example skipped: {e}")
+    except Exception as e:  # e.g. no such agent in this workspace
         print(f"⚠️  OpenAI Agents example skipped: {e}")
 
 
@@ -204,9 +201,9 @@ def main():
     print("="*70)
     print("\nThis script demonstrates the provider skill-loading options:")
     print("  - install(enable_skill_loader=True): Auto-inject skills into prompts")
-    print("  - load_skill tool: auto-registered with the loader on adapters that")
-    print("    own a tool loop (openai_agents, pydantic_ai); config-driven via")
-    print("    init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL")
+    print("  - load_skill tool: auto-registered with the loader on pydantic_ai;")
+    print("    config-driven via init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL")
+    print("  - OpenAI Agents SDK: decimalai.openai_agents.load_agent(name)")
 
     # Example 1: Anthropic
     try:
@@ -248,11 +245,9 @@ Provider-specific options summary:
      stays on prompt injection.
 
 2. OPENAI AGENTS (decimalai.openai_agents)
-   - install(enable_skill_loader=True) → skills injected into instructions
-     AND the load_skill tool registers automatically (the agent owns its
-     tool loop). install() takes NO enable_load_skill_tool parameter here:
-     the tool is on by default with the loader; disable it globally with
-     decimalai.init(load_skill_tool=False) or DECIMALAI_LOAD_SKILL_TOOL=0.
+   - load_agent(name) → pass .instructions and .tools into your own Agent(...)
+     (the agent owns its tool loop, so load_skill results go back to the model).
+     Nothing is installed or patched for this framework.
 
 3. PYDANTIC AI (decimalai.pydantic_ai)
    - install(enable_skill_loader=True) → skills injected into system_prompt

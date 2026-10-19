@@ -368,54 +368,71 @@ class TestAnthropicOrdering:
 
 
 @pytest.fixture
-def openai_agents_router(monkeypatch, quiet_rails):
+def openai_agents_config(monkeypatch):
+    """`load_agent()` configs for one saved prompt, on a router that routes per
+    message: the menu of an agent with more skills than fit, so every run's
+    menu is picked for its own message and differs between two queries."""
+    pytest.importorskip("agents")
     import decimalai.openai_agents as oa_mod
+    import decimalai.skill_router as sr
 
-    router = _QueryVaryingRouter()
+    class _PerMessageRouter(_QueryVaryingRouter):
+        def build_prompt_parts(self, query=None, **kwargs):
+            fragment, routing_id = self.build_prompt_fragment(query, **kwargs)
+            sr._last_offered_names_ctx.set([f"skill-{abs(hash(query)) % 97}"])
+            sr._last_menu_truncated_ctx.set(True)
+            return fragment, "", routing_id
+
+    router = _PerMessageRouter()
     monkeypatch.setattr(oa_mod, "_skill_router_singleton", router)
-    # Keep the load_skill hint out of it: it rides with the fragment, so it
-    # cannot affect the prefix, but pinning it here would couple this test to
-    # an unrelated gate.
-    monkeypatch.setattr(oa_mod, "_load_skill_reachable", lambda agent: False)
-    return oa_mod, router
+
+    def config(prompt: str):
+        saved = types.SimpleNamespace(agent_name="ada", system_prompt=prompt, version_number=1,
+                                      content_hash=None, is_fallback=False)
+        return oa_mod.OpenAIAgentConfig(saved, fallback=None, on_unavailable="continue")
+
+    return config, router
+
+
+def _openai_instructions(config, query: str) -> str:
+    """What the Agents SDK gets from ``config.instructions`` for a run asking ``query``."""
+    import asyncio
+
+    ctx = types.SimpleNamespace(context=None, turn_input=[{"role": "user", "content": query}])
+    agent = types.SimpleNamespace(name="ada", tools=list(config.tools))
+    return asyncio.run(config.instructions(ctx, agent))
 
 
 class TestOpenAIAgentsOrdering:
-    """`_make_skill_aware_instructions` — decimalai/openai_agents.py."""
+    """`load_agent(...).instructions` — decimalai/openai_agents.py."""
 
-    def test_instructions_prefix_is_byte_identical_across_queries(
-        self, openai_agents_router
-    ):
-        oa_mod, _router = openai_agents_router
-
-        instructions_fn = oa_mod._make_skill_aware_instructions(CALLER_PROMPT)
-        agent = types.SimpleNamespace(name="ada", tools=[])
+    def test_instructions_prefix_is_byte_identical_across_queries(self, openai_agents_config):
+        make, router = openai_agents_config
+        config = make(CALLER_PROMPT)
 
         prefixes = []
-        for query in ("how do refunds work?", "write me a haiku about otters"):
-            out = instructions_fn(types.SimpleNamespace(input=query), agent)
+        queries = ("how do refunds work?", "write me a haiku about otters")
+        for query in queries:
+            out = _openai_instructions(config, query)
             head, sep, _tail = out.partition(MENU_MARKER)
             assert sep, f"no fragment in {out!r}"
             prefixes.append(head.encode())
 
+        assert router.queries == list(queries)    # each run's menu was its own
         _assert_prefix_is_stable(*prefixes, adapter="openai_agents")
 
-    def test_agent_instructions_lead(self, openai_agents_router):
-        oa_mod, _router = openai_agents_router
+    def test_agent_instructions_lead(self, openai_agents_config):
+        make, _router = openai_agents_config
 
-        out = oa_mod._make_skill_aware_instructions(CALLER_PROMPT)(
-            types.SimpleNamespace(input="q"), types.SimpleNamespace(name="ada", tools=[])
-        )
+        out = _openai_instructions(make(CALLER_PROMPT), "q")
 
         assert out.startswith(CALLER_PROMPT)
         assert out.index(CALLER_PROMPT) < out.index(MENU_MARKER)
 
-    def test_empty_base_still_returns_just_the_fragment(self, openai_agents_router):
-        oa_mod, _router = openai_agents_router
+    def test_empty_base_still_returns_just_the_fragment(self, openai_agents_config):
+        make, _router = openai_agents_config
 
-        out = oa_mod._make_skill_aware_instructions("")(
-            types.SimpleNamespace(input="q"), types.SimpleNamespace(name="ada", tools=[])
-        )
+        out = _openai_instructions(make(""), "q")
 
         assert out.startswith(MENU_MARKER)
 

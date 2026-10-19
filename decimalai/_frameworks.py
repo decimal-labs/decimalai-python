@@ -194,10 +194,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
     ),
     Framework(
         key="openai-agents",
-        title="OpenAI Agents (with `instrument(agent=...)`)",
+        title="OpenAI Agents (with `load_agent(...)`)",
         cli_label="OpenAI Agents",
         module="decimalai.openai_agents",
-        entry_point="`instrument(agent=...)`",
+        entry_point="`load_agent(name)`",
         init_flag="openai_agents",
         extra="openai-agents",
         scaffold=TEMPLATE,
@@ -220,9 +220,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             handoffs="✅",
             skills_rail="`load_skill` tool",
         ),
-        use_for="OpenAI Agents SDK — pass the Agent object for full schema introspection; "
-                "`sandbox_skills()` is a `SandboxAgent`'s Skills capability over installed "
-                "skills (0.16+)",
+        use_for="OpenAI Agents SDK — `load_agent(name)` returns the agent's prompt and "
+                "skills to pass as `Agent(instructions=..., tools=[...])`, nothing patched "
+                "(0.18+); `sandbox_skills()` is a `SandboxAgent`'s Skills capability over "
+                "installed skills (0.16+)",
     ),
     Framework(
         key="claude-agent-sdk",

@@ -298,28 +298,22 @@ def test_langchain_loader_stops_routing_after_a_disabled_reinit(monkeypatch, fre
     assert "Recommended Skills" in seen[-1]
 
 
-def test_openai_agents_loader_stops_routing_after_a_disabled_reinit(monkeypatch, tmp_path):
+def test_openai_agents_load_agent_skills_stop_after_a_disabled_reinit(monkeypatch, tmp_path):
+    """A `load_agent()` config built while enabled keeps a copy of its skill
+    list. After `init(enabled=False)` it neither routes nor shows that copy;
+    the prompt it read still runs."""
     agents = pytest.importorskip("agents")
     import asyncio
 
     import decimalai
     import decimalai._config as cfg
     import decimalai.openai_agents as oa
-    from agents.run_internal import turn_resolution
     from agents.tracing import get_trace_provider, set_trace_processors
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING", "1")
     monkeypatch.setattr(cfg, "_config", None, raising=False)
     monkeypatch.setattr(cfg, "_client", None, raising=False)
-    for method in ("__init__", "get_system_prompt", "get_all_tools"):
-        monkeypatch.setattr(agents.Agent, method, getattr(agents.Agent, method))
-    monkeypatch.setattr(turn_resolution, "check_for_final_output_from_tools",
-                        turn_resolution.check_for_final_output_from_tools)
-    for name in ("_skill_loader_installed", "_agent_hooks_installed",
-                 "_final_output_guard_installed", "_installed"):
-        if hasattr(oa, name):
-            monkeypatch.setattr(oa, name, False)
     monkeypatch.setattr(oa, "_skill_router_singleton", None)
     monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
     provider = get_trace_provider()
@@ -329,15 +323,21 @@ def test_openai_agents_loader_stops_routing_after_a_disabled_reinit(monkeypatch,
     fake = _RoutingPlatform()
     monkeypatch.setattr(httpx, "request", fake)
 
-    def prompt(agent, text):
-        ctx = agents.RunContextWrapper(context=None, turn_input=[{"role": "user", "content": text}])
-        return asyncio.run(agent.get_system_prompt(ctx)) or ""
-
     decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", openai_agents=True)
-    agent = agents.Agent(name="support", instructions="You help.")
-    assert "Recommended Skills" in prompt(agent, "how do refunds work?"), "control"
+    monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
+        "agent_name": name, "system_prompt": "You help.", "version_number": 1,
+    })
+    support = oa.load_agent("support")
+    agent = agents.Agent(name="support", instructions=support.instructions, tools=[*support.tools])
+
+    def prompt(text):
+        ctx = agents.RunContextWrapper(context=None, turn_input=[{"role": "user", "content": text}])
+        return asyncio.run(support.instructions(ctx, agent))
+
+    assert "Recommended Skills" in prompt("how do refunds work?"), "control"
 
     decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=False)
     before = list(fake.skill_calls())
-    assert "Recommended Skills" not in prompt(agent, "can I return an opened box?")
+    shown = prompt("can I return an opened box?")
+    assert "Recommended Skills" not in shown and shown.startswith("You help.")
     assert fake.skill_calls() == before

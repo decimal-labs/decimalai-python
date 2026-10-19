@@ -10,9 +10,11 @@ have to fail the build, because the product claim is that the file RUNS.
 The four things that must never regress:
 
   1. `enable_skill_loader=True` is present, as a real keyword on the real
-     `instrument()` call. It defaults to False on both adapters, so a file
+     `instrument()` call. It defaults to False on the adapters, so a file
      without it traces perfectly and delivers none of the agent's skills —
-     silently. That is the single most important line in the template.
+     silently. That is the single most important line in the template. On
+     openai-agents (0.18+) the equivalent is `load_agent()`'s two pieces in
+     `Agent(...)`: nothing else gives that agent its skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
      files traces against a different agent than the one the user configured;
@@ -273,8 +275,18 @@ class TestTemplateIsCode:
 # ── 2. the flag that makes the whole thing worth shipping ────────────
 
 
+#: The templates whose skills arrive through instrument()'s loader. openai-agents
+#: has none since 0.18: `load_agent()` hands the pieces to the file's own Agent.
+LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f != "openai-agents"]
+
+
+def _support_attr(node: ast.AST, attr: str) -> bool:
+    """``node`` is ``support.<attr>``, the config ``load_agent()`` returned."""
+    return isinstance(node, ast.Attribute) and node.attr == attr and reads(node.value, "support")
+
+
 class TestSkillLoaderIsOn:
-    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    @pytest.mark.parametrize("framework", LOADER_FRAMEWORKS)
     def test_enable_skill_loader_is_true_on_instrument(self, framework):
         """Both adapters default it to False. Without it the file traces and
         delivers no skills, with no error anywhere — the exact silent failure
@@ -326,14 +338,22 @@ class TestSkillLoaderIsOn:
             f"sources on one file means every span is sent twice."
         )
 
-    def test_openai_agents_instruments_before_constructing_the_agent(self):
-        """The loader wraps `Agent.__init__`, so an Agent built above the
-        instrument() call silently receives nothing on builds without the
-        run-time hooks."""
+    def test_openai_agents_plugs_load_agent_into_the_agent(self):
+        """Nothing patches the Agents SDK since 0.18: the skills reach the model
+        only because the file passes `load_agent()`'s instructions and tools
+        into its own `Agent(...)`. Without either, it traces and delivers no
+        skills — the same silent failure a missing loader flag was."""
         tree = parse(render_agent_file(AGENT, "openai-agents", SKILLS))
-        instrument_line = calls(tree, "instrument")[0].lineno
-        agent_line = calls(tree, "Agent")[0].lineno
-        assert instrument_line < agent_line
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "load_agent")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (agent,) = calls(tree, "Agent")
+        keywords = {kw.arg: kw.value for kw in agent.keywords}
+        assert _support_attr(keywords["instructions"], "instructions")
+        assert isinstance(keywords["tools"], ast.List)
+        assert any(isinstance(e, ast.Starred) and _support_attr(e.value, "tools")
+                   for e in keywords["tools"].elts)
 
 
 # ── 2b. the agent's own system prompt is what it runs on ─────────────
@@ -382,7 +402,7 @@ class TestPromptIsRead:
         assert not isinstance(value, ast.Constant), (
             "instructions= must come from load_agent(), not a literal"
         )
-        assert isinstance(value, ast.Attribute) and value.attr == "system_prompt"
+        assert _support_attr(value, "instructions")
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_the_prompt_body_is_never_baked_into_the_file(self, framework):
@@ -429,7 +449,7 @@ class TestAgentNameBinding:
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         assert assigned(tree, "AGENT_NAME") == AGENT
         assert kwarg_reads(calls(tree, "init")[0], "agent_name", "AGENT_NAME")
-        assert not has_kwarg(calls(tree, "instrument")[0], "agent_name")
+        assert not any(has_kwarg(c, "agent_name") for c in calls(tree, "instrument"))
 
     #: Each name below makes a different second copy visible. `refund_bot` is
     #: already a Python identifier, so a scaffold-time ADK node name would be
@@ -459,9 +479,14 @@ class TestAgentNameBinding:
     @pytest.mark.parametrize("framework", ["openai-agents", "pydantic-ai"])
     def test_the_framework_agent_is_named_from_the_constant(self, framework):
         """A framework-native name that must exist reads AGENT_NAME — a literal
-        there was the copy a rename used to miss."""
+        there was the copy a rename used to miss. On openai-agents it is
+        ``support.name``: the canonical name DecimalAI gave back for AGENT_NAME."""
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        assert kwarg_reads(calls(tree, "Agent")[0], "name", "AGENT_NAME")
+        name = next(kw.value for kw in calls(tree, "Agent")[0].keywords if kw.arg == "name")
+        if framework == "openai-agents":
+            assert _support_attr(name, "name")
+        else:
+            assert reads(name, "AGENT_NAME")
 
     @staticmethod
     def _adk_node_name(name: str) -> str:
@@ -1278,6 +1303,13 @@ class TestConsistencyWithFrontendSnippets:
         assert len(init_calls) == 1
         assert kwarg_reads(init_calls[0], "agent_name", "AGENT_NAME")
         inst = calls(tree, "instrument")
+        if framework == "openai-agents":
+            # 0.18's shape, which the dashboard snippet adopts with the release:
+            # no instrument() at all, one load_agent(AGENT_NAME).
+            assert inst == []
+            (load,) = calls(tree, "load_agent")
+            assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
+            return
         assert len(inst) == 1
         assert not has_kwarg(inst[0], "agent_name")
         assert kwarg(inst[0], "enable_skill_loader") is True

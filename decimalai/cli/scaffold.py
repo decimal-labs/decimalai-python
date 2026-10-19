@@ -428,11 +428,20 @@ def _header_lines(
     return lines
 
 
-def _agent_name_lines(agent_name: str) -> List[str]:
-    """The one place a generated file writes the agent's name (point 2)."""
+def _agent_name_lines(agent_name: str, *, load_agent_routes: bool = False) -> List[str]:
+    """The one place a generated file writes the agent's name (point 2).
+
+    ``load_agent_routes``: the template's ``load_agent()`` call brings the
+    skills as well as the prompt (OpenAI Agents), so init() only traces.
+    """
+    second = (
+        "# to everything that traces, and load_agent() reads its prompt and skills."
+        if load_agent_routes else
+        "# to everything that traces or routes skills, and load_agent() reads its prompt."
+    )
     return [
         "# The DecimalAI agent this file runs as. Named once, here: init() passes it",
-        "# to everything that traces or routes skills, and load_agent() reads its prompt.",
+        second,
         f"AGENT_NAME = {_py(agent_name)}",
     ]
 
@@ -577,11 +586,11 @@ def _render_openai_agents(
         "import decimalai",
         "from agents import Agent, Runner",
         "from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError",
-        "from decimalai.openai_agents import instrument",
+        "from decimalai.openai_agents import load_agent",
         "",
         "# Change this to any model your OpenAI key can reach.",
         f"MODEL = {_py(model)}",
-        *_agent_name_lines(agent_name),
+        *_agent_name_lines(agent_name, load_agent_routes=True),
         "# The SDK default is 10, which a skill-loading turn can legitimately",
         "# exceed. Raise it if your agent has many tools; lower it to fail faster.",
         "MAX_TURNS = 20",
@@ -591,38 +600,24 @@ def _render_openai_agents(
         "# file you are going to commit.",
         _init_call(base_url),
         "",
-        "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# instrument() defaults it to False, and tracing alone does not deliver",
-        "# them. This adapter owns a tool loop, so the model fetches each skill's",
-        "# body on demand via the load_skill tool rather than having it injected.",
-        "#",
-        "# This call must stay ABOVE the Agent(...) below: the loader works by",
-        "# wrapping Agent.__init__, and on builds without the run-time hooks an",
-        "# agent constructed earlier silently receives nothing.",
-        "#",
-        "# No agent_name here: init() above already named the agent, and that name",
-        "# wins over Agent(name=) below for both the trace and skill routing. Do not",
-        "# also pass openai_agents=True to init(). That is this same install, so it",
-        "# is one or the other — never both.",
-        "instrument(enable_skill_loader=True)",
-        "",
-        "# Your agent's system prompt, as it stands in the dashboard right now.",
-        "# It is handed to you as data and passed to the Agent by the line YOU can",
-        "# see below — nothing injects it behind your back, so what this file sends",
-        "# is what this file says. (Skills are the other way round: instrument()",
-        "# delivers those for you, because a menu is additive and a prompt is not.)",
-        "#",
-        "# Read at run time, so editing the prompt in the dashboard changes the",
-        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "config = decimalai.load_agent(AGENT_NAME)",
+        "# This agent's prompt and skills, from DecimalAI. Nothing is injected behind",
+        "# your back: the two lines in Agent(...) below are where they go in.",
+        "#   support.instructions  the prompt saved in the dashboard, then the list of",
+        "#                         this agent's skills. Read on every run, so a prompt",
+        "#                         saved in the dashboard reaches the next run with no",
+        "#                         redeploy. {{placeholders}} in it are filled from",
+        "#                         Runner.run(..., context=...).",
+        "#   support.tools         the load_skill tool the model reads a skill with.",
+        "# With no prompt saved, the agent gets only the skill list: nothing this file",
+        "# made up. Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
+        "support = load_agent(AGENT_NAME)",
         "",
         "agent = Agent(",
-        "    name=AGENT_NAME,",
+        "    name=support.name,",
         "    model=MODEL,",
-        "    # None when this agent has no prompt set — a real state, not a failure",
-        "    # (a failed read raises instead). The Agent then runs with no",
-        "    # instructions rather than a default this file made up.",
-        "    instructions=config.system_prompt,",
+        "    instructions=support.instructions,",
+        "    # Your own tools go first; DecimalAI adds load_skill.",
+        "    tools=[*support.tools],",
         ")",
         "",
         "",

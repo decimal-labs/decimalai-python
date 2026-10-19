@@ -7,8 +7,8 @@ The scenarios (``_scenario_openai_agents``) run in a child: a ``SandboxAgent`` w
 its own (so an injection would show). ``native``: run 1 loads the target, reads its
 ``SKILL.md``, loads it again, reads its resource and runs its script; then
 ``decimalai skills update`` replaces it with version 2 and run 2, with the same agent,
-loads and reads it again. ``two_catalogs``: the capability is hidden from the adapter, so
-the router injects and the sandbox loads in the same run.
+loads and reads it again. ``two_catalogs``: the same agent is also handed
+``load_agent()``'s instructions and tool, and DecimalAI's skills stay off for it.
 """
 
 from __future__ import annotations
@@ -107,19 +107,26 @@ def test_router_injection_is_off_for_an_agent_with_the_sandbox_skills_capability
         assert "decimalai_load_skill" not in system
     # Exactly the sandbox's tools: its shell and its own load_skill, none of ours.
     assert notes["tools"] == [["exec_command", "load_skill", "write_stdin"]] * 2
-    said = [line for line in notes["logs"] if "sandbox Skills capability" in line["message"]]
-    assert [line["level"] for line in said] == ["INFO"]
+    # Since 0.18 init() gives no agent skills, so there is nothing to turn off or announce.
+    assert not [line for line in notes["logs"] if "sandbox Skills capability" in line["message"]]
 
 
-def test_a_native_load_on_a_run_the_router_injected_into_warns_once(two_catalogs,
-                                                                    native_project):
-    for i, system in enumerate(two_catalogs["notes"]["system"]):
-        assert "conformance-skill-alpha" in system and "## Skills" in system
+def test_load_agent_skills_stay_off_beside_the_sandbox_skills_capability(two_catalogs,
+                                                                         native_project):
+    """An agent handed ``load_agent()``'s instructions and tool AND the sandbox's own
+    ``Skills``: DecimalAI's skills turn off for it, said once, and the sandbox's catalog
+    is the only one that reaches the model, still graded as its activation."""
+    notes = two_catalogs["notes"]
+    assert notes["route_calls"] == 0
+    for i, system in enumerate(notes["system"]):
+        assert "## Skills" in system and "Answer refund questions." in system
+        assert not any(name in system for name in notes["router_skills"])
         _, trace = _run(two_catalogs, i)
         assert trace["active_skills"] == [native_project.expected()]
-    warned = [line for line in two_catalogs["notes"]["logs"]
-              if "two skill catalogs reached the model" in line["message"]]
-    assert [line["level"] for line in warned] == ["WARNING"]
+    assert notes["tools"] == [["exec_command", "load_skill", "write_stdin"]] * 2
+    said = [line for line in notes["logs"] if "sandbox Skills capability" in line["message"]]
+    assert [line["level"] for line in said] == ["WARNING"]
+    assert not [line for line in notes["logs"] if "two skill catalogs" in line["message"]]
 
 
 def test_the_pointer_helper_lists_the_installed_skills(result, native_project):

@@ -18,6 +18,7 @@ Every case restores the global config and every adapter global it writes.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import threading
@@ -505,9 +506,9 @@ class TestOpenAIAgentsTraceName:
 
     def test_a_name_given_with_an_agent_is_that_agents(self, configured, monkeypatch):
         """``instrument(agent=a, agent_name=X)`` once per agent — a process that
-        serves several — names each Agent's runs and routing, not the whole
-        process's: as a process-wide name the last install would file every
-        run (conformance C9)."""
+        serves several — names each Agent's runs, not the whole process's: as a
+        process-wide name the last install would file every run (conformance C9).
+        Routing is named by ``load_agent(name)`` alone."""
         from agents.tracing import get_trace_provider, set_trace_processors
 
         import decimalai.openai_agents as oa
@@ -530,7 +531,6 @@ class TestOpenAIAgentsTraceName:
             for agent, expected in ((triage, "support"), (refunds, "billing"),
                                     (other, "process-wide")):
                 assert _one_trace(processor, client, agent_span=agent.name).agent_name == expected
-                assert oa._routing_agent_name(agent) == expected
         finally:
             set_trace_processors(saved)
 
@@ -555,7 +555,7 @@ class TestOpenAIAgentsTraceName:
 
 class TestOpenAIAgentsRunEndToEnd:
     """A real ``Runner.run_sync`` with a scripted model: the routing call, the
-    ``load_skill`` call and the trace all name the same agent."""
+    ``load_skill`` call and the trace all name the ``load_agent()`` agent."""
 
     SKILL = "refund-policy"
 
@@ -565,7 +565,6 @@ class TestOpenAIAgentsRunEndToEnd:
         from agents import Runner
         from agents.items import ModelResponse
         from agents.models.interface import Model
-        from agents.sandbox.capabilities import Skills
         from agents.tracing import get_trace_provider, set_trace_processors
         from agents.usage import Usage
         from openai.types.responses import (
@@ -578,28 +577,15 @@ class TestOpenAIAgentsRunEndToEnd:
         from decimalai import skill_router as sr
         from decimalai.schema.manifest import ManifestTracker
 
-        for method in ("__init__", "get_system_prompt", "get_all_tools"):
-            monkeypatch.setattr(agents.Agent, method, getattr(agents.Agent, method))
-        for method in ("load_skill", "instructions"):
-            monkeypatch.setattr(Skills, method, getattr(Skills, method))
         for name, value in (
-            ("_skill_loader_installed", False), ("_agent_hooks_installed", False),
-            ("_retrofit_notice_emitted", False), ("_skill_router_singleton", None),
-            ("_load_skill_tool_registration_failed", False), ("_manifest_id", None),
-            ("_manifest_tracker", ManifestTracker()), ("_namespace_notice_emitted", False),
-            ("_native_skills_notice_emitted", False), ("_native_hook_installed", False),
-            ("_two_catalogs_warned", False), ("_final_output_guard_installed", False),
-            ("_tracing_processor", None), ("_run_rails", OrderedDict()),
-            ("_name_overrides_noted", set()),
+            ("_skill_router_singleton", None), ("_manifest_id", None),
+            ("_manifest_tracker", ManifestTracker()), ("_two_catalogs_warned", False),
+            ("_tracing_processor", None), ("_tracing_processor_added", False),
+            ("_run_rails", OrderedDict()), ("_name_overrides_noted", set()),
+            ("_config_pool", None),
         ):
             monkeypatch.setattr(oa, name, value)
-        monkeypatch.setattr(oa, "_load_skill_tool_enabled", lambda: True)
-        from agents.run_internal import turn_resolution
-
-        monkeypatch.setattr(
-            turn_resolution, "check_for_final_output_from_tools",
-            turn_resolution.check_for_final_output_from_tools,
-        )
+        monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
         saved = list(get_trace_provider()._multi_processor._processors)
         set_trace_processors([])
         sr._last_offered_names_ctx.set(None)
@@ -620,10 +606,19 @@ class TestOpenAIAgentsRunEndToEnd:
             return ModelResponse(output=[call], usage=Usage(), response_id=None)
 
         class Scripted(Model):
-            def __init__(self) -> None:
-                self.script = [load(skill), text("done")]
+            def __init__(self, *, loads: bool, together: Optional[List[str]] = None) -> None:
+                self.script = [load(skill), text("done")] if loads else [text("done")]
+                self.together = together
 
             async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+                if self.together is not None and len(self.script) == 2:
+                    # Hold the first answer until every run in the group has
+                    # resolved its instructions: they all overlap.
+                    self.together.append("here")
+                    for _ in range(500):
+                        if len(self.together) >= 2:
+                            break
+                        await asyncio.sleep(0.01)
                 return self.script.pop(0) if self.script else text("done")
 
             def stream_response(self, *args: Any, **kwargs: Any):  # pragma: no cover
@@ -635,11 +630,12 @@ class TestOpenAIAgentsRunEndToEnd:
                 self.loads: List[Optional[str]] = []
                 self.lock = threading.Lock()
 
-            def build_prompt_fragment(self, query=None, *, agent_name=None, scope=None, **_):
+            def build_prompt_parts(self, query=None, *, agent_name=None, scope=None, **_):
                 with self.lock:
                     self.routes.append(agent_name)
                 sr._last_offered_names_ctx.set([skill])
-                return f"## Recommended Skills\n| {skill} | refunds |", "rt_0123456789abcdef01234567"
+                return (f"## Recommended Skills\n| {skill} | refunds |", "",
+                        "rt_0123456789abcdef01234567")
 
             def load_skill(self, name, *, scope=None, agent_name=None):
                 with self.lock:
@@ -664,41 +660,62 @@ class TestOpenAIAgentsRunEndToEnd:
             def consume_delivered_versions(self, scope=None):
                 return []
 
-        def _run(*, init_name: Optional[str], instrument_name: Optional[str]) -> tuple:
+        def _run(*, init_name: Optional[str], load_names: List[Optional[str]]) -> tuple:
+            """One run per entry, concurrently: ``load_agent(name)``'s agent, or
+            for None a plain agent with its own instructions. Every Agent is
+            ``Agent(name="Assistant")``."""
             client = configured(init_name)
+            client.get_agent_prompt.side_effect = lambda name, version=None: {
+                "agent_name": name, "system_prompt": "Be helpful.", "version_number": 1,
+            }
             router = Router()
-            oa.instrument(
-                agent_name=instrument_name, enable_skill_loader=True,
-                disk_sync=False, exclusive=True,
-            )
             oa._skill_router_singleton = router
-            agent = agents.Agent(name="Assistant", instructions="Be helpful.", model=Scripted())
-            Runner.run_sync(agent, "how do refunds work?")
+            oa.instrument(disk_sync=False, exclusive=True)
+            together: Optional[List[str]] = [] if len(load_names) > 1 else None
+            runs = []
+            for load_name in load_names:
+                if load_name:
+                    support = oa.load_agent(load_name)
+                    runs.append(agents.Agent(name="Assistant", instructions=support.instructions,
+                                             tools=[*support.tools],
+                                             model=Scripted(loads=True, together=together)))
+                else:
+                    runs.append(agents.Agent(name="Assistant", instructions="Be helpful.",
+                                             model=Scripted(loads=False, together=together)))
+
+            async def all_runs():
+                await asyncio.gather(*(Runner.run(agent, "how do refunds work?") for agent in runs))
+
+            asyncio.run(all_runs())
             from decimalai._config import _sender
 
             _sender.flush()
-            [trace] = [c.args[0] for c in client.ingest_trace.call_args_list]
-            return router, trace
+            traces = [c.args[0] for c in client.ingest_trace.call_args_list]
+            return router, traces
 
         try:
             yield _run
         finally:
             set_trace_processors(saved)
 
-    @pytest.mark.parametrize("init_name,instrument_name", [
-        (NAME, None),      # init(agent_name=...) then a bare instrument()
-        (None, NAME),      # instrument(agent_name=...)
-        ("other", NAME),   # the explicit one wins
-    ])
-    def test_the_decimalai_name_wins_everywhere(self, run, init_name, instrument_name):
-        router, trace = run(init_name=init_name, instrument_name=instrument_name)
+    @pytest.mark.parametrize("init_name", [None, NAME, "other"])
+    def test_the_load_agent_name_wins_everywhere(self, run, init_name):
+        router, [trace] = run(init_name=init_name, load_names=[NAME])
         assert router.routes and set(router.routes) == {NAME}
         assert router.loads == [NAME]
         assert trace.agent_name == NAME
 
-    def test_with_no_decimalai_name_the_agent_names_both(self, run):
-        """Unchanged: no DecimalAI name, so ``Agent(name=...)`` is the only one."""
-        router, trace = run(init_name=None, instrument_name=None)
-        assert set(router.routes) == {"Assistant"}
-        assert router.loads == ["Assistant"]
+    def test_two_agents_with_one_openai_name_each_keep_their_own(self, run):
+        """Both Agents are ``name="Assistant"``, and their runs overlap. Each
+        trace is filed under the config that served it, not under whichever
+        config's run resolved its instructions last."""
+        router, traces = run(init_name=None, load_names=["support", "billing"])
+        assert sorted(router.loads) == ["billing", "support"]
+        assert sorted(trace.agent_name for trace in traces) == ["billing", "support"]
+
+    def test_with_no_decimalai_name_the_agent_names_its_trace(self, run):
+        """No ``load_agent()`` and no ``init(agent_name=...)``: ``Agent(name=...)``
+        is the only name, and nothing is routed."""
+        router, [trace] = run(init_name=None, load_names=[None])
+        assert router.routes == [] and router.loads == []
         assert trace.agent_name == "Assistant"

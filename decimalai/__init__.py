@@ -777,6 +777,28 @@ class _SkillsFromEnv:
 _SKILLS_FROM_ENV: Any = _SkillsFromEnv()
 
 
+_openai_agents_skills_note_emitted = False
+
+
+def _note_openai_agents_skills_moved(*, loud: bool) -> None:
+    """Say once that `init(openai_agents=True)` traces only, and where skills went.
+
+    Through 0.17 the flag also delivered skills by patching the Agents SDK. A
+    program written for that would now run without skills and nothing would
+    say why, so the first such init() says so.
+    """
+    global _openai_agents_skills_note_emitted
+    if _openai_agents_skills_note_emitted:
+        return
+    _openai_agents_skills_note_emitted = True
+    (logger.warning if loud else logger.info)(
+        "DecimalAI: init(openai_agents=True) traces runs but no longer gives agents "
+        "skills. Use `support = decimalai.openai_agents.load_agent(\"<agent name>\")` "
+        "and pass instructions=support.instructions, tools=[..., *support.tools] to "
+        "your Agent(...). Set DECIMALAI_SKILLS=0 or skills=False to silence this."
+    )
+
+
 def _skills_from_env() -> bool:
     """``init(skills=...)`` left unset: what ``DECIMALAI_SKILLS`` says.
 
@@ -882,9 +904,11 @@ def init(
             turns it back on.
         langchain: If ``True``, instrument LangChain / LangGraph, and deliver
             skills into every chat-model call (see ``skills``).
-        openai_agents: If ``True``, instrument the OpenAI Agents SDK, and
-            deliver skills: a menu in each Agent's instructions and a
-            ``load_skill`` tool for the bodies (see ``skills``).
+        openai_agents: If ``True``, trace the OpenAI Agents SDK. Tracing only:
+            since 0.18 an agent gets its DecimalAI prompt and skills from
+            ``decimalai.openai_agents.load_agent(name)``, which you pass into
+            your own ``Agent(...)``. An explicit ``skills=True`` with this
+            flag raises.
         adk: If ``True``, instrument Google ADK (Agent Development Kit) via a
             native ADK plugin, and deliver skills into each model request's
             system instruction (see ``skills``). ADK is Gemini-native.
@@ -1204,7 +1228,33 @@ def init(
 
         if openai_agents:
             from .openai_agents import instrument as _oai_install
-            _oai_install(agent_name=agent_name, enable_skill_loader=skills)
+            if not skills_from_env and skills:
+                raise ValueError(
+                    "init(openai_agents=True, skills=True) no longer delivers skills: since "
+                    "0.18 nothing patches the OpenAI Agents SDK. Give an agent its prompt and "
+                    "skills with decimalai.openai_agents.load_agent(name) and pass "
+                    "instructions=... and tools=[..., *config.tools] into your Agent(...)."
+                )
+            oai_disk_sync = None
+            if skills:
+                # Loud when an agent is named, which is how the skills setup read
+                # through 0.17; a bare tracing setup never had skills to lose.
+                _note_openai_agents_skills_moved(
+                    loud=bool(agent_name or os.environ.get("DECIMAL_AGENT_NAME")),
+                )
+                # Through 0.17 this form turned the loader on, which made DecimalAI's
+                # router the skills' source and left local SKILL.md files unread
+                # (and un-uploaded). The skills still come from DecimalAI, through
+                # load_agent(), so an upgrade keeps that; the harness authority
+                # still reads them.
+                try:
+                    from ._config import _get_config as _cfg
+
+                    if not _cfg().resolve_disk_sync(loader_active=True):
+                        oai_disk_sync = False
+                except Exception:
+                    pass
+            _oai_install(agent_name=agent_name, disk_sync=oai_disk_sync)
 
         if adk:
             from .adk import instrument as _adk_install

@@ -57,6 +57,22 @@ _last_split_parts_ctx: ContextVar[Optional[tuple]] = ContextVar(
     "decimalai_skill_router_last_split_parts", default=None,
 )
 
+# Whether the most recent `build_prompt_fragment` result was a menu the platform
+# CUT to fit its caps: more skills are eligible than it lists (``truncated`` on the
+# whole-menu answer, or a ``smart_routing`` answer, which is the over-the-caps
+# path). An adapter that keeps a local copy of an agent's menu re-routes such an
+# agent on every message, since which rows make the cut depends on the message.
+_last_menu_truncated_ctx: ContextVar[Optional[bool]] = ContextVar(
+    "decimalai_skill_router_last_menu_truncated", default=None,
+)
+
+
+def consume_last_menu_truncated() -> Optional[bool]:
+    """Read + clear whether the last routed menu was cut to fit (None: unknown)."""
+    value = _last_menu_truncated_ctx.get()
+    _last_menu_truncated_ctx.set(None)
+    return value
+
 
 def consume_last_offered_names() -> List[str]:
     """Read + clear the names from the most recent `build_prompt_fragment`.
@@ -2936,7 +2952,7 @@ class SkillRouter:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions) = cached
+                 delivered_versions, menu_truncated) = cached
                 # The hit re-offers the same decision, so this run's loads name
                 # it — the cache key carries the scope, so the miss filed it
                 # under this run already unless the bounded store evicted it.
@@ -2947,6 +2963,7 @@ class SkillRouter:
                 # text would change mid-turn, which is the one thing a
                 # "byte-identical prefix" must never do.
                 _last_split_parts_ctx.set(split_parts)
+                _last_menu_truncated_ctx.set(menu_truncated)
                 # A cache hit must re-emit the telemetry the miss path set:
                 # a second turn inside the 30s window would otherwise lose
                 # offered/delivered names on every rail (the first turn's
@@ -2977,6 +2994,7 @@ class SkillRouter:
         _last_delivered_names_ctx.set(None)
         _last_delivered_versions_ctx.set(None)
         _last_split_parts_ctx.set(None)
+        _last_menu_truncated_ctx.set(None)
 
         # How long the routing call took: a failure is cached only when
         # retrying it would cost the turn that time again (see below).
@@ -3188,6 +3206,17 @@ class SkillRouter:
         # public return stays a 2-tuple.
         split_parts = (split_prefix, split_tail) if split_prefix else None
         _last_split_parts_ctx.set(split_parts)
+        menu_truncated = result.get("truncated") if isinstance(result, dict) else None
+        if not isinstance(menu_truncated, bool):
+            # Over the menu caps the platform answers by retrieval for THIS
+            # message ("smart_routing"): a fixed head of the eligible set plus the
+            # rows hinted for the message, with no `truncated` field. Which rows
+            # appear depends on the message, which is what the flag reports.
+            menu_truncated = (
+                True if isinstance(result, dict) and result.get("strategy") == "smart_routing"
+                else None
+            )
+        _last_menu_truncated_ctx.set(menu_truncated)
 
         cache_failure = routing_failed and _failure_worth_caching(result, route_elapsed)
         if fragment or routing_id or cache_failure:
@@ -3195,7 +3224,7 @@ class SkillRouter:
             self._fragment_cache.set(
                 cache_key,
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions),
+                 delivered_versions, menu_truncated),
                 ttl_seconds=_UNSCOPED_FAILURE_TTL_S if failure_only and not scope else None,
             )
         return fragment, routing_id

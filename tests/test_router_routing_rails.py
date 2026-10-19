@@ -199,9 +199,6 @@ class TestOpenAIAgentsDrain:
         monkeypatch.setattr(cfg, "_client", client)
         monkeypatch.setattr(oa, "_manifest_id", None)
         monkeypatch.setattr(oa, "_skill_router_singleton", None)
-        oa._routing_id_ctx.set(None)
-        oa._skills_offered_ctx.set(None)
-        oa._skills_delivered_ctx.set(None)
         yield
 
     def _run_one_trace(self):
@@ -218,8 +215,8 @@ class TestOpenAIAgentsDrain:
 
     def test_trace_recovers_the_decision_from_a_copied_context(self):
         """The reported failure: the instructions callable runs in a copied
-        context, so `_consume_routing_id()` / `_consume_skills_offered()`
-        both came back empty at trace-send and the trace shipped NULL."""
+        context, so per-call contextvar writes came back empty at trace-send
+        and the trace shipped NULL. The router's rail survives the copy."""
         oa = _module("decimalai.openai_agents")
 
         router = _router()
@@ -227,16 +224,9 @@ class TestOpenAIAgentsDrain:
 
         def _assemble_prompt_in_isolated_context():
             with patch.object(router, "smart_route", return_value=_route_result()):
-                _, routing_id = router.build_prompt_fragment(query="q")
-            # What the skill loader callable does, in the SAME copied context.
-            oa._set_routing_id(routing_id)
-            oa._add_skills_offered(sr.consume_last_offered_names())
+                router.build_prompt_fragment(query="q")
 
         contextvars.copy_context().run(_assemble_prompt_in_isolated_context)
-
-        # Neither contextvar write escaped...
-        assert oa._consume_routing_id() is None
-        assert oa._consume_skills_offered() == []
 
         run_trace = self._run_one_trace()
         assert run_trace.routing_id == "rt_1"
@@ -273,22 +263,6 @@ class TestOpenAIAgentsDrain:
         run_trace = self._run_one_trace()
         assert run_trace.skills_delivered == ["s1"]
         assert run_trace.skills_offered_in_prompt == ["s1", "s2"]
-
-    def test_contextvar_still_wins_where_it_propagates(self):
-        """Don't regress the paths that already worked: a routing_id that
-        DID reach this context takes precedence, and the rail is drained
-        anyway so it can't leak into the next trace."""
-        oa = _module("decimalai.openai_agents")
-
-        router = _router()
-        oa._skill_router_singleton = router
-        with patch.object(router, "smart_route", return_value=_route_result("rt_rail")):
-            router.build_prompt_fragment(query="q")
-        oa._set_routing_id("rt_ctx")
-
-        run_trace = self._run_one_trace()
-        assert run_trace.routing_id == "rt_ctx"
-        assert router.consume_routing_id() is None
 
     def test_trace_without_routing_stays_null(self):
         run_trace = self._run_one_trace()

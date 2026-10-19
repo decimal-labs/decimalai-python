@@ -93,14 +93,16 @@ class TestWarningGuards:
             lc._install_skill_loader()
         assert 'decimalai[langchain]' in caplog.text
 
-    def test_openai_agents_loader_warns_with_extra(self, monkeypatch, caplog):
+    def test_openai_agents_load_agent_names_the_extra_before_any_call(self, monkeypatch):
+        """Since 0.18 the skills come from load_agent(), which needs the SDK
+        outright: it raises, naming the extra, before init() or any request."""
         import decimalai.openai_agents as oa
 
         _block(monkeypatch, "agents")
-        monkeypatch.setattr(oa, "_skill_loader_installed", False)
-        with caplog.at_level("WARNING"):
-            oa._install_skill_loader()
-        assert 'decimalai[openai-agents]' in caplog.text
+        monkeypatch.setattr(oa, "_ensure_initialized",
+                            lambda: pytest.fail("set up before the import check"))
+        with pytest.raises(ImportError, match=r'decimalai\[openai-agents\]'):
+            oa.load_agent("support")
 
 
 class TestCoreImportSurvivesMissingFrameworks:

@@ -3,11 +3,13 @@
 Two defects from the 2026-10-13 framework-integration audit, both silent:
 
 1. **The documented one-liner delivered no skills.** The quickstart teaches
-   `decimalai.init(langchain=True)` (and `openai_agents=True`, `crewai=True`,
-   `adk=True`). That form called the adapter's `instrument()` with the skill
-   loader OFF, so a user who followed the docs got good traces and zero skills,
-   with nothing anywhere saying so. The flag form now turns the loader on;
-   `skills=False` keeps the tracing-only install for anyone who wants it.
+   `decimalai.init(langchain=True)` (and `crewai=True`, `adk=True`). That form
+   called the adapter's `instrument()` with the skill loader OFF, so a user who
+   followed the docs got good traces and zero skills, with nothing anywhere
+   saying so. The flag form now turns the loader on; `skills=False` keeps the
+   tracing-only install for anyone who wants it. `openai_agents=True` is the
+   exception since 0.18: it traces only, skills come from `load_agent()`, and
+   the first such init() says so.
 
 2. **Re-init kept the previous org's router.** `init()` rebuilds the trace
    client and drops the prompt cache, because a re-init means a different key,
@@ -119,47 +121,73 @@ class TestFlagFormDeliversSkills:
         assert loader == []
         assert lc._installed is True, "skills=False must still install tracing"
 
-    def test_openai_agents_flag_installs_the_loader_and_one_processor(
-        self, monkeypatch
-    ):
-        pytest.importorskip("agents")
+    @pytest.fixture
+    def openai_agents_flag(self, monkeypatch):
+        """``init(openai_agents=True)`` against a stand-in processor list."""
+        agents = pytest.importorskip("agents")
         import agents.tracing as agents_tracing
 
+        import decimalai as dai
         import decimalai.openai_agents as oa
 
+        _keep(monkeypatch, oa, "_tracing_processor", "_tracing_processor_added")
+        monkeypatch.setattr(dai, "_openai_agents_skills_note_emitted", False)
         processors: List[Any] = []
         monkeypatch.setattr(agents_tracing, "add_trace_processor", processors.append)
-        loader = _counter(monkeypatch, oa, "_install_skill_loader")
-        hooks = _counter(monkeypatch, oa, "_install_agent_hooks")
+        untouched = {name: getattr(agents.Agent, name)
+                     for name in ("__init__", "get_system_prompt", "get_all_tools")}
+        return processors, untouched, agents
 
-        _init(openai_agents=True, agent_name="support")
+    def test_openai_agents_flag_traces_and_says_where_skills_went(
+        self, openai_agents_flag, caplog
+    ):
+        """Since 0.18 the flag form traces only: skills come from
+        ``load_agent()``, which nothing but the developer's own Agent sees. A
+        program written for the old flag would run without skills, so the
+        first such init() says where they went."""
+        processors, untouched, agents = openai_agents_flag
 
-        assert loader == [1], (
-            "init(openai_agents=True) installed tracing without the skill loader"
-        )
-        assert len(processors) == 1, (
-            f"one init() registered {len(processors)} trace processors"
-        )
-        assert hooks == []  # the loader installs its own hooks
+        with caplog.at_level("WARNING", logger="decimalai"):
+            _init(openai_agents=True, agent_name="support")
+            assert len(processors) == 1, f"one init() registered {len(processors)} trace processors"
+            # (A re-init's processor count is TestOpenAIAgentsRepeatInstall's,
+            # on the live list: this stand-in list never reaches it.)
+            _init(openai_agents=True, agent_name="support")
+
+        assert {name: getattr(agents.Agent, name) for name in untouched} == untouched
+        notes = [r for r in caplog.records if "load_agent" in r.getMessage()]
+        assert len(notes) == 1, "said once per process, not once per init()"
+
+    @pytest.mark.parametrize("skills, reads_local_skills", [(None, False), (False, True)])
+    def test_openai_agents_flag_reads_local_skills_as_0_17_did(
+        self, openai_agents_flag, monkeypatch, skills, reads_local_skills,
+    ):
+        """Through 0.17 the flag turned the loader on, which left local SKILL.md
+        files unread; `skills=False` was the tracing-only install, which read and
+        uploaded them. An upgrade keeps both, though the flag delivers no skills."""
+        import decimalai.skills as skills_mod
+
+        seen: List[int] = []
+        monkeypatch.setattr(skills_mod, "discover_skills", lambda *a, **k: seen.append(1) or [])
+        kwargs = {} if skills is None else {"skills": skills}
+        _init(openai_agents=True, agent_name="support", **kwargs)
+        assert bool(seen) is reads_local_skills
+
+    def test_openai_agents_flag_asked_for_skills_says_how(self, openai_agents_flag):
+        with pytest.raises(ValueError, match="load_agent"):
+            _init(openai_agents=True, agent_name="support", skills=True)
 
     def test_openai_agents_flag_with_skills_false_is_tracing_only(
-        self, monkeypatch
+        self, openai_agents_flag, caplog
     ):
-        pytest.importorskip("agents")
-        import agents.tracing as agents_tracing
+        processors, untouched, agents = openai_agents_flag
 
-        import decimalai.openai_agents as oa
+        with caplog.at_level("INFO", logger="decimalai"):
+            _init(openai_agents=True, agent_name="support", skills=False)
 
-        processors: List[Any] = []
-        monkeypatch.setattr(agents_tracing, "add_trace_processor", processors.append)
-        loader = _counter(monkeypatch, oa, "_install_skill_loader")
-        hooks = _counter(monkeypatch, oa, "_install_agent_hooks")
-
-        _init(openai_agents=True, agent_name="support", skills=False)
-
-        assert loader == []
-        assert hooks == [1]
         assert len(processors) == 1
+        assert {name: getattr(agents.Agent, name) for name in untouched} == untouched
+        assert not [r for r in caplog.records if "load_agent" in r.getMessage()]
 
     @pytest.mark.parametrize("skills, expected", [(True, True), (False, False)])
     def test_adk_flag_follows_skills(self, monkeypatch, skills, expected):
@@ -314,8 +342,6 @@ class TestOpenAIAgentsRepeatInstall:
         # The process's one processor, as if no test had built it yet.
         monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
         monkeypatch.setattr(oa, "_tracing_processor_added", False, raising=False)
-        _counter(monkeypatch, oa, "_install_skill_loader")
-        _counter(monkeypatch, oa, "_install_agent_hooks")
 
         def ours() -> List[Any]:
             return [
@@ -331,15 +357,16 @@ class TestOpenAIAgentsRepeatInstall:
         _init(openai_agents=True, agent_name="support", api_key=KEY_B)
         assert len(processors()) == 1
 
-    def test_flag_then_explicit_instrument_registers_one_processor(
-        self, processors
-    ):
-        """The docs' old two-line form: `init(openai_agents=True)` and then
-        `instrument(enable_skill_loader=True)`."""
-        from decimalai.openai_agents import instrument
+    def test_flag_then_load_agent_registers_one_processor(self, processors, monkeypatch):
+        """The documented pair: `init(openai_agents=True)`, then `load_agent()`."""
+        from decimalai.openai_agents import instrument, load_agent
 
         _init(openai_agents=True, agent_name="support")
-        instrument(agent_name="support", enable_skill_loader=True)
+        monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
+            "agent_name": name, "system_prompt": "Be helpful.", "version_number": 1,
+        })
+        load_agent("support")
+        instrument(agent_name="support")
         assert len(processors()) == 1
 
 

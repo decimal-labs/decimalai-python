@@ -4,6 +4,58 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Changed (breaking): OpenAI Agents SDK agents get their prompt and skills from `load_agent()`
+
+- **New:** `decimalai.openai_agents.load_agent(name, fallback=..., on_unavailable="continue")`
+  returns `instructions` (the agent's saved prompt, with `{{placeholders}}` filled from
+  `Runner.run(context=...)`, then its skill list) and `tools` (`load_skill`, limited to the
+  agent's skills), which you pass into your own `Agent(...)`. Every run is routed on its own
+  latest message (read from `RunContextWrapper.turn_input`; without it, a fixed order and one
+  warning): the first run before its model call, later runs from a local copy while their own
+  decision is recorded in the background, and an agent whose menu is cut to fit before every
+  model call. The prompt is re-read in the background at most once a minute. The prompt
+  version, its placeholder names (not values) and any skill outage are on the agent's span,
+  and the trace is filed under the `load_agent()` name. An unknown agent name raises.
+- **Removed:** every patch on the Agents SDK — `Agent.__init__`, `Agent.get_system_prompt`,
+  `Agent.get_all_tools`, `agents.run_internal.turn_resolution.check_for_final_output_from_tools`
+  and the sandbox `Skills.load_skill` / `Skills.instructions`. They gave every agent in the
+  process skills and relied on SDK internals that may change in any patch release.
+- `init(openai_agents=True)` and `instrument()` now trace only. `instrument(enable_skill_loader=True)`
+  and `init(openai_agents=True, skills=True)` raise with the migration below; with `skills` left
+  at its default, `init(openai_agents=True)` warns once.
+- DecimalAI's skills turn off for one agent, with one warning, when its `tool_use_behavior`
+  is `"stop_on_first_tool"` (a skill's text would become the answer), it loads skills with the
+  sandbox `Skills` capability, it has another tool named `load_skill`, or its instructions are
+  `support.instructions` but its tools leave out `*support.tools`. The prompt still runs.
+- The tool's kill switch still works: with `DECIMALAI_LOAD_SKILL_TOOL=0` or
+  `init(load_skill_tool=False)`, the text of the skills picked for each run's message goes into
+  the instructions instead (`inject_skill_body`, which defaults to on once the tool is off).
+- `init(enabled=False)` after `load_agent()` stops routing and skills for that config; the
+  prompt it read keeps running.
+- `init(openai_agents=True)` still leaves local `SKILL.md` files unread and un-uploaded, as
+  when it turned the loader on; `skills=False`, the harness skill authority and a direct
+  `instrument()` read them as before.
+- `sandbox_skills()` still records what it lists and loads, in its own `Skills` subclass; a
+  plain `Skills(...)` is no longer observed.
+- `decimalai init --framework openai-agents` writes the new shape.
+
+Migration:
+
+```python
+# before
+decimalai.init(openai_agents=True, agent_name="support")
+agent = Agent(name="support", instructions=BASE_INSTRUCTIONS, tools=[lookup_order])
+
+# after
+from decimalai.openai_agents import load_agent
+
+support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+agent = Agent(name=support.name, instructions=support.instructions,
+              tools=[lookup_order, *support.tools])
+```
+
 ## [0.17.0] — 2026-10-19
 
 ### Changed: `init()` is the default agent name and API key

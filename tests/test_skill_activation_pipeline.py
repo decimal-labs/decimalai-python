@@ -355,19 +355,13 @@ class TestSkillsDeliveredLadder:
         with pytest.raises(DecimalConfigError):
             decimalai.log_skill_delivered(names=["orphan"])
 
-    def test_openai_agents_accumulator_and_drain(self):
-        """The oai accumulator carries skills_delivered; the contextvar
-        drain path mirrors the offered rail."""
-        import decimalai.openai_agents as oa
+    def test_openai_agents_accumulator_carries_delivered(self):
+        """The oai accumulator carries skills_delivered (filled from each
+        run's own rail since 0.18)."""
         from decimalai.openai_agents import _TraceAccumulator
 
         acc = _TraceAccumulator(trace_id="t-1", trace_name="t")
         assert acc.skills_delivered == set()
-
-        oa._skills_delivered_ctx.set(None)
-        oa._add_skills_delivered(["s1", "s2"])
-        assert oa._consume_skills_delivered() == ["s1", "s2"]
-        assert oa._consume_skills_delivered() == []  # drained
 
     def test_langchain_build_trace_includes_delivered(self):
         from decimalai.langchain import CallbackHandler

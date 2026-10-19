@@ -2,10 +2,14 @@
 
 Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/openai-agents``
 — build an ``agents.Agent``, hand it to ``instrument(agent=...)`` for full
-introspection, then ``Runner.run_sync`` — plus the module docstring's
-``enable_skill_loader=True`` form for the skills rail, which is where semantic
-routing engages: the loader's dynamic-instructions callable reads the turn's
-user message off ``RunContextWrapper.turn_input`` and routes on it.
+introspection, then ``Runner.run_sync`` — plus, for the skills rail, the
+``load_agent(name)`` form: the agent's prompt and skills pulled from DecimalAI
+and plugged into the developer's own ``Agent(instructions=..., tools=[...])``.
+That is where semantic routing engages: the config's instructions function
+reads the turn's user message off ``RunContextWrapper.turn_input`` and routes on
+it. Since 0.18 nothing patches the SDK, so the rail is on only for the agents
+built that way (``Driver.loads_agent_from_platform``: the harness puts each
+phase's agent in the workspace first, as the dashboard would).
 
 The model is a stub, but the model *path* is real: ``OpenAIResponsesModel``
 against :mod:`._openai_wire`. That is the API a plain ``Agent(model="gpt-…")``
@@ -21,19 +25,20 @@ Two deliberate choices, both documented forms of the same entry point:
   OpenAI's own trace backend — and keeps re-installing per phase from stacking
   processors, which would double-count every trace and fail C9/C10 on a driver
   artifact rather than an adapter defect.
-* ``instrument()`` before ``Agent(...)`` in the skills phase, which is what the
-  adapter's own retrofit notice tells users to do.
+* One ``load_agent()`` per agent name in a phase, shared by its lanes: the
+  documented module-level config that every run of that agent goes through.
 
 ``disk_sync`` is left at its default on purpose. It is what a user who follows
 the docs gets, and whatever it writes into the working directory is exactly
-what C11 exists to grade.
+what C11 exists to grade. The one exception is the skills phase's seeding call
+(see ``run_skills``).
 
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..delivery import INJECTED
 from . import (
@@ -96,6 +101,29 @@ def _agent(
         tools=[_tool(ctx)] if tools else [],
         model=_model(),
         input_guardrails=list(guardrails),
+    )
+
+
+def _skills_agent(
+    ctx: Ctx, *, name: Optional[str] = None, cls: Any = None,
+    configs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """The documented ``load_agent()`` snippet: this agent's prompt and skills
+    from DecimalAI, plugged into the developer's own ``Agent``. ``configs``
+    shares one config per agent name, as a module-level one would be."""
+    from agents import Agent
+
+    from decimalai.openai_agents import load_agent
+
+    configs = {} if configs is None else configs
+    if ctx.agent_name not in configs:
+        configs[ctx.agent_name] = load_agent(ctx.agent_name)
+    support = configs[ctx.agent_name]
+    return (cls or Agent)(
+        name=name or support.name,
+        instructions=support.instructions,
+        tools=[_tool(ctx), *support.tools],
+        model=_model(),
     )
 
 
@@ -204,13 +232,11 @@ def run_concurrent(ctxs: Sequence[Ctx]) -> Any:
 
 
 def run_skills(ctxs: Sequence[Ctx]) -> Any:
-    """The skills rail: the loader on, agents built after it, N lanes at once.
+    """The skills rail: ``load_agent()`` agents, N lanes at once.
 
-    ``instrument(enable_skill_loader=True)`` monkey-patches ``Agent.__init__``
-    and the ``Agent`` class itself, so it runs LAST and the agents are built
-    after it — the order the adapter's own retrofit notice asks for. Each lane
-    asks a different question, so the router mints a routing decision per lane
-    and a leaked one is visible.
+    The lanes share one agent name and so one config, the way every run of a
+    module-level agent does. Each lane asks a different question, so the router
+    mints a routing decision per lane and a leaked one is visible.
     """
     from agents import Runner
 
@@ -233,37 +259,29 @@ def run_skills(ctxs: Sequence[Ctx]) -> Any:
     # What grades it is `tests/test_inference_never_writes_the_activation_rung.py`, which
     # makes the router silent; two of its cases go red under the fold. Seeding is worth
     # keeping because an unreachable line is a worse kind of green than an unexercised one.
+    #
+    # `disk_sync=False`: this call only seeds that registry. The documented skills
+    # path, `init(openai_agents=True)` then `load_agent()`, reads no local SKILL.md
+    # (the skills come from DecimalAI), and a direct instrument() given skills would
+    # upload them and write `.decimal/install.json`, which is not what a user gets.
     instrument(
         agent_name=ctxs[0].agent_name,
         exclusive=True,
-        enable_skill_loader=True,
         skills=[dict(sk) for ctx in ctxs for sk in ctx.skills],
+        disk_sync=False,
     )
 
+    configs: Dict[str, Any] = {}
     pairs = []
     for ctx in ctxs:
         _wire().register(ctx, script=_skill_script(ctx))
-        pairs.append((ctx, _agent(ctx)))
+        pairs.append((ctx, _skills_agent(ctx, configs=configs)))
 
     def _one(pair: Any) -> Any:
         ctx, agent = pair
         return Runner.run_sync(agent, user_message(ctx))
 
     return fanout_threads(_one)(pairs)
-
-
-def _rail_on(ctx: Ctx) -> None:
-    """The skills phase's install again, naming THIS phase's agent.
-
-    The DecimalAI name wins over ``Agent(name=...)`` for the trace and for
-    routing (since 2026-10-18), and a repeat ``instrument()`` that names no
-    agent keeps the one already installed — so without a name here every later
-    phase would be filed under the skills phase's agent. ``exclusive=True`` for
-    the reason the module docstring gives — the stock exporter would ship to
-    OpenAI."""
-    from decimalai.openai_agents import instrument
-
-    instrument(agent_name=ctx.agent_name, exclusive=True, enable_skill_loader=True)
 
 
 #: What the unnamed phase's Agent calls itself: anything but the DecimalAI name.
@@ -275,21 +293,15 @@ def run_unnamed(ctx: Ctx) -> Any:
 
     An OpenAI Agents ``Agent`` cannot be unnamed — ``name`` is required — so
     the case is the one ADK's driver grades: the framework object is called
-    ``Assistant`` while the DecimalAI agent, given once at the install, is this
-    run's. The trace and the routing call must both name the DecimalAI agent.
-
-    Until 2026-10-18 this phase ran the Agent under its own name with no
-    DecimalAI name for the run, because ``Agent(name=...)`` won both the trace
-    and routing. The DecimalAI name wins now (it is the agent the skills are
-    attached to), and once the skills phase has installed one this process has
-    no way back to "no DecimalAI name" — that case is a unit test instead
+    ``Assistant`` while the DecimalAI agent, named once in ``load_agent()``, is
+    this run's. The trace and the routing call must both name the DecimalAI
+    agent. A run with no DecimalAI name at all is a unit test instead
     (tests/test_init_agent_name_defaults.py).
     """
     from agents import Runner
 
-    _rail_on(ctx)
     _wire().register(ctx, script=_skill_script(ctx))
-    return Runner.run_sync(_agent(ctx, name=_FRAMEWORK_AGENT_NAME), user_message(ctx))
+    return Runner.run_sync(_skills_agent(ctx, name=_FRAMEWORK_AGENT_NAME), user_message(ctx))
 
 
 def run_conversation(ctxs: Sequence[Ctx]) -> Any:
@@ -298,10 +310,9 @@ def run_conversation(ctxs: Sequence[Ctx]) -> Any:
     from agents import Runner
 
     first, second = ctxs
-    _rail_on(first)
     for ctx in ctxs:
         _wire().register(ctx, script=_skill_script(ctx))
-    agent = _agent(first)
+    agent = _skills_agent(first)
     turn_one = Runner.run_sync(agent, user_message(first))
     history = turn_one.to_input_list() + [
         {"role": "user", "content": user_message(second)}
@@ -310,14 +321,14 @@ def run_conversation(ctxs: Sequence[Ctx]) -> Any:
 
 
 def _sandbox_shape(ctxs: Sequence[Ctx]) -> Any:
-    """A ``SandboxAgent`` with the rail on, run in a local sandbox session.
+    """A ``SandboxAgent`` built from ``load_agent()``, run in a local sandbox session.
 
     ``agents.sandbox.SandboxAgent`` is a ``@dataclass`` subclass of ``Agent``
     with its own generated ``__init__``, and a sandbox run executes a CLONE of
-    it whose ``instructions`` is the sandbox's own prompt builder. The run is
-    the SDK's documented local form: ``RunConfig(sandbox=SandboxRunConfig(
-    client=UnixLocalSandboxClient()))``. The model only calls the conformance
-    tool, so no sandbox command ever runs.
+    it whose ``instructions`` is the sandbox's own prompt builder around ours.
+    The run is the SDK's documented local form: ``RunConfig(sandbox=
+    SandboxRunConfig(client=UnixLocalSandboxClient()))``. The model only calls
+    the conformance tool, so no sandbox command ever runs.
     """
     from agents import RunConfig, Runner
     from agents.sandbox import SandboxAgent, SandboxRunConfig
@@ -325,14 +336,8 @@ def _sandbox_shape(ctxs: Sequence[Ctx]) -> Any:
 
     out = []
     for ctx in ctxs:
-        _rail_on(ctx)
         _wire().register(ctx)
-        agent = SandboxAgent(
-            name=ctx.agent_name,
-            instructions=SYSTEM_PROMPT,
-            tools=[_tool(ctx)],
-            model=_model(),
-        )
+        agent = _skills_agent(ctx, cls=SandboxAgent)
         out.append(Runner.run_sync(
             agent, user_message(ctx),
             run_config=RunConfig(sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())),
@@ -341,18 +346,17 @@ def _sandbox_shape(ctxs: Sequence[Ctx]) -> Any:
 
 
 def _init_flag_shape(ctxs: Sequence[Ctx]) -> Any:
-    """``decimalai.init(openai_agents=True)``, then ``instrument(enable_skill_loader=True)``.
+    """``decimalai.init(openai_agents=True)``, then ``load_agent()``.
 
-    The documented one-liner followed by the documented way to add skills to it
-    — the adapter's ``instrument()`` says it is safe to call after the init
-    flag. Neither call is exclusive, which is how a user makes them; the stock
-    OpenAI exporter is already off in this process (every earlier phase
+    The documented one-liner, then the documented way to give an agent its
+    prompt and skills: two registrations of one processor if either call
+    stacked a second. Neither is exclusive, which is how a user makes them; the
+    stock OpenAI exporter is already off in this process (every earlier phase
     installed exclusively), so nothing leaves 127.0.0.1.
     """
     from agents import Runner
 
     import decimalai
-    from decimalai.openai_agents import instrument
 
     out = []
     for ctx in ctxs:
@@ -361,8 +365,7 @@ def _init_flag_shape(ctxs: Sequence[Ctx]) -> Any:
             api_key=ctx.api_key, base_url=ctx.base_url, verify=False,
             openai_agents=True, agent_name=ctx.agent_name,
         )
-        instrument(enable_skill_loader=True)
-        out.append(Runner.run_sync(_agent(ctx), user_message(ctx)))
+        out.append(Runner.run_sync(_skills_agent(ctx), user_message(ctx)))
     return out
 
 
@@ -371,7 +374,7 @@ DRIVER = Driver(
     covers=frozenset({"openai-agents"}),
     requires=("agents", "openai"),
     frameworks=("openai-agents",),
-    entrypoint="decimalai.openai_agents.instrument(agent=...) / enable_skill_loader",
+    entrypoint="decimalai.openai_agents.instrument(agent=...) / load_agent(name)",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
@@ -379,22 +382,23 @@ DRIVER = Driver(
     run_skills=run_skills,
     run_unnamed=run_unnamed,
     run_conversation=run_conversation,
+    loads_agent_from_platform=True,
     shapes=(
         Shape(
             name="sandbox_agent",
             doc=(
-                "agents.sandbox.SandboxAgent under instrument(enable_skill_loader="
-                "True), run with RunConfig(sandbox=SandboxRunConfig(client="
-                "UnixLocalSandboxClient()))"
+                "agents.sandbox.SandboxAgent built from load_agent(name)'s "
+                "instructions and tools, run with RunConfig(sandbox=SandboxRunConfig("
+                "client=UnixLocalSandboxClient()))"
             ),
             run=_sandbox_shape,
             routed=True,
         ),
         Shape(
-            name="init_flag_then_instrument",
+            name="init_flag_then_load_agent",
             doc=(
                 "decimalai.init(openai_agents=True, agent_name=...) followed by "
-                "instrument(enable_skill_loader=True), then Runner.run_sync"
+                "load_agent(name) into the Agent, then Runner.run_sync"
             ),
             run=_init_flag_shape,
             routed=True,

@@ -458,10 +458,14 @@ class Probe:
         self.routing_queries: Dict[str, Optional[str]] = {}
         # Agents this workspace holds — the platform state `decimalai init`
         # resolves a name against, reads a prompt from and lists skills for.
-        # Populated by the JOURNEY tier (`journey.py`) via `register_agent`;
-        # empty for every driver run, which is why the adapter matrix sees no
-        # change. agent_name -> the row below.
+        # Populated by the JOURNEY tier (`journey.py`) via `register_agent`, and
+        # for a driver whose snippet loads its agent from DecimalAI
+        # (`Driver.loads_agent_from_platform`) by the harness; empty for every
+        # other driver run. agent_name -> the row below.
         self.agents: Dict[str, Dict[str, Any]] = {}
+        # Set by the harness for such a driver: each phase's agents are
+        # registered with this saved prompt before the phase runs.
+        self.platform_agent_prompt: Optional[str] = None
         # The registry the install routes serve (`add_install_row`), and the API
         # keys they accept: key -> the organization it belongs to. Empty for every
         # conformance run.

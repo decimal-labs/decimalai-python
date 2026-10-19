@@ -4,6 +4,8 @@ A ``SandboxAgent`` with the sandbox's own ``Skills`` capability, built by
 ``decimalai.openai_agents.sandbox_skills()``, in a local Unix sandbox, driven by the SDK's
 ``ScriptedModel``; DecimalAI's instrumentation (``decimalai.init(openai_agents=True)``)
 sends each run's trace to a probe. Nothing here asserts: the parent grades what comes back.
+Since 0.18 that init gives no agent skills of its own, so DecimalAI's skills reach an agent
+only through ``load_agent()`` (the ``two_catalogs`` scenario).
 
 The sandbox's ``load_skill`` returns only a status; the model reads the body by opening
 ``SKILL.md`` in the copy the load made, so a "load" here is ``load_skill`` and then
@@ -59,14 +61,18 @@ def manifest():
         SandboxPathGrant(path=str(Path(sys.base_prefix).resolve()), read_only=True),))
 
 
-def agent(model: Any, **kw: Any) -> Any:
+AGENT = "native-refunds"
+INSTRUCTIONS = "Answer refund questions."
+
+
+def agent(model: Any, *, instructions: Any = INSTRUCTIONS, **kw: Any) -> Any:
     """The documented native-mode agent: the shell, and the pointer helper's ``Skills``."""
     from agents.sandbox import SandboxAgent
     from agents.sandbox.capabilities import Shell
 
     from decimalai.openai_agents import sandbox_skills
 
-    return SandboxAgent(name="native-refunds", instructions="Answer refund questions.",
+    return SandboxAgent(name=AGENT, instructions=instructions,
                         model=model, capabilities=[Shell(), sandbox_skills()],
                         default_manifest=manifest(), **kw)
 
@@ -193,18 +199,20 @@ def native(ctx: dict) -> dict:
 
 
 def two_catalogs(ctx: dict) -> dict:
-    """The capability out of the adapter's sight (its detection made to miss it), so the
-    router injects into an agent whose sandbox also loads a skill: the warning case."""
+    """The same agent also given DecimalAI's skills with ``load_agent()``: its
+    instructions and its ``load_skill`` tool, beside the sandbox's own ``Skills``.
+    DecimalAI's skills turn off for it (D7), so one catalog reaches the model."""
     from tests.conformance.isolation import CONFORMANCE_SKILLS
 
-    import decimalai.openai_agents as oa
+    from decimalai.openai_agents import load_agent
 
     logs = watch_logs()
     s = col.Session("openai-agents", distributions=DISTRIBUTIONS, openai_agents=True)
     s.probe.skills = [dict(sk) for sk in CONFORMANCE_SKILLS]
-    oa._has_native_skills = lambda agent: False
+    s.probe.register_agent(AGENT, system_prompt=INSTRUCTIONS)
+    support = load_agent(AGENT)
     turns = Turns()
-    the_agent = agent(turns.model)
+    the_agent = agent(turns.model, instructions=support.instructions, tools=[*support.tools])
     seen: Dict[str, Any] = {}
 
     def once(run: col.Run) -> None:
@@ -213,7 +221,13 @@ def two_catalogs(ctx: dict) -> dict:
 
     s.run(once)
     s.run(once)
-    s.notes.update({"system": [r["system"][0] for r in seen["runs"]], "logs": logs.lines})
+    s.notes.update({
+        "router_skills": [sk["name"] for sk in CONFORMANCE_SKILLS],
+        "route_calls": _route_calls(s),
+        "system": [r["system"][0] for r in seen["runs"]],
+        "tools": [r["tools"][0] for r in seen["runs"]],
+        "logs": logs.lines,
+    })
     return s.result()
 
 

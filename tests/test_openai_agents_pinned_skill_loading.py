@@ -1,8 +1,8 @@
-"""Native tool invocation must fetch the current agent's saved skill version.
+"""A skill load must fetch the loading agent's saved skill version.
 
-These tests use the real Agents function-tool wrapper and real local HTTP. Two
-agents share one router and concurrently load the same skill at different pins.
-No provider or remote backend is contacted.
+These tests use `load_agent()` tools, a real SkillRouter and real local HTTP.
+Two agents share one router and concurrently load the same skill at different
+pins. No provider or remote backend is contacted.
 """
 
 from __future__ import annotations
@@ -17,11 +17,16 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from decimalai import openai_agents as oa
-from decimalai import skill_router as sr
-from decimalai.skill_router import SkillRouter
-
 agents = pytest.importorskip("agents")
+
+from decimalai import openai_agents as oa  # noqa: E402
+from decimalai import skill_router as sr  # noqa: E402
+from decimalai.skill_router import SkillRouter  # noqa: E402
+from tests import test_openai_agents_phase1 as phase1  # noqa: E402
+
+#: Phase 1's fixture: a configured SDK whose client serves a saved prompt.
+sdk = phase1.sdk
+
 NAME = "file-watcher"
 SKILL_ID = "cb105bfb-b108-4e39-9304-ed0b41600ab7"
 VERSION_IDS = {"pinned-agent": "cf4a7d84-1bd2-4a27-82bb-b957d8f1c0ca", "other-agent": "af4b28a6-2a52-4318-a498-ac3641b781d5"}
@@ -33,17 +38,9 @@ run_key = contextvars.ContextVar("native_pin_test_run", default=None)
 
 
 @pytest.fixture
-def native_tools(monkeypatch):
-    """Restore all patched Agent methods and router rails after each test."""
-    for method in ("__init__", "get_system_prompt", "get_all_tools"):
-        monkeypatch.setattr(agents.Agent, method, getattr(agents.Agent, method))
-    monkeypatch.setattr(oa, "_skill_loader_installed", False)
-    monkeypatch.setattr(oa, "_agent_hooks_installed", False)
-    monkeypatch.setattr(oa, "_skill_router_singleton", None)
-    monkeypatch.setattr(oa, "_run_rails", oa.OrderedDict())
+def scoped(sdk, monkeypatch):
+    """Runs keyed by this test's own run key, with fresh body budgets."""
     monkeypatch.setattr(oa, "_current_run_key", lambda: run_key.get())
-    monkeypatch.setattr(oa, "_load_skill_tool_registration_failed", False)
-    monkeypatch.setattr(oa, "_load_skill_tool_enabled", lambda: True)
     sr._body_budget_ctx.set(None)
     yield
     sr._body_budget_ctx.set(None)
@@ -98,54 +95,54 @@ def body_server():
         worker.join(timeout=5)
 
 
-async def invoke(agent, *, scope=None, name=NAME):
+async def invoke(config, *, scope, name=NAME):
+    """Call ``config``'s load_skill tool the way the Agents SDK does, in run ``scope``."""
     from agents.tool_context import ToolContext
 
     token = run_key.set(scope)
     try:
         context = agents.RunContextWrapper(context=None)
-        tools = await agent.get_all_tools(context)
-        tool = next(tool for tool in tools if tool.name == "load_skill")
-        tool_context = ToolContext.from_agent_context(context, "call-test", tool_name="load_skill", tool_arguments=json.dumps({"name": name}))
-        return await tool.on_invoke_tool(tool_context, json.dumps({"name": name}))
+        arguments = json.dumps({"name": name})
+        tool_context = ToolContext.from_agent_context(
+            context, "call-test", tool_name="load_skill", tool_arguments=arguments,
+        )
+        return await config.load_skill.on_invoke_tool(tool_context, arguments)
     finally:
         run_key.reset(token)
 
 
-def test_native_tool_concurrently_fetches_exact_agent_pins(native_tools, body_server, monkeypatch):
+def test_concurrent_loads_fetch_each_agents_own_pin(scoped, body_server):
     router, requests, concurrent = body_server
-    monkeypatch.setattr(oa, "_skill_router_singleton", router)
-    oa._install_skill_loader()
-    pinned = agents.Agent(name="pinned-agent", instructions="Use a skill")
-    other = agents.Agent(name="other-agent", instructions="Use a skill")
+    oa._skill_router_singleton = router
+    pinned, other = oa.load_agent("pinned-agent"), oa.load_agent("other-agent")
     concurrent.set()
 
     async def run():
-        return await asyncio.gather(invoke(pinned, scope=RUN_IDS[pinned.name]), invoke(other, scope=RUN_IDS[other.name]))
+        return await asyncio.gather(invoke(pinned, scope=RUN_IDS[pinned.name]),
+                                    invoke(other, scope=RUN_IDS[other.name]))
 
     bodies = asyncio.run(run())
     assert "FULL INSTRUCTIONS FOR pinned-agent" in bodies[0]
     assert "FULL INSTRUCTIONS FOR other-agent" in bodies[1]
     assert sorted(requests) == sorted([(f"/api/v1/skills/{NAME}/body", name) for name in VERSION_IDS])
-    assert router.agent_name is None  # singleton was never repointed
-    for agent in (pinned, other):
-        rail = oa._pop_run_rail(RUN_IDS[agent.name])
+    assert router.agent_name is None  # the shared router was never repointed
+    for config in (pinned, other):
+        rail = oa._pop_run_rail(RUN_IDS[config.name])
         assert rail["loaded"] == [NAME]
-        assert rail["delivered_versions"][0]["version_id"] == VERSION_IDS[agent.name]
+        assert rail["delivered_versions"][0]["version_id"] == VERSION_IDS[config.name]
 
 
-def test_parallel_distinct_skills_in_one_run_keep_every_body_witness(native_tools, body_server, monkeypatch):
+def test_parallel_distinct_skills_in_one_run_keep_every_body_witness(scoped, body_server, monkeypatch):
     router, requests, concurrent = body_server
-    monkeypatch.setattr(oa, "_skill_router_singleton", router)
-    oa._install_skill_loader()
-    agent = agents.Agent(name="pinned-agent", instructions="Use both skills")
+    oa._skill_router_singleton = router
+    config = oa.load_agent("pinned-agent")
     concurrent.set()
     both_loaded = threading.Barrier(2)
     consume_versions = router.consume_delivered_versions
 
     def drain_after_both_bodies(*args, **kwargs):
         # Only scheduling is controlled: both real HTTP bodies are recorded
-        # before one native callback drains this run's shared version rail.
+        # before one callback drains this run's shared version rail.
         both_loaded.wait(timeout=5)
         return consume_versions(*args, **kwargs)
 
@@ -153,42 +150,41 @@ def test_parallel_distinct_skills_in_one_run_keep_every_body_witness(native_tool
     scope = "parallel-distinct-skills"
 
     async def run():
-        return await asyncio.gather(invoke(agent, scope=scope), invoke(agent, scope=scope, name=OTHER_NAME))
+        return await asyncio.gather(invoke(config, scope=scope), invoke(config, scope=scope, name=OTHER_NAME))
 
     bodies = asyncio.run(run())
     assert f"({NAME})" in bodies[0]
     assert f"({OTHER_NAME})" in bodies[1]
-    assert sorted(requests) == sorted([(f"/api/v1/skills/{name}/body", agent.name) for name in (NAME, OTHER_NAME)])
+    assert sorted(requests) == sorted([(f"/api/v1/skills/{name}/body", config.name) for name in (NAME, OTHER_NAME)])
     rail = oa._pop_run_rail(scope)
     assert sorted(rail["loaded"]) == sorted([NAME, OTHER_NAME])
     assert {(v["name"], v["skill_id"], v["version_id"], v["hash"]) for v in rail["delivered_versions"]} == {
-        (name, skill_id, version_id, hashlib.sha256(f"FULL INSTRUCTIONS FOR {agent.name} ({name})".encode()).hexdigest())
-        for name, skill_id, version_id in ((NAME, SKILL_ID, VERSION_IDS[agent.name]), (OTHER_NAME, OTHER_SKILL_ID, OTHER_VERSION_IDS[agent.name]))
+        (name, skill_id, version_id, hashlib.sha256(f"FULL INSTRUCTIONS FOR {config.name} ({name})".encode()).hexdigest())
+        for name, skill_id, version_id in ((NAME, SKILL_ID, VERSION_IDS[config.name]), (OTHER_NAME, OTHER_SKILL_ID, OTHER_VERSION_IDS[config.name]))
     }
     assert sorted(rail["delivered"]) == sorted([NAME, OTHER_NAME])
     assert consume_versions(scope=scope) == []
 
 
-def test_same_run_handoff_uses_each_agents_menu_and_retains_both_pins(native_tools, body_server, monkeypatch):
+def test_a_handoff_in_one_run_uses_each_agents_menu_and_keeps_both_pins(scoped, body_server):
+    """Agent A hands off to agent B in the same run: each shows its own skill
+    list, each load fetches its own agent's pin, and the run keeps both."""
     router, requests, _ = body_server
-    monkeypatch.setattr(oa, "_skill_router_singleton", router)
-    oa._install_skill_loader()
-    original = agents.Agent(name="pinned-agent", instructions="Use a skill")
-    handoff = original.clone(name="other-agent")
+    oa._skill_router_singleton = router
+    configs = [oa.load_agent("pinned-agent"), oa.load_agent("other-agent")]
     scope = "handoff-run"
 
     async def run():
         bodies = []
-        for agent in (original, handoff):
+        for config in configs:
+            agent = agents.Agent(name=config.name, instructions=config.instructions, tools=[*config.tools])
             token = run_key.set(scope)
             try:
-                # The actual framework prompt hook gives each handoff agent
-                # its own offered menu and a fresh per-turn body budget.
-                prompt = await agent.get_system_prompt(agents.RunContextWrapper(context=None))
-                assert f"SKILLS FOR {agent.name}" in prompt
+                prompt = await config.instructions(agents.RunContextWrapper(context=None), agent)
+                assert f"SKILLS FOR {config.name}" in prompt
             finally:
                 run_key.reset(token)
-            bodies.append(await invoke(agent, scope=scope))
+            bodies.append(await invoke(config, scope=scope))
         return bodies
 
     bodies = asyncio.run(run())
@@ -198,45 +194,10 @@ def test_same_run_handoff_uses_each_agents_menu_and_retains_both_pins(native_too
     rail = oa._pop_run_rail(scope)
     assert rail["loaded"] == [NAME]
     assert {v["version_id"] for v in rail["delivered_versions"]} == set(VERSION_IDS.values())
+    assert set(rail["decimal_prompts"]) == set(VERSION_IDS)
 
 
-def test_clone_rebinds_the_sdk_tool_without_changing_the_original(native_tools, body_server, monkeypatch):
-    router, requests, _ = body_server
-    monkeypatch.setattr(oa, "_skill_router_singleton", router)
-    oa._install_skill_loader()
-    original = agents.Agent(name="pinned-agent", instructions="Use a skill")
-    clone = original.clone(name="other-agent")
-    assert clone.tools[0] is original.tools[0]  # the real SDK shares tools
-    assert "FULL INSTRUCTIONS FOR other-agent" in asyncio.run(invoke(clone, scope="clone-run"))
-    assert "FULL INSTRUCTIONS FOR pinned-agent" in asyncio.run(invoke(original, scope="original-run"))
-    assert [agent for _, agent in requests] == ["other-agent", "pinned-agent"]
-
-
-def test_prebuilt_agent_is_bound_when_its_tools_are_retrofitted(native_tools, body_server, monkeypatch):
-    router, requests, _ = body_server
-    monkeypatch.setattr(oa, "_skill_router_singleton", router)
-    early = agents.Agent(name="pinned-agent", instructions="Use a skill")
-    assert early.tools == []
-    oa._install_skill_loader()
-    assert "FULL INSTRUCTIONS FOR pinned-agent" in asyncio.run(invoke(early, scope="early-run"))
-    assert requests == [(f"/api/v1/skills/{NAME}/body", "pinned-agent")]
-    assert early.tools == []  # retrofit never mutates declared user tools
-
-
-def test_user_declared_loader_is_not_replaced(native_tools):
-    @agents.function_tool
-    def load_skill(name: str) -> str:
-        """A user-owned loader."""
-        return f"USER BODY {name}"
-
-    oa._install_skill_loader()
-    agent = agents.Agent(name="pinned-agent", tools=[load_skill])
-    tools = asyncio.run(agent.get_all_tools(agents.RunContextWrapper(context=None)))
-    assert tools == [load_skill]
-    assert "USER BODY file-watcher" in asyncio.run(invoke(agent, scope="user-run"))
-
-
-def test_legacy_router_fallback_preserves_agent_and_never_fetches_unscoped(native_tools, monkeypatch):
+def test_legacy_router_fallback_preserves_agent_and_never_fetches_unscoped(scoped, monkeypatch):
     class OldScopedRouter:
         def load_skill(self, name, *, agent_name):
             return f"## Skill: {name}\n\nBODY FOR {agent_name}"
