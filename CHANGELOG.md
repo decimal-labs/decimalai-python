@@ -42,6 +42,14 @@ and patch releases are fixes.
   model's class name. Before, it was recorded with no model name and the platform
   rejected the whole trace.
 
+### Deprecated (unchanged, and kept one release longer)
+
+The 0.14 disk verbs (`decimalai skills export <ref>`, `decimalai skills install <ref>`,
+`SkillRouter.install()`, `install_skill()`, `pull_missing()`, `export_to_disk()` and the
+`disk_export` writers) and the version 1 lock fallback still work in 0.17.0, with the same
+warning. The 0.16.0 notes said they would stop working in 0.17; they now stop working in
+0.18, and the warnings say so.
+
 ## [0.16.0] — 2026-10-18
 
 ### Added: native mode — a framework's own skill loader, seen by DecimalAI
