@@ -73,9 +73,21 @@ _MANIFEST_OWNERS: dict = {}
 
 
 @pytest.fixture(autouse=True)
-def _reset_sdk():
+def _reset_sdk(monkeypatch):
     import decimalai._config as cfg
+    import decimalai.providers as providers
     from decimalai._config import DecimalConfig
+    from opentelemetry.trace import NoOpTracerProvider
+
+    # `agent_run` is not only a name scope: it also opens an OTel span, on
+    # `providers._last_provider` or else the process-global provider. An earlier
+    # test that installed DecimalAI's OTel pipeline (`init(crewai=True)` sets the
+    # global provider, and OTel never gives it back) leaves its exporter
+    # listening, so every lane's `agent.run` span ships as a one-span trace of
+    # its own into THIS test's client — on a 5 s batch timer, so the count was
+    # 8 or 15 or 16 depending on when the timer fired. Pin the scope to a
+    # provider with no exporter: what a process tracing only LlamaIndex has.
+    monkeypatch.setattr(providers, "_last_provider", NoOpTracerProvider())
 
     cfg._config = DecimalConfig(
         api_key="dai_sk_test",
