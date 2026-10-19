@@ -41,13 +41,24 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    (`init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
    `init(crewai=True)` turn the loader on themselves since 2026-10-14; the
    templates keep the explicit `instrument()` line because it is where the
-   agent name is bound and where the adapter's other options go.)
+   adapter's other options go.)
 
-2. The agent name is BOUND. An unbound name means the adapter auto-detects
-   one off the runnable ("langchain-agent" when it cannot tell), so traces are
-   filed under a different agent than the one the user configured — their page
-   stays empty forever while traces pile up somewhere else. Same bug the
-   dashboard snippets were fixed for on 2026-08-22.
+2. The agent name is BOUND, and written ONCE. An unbound name means the
+   adapter auto-detects one off the runnable ("langchain-agent" when it cannot
+   tell), so traces are filed under a different agent than the one the user
+   configured — their page stays empty forever while traces pile up somewhere
+   else. Same bug the dashboard snippets were fixed for on 2026-08-22.
+
+   Written once because a second copy is the same bug on a delay. Until
+   2026-10-19 the name was a literal in `instrument(agent_name=...)`, in
+   `load_agent(...)` and in the framework's own `Agent(name=...)`, beside an
+   `AGENT_NAME` constant only error strings read — so renaming the agent meant
+   finding every copy, and a missed one filed traces under the old name with no
+   error. Now each file assigns `AGENT_NAME` once and passes it to
+   `init(agent_name=AGENT_NAME)`, which every adapter's `instrument()` falls
+   back to (`decimalai/_config.py` `default_agent_name`); the other uses read
+   the constant. `tests/test_cli_init_scaffold.py` fails if the literal
+   appears twice.
 
 3. What comes out is an AGENT. Until 2026-08-29 the langchain template emitted
    `agent = init_chat_model(MODEL)` — a chat completion with a variable named
@@ -120,19 +131,22 @@ they additionally construct a model and an entry point. Every claim the two
 share is identical, deliberately:
 
   * langchain: `init()` with no framework flag, then a single
-    `instrument(agent_name=..., enable_skill_loader=True)`. `init(langchain=True)`
-    is the same install, so passing it as well installs twice: the first one
-    wins, and the explicit call's arguments — its `agent_name` included — are
-    dropped with a warning, which leaves skills routed for no agent.
+    `instrument(enable_skill_loader=True)`. `init(langchain=True)` is the same
+    install, so passing it as well installs twice: the first one wins, and the
+    explicit call's other arguments are dropped with a warning.
   * openai-agents: same shape. `init(openai_agents=True)` is the same install
     as the explicit `instrument()` line, so it is one or the other — never
     both.
-  * pydantic-ai: the same `instrument(agent_name=..., enable_skill_loader=True)`
-    — but `init(otel=True)`, not a bare `init()`. That is not a contradiction of
-    the rule above, it is the same rule: exactly one span source per file. On
-    the other two the adapter IS the span source; here it is not (point 4).
+  * pydantic-ai: the same `instrument(enable_skill_loader=True)` — but
+    `init(..., otel=True)`. That is not a contradiction of the rule above, it
+    is the same rule: exactly one span source per file. On the other two the
+    adapter IS the span source; here it is not (point 4).
 
-Two differences are intentional. The openai-agents snippet awaits
+Three differences are intentional. The snippets name the agent on
+`instrument(agent_name=...)`; the templates name it on `init(agent_name=...)`
+(point 2). It is the same binding — `init()`'s name is the one every
+`instrument()` falls back to — moved to the one call that reaches every
+adapter, so a whole file can name its agent once. The openai-agents snippet awaits
 `Runner.run(...)` because it is being pasted into an async app, while the
 generated file is a standalone script and uses `Runner.run_sync(...)`. And the
 pydantic-ai snippet stops at `Agent(...)` without a `name=`, because it is being
@@ -414,8 +428,21 @@ def _header_lines(
     return lines
 
 
+def _agent_name_lines(agent_name: str) -> List[str]:
+    """The one place a generated file writes the agent's name (point 2)."""
+    return [
+        "# The DecimalAI agent this file runs as. Named once, here: init() passes it",
+        "# to everything that traces or routes skills, and load_agent() reads its prompt.",
+        f"AGENT_NAME = {_py(agent_name)}",
+    ]
+
+
 def _init_call(base_url: Optional[str], *flags: str) -> str:
-    """`decimalai.init(...)` — with a base_url only when one is needed.
+    """`decimalai.init(agent_name=AGENT_NAME, ...)` — with a base_url only when
+    one is needed.
+
+    `agent_name=AGENT_NAME` names the agent for every adapter's `instrument()`,
+    so the template's `instrument()` line does not repeat it (point 2).
 
     The key is read from the environment by `init()` itself, so no generated
     file ever contains one. A non-default base_url IS baked in: it is not a
@@ -427,7 +454,7 @@ def _init_call(base_url: Optional[str], *flags: str) -> str:
     its own — see point 4 in the module docstring. A template that can trace
     without one must not pass one: a second exporter double-sends every span.
     """
-    args = []
+    args = ["agent_name=AGENT_NAME"]
     if base_url:
         args.append(f"base_url={_py(base_url)}")
     args += [f"{flag}=True" for flag in flags]
@@ -454,6 +481,7 @@ def _render_langchain(
         "# (install that provider\'s package too: langchain-anthropic /",
         "#  langchain-google-genai)",
         f"MODEL = {_py(model)}",
+        *_agent_name_lines(agent_name),
         "",
         *_key_guard_lines("langchain", model),
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
@@ -470,10 +498,10 @@ def _render_langchain(
         "# The SDK turns injection on by default for adapters with no load_skill",
         "# tool — pass init(inject_skill_body=False) if you want menu-only.",
         "#",
-        "# Do not also pass langchain=True to init() above. That is this same",
-        "# install, and the first one wins: this line's agent_name would be",
-        "# ignored, so skills would be routed for no agent.",
-        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "# No agent_name here: init() above already named the agent. Do not also",
+        "# pass langchain=True to init(). That is this same install, and the first",
+        "# one wins: options you add to this call later would be dropped.",
+        "instrument(enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
         "# It is handed to you as data and sent by the line YOU can see below —",
@@ -483,7 +511,7 @@ def _render_langchain(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        f"config = decimalai.load_agent({_py(agent_name)})",
+        "config = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, the skills rail delivers, and adding a tool later needs no",
@@ -553,7 +581,7 @@ def _render_openai_agents(
         "",
         "# Change this to any model your OpenAI key can reach.",
         f"MODEL = {_py(model)}",
-        f"AGENT_NAME = {_py(agent_name)}",
+        *_agent_name_lines(agent_name),
         "# The SDK default is 10, which a skill-loading turn can legitimately",
         "# exceed. Raise it if your agent has many tools; lower it to fail faster.",
         "MAX_TURNS = 20",
@@ -572,9 +600,11 @@ def _render_openai_agents(
         "# wrapping Agent.__init__, and on builds without the run-time hooks an",
         "# agent constructed earlier silently receives nothing.",
         "#",
-        "# Do not also pass openai_agents=True to init() above. That is this same",
-        "# install, so it is one or the other — never both.",
-        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "# No agent_name here: init() above already named the agent, and that name",
+        "# wins over Agent(name=) below for both the trace and skill routing. Do not",
+        "# also pass openai_agents=True to init(). That is this same install, so it",
+        "# is one or the other — never both.",
+        "instrument(enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
         "# It is handed to you as data and passed to the Agent by the line YOU can",
@@ -584,10 +614,10 @@ def _render_openai_agents(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        f"config = decimalai.load_agent({_py(agent_name)})",
+        "config = decimalai.load_agent(AGENT_NAME)",
         "",
         "agent = Agent(",
-        f"    name={_py(agent_name)},",
+        "    name=AGENT_NAME,",
         "    model=MODEL,",
         "    # None when this agent has no prompt set — a real state, not a failure",
         "    # (a failed read raises instead). The Agent then runs with no",
@@ -653,7 +683,7 @@ def _render_pydantic_ai(
         "# all three ship with the pydantic-ai install; the key each one reads is",
         "# named in the `Set:` list `decimalai init` printed for your model.",
         f"MODEL = {_py(model)}",
-        f"AGENT_NAME = {_py(agent_name)}",
+        *_agent_name_lines(agent_name),
         "# Pydantic AI's own default is 50 model requests. Lower, because a",
         "# runaway loop here costs real tokens; raise it if your agent legitimately",
         "# chains many tool calls.",
@@ -687,14 +717,15 @@ def _render_pydantic_ai(
         "# and Pydantic AI owns its tool loop — so the model reads the menu, asks",
         "# for the one it needs, and the body comes back mid-turn.",
         "#",
-        "# agent_name is the fallback for an Agent built without a name=. Pydantic",
-        "# AI infers one from the VARIABLE it was assigned to in that case, so",
-        "# without this line an agent you renamed files its traces under 'agent'.",
+        "# No agent_name here: this call takes init()'s, as the fallback for an",
+        "# Agent built without a name=. Pydantic AI infers one from the VARIABLE it",
+        "# was assigned to in that case, so without it an agent you renamed files",
+        "# its traces under 'agent'.",
         "#",
         "# This call must stay ABOVE the Agent(...) below: the loader works by",
         "# wrapping Agent.__init__, so an Agent constructed earlier gets neither",
         "# the skills prompt nor the load_skill tool.",
-        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "instrument(enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
         "# It is handed to you as data and passed to the Agent by the line YOU can",
@@ -704,7 +735,7 @@ def _render_pydantic_ai(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        f"config = decimalai.load_agent({_py(agent_name)})",
+        "config = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, the skills rail delivers, and adding a tool later needs no",
@@ -761,23 +792,16 @@ def _render_pydantic_ai(
     ]
 
 
-def adk_node_name(agent_name: str) -> str:
-    """ADK agent names must be Python identifiers (``base_agent.validate_name``);
-    a DecimalAI name need not be. Traces still file under the DecimalAI name —
-    ``instrument(agent_name=)`` carries it (decimalai/adk.py resolves the explicit
-    name ahead of the node's)."""
-    node = re.sub(r"\W", "_", str(agent_name))
-    if not node or node[0].isdigit() or node == "user":
-        node = "agent_" + node
-    return node
-
-
 def _render_adk(
     agent_name: str, model: str, base_url: Optional[str]
 ) -> List[str]:
+    # NODE_NAME is derived IN the file rather than rendered here, so it is not a
+    # second copy of the name (point 2). The rule is ADK's own
+    # (`BaseAgent.validate_name`: an identifier, and not "user").
     return [
         "import asyncio",
         "import os",
+        "import re",
         "",
         "import decimalai",
         "from decimalai.adk import instrument",
@@ -788,10 +812,12 @@ def _render_adk(
         "# Any Gemini model your key can reach. ADK resolves a bare `gemini-*` name",
         "# natively; for another provider wrap it: model=LiteLlm(\"openai/gpt-4o-mini\").",
         f"MODEL = {_py(model)}",
-        f"AGENT_NAME = {_py(agent_name)}",
-        "# ADK node names must be Python identifiers; the DecimalAI name need not be.",
-        "# Traces still file under AGENT_NAME — instrument() below carries it.",
-        f"NODE_NAME = {_py(adk_node_name(agent_name))}",
+        *_agent_name_lines(agent_name),
+        "# ADK node names must be Python identifiers, and not \"user\"; the DecimalAI",
+        "# name need not be. Traces still file under AGENT_NAME — init() carries it.",
+        "NODE_NAME = re.sub(r\"\\W\", \"_\", AGENT_NAME)",
+        "if not NODE_NAME.isidentifier() or NODE_NAME == \"user\":",
+        "    NODE_NAME = \"agent_\" + NODE_NAME",
         "",
         "# ADK's Gemini client reads GOOGLE_API_KEY (or GEMINI_API_KEY) at the FIRST",
         "# model call, deep inside the run loop. Fail here, before anything runs.",
@@ -813,13 +839,14 @@ def _render_adk(
         "# registers no load_skill tool, so injection is the only body channel.",
         "#",
         "# This call patches Runner.__init__ to attach the DecimalAI plugin, so it",
-        "# must stay ABOVE the InMemoryRunner(...) below. Do not also pass adk=True",
-        "# to init() above: that is this same install, so one of the two is noise.",
-        f"instrument(agent_name={_py(agent_name)}, enable_skill_loader=True)",
+        "# must stay ABOVE the InMemoryRunner(...) below. No agent_name here: init()",
+        "# above already named the agent. Do not also pass adk=True to init(): that",
+        "# is this same install, so one of the two is noise.",
+        "instrument(enable_skill_loader=True)",
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
         "# Read at run time, so editing it in the dashboard changes the next run.",
-        f"config = decimalai.load_agent({_py(agent_name)})",
+        "config = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub.",
         "TOOLS: list = []",
@@ -1135,8 +1162,9 @@ def render_agent_file(
     instead of pattern-matching a string.
 
     Args:
-        agent_name: The agent as it exists on DecimalAI. Bound into
-            `instrument()` so traces file against it and its skills resolve.
+        agent_name: The agent as it exists on DecimalAI. Written once, as
+            `AGENT_NAME`, and bound by `init(agent_name=AGENT_NAME)` so traces
+            file against it and its skills resolve.
         framework: Already normalized by `normalize_framework`.
         skills: Rows from `GET /api/v1/agents/{name}/skills`. Named in a
             comment so the file shows what it will use.

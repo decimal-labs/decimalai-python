@@ -13,9 +13,10 @@ The four things that must never regress:
      `instrument()` call. It defaults to False on both adapters, so a file
      without it traces perfectly and delivers none of the agent's skills —
      silently. That is the single most important line in the template.
-  2. The agent name is BOUND, and survives a name that needs escaping.
-     Unbound, the adapter auto-detects a name off the runnable and files
-     traces against a different agent than the one the user configured.
+  2. The agent name is BOUND, written ONCE, and survives a name that needs
+     escaping. Unbound, the adapter auto-detects a name off the runnable and
+     files traces against a different agent than the one the user configured;
+     written twice, a rename that misses one copy does the same.
   3. No API key literal is ever written. The file reads DECIMAL_API_KEY from
      the environment, because people commit these.
   4. Refusing to clobber. A scaffold that silently eats an existing agent.py
@@ -97,6 +98,28 @@ def kwarg(call: ast.Call, name: str):
         if kw.arg == name:
             return ast.literal_eval(kw.value)
     return None
+
+
+def has_kwarg(call: ast.Call, name: str) -> bool:
+    return any(kw.arg == name for kw in call.keywords)
+
+
+def reads(node: ast.AST, variable: str) -> bool:
+    """`node` is a bare read of `variable` — `AGENT_NAME`, not a copy of its value."""
+    return isinstance(node, ast.Name) and node.id == variable
+
+
+def kwarg_reads(call: ast.Call, name: str, variable: str) -> bool:
+    return any(kw.arg == name and reads(kw.value, variable) for kw in call.keywords)
+
+
+def assigned(tree: ast.Module, variable: str):
+    """The literal a module-level `variable = <literal>` assigns. Exactly one."""
+    values = [ast.literal_eval(n.value) for n in tree.body
+              if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == variable for t in n.targets)]
+    assert len(values) == 1, f"expected one {variable} assignment, got {len(values)}"
+    return values[0]
 
 
 def _header_text(source: str) -> str:
@@ -268,7 +291,7 @@ class TestSkillLoaderIsOn:
     #: "exactly one flag" are the same rule seen from two adapters. On langchain
     #: and openai-agents `instrument()` installs the span source itself, so any
     #: flag here is a SECOND install of the same adapter: on langchain the first
-    #: one wins and the explicit call's `agent_name` is dropped with a warning,
+    #: one wins and the explicit call's other options are dropped with a warning,
     #: and on openai-agents the adapter is installed twice. On pydantic-ai
     #: `instrument()` installs NO span source (that adapter ships the skills rail
     #: and the run boundary; Pydantic AI emits no spans of its own), so `otel=True`
@@ -328,7 +351,9 @@ class TestPromptIsRead:
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         loads = calls(tree, "load_agent")
         assert len(loads) == 1, "expected exactly one load_agent() call"
-        assert [ast.literal_eval(a) for a in loads[0].args] == [AGENT]
+        assert len(loads[0].args) == 1 and reads(loads[0].args[0], "AGENT_NAME")
+        assert not loads[0].keywords
+        assert assigned(tree, "AGENT_NAME") == AGENT
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_load_agent_runs_at_module_scope(self, framework):
@@ -397,9 +422,78 @@ class TestPromptIsRead:
 
 class TestAgentNameBinding:
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
-    def test_name_is_interpolated_into_instrument(self, framework):
+    def test_name_is_bound_on_init_and_not_repeated_on_instrument(self, framework):
+        """`init(agent_name=AGENT_NAME)` is the default every adapter's
+        `instrument()` falls back to, so the name rides on init() and the
+        instrument() line carries none of its own."""
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        assert kwarg(calls(tree, "instrument")[0], "agent_name") == AGENT
+        assert assigned(tree, "AGENT_NAME") == AGENT
+        assert kwarg_reads(calls(tree, "init")[0], "agent_name", "AGENT_NAME")
+        assert not has_kwarg(calls(tree, "instrument")[0], "agent_name")
+
+    #: Each name below makes a different second copy visible. `refund_bot` is
+    #: already a Python identifier, so a scaffold-time ADK node name would be
+    #: the same literal again; `[Demo] support-agent` needs escaping.
+    @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
+    @pytest.mark.parametrize("name", ["refund-bot", "refund_bot", "[Demo] support-agent"])
+    def test_the_name_literal_appears_exactly_once(self, framework, name):
+        """Renaming the agent is one edit. Every string constant in the file
+        that carries the name is counted — call arguments, `Agent(name=...)`,
+        f-string parts — and the only one allowed is the AGENT_NAME assignment.
+        Comments are not code and are not counted (the header says which
+        command generated the file)."""
+        tree = parse(render_agent_file(name, framework, SKILLS))
+        carriers = [n for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and name in n.value]
+        assert len(carriers) == 1, (
+            f"{framework}: the name {name!r} is written {len(carriers)} times "
+            f"(lines {[n.lineno for n in carriers]}); a rename that misses one "
+            f"files traces under the old name"
+        )
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "AGENT_NAME"
+                              for t in n.targets))
+        assert holder.value is carriers[0]
+
+    @pytest.mark.parametrize("framework", ["openai-agents", "pydantic-ai"])
+    def test_the_framework_agent_is_named_from_the_constant(self, framework):
+        """A framework-native name that must exist reads AGENT_NAME — a literal
+        there was the copy a rename used to miss."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        assert kwarg_reads(calls(tree, "Agent")[0], "name", "AGENT_NAME")
+
+    @staticmethod
+    def _adk_node_name(name: str) -> str:
+        """Run the generated file's own NODE_NAME lines, nothing else of it."""
+        tree = parse(render_agent_file(name, "adk", SKILLS))
+        keep = [
+            n for n in tree.body
+            if (isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in ("AGENT_NAME", "NODE_NAME")
+                for t in n.targets))
+            or (isinstance(n, ast.If) and "NODE_NAME" in ast.unparse(n.test))
+        ]
+        namespace: dict = {"re": re}
+        exec(compile(ast.Module(body=keep, type_ignores=[]), "agent.py", "exec"),
+             namespace)
+        return namespace["NODE_NAME"]
+
+    @pytest.mark.parametrize("name,node", [
+        ("refund-bot", "refund_bot"),
+        ("conformance-journey-agent", "conformance_journey_agent"),
+        ("[Demo] support-agent", "_Demo__support_agent"),
+        ("7-eleven", "agent_7_eleven"),
+        ("user", "agent_user"),
+    ])
+    def test_adk_node_name_is_derived_from_agent_name_in_the_file(self, name, node):
+        """ADK's node and app names must be identifiers and not "user"
+        (`BaseAgent.validate_name`). The file derives them from AGENT_NAME at
+        run time, so they follow a rename instead of keeping the old name."""
+        tree = parse(render_agent_file(name, "adk", SKILLS))
+        assert kwarg_reads(calls(tree, "LlmAgent")[0], "name", "NODE_NAME")
+        assert kwarg_reads(calls(tree, "InMemoryRunner")[0], "app_name", "NODE_NAME")
+        assert self._adk_node_name(name) == node
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     @pytest.mark.parametrize("name", [
@@ -422,7 +516,10 @@ class TestAgentNameBinding:
         """Escaped by Python's own `repr`, not by hand. A name that breaks the
         file is a name that breaks the product for that user."""
         tree = parse(render_agent_file(name, framework, SKILLS))
-        assert kwarg(calls(tree, "instrument")[0], "agent_name") == name
+        assert assigned(tree, "AGENT_NAME") == name
+        if framework == "adk":
+            node = self._adk_node_name(name)
+            assert node.isidentifier() and node != "user", node
 
     def test_empty_name_is_refused_rather_than_emitted(self):
         with pytest.raises(ValueError):
@@ -722,7 +819,8 @@ class TestCliWritesTheFile:
         compile(source, "agent.py", "exec")
         tree = parse(source)
         assert kwarg(calls(tree, "instrument")[0], "enable_skill_loader") is True
-        assert kwarg(calls(tree, "instrument")[0], "agent_name") == AGENT
+        assert assigned(tree, "AGENT_NAME") == AGENT
+        assert kwarg_reads(calls(tree, "init")[0], "agent_name", "AGENT_NAME")
 
     def test_out_path_is_honored(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -840,7 +938,7 @@ class TestCliWritesTheFile:
         # Silent about a prompt it could not read — and still reads it at run time.
         assert "System prompt:" not in source
         assert "no system prompt set" not in source
-        assert 'decimalai.load_agent("refund-bot")' in source
+        assert "decimalai.load_agent(AGENT_NAME)" in source
         # Said out loud, because a silently missing comment is indistinguishable
         # from an agent that has no prompt.
         assert "Could not read" in result.output
@@ -1171,12 +1269,17 @@ class TestConsistencyWithFrontendSnippets:
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_same_shape_as_the_snippet(self, framework):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        # One bare init(), one instrument() carrying both the name and the
-        # loader — the shape the dashboard snippets settled on 2026-08-22.
-        assert len(calls(tree, "init")) == 1
+        # One init(), one instrument() carrying the loader — the shape the
+        # dashboard snippets settled on 2026-08-22. One deliberate difference
+        # (scaffold.py, "Three differences are intentional"): the snippets name
+        # the agent on instrument(), the templates on init(), which is the same
+        # binding — init()'s name is the one every instrument() falls back to.
+        init_calls = calls(tree, "init")
+        assert len(init_calls) == 1
+        assert kwarg_reads(init_calls[0], "agent_name", "AGENT_NAME")
         inst = calls(tree, "instrument")
         assert len(inst) == 1
-        assert kwarg(inst[0], "agent_name") == AGENT
+        assert not has_kwarg(inst[0], "agent_name")
         assert kwarg(inst[0], "enable_skill_loader") is True
 
 

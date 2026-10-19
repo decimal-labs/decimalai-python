@@ -391,7 +391,8 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     assert "LOADER: True" in out, out
 
     # And the name reached the adapter, so traces file against the agent the
-    # user configured rather than an auto-detected one.
+    # user configured rather than an auto-detected one. The template names it
+    # only on `init(agent_name=AGENT_NAME)`; this is the adapter reading it back.
     assert f"BOUND: {AGENT}" in out, out
 
     # The prompt: read for THIS agent, and actually delivered to the model.
@@ -446,7 +447,7 @@ def test_generated_file_executes(framework, prompt, tmp_path):
 
     # Exactly one DecimalAI processor. Two would mean every span is sent
     # twice — the failure `init(openai_agents=True)` plus `instrument()`
-    # produces, and the reason the template passes a bare `init()`.
+    # produces, and the reason the template passes init() no framework flag.
     if framework == "openai-agents":
         assert "PROCESSORS: 1" in out, out
 

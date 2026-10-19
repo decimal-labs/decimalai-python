@@ -69,7 +69,8 @@ def observe(trace: RunTrace) -> None:
 
 
 # The check and your service use this same model, prompt, skill loader and run().
-decimalai.init(base_url=BASE_URL)
+# agent_name names the agent for instrument() below too; AGENT_NAME is its only copy.
+decimalai.init(base_url=BASE_URL, agent_name=AGENT_NAME)
 config = decimalai.load_agent(AGENT_NAME)
 CAPABILITY_CONTEXT = (
     "Runtime capabilities: You may perform actions only through the tools actually provided. "
@@ -102,7 +103,7 @@ CAPABILITY_CONTEXT = (
 SYSTEM_PROMPT = "\\n\\n".join(part for part in (config.system_prompt, CAPABILITY_CONTEXT) if part)
 # Skills may assume tools this application lacks. Repeat the actual constraints
 # after their guidance, while retaining the full skill bodies for trace evidence.
-instrument(agent_name=AGENT_NAME, enable_skill_loader=True, skill_body_top_k=3,
+instrument(enable_skill_loader=True, skill_body_top_k=3,
            priority_skills={[bindings[SUPPORT_SKILLS[1]]]!r}, on_trace=observe,
            runtime_policy=CAPABILITY_CONTEXT)
 # Keep generation settings explicit for the tested default and GPT-4.1 overrides.

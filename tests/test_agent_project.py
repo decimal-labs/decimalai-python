@@ -27,6 +27,32 @@ def test_cli_generates_a_complete_project(tmp_path):
     assert json.loads((dest / "checks.json").read_text())["suite"] == "support-draft/v1"
 
 
+def test_project_names_the_agent_once():
+    """agent.py writes the name once, as AGENT_NAME, and init() carries it to
+    instrument(); check_agent.py reads it from project.json, not a copy."""
+    import ast
+
+    files = render_project("refund_bot", SKILLS, None, "http://localhost:8000")
+    tree = ast.parse(files["agent.py"])
+    carriers = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and "refund_bot" in n.value]
+    assert len(carriers) == 1
+    holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "AGENT_NAME")
+    assert holder.value is carriers[0]
+
+    def keywords(func):
+        found = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and getattr(n.func, "attr", getattr(n.func, "id", None)) == func]
+        assert len(found) == 1, func
+        return {kw.arg: kw.value for kw in found[0].keywords}
+
+    init_name = keywords("init")["agent_name"]
+    assert isinstance(init_name, ast.Name) and init_name.id == "AGENT_NAME"
+    assert "agent_name" not in keywords("instrument")
+    assert "refund_bot" not in files["check_agent.py"]
+    assert json.loads(files["project.json"])["agent_name"] == "refund_bot"
+
+
 def test_renamed_fork_uses_source_identity():
     skills = [dict(s) for s in SKILLS]
     skills[0] = {"skill_name": "our-billing-policy", "source_skill_slug": SUPPORT_SKILLS[0]}
