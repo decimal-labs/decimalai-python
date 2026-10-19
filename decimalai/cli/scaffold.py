@@ -603,9 +603,10 @@ def _render_openai_agents(
         "# This agent's prompt and skills, from DecimalAI. Nothing is injected behind",
         "# your back: the two lines in Agent(...) below are where they go in.",
         "#   support.instructions  the prompt saved in the dashboard, then the list of",
-        "#                         this agent's skills. Read on every run, so a prompt",
-        "#                         saved in the dashboard reaches the next run with no",
-        "#                         redeploy. {{placeholders}} in it are filled from",
+        "#                         this agent's skills. Re-read at most once a minute,",
+        "#                         so a prompt saved in the dashboard reaches a run",
+        "#                         within a minute, with no redeploy. {{placeholders}}",
+        "#                         in it are filled from",
         "#                         Runner.run(..., context=...).",
         "#   support.tools         the load_skill tool the model reads a skill with.",
         "# With no prompt saved, the agent gets only the skill list: nothing this file",
@@ -1120,17 +1121,17 @@ def _key_guard_lines(framework: str, model: str) -> List[str]:
     """The two-line refusal at the top of a template, or nothing (see provider_key).
 
     Without it a missing provider key is a traceback from inside the provider
-    client — after init(), instrument() and load_agent() have all made their
-    network calls (openai-agents: only on the first Runner.run_sync).
+    client — after the file's DecimalAI setup has made its network calls
+    (openai-agents: only on the first Runner.run_sync).
     """
     key = provider_key(framework, model)
     if not key:
         return []
     return [
         "# The key MODEL's provider reads, checked before anything talks to DecimalAI.",
-        "# Without this it is a traceback from inside the provider client after init(),",
-        "# instrument() and load_agent() have all run. Change this name if you change",
-        "# MODEL to another provider.",
+        "# Without this it is a traceback from inside the provider client, after the",
+        "# DecimalAI setup below has run. Change this name if you change MODEL to",
+        "# another provider.",
         f"PROVIDER_KEY = {_py(key)}",
         "if not os.environ.get(PROVIDER_KEY):",
         "    raise SystemExit(",
