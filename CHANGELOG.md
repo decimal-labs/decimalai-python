@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.17.0] — 2026-10-19
 
 ### Changed: `init()` is the default agent name and API key
 
@@ -20,6 +20,27 @@ and patch releases are fixes.
   `instrument()`'s docstring always said; with none, `Agent(name=)` is used as before. A name
   given together with `agent=` applies to that agent only. An INFO line says so once when the
   two names differ. Pydantic AI keeps its documented rule (`Agent(name=)` first).
+
+### Changed: `decimalai init` files name the agent once
+
+- A generated `agent.py` assigns `AGENT_NAME` once and passes it to
+  `decimalai.init(agent_name=AGENT_NAME)`; `instrument()`, `load_agent()` and the
+  framework's own `Agent(name=...)` read it from there. Before, the name was written in
+  up to four places, and renaming the agent in one of them filed traces under the old
+  name with no error. The ADK file derives its node name from `AGENT_NAME` when it runs.
+- Because the name now reaches `init()`, its check for a near-miss agent name (a likely
+  typo of an existing agent) runs at startup: one extra `GET /api/v1/agents` when
+  `verify` is on.
+
+### Fixed
+
+- **LangChain:** a tool's result is recorded as what the tool said. From a LangGraph
+  tool node (`create_agent`, `create_react_agent`) the output is a `ToolMessage`, and the
+  record held its repr (`content='...' name=... tool_call_id=...`).
+- **LangChain:** an LLM call from a chat model that names no model in its invocation
+  params (a custom model class, or a wrapper that drops the field) is recorded under the
+  model's class name. Before, it was recorded with no model name and the platform
+  rejected the whole trace.
 
 ## [0.16.0] — 2026-10-18
 
