@@ -9,20 +9,29 @@ probe, the project loaded through ``skills_plugin()``. Run 1 loads the target wi
 
 The last tests drive the hook in-process with synthetic messages: they patch nothing
 global, so they need no child.
+
+The CLI rewrites every body it delivers (it fills ``$ARGUMENTS``, ``$0``, ``$1``, ... and
+``${CLAUDE_SKILL_DIR}``), so a body with placeholders reaches the model as bytes no version
+hashes to. ``rewritten`` loads such skills through the real CLI, and the replays after it feed
+the hook the CLI's recorded output (``tests/fixtures/claude_skill_args_2_1_299.json``).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import dataclasses
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytest
 
 from decimalai import _native
+from decimalai.skillpkg import identity
 from decimalai.skillpkg.identity import ManagedSkill
-from tests.native_loaders import ledger
+from tests.native_loaders import ledger, oracle
 
 from ._runner import run_scenario
-from .conftest import V2_SENTINEL
+from .conftest import V2_SENTINEL, NativeProject
 
 FRAMEWORK = "claude-agent-sdk"
 PLUGIN = "decimalai-skills"
@@ -190,3 +199,192 @@ def test_a_body_that_is_no_known_version_names_the_skill_but_no_version(native_p
     (activation,) = got
     assert activation.how == _native.UNVERIFIED and activation.version_id is None
     assert activation.skill_id == native_project.expected()["skill_id"]
+
+
+# ── bodies the CLI rewrites ─────────────────────────────────────────────────
+
+FIXTURE = json.loads((Path(__file__).resolve().parents[1] / "fixtures"
+                      / "claude_skill_args_2_1_299.json").read_text())
+RECORDED = {c["case"]: c for c in FIXTURE["renders"]}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Row(oracle.SkillRow):
+    """An oracle skill with a body of its own and, optionally, an ``arguments`` line."""
+
+    body: str = ""
+    arguments: str = ""
+
+    @property
+    def stored_body(self) -> str:
+        return self.body
+
+
+def _row(i: int, name: str, body: str, arguments: str = "") -> _Row:
+    base = oracle._row(0x40 + i, name=name, title=name, sentinel=f"SENTINEL-REWRITE-{i}",
+                       allowed_tools=(), invocation_mode="model", variant="authored",
+                       public=False, pin="latest")
+    return _Row(**{f.name: getattr(base, f.name) for f in dataclasses.fields(base)},
+                body=body, arguments=arguments)
+
+
+#: ``$12`` is a price, but the 13th word of a long args fills it.
+LATE_FEES = ("# Late fees\n\nA late fee is $12, waived once a year. Refunds over $100 need a "
+             "manager.\nThe customer wrote: \"$ARGUMENTS\". The fee table is in "
+             "${CLAUDE_SKILL_DIR}/references.\n")
+LATE_ARGS = "Write a reply to a customer who paid on time but was charged a late fee"
+CITY_GUIDE = ("# City guide\n\nRecommend three sights in $city for session ${CLAUDE_SESSION_ID}"
+              " of ${CLAUDE_PROJECT_DIR}.\n")
+REFUND_TOTAL = "# Refund total\n\nAdd \\$5 to every refund. Asked for: [$ARGUMENTS].\n"
+PLAIN = "# Plain\n\nNo placeholders in this one.\n"
+ROWS = (
+    _row(0, "acme/late-fees", LATE_FEES),
+    _row(1, "acme/city-guide", CITY_GUIDE, "arguments: [city]"),
+    _row(2, "acme/refund-total", REFUND_TOTAL),
+    _row(3, "acme/plain", PLAIN),
+    _row(4, "acme/full-placeholders", RECORDED["full_args"]["body"],
+         RECORDED["full_args"]["frontmatter"].strip()),
+)
+LOADS = [("acme-late-fees", LATE_ARGS), ("acme-city-guide", "Lisbon"),
+         ("acme-refund-total", None), ("acme-plain", "!urgent refund")]
+
+
+@pytest.fixture
+def placeholder_project(tmp_path, monkeypatch) -> NativeProject:
+    root = (tmp_path / "project").resolve()
+    root.mkdir()
+    (root / ".git").mkdir()
+    lock = oracle.write(root, ROWS)
+    for row in ROWS:
+        if row.arguments:
+            path = root / oracle.ROOT / oracle.install_name_for(row.name, row.skill_id) / "SKILL.md"
+            text = path.read_text()
+            path.write_text(text.replace("\nmetadata:\n", f"\n{row.arguments}\nmetadata:\n", 1))
+    monkeypatch.chdir(root)
+    identity.clear_cache()
+    _native._reset_seen()
+    yield NativeProject(root=root, lock=lock)
+    identity.clear_cache()
+    _native._reset_seen()
+
+
+@pytest.fixture
+def rewritten(placeholder_project):
+    from tests.conformance.environments import loader_graded_elsewhere
+
+    if loader_graded_elsewhere(FRAMEWORK):
+        ledger.skip_declared("elsewhere", f"{FRAMEWORK}:native", "Claude Agent SDK native mode")
+    return run_scenario("tests.native._scenario_claude_agent_sdk:rewritten", {"loads": LOADS},
+                        cwd=placeholder_project.root)
+
+
+def test_bodies_the_cli_rewrote_are_activations_of_the_installed_versions(
+        rewritten, placeholder_project):
+    run = rewritten["runs"][0]
+    assert run["error"] is None, run["error"]
+    (trace,) = run["traces"]
+    received = "\n".join(run["received"])
+    skill_dir = placeholder_project.skills_dir / "acme-late-fees"
+    # The CLI rewrote each body, so none of them is a locked body byte for byte...
+    assert "A late fee is charged, waived once a year. Refunds over $100" in received
+    assert f'The customer wrote: "{LATE_ARGS}". The fee table is in {skill_dir}/' in received
+    assert "Recommend three sights in Lisbon for session " in received
+    assert f" of {placeholder_project.root}." in received
+    assert "Add $5 to every refund. Asked for: []." in received
+    assert "ARGUMENTS: \\!urgent refund" in received
+    # ...and each activation still names the installed version exactly.
+    by_name = sorted(trace["active_skills"], key=lambda e: e["name"])
+    want = sorted((placeholder_project.expected(n) for n, _ in LOADS), key=lambda e: e["name"])
+    assert by_name == want
+
+
+class SystemMessage:
+    def __init__(self, data: dict) -> None:
+        self.subtype, self.data = "init", data
+
+
+def _replay(project: NativeProject, case: str, *, args: Optional[str] = "recorded",
+            shown: bool = True, install_name: str = "acme-full-placeholders"):
+    """The hook fed what the CLI delivered for ``case`` (with this project's paths), after a
+    ``Skill`` call with the recorded args (or ``args``), or after no call it saw."""
+    recorded = RECORDED[case]
+    skill_dir = project.skills_dir / install_name
+    plugin_root = project.root / ".agents"
+    delivered = (recorded["delivered"].replace("<SKILL_DIR>", str(skill_dir))
+                 .replace("<PLUGIN_ROOT>", str(plugin_root))
+                 .replace("<PROJECT_DIR>", str(project.root))
+                 .replace("<SESSION_ID>", "session-1"))
+    init = SystemMessage({"session_id": "session-1", "cwd": str(project.root),
+                          "plugins": [{"name": PLUGIN, "path": str(plugin_root)}]})
+    call_args = recorded["args"] if args == "recorded" else args
+    inp = {"skill": f"{PLUGIN}:{install_name}"}
+    if call_args is not None:
+        inp["args"] = call_args
+    messages = [init]
+    if shown:
+        messages += [AssistantMessage([ToolUseBlock("t1", "Skill", inp)]),
+                     UserMessage([ToolResultBlock("t1", "Launching skill")])]
+    messages.append(UserMessage([TextBlock(
+        f"Base directory for this skill: {skill_dir}\n{delivered}")]))
+    return _feed(*messages)
+
+
+def test_a_recorded_rewrite_with_args_names_the_version(placeholder_project):
+    (got,) = _replay(placeholder_project, "full_args")
+    assert (got.entry(), got.how) == (
+        placeholder_project.expected("acme-full-placeholders"), _native.BY_RENDER)
+
+
+def test_a_recorded_rewrite_without_args_names_the_version(placeholder_project):
+    want = placeholder_project.expected("acme-full-placeholders")
+    for shown in (True, False):
+        (got,) = _replay(placeholder_project, "full_absent", shown=shown)
+        assert (got.entry(), got.how) == (want, _native.BY_RENDER)
+        _native._reset_seen()
+
+
+def test_a_rewrite_that_does_not_fit_the_calls_args_names_no_version(placeholder_project):
+    # The body the CLI renders for no args, after a call that passed some: no guess.
+    (got,) = _replay(placeholder_project, "full_absent", args="Paris tomorrow")
+    assert (got.how, got.version_id) == (_native.UNVERIFIED, None)
+    assert got.skill_id == placeholder_project.expected("acme-full-placeholders")["skill_id"]
+
+
+def test_after_the_lock_moved_on_an_old_rewrite_is_not_the_new_version(placeholder_project):
+    name = "acme-full-placeholders"
+    skill_md = placeholder_project.skills_dir / name / "SKILL.md"
+    skill_md.write_text(skill_md.read_text().replace("Fee: $12.", "Fee: $15."))
+    lock_path = placeholder_project.root / ".decimal" / "skills.lock"
+    lock = json.loads(lock_path.read_text())
+    from skillevaluation import skillfmt
+
+    entry = lock["skills"][name]
+    entry["version_id"] = "00000000-0000-0000-0000-00000000beef"
+    entry["body_sha256"] = skillfmt.body_sha256(skillfmt.split_frontmatter(
+        skill_md.read_text())[1])
+    lock_path.write_text(json.dumps(lock))
+    identity.clear_cache()
+    (got,) = _replay(placeholder_project, "full_args")
+    assert (got.how, got.version_id) == (_native.UNVERIFIED, None)
+
+
+def test_a_body_edited_after_install_is_no_template(placeholder_project):
+    skill_md = placeholder_project.skills_dir / "acme-full-placeholders" / "SKILL.md"
+    skill_md.write_text(skill_md.read_text().replace("Fee: $12.", "Fee: $15."))
+    (got,) = _replay(placeholder_project, "full_args")
+    assert (got.how, got.version_id) == (_native.UNVERIFIED, None)
+
+
+def test_appended_args_with_an_escaped_bang_are_taken_off(placeholder_project):
+    plain = placeholder_project.skills_dir / "acme-plain"
+    delivered = (f"Base directory for this skill: {plain}\n\n"
+                 + PLAIN.strip() + "\n\n\nARGUMENTS: \\!urgent refund")
+    got = _feed(_skill_call_to("acme-plain", "t1", args="!urgent refund"),
+                UserMessage([TextBlock(delivered)]))
+    assert [(a.entry(), a.how) for a in got] == [
+        (placeholder_project.expected("acme-plain"), _native.BY_LOCK)]
+
+
+def _skill_call_to(install_name: str, i: str, **inp: Any) -> AssistantMessage:
+    return AssistantMessage([ToolUseBlock(i, "Skill", {"skill": f"{PLUGIN}:{install_name}",
+                                                       **inp})])

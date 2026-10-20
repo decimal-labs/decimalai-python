@@ -8,6 +8,32 @@ and patch releases are fixes.
 
 ### Fixed
 
+- **Claude Agent SDK: a skill whose body Claude Code rewrote is still its exact version.**
+  Claude Code rewrites a skill's body before the model reads it. It fills `$ARGUMENTS`, `$0`,
+  `$1`, ... with the words of the `Skill` call's `args` (0-based, and with the empty string when
+  the call has none), drops the backslash from `\$1`, and fills `${CLAUDE_SKILL_DIR}`,
+  `${CLAUDE_SESSION_ID}`, `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PROJECT_DIR}`. The hook named a
+  version by hashing the delivered body against the lock, so any body that changed matched
+  nothing, and its activation went out with the skill but no `version_id`. The prod prober found
+  this on 2026-10-20: `support-reply-format` quotes a `$12` fee, and a 13-word `args` replaced it
+  with the 13th word. Now, when the delivered body is no version's, the hook redoes Claude Code's
+  rewrite on the locked body and names that version only if the result is the delivered body byte
+  for byte. The installed `SKILL.md` is read for this, and counts only while its body is still the
+  locked one. A body that does not match still names no version; it is never guessed.
+  - The rules were read from the bundled CLI (claude-agent-sdk 0.2.166, Claude Code 2.1.299) and
+    checked against it: 226 `args` strings and 13 bodies recorded with the local stub, and one
+    claude-haiku-4-5 run. Claude Code splits `args` into words with its own bash parser (quotes
+    group words, `#` starts a comment, `;` and `|` end the list). DecimalAI follows that split; it
+    matched all 60 realistic `args` held out from writing it. A split it gets wrong costs the
+    activation its version, never gives it a wrong one.
+  - Not reproduced, so such a body still names no version: `${CLAUDE_EFFORT}`,
+    `${CLAUDE_PLUGIN_DATA}` and inline shell (`` !`cmd` ``), whose values only the CLI saw; and a
+    cached older version loaded with arguments after `decimalai skills update` (the file on disk
+    is then the newer version).
+  - Args appended to a body with no placeholder are taken off when they start with `!` too
+    (Claude Code escapes it as `\!`), and a call without args no longer strips a body's own last
+    line when that line starts with `ARGUMENTS:`.
+
 - **One lost packet no longer costs an agent its skill.** `SkillRouter` gave every request one
   attempt, with 1 s to open the connection. The operating system re-sends a lost first packet
   after about 1 s, so a single dropped packet failed the call. Inside a turn that is silent:

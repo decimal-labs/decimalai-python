@@ -16,10 +16,15 @@ the folder on disk is the wrong witness. The order, first hit wins:
 2. the lock, by the delivered body's hash;
 3. every body hash this process has seen in a lock or a verified stamp, which attributes the
    old version after the lock moved on;
-4. the skill alone, when it is known by stamp, name or path but the body is none of its known
+4. the lock, for a loader that rewrites a body before delivering it (Claude Code fills in a
+   skill's ``$ARGUMENTS``): when the loader's rewrite of the locked body is the delivered body.
+   This is the one step that reads the skill's folder, and the file there is a template, not
+   a witness: it counts only while its body is the locked version's, and only when its
+   rewrite matches the delivered bytes;
+5. the skill alone, when it is known by stamp, name or path but the body is none of its known
    versions: ``skill_id`` and ``body_sha256``, no ``version_id``. The platform resolves the
    version from those if it can; if it cannot, the activation stays unverified;
-5. a skill DecimalAI did not install: its name and body hash, which the platform resolves as
+6. a skill DecimalAI did not install: its name and body hash, which the platform resolves as
    it resolves the router rail's ``{name, hash}``.
 
 One run reports one activation per skill: a repeat load is counted once, and if a run loads
@@ -35,7 +40,7 @@ import threading
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from skillevaluation import skillfmt
 
@@ -53,6 +58,7 @@ STAMP_NAME = "decimalai-name"
 BY_STAMP = "stamp"
 BY_LOCK = "lock"
 BY_SEEN = "seen"
+BY_RENDER = "rendered"
 UNVERIFIED = "unverified"
 UNMANAGED = "unmanaged"
 
@@ -78,6 +84,10 @@ class Load:
         metadata: the frontmatter's ``metadata`` map as the loader parsed it. Wins over the
             metadata in ``text``.
         path: the skill's folder or its ``SKILL.md``, when the loader says where it read it.
+        renders: for a loader that rewrites a body before the model sees it, whether a
+            stored body (with its frontmatter) becomes exactly what this load delivered.
+            ``body`` is then the delivered body; resolution asks this only when no known
+            version has that body.
     """
 
     framework: str = ""
@@ -86,6 +96,7 @@ class Load:
     body: Optional[str] = None
     metadata: Optional[Mapping[str, Any]] = None
     path: Optional[str] = None
+    renders: Optional[Callable[[str, Mapping[str, Any]], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -98,9 +109,10 @@ class Activation:
         skill_id, version_id: the registry identity; ``version_id`` is None when the
             delivered body is not a version this process can name.
         body_sha256: :func:`skillfmt.body_sha256` of the delivered body, or None when the
-            hook could not see it.
-        how: one of :data:`BY_STAMP`, :data:`BY_LOCK`, :data:`BY_SEEN`, :data:`UNVERIFIED`,
-            :data:`UNMANAGED`.
+            hook could not see it. For :data:`BY_RENDER`, the locked body's: the version's
+            own, which the loader's rewrite delivered.
+        how: one of :data:`BY_STAMP`, :data:`BY_LOCK`, :data:`BY_SEEN`, :data:`BY_RENDER`,
+            :data:`UNVERIFIED`, :data:`UNMANAGED`.
     """
 
     name: str
@@ -270,7 +282,8 @@ def _wire_name(skill_id: str, registry_name: Optional[str], install_name: Option
 def resolve(load: Load, *, index: Optional[ManagedIndex] = None) -> Optional[Activation]:
     """The activation one load amounts to, or None when nothing names a skill.
 
-    Never raises for what the loader handed over, and never reads the skill's folder.
+    Never raises for what the loader handed over. Reads the skill's folder only for a load
+    that ``renders`` and matched no known version by hash.
     """
     if index is None:
         index = current_index()
@@ -299,7 +312,10 @@ def resolve(load: Load, *, index: Optional[ManagedIndex] = None) -> Optional[Act
 
     known = _known_skill(load, stamp, skill_id, install_name, index)
     if known is not None:
-        known_id, known_name = known
+        known_id, known_name, locked = known
+        rendered = _rendered(load, locked, index)
+        if rendered is not None:
+            return rendered
         return Activation(known_name, known_id, None, digest, UNVERIFIED)
 
     name = install_name or (load.name if isinstance(load.name, str) and load.name else None)
@@ -310,25 +326,45 @@ def resolve(load: Load, *, index: Optional[ManagedIndex] = None) -> Optional[Act
 
 def _known_skill(load: Load, stamp: Optional[_Stamp], seen_skill_id: Optional[str],
                  install_name: Optional[str],
-                 index: ManagedIndex) -> Optional[Tuple[str, str]]:
-    """``(skill_id, trace name)`` of the skill the load was, when anything says which."""
+                 index: ManagedIndex) -> Optional[Tuple[str, str, Optional[ManagedSkill]]]:
+    """``(skill_id, trace name, its lock entry)`` of the skill the load was, when anything
+    says which. The entry is None for a stamped skill the lock does not hold."""
     if stamp is not None:
         name = _wire_name(stamp.skill_id, stamp.registry_name, install_name, index)
         if name:
-            return stamp.skill_id, name
+            return stamp.skill_id, name, index.by_skill_id(stamp.skill_id)
     for reported in (load.name, load.path):
         locked = index.get(reported) if isinstance(reported, str) else None
         if locked is not None:
-            return locked.skill_id, locked.wire_name
+            return locked.skill_id, locked.wire_name, locked
     if install_name is not None:
         locked = index.by_install_name(install_name)
         if locked is not None:
-            return locked.skill_id, locked.wire_name
+            return locked.skill_id, locked.wire_name, locked
     if seen_skill_id is not None:
         locked = index.by_skill_id(seen_skill_id)
         if locked is not None:
-            return locked.skill_id, locked.wire_name
+            return locked.skill_id, locked.wire_name, locked
     return None
+
+
+def _rendered(load: Load, locked: Optional[ManagedSkill],
+              index: ManagedIndex) -> Optional[Activation]:
+    """The locked version, when the loader's rewrite of its body is what it delivered."""
+    if load.renders is None or locked is None:
+        return None
+    text = index.locked_text(locked)
+    if text is None:
+        return None
+    try:
+        if not load.renders(*text):
+            return None
+    except Exception:  # noqa: BLE001 - a rewrite that fails names no version
+        logger.debug("native load: could not re-render %s", locked.install_name,
+                     exc_info=True)
+        return None
+    return Activation(locked.wire_name, locked.skill_id, locked.version_id,
+                      locked.body_sha256, BY_RENDER)
 
 
 # ── one run's loads ──────────────────────────────────────────────────────────

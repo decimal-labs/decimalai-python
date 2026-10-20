@@ -166,6 +166,33 @@ def native(ctx: dict) -> dict:
     return s.result()
 
 
+# ── bodies the CLI rewrites (``test_claude_agent_sdk_native``'s placeholder project) ────
+
+
+def load_skill(name: str, args: Optional[str] = None) -> Callable[[dict], list]:
+    def step(body: dict) -> list:
+        inp = {"skill": qualified(body, name)}
+        if args is not None:
+            inp["args"] = args
+        return [tool_use("Skill", inp)]
+    return step
+
+
+def rewritten(ctx: dict) -> dict:
+    """One run that loads each of ``ctx["loads"]`` (``[install name, args or None]``) in a
+    project whose skills hold argument placeholders and ``${CLAUDE_*}`` variables, which the
+    real CLI fills in before the model reads them."""
+    s = col.Session("claude-agent-sdk", distributions=DISTRIBUTIONS, claude_agent_sdk=True)
+
+    def run(r: col.Run) -> None:
+        got = query([load_skill(name, args) for name, args in ctx["loads"]])
+        for text in got["received"]:
+            r.saw(text)
+
+    s.run(run)
+    return s.result()
+
+
 # ── the live check (``test_native_live.py``): the real CLI and a REAL Claude model ──────
 
 #: The budget Claude model the live check runs, overridable by ``LIVE_LLM_ANTHROPIC_MODEL``.

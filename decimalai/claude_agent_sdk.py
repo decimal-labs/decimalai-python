@@ -54,9 +54,20 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 from uuid import UUID, uuid4
 
+from . import _claude_skill_render as _render
 from ._native import Load, NativeLoads, record
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
@@ -360,7 +371,9 @@ class _RunState:
         # The skills Claude Code itself listed and delivered on this run.
         self.native = NativeLoads()
         # (skill, args) of each `Skill` call, newest last: the delivered body that
-        # follows names neither, so it is matched back to its call by folder name.
+        # follows names neither, so it is matched back to its call by folder name. A call
+        # without args has "" (the CLI fills the body with ""); None means args that were
+        # not a string.
         self.skill_calls: List[Tuple[Optional[str], Optional[str]]] = []
 
 
@@ -411,12 +424,17 @@ def _ingest_system(state: _RunState, message: Any) -> None:
 #
 #     Base directory for this skill: <abs folder>
 #
-#     <the SKILL.md body, frontmatter removed>
+#     <the SKILL.md body, frontmatter removed, as the CLI rewrote it>
 #
-# with "\n\nARGUMENTS: <args>" appended when the call passed args. A repeat call in
-# one session either delivers the body again after a "(Re-invocation ...)" note or
-# says "already loaded above" and delivers nothing. A slash command in the prompt
-# is expanded before the stream starts, so it never shows up here.
+# The CLI rewrites every body it delivers: it fills `$ARGUMENTS`, `$0`, `$1`, ... with the
+# call's args (the empty string when there are none), appends "\n\nARGUMENTS: <args>"
+# when no placeholder took them, and fills `${CLAUDE_SKILL_DIR}` and its other variables;
+# `decimalai._claude_skill_render` has the rules. A body that quotes a "$12" fee is a
+# different body once a long args fills `$12`, so its hash names no version, and the
+# version is found by redoing the rewrite on the locked body (`_renders`). A repeat call
+# in one session either delivers the body again after a "(Re-invocation ...)" note or
+# says "already loaded above" and delivers nothing. A slash command in the prompt is
+# expanded before the stream starts, so it never shows up here.
 
 #: The line the CLI puts before every skill body it hands the model.
 _SKILL_HEADER = "Base directory for this skill:"
@@ -444,8 +462,10 @@ def _block_text(block: Any) -> Optional[str]:
     return text if isinstance(text, str) else None
 
 
-def _skill_call_for(state: _RunState, folder: str) -> Tuple[Optional[str], Optional[str]]:
-    """``(skill, args)`` of the newest `Skill` call for ``folder``, consumed.
+def _skill_call_for(state: _RunState,
+                    folder: str) -> Optional[Tuple[Optional[str], Optional[str]]]:
+    """``(skill, args)`` of the newest `Skill` call for ``folder``, consumed; None when
+    this stream showed no such call.
 
     Newest first: an earlier call that got "already loaded" delivered nothing and
     must not lend its args to a later delivery.
@@ -455,20 +475,78 @@ def _skill_call_for(state: _RunState, folder: str) -> Tuple[Optional[str], Optio
         if isinstance(skill, str) and skill.rsplit(":", 1)[-1] == folder:
             del state.skill_calls[i]
             return skill, args
-    return None, None
+    return None
 
 
-def _without_arguments(body: str, args: Optional[str]) -> str:
-    """The body as the skill holds it: the CLI appends the call's args after it."""
+#: The args the CLI appended to a body that took none of them, for a call not shown.
+_APPENDED = re.compile(r"\n\s*ARGUMENTS: ([^\n]*)\Z")
+
+
+def _without_arguments(body: str, args: Optional[str], shown: bool = True) -> str:
+    """The body as the skill holds it, when the CLI only appended the call's args after it
+    (a body with no placeholder). ``args`` None with ``shown``: args that were not a string."""
     trimmed = body.rstrip()
+    if not shown:
+        # No call to read the args from (a call this stream did not show).
+        match = _APPENDED.search(trimmed)
+        return trimmed[: match.start()] if match else body
     if args:
-        tail = f"ARGUMENTS: {args}".rstrip()
+        tail = _render.appended(args).rstrip()
         if trimmed.endswith(tail):
             return trimmed[: -len(tail)]
-        return body
-    # No call to read the args from (a call this stream did not show).
-    match = re.search(r"\n\s*ARGUMENTS: [^\n]*\Z", trimmed)
-    return trimmed[: match.start()] if match else body
+    return body
+
+
+def _plugin_root(state: _RunState, base_dir: str) -> Optional[str]:
+    """The path of the plugin the skill folder is in, as the init message lists it."""
+    best: Optional[str] = None
+    for plugin in state.init_data.get("plugins") or []:
+        path = plugin.get("path") if isinstance(plugin, dict) else None
+        if not (isinstance(path, str) and os.path.isabs(path)):
+            continue
+        root = path.rstrip("/\\") or path
+        if base_dir.startswith(root + os.sep) and (best is None or len(root) > len(best)):
+            best = root
+    return best
+
+
+def _project_dirs(state: _RunState) -> List[str]:
+    """``${CLAUDE_PROJECT_DIR}`` as the CLI fills it: its working directory with symlinks
+    resolved (measured), and as given in case it is not."""
+    cwd = state.init_data.get("cwd") or _opt(state.options, "cwd") or os.getcwd()
+    cwd = str(cwd)
+    real = os.path.realpath(cwd)
+    return [real] if real == cwd else [real, cwd]
+
+
+def _renders(state: _RunState, delivered: str, base_dir: str, args: Optional[str],
+             shown: bool) -> Optional[Callable[[str, Mapping[str, Any]], bool]]:
+    """Whether the CLI's rewrite of a stored body is ``delivered``: the check
+    ``decimalai._native`` runs on the locked body when no version has the delivered hash."""
+    from skillevaluation import skillfmt
+
+    if shown:
+        if args is None:
+            return None
+        options = [args]
+    else:
+        # A call this stream did not show: no args, or the ones the CLI appended.
+        match = _APPENDED.search(delivered.rstrip())
+        options = [""] + ([match.group(1)] if match else [])
+    want = skillfmt.body_sha256(delivered)
+
+    def renders(body: str, frontmatter: Mapping[str, Any]) -> bool:
+        names = _render.argument_names(frontmatter)
+        plugin_root, project_dirs = _plugin_root(state, base_dir), _project_dirs(state)
+        for each in options:
+            for out in _render.renderings(
+                    body, each, names=names, skill_dir=base_dir, plugin_root=plugin_root,
+                    project_dirs=project_dirs, session_id=state.session_id):
+                if skillfmt.body_sha256(out) == want:
+                    return True
+        return False
+
+    return renders
 
 
 def _note_skill_delivery(state: _RunState, text: str) -> None:
@@ -478,12 +556,15 @@ def _note_skill_delivery(state: _RunState, text: str) -> None:
         base_dir = first[len(_SKILL_HEADER):].strip()
         if not base_dir:
             return
-        name, args = _skill_call_for(state, os.path.basename(base_dir.rstrip("/\\")))
+        call = _skill_call_for(state, os.path.basename(base_dir.rstrip("/\\")))
+        name, args = call if call is not None else (None, None)
         from .skillpkg.identity import current_index
 
         record(
             Load(framework="claude-agent-sdk", name=name,
-                 body=_without_arguments(rest, args), path=base_dir),
+                 body=_without_arguments(rest, args, shown=call is not None),
+                 path=base_dir,
+                 renders=_renders(state, rest, base_dir, args, shown=call is not None)),
             loads=state.native,
             # The project the skill folder is in. The CLI may run elsewhere than this
             # process (`ClaudeAgentOptions(cwd=...)`), so the working directory is not it.
@@ -657,6 +738,7 @@ def _add_to_turn(
         name = str(tname) if tname else "tool"
         if name == _SKILL_TOOL and isinstance(tinput, dict):
             args = tinput.get("args")
+            args = "" if args is None else args
             state.skill_calls.append(
                 (tinput.get("skill"), args if isinstance(args, str) else None))
             del state.skill_calls[:-_SKILL_CALLS_KEPT]

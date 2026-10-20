@@ -1,0 +1,1926 @@
+{
+ "recorded": "2026-10-21",
+ "claude_agent_sdk": "0.2.166",
+ "claude_code": "2.1.299",
+ "how": "The bundled CLI against the local Messages stub (tests/native_loaders/stubs/anthropic_messages.py): a scripted model calls the Skill tool with each args, and the body the CLI hands back is recorded. words: what the CLI filled /bin/zsh, , ... with (as filled in, so a '!' that starts a word carries its backslash); the last 60 were recorded after the emulation was written, to measure it. renders: the body after the frontmatter, and what the CLI delivered after its header line, with the run's paths and session id replaced by <SKILL_DIR>, <PLUGIN_ROOT>, <PROJECT_DIR> and <SESSION_ID>; the project path held a space.",
+ "words": [
+  {
+   "args": "A customer wants a refund for $100 after 45 days.",
+   "words": [
+    "A",
+    "customer",
+    "wants",
+    "a",
+    "refund",
+    "for",
+    "$100",
+    "after",
+    "45",
+    "days."
+   ]
+  },
+  {
+   "args": "customer's order is late",
+   "words": [
+    "customer's order is late"
+   ]
+  },
+  {
+   "args": "the customer's and the agent's notes",
+   "words": [
+    "the",
+    "customers and the agents",
+    "notes"
+   ]
+  },
+  {
+   "args": "Is this refundable?",
+   "words": [
+    "Is",
+    "this",
+    "refundable?"
+   ]
+  },
+  {
+   "args": "Hello! How are you?",
+   "words": [
+    "Hello!",
+    "How",
+    "are",
+    "you?"
+   ]
+  },
+  {
+   "args": "order #12345 arrived damaged",
+   "words": [
+    "order"
+   ]
+  },
+  {
+   "args": "#12345",
+   "words": [
+    "#12345"
+   ]
+  },
+  {
+   "args": "refund $50 to customer",
+   "words": [
+    "refund",
+    "$50",
+    "to",
+    "customer"
+   ]
+  },
+  {
+   "args": "price is $12.99",
+   "words": [
+    "price",
+    "is",
+    "$12.99"
+   ]
+  },
+  {
+   "args": "$5",
+   "words": [
+    "$5"
+   ]
+  },
+  {
+   "args": "a $5 b",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "costs $ 5",
+   "words": [
+    "costs",
+    "5"
+   ]
+  },
+  {
+   "args": "for a refund after 45 days",
+   "words": [
+    "refund",
+    "after",
+    "45",
+    "days"
+   ]
+  },
+  {
+   "args": "if the customer asks",
+   "words": [
+    "the",
+    "customer",
+    "asks"
+   ]
+  },
+  {
+   "args": "do it now",
+   "words": [
+    "it",
+    "now"
+   ]
+  },
+  {
+   "args": "time to reply",
+   "words": [
+    "time",
+    "to",
+    "reply"
+   ]
+  },
+  {
+   "args": "export the report",
+   "words": [
+    "export"
+   ]
+  },
+  {
+   "args": "x=1 y z",
+   "words": [
+    "y",
+    "z"
+   ]
+  },
+  {
+   "args": "a b=c d",
+   "words": [
+    "a",
+    "b=c",
+    "d"
+   ]
+  },
+  {
+   "args": "(urgent) refund request",
+   "words": [
+    "urgent"
+   ]
+  },
+  {
+   "args": "refund (urgent)",
+   "words": [
+    "refund"
+   ]
+  },
+  {
+   "args": "use {curly} braces",
+   "words": [
+    "use",
+    "{curly}",
+    "braces"
+   ]
+  },
+  {
+   "args": "[draft] reply",
+   "words": [
+    "reply"
+   ]
+  },
+  {
+   "args": "reply [draft]",
+   "words": [
+    "reply",
+    "[draft]"
+   ]
+  },
+  {
+   "args": "~/docs path",
+   "words": [
+    "~/docs",
+    "path"
+   ]
+  },
+  {
+   "args": "home ~ dir",
+   "words": [
+    "home",
+    "~",
+    "dir"
+   ]
+  },
+  {
+   "args": "a*b c?d",
+   "words": [
+    "a*b",
+    "c?d"
+   ]
+  },
+  {
+   "args": "*",
+   "words": [
+    "*"
+   ]
+  },
+  {
+   "args": "say \"hello world\" please",
+   "words": [
+    "say",
+    "hello world",
+    "please"
+   ]
+  },
+  {
+   "args": "it's",
+   "words": [
+    "it's"
+   ]
+  },
+  {
+   "args": "don't do that",
+   "words": [
+    "don't do that"
+   ]
+  },
+  {
+   "args": "path/to/file.txt --flag -v",
+   "words": [
+    "path/to/file.txt",
+    "--flag",
+    "-v"
+   ]
+  },
+  {
+   "args": "email: user@example.com, phone: 555-1234",
+   "words": [
+    "email:",
+    "user@example.com,",
+    "phone:",
+    "555-1234"
+   ]
+  },
+  {
+   "args": "50% off; final sale",
+   "words": [
+    "50%",
+    "off"
+   ]
+  },
+  {
+   "args": "a & b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a && b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a | b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a > b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a < b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "line1\nline2 word",
+   "words": [
+    "line1"
+   ]
+  },
+  {
+   "args": "\nleading newline",
+   "words": [
+    "leading",
+    "newline"
+   ]
+  },
+  {
+   "args": "tab\tseparated",
+   "words": [
+    "tab",
+    "separated"
+   ]
+  },
+  {
+   "args": "back\\slash",
+   "words": [
+    "backslash"
+   ]
+  },
+  {
+   "args": "a\\ b c",
+   "words": [
+    "a b",
+    "c"
+   ]
+  },
+  {
+   "args": "café über naïve",
+   "words": [
+    "café",
+    "über",
+    "naïve"
+   ]
+  },
+  {
+   "args": "emoji 🎉 party",
+   "words": [
+    "emoji",
+    "🎉",
+    "party"
+   ]
+  },
+  {
+   "args": "!important note",
+   "words": [
+    "\\!important",
+    "note"
+   ]
+  },
+  {
+   "args": "! negated",
+   "words": [
+    "negated"
+   ]
+  },
+  {
+   "args": "wow!! great",
+   "words": [
+    "wow!!",
+    "great"
+   ]
+  },
+  {
+   "args": "`code` here",
+   "words": [
+    "code` here"
+   ]
+  },
+  {
+   "args": "run $(date) now",
+   "words": [
+    "run"
+   ]
+  },
+  {
+   "args": "${HOME} dir",
+   "words": [
+    "${HOME}",
+    "dir"
+   ]
+  },
+  {
+   "args": "a,b,c d",
+   "words": [
+    "a,b,c",
+    "d"
+   ]
+  },
+  {
+   "args": "{a,b} c",
+   "words": [
+    "{a,b}",
+    "c"
+   ]
+  },
+  {
+   "args": "--- dashes ---",
+   "words": [
+    "---",
+    "dashes",
+    "---"
+   ]
+  },
+  {
+   "args": "-n option",
+   "words": [
+    "-n",
+    "option"
+   ]
+  },
+  {
+   "args": "!",
+   "words": [
+    "\\!"
+   ]
+  },
+  {
+   "args": "say 'hi there' ok",
+   "words": [
+    "say",
+    "hi there",
+    "ok"
+   ]
+  },
+  {
+   "args": "\"unterminated",
+   "words": [
+    "\"unterminated"
+   ]
+  },
+  {
+   "args": "unterminated'",
+   "words": [
+    "unterminated'"
+   ]
+  },
+  {
+   "args": "Q: what's the policy? A: 30 days.",
+   "words": [
+    "Q:",
+    "what's the policy? A: 30 days."
+   ]
+  },
+  {
+   "args": "10:30 AM",
+   "words": [
+    "10:30",
+    "AM"
+   ]
+  },
+  {
+   "args": "#",
+   "words": [
+    "#"
+   ]
+  },
+  {
+   "args": "a #comment b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a#b c",
+   "words": [
+    "a#b",
+    "c"
+   ]
+  },
+  {
+   "args": "@user hi",
+   "words": [
+    "@user",
+    "hi"
+   ]
+  },
+  {
+   "args": "^caret",
+   "words": [
+    "^caret"
+   ]
+  },
+  {
+   "args": "=equals start",
+   "words": [
+    "=equals",
+    "start"
+   ]
+  },
+  {
+   "args": "a=b",
+   "words": [
+    "a=b"
+   ]
+  },
+  {
+   "args": "a == b",
+   "words": [
+    "a",
+    "==",
+    "b"
+   ]
+  },
+  {
+   "args": "case closed",
+   "words": [
+    "case",
+    "closed"
+   ]
+  },
+  {
+   "args": "then what",
+   "words": [
+    "what"
+   ]
+  },
+  {
+   "args": "while waiting",
+   "words": [
+    "waiting"
+   ]
+  },
+  {
+   "args": "function test",
+   "words": [
+    "function",
+    "test"
+   ]
+  },
+  {
+   "args": "select one",
+   "words": [
+    "select",
+    "one"
+   ]
+  },
+  {
+   "args": "until tomorrow",
+   "words": [
+    "tomorrow"
+   ]
+  },
+  {
+   "args": "in progress",
+   "words": [
+    "in",
+    "progress"
+   ]
+  },
+  {
+   "args": "done deal",
+   "words": [
+    "deal"
+   ]
+  },
+  {
+   "args": "local store",
+   "words": [
+    "local"
+   ]
+  },
+  {
+   "args": "declare war",
+   "words": [
+    "declare"
+   ]
+  },
+  {
+   "args": "unset value",
+   "words": [
+    "unset",
+    "value"
+   ]
+  },
+  {
+   "args": "readonly mode",
+   "words": [
+    "readonly"
+   ]
+  },
+  {
+   "args": "{ grouped }",
+   "words": [
+    "grouped",
+    "}"
+   ]
+  },
+  {
+   "args": "[[ test ]]",
+   "words": [
+    "[[",
+    "test",
+    "]]"
+   ]
+  },
+  {
+   "args": "$((1+2)) math",
+   "words": [
+    "$((1+2))",
+    "math"
+   ]
+  },
+  {
+   "args": "<(cmd) x",
+   "words": [
+    "<(cmd)",
+    "x"
+   ]
+  },
+  {
+   "args": "a\\\nb",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "trailing backslash\\",
+   "words": [
+    "trailing",
+    "backslash"
+   ]
+  },
+  {
+   "args": "multiple   spaces   here",
+   "words": [
+    "multiple",
+    "spaces",
+    "here"
+   ]
+  },
+  {
+   "args": "   ",
+   "words": []
+  },
+  {
+   "args": "He said \"it's fine\" ok",
+   "words": [
+    "He",
+    "said",
+    "it's fine",
+    "ok"
+   ]
+  },
+  {
+   "args": "\"a b\"c d",
+   "words": [
+    "a bc",
+    "d"
+   ]
+  },
+  {
+   "args": "x'y z'w q",
+   "words": [
+    "xy zw",
+    "q"
+   ]
+  },
+  {
+   "args": "1 2 3 4 5 6 7 8 9 10 11 12 13 14",
+   "words": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14"
+   ]
+  },
+  {
+   "args": "Refund policy for order 4521: customer says it's been 45 days, wants $89.99 back. What do we say?",
+   "words": [
+    "Refund",
+    "policy",
+    "for",
+    "order",
+    "4521:",
+    "customer",
+    "says",
+    "it's been 45 days, wants $89.99 back. What do we say?"
+   ]
+  },
+  {
+   "args": "Write a reply to a customer asking for a refund on a $12 item they bought 3 weeks ago",
+   "words": [
+    "Write",
+    "a",
+    "reply",
+    "to",
+    "a",
+    "customer",
+    "asking",
+    "for",
+    "a",
+    "refund",
+    "on",
+    "a",
+    "$12",
+    "item",
+    "they",
+    "bought",
+    "3",
+    "weeks",
+    "ago"
+   ]
+  },
+  {
+   "args": "summarize: the user (a premium member) wants to cancel",
+   "words": [
+    "summarize:",
+    "the",
+    "user",
+    "wants",
+    "to",
+    "cancel"
+   ]
+  },
+  {
+   "args": "translate to French",
+   "words": [
+    "translate",
+    "to",
+    "French"
+   ]
+  },
+  {
+   "args": "--format=json --verbose",
+   "words": [
+    "--format=json",
+    "--verbose"
+   ]
+  },
+  {
+   "args": "key=value",
+   "words": [
+    "key=value"
+   ]
+  },
+  {
+   "args": "a b\\",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "a 'b",
+   "words": [
+    "a",
+    "'b"
+   ]
+  },
+  {
+   "args": "a \"b",
+   "words": [
+    "a",
+    "\"b"
+   ]
+  },
+  {
+   "args": "a`b",
+   "words": [
+    "a`b"
+   ]
+  },
+  {
+   "args": "a (b c) d e",
+   "words": [
+    "a",
+    "d",
+    "e"
+   ]
+  },
+  {
+   "args": "x (y) z",
+   "words": [
+    "x",
+    "z"
+   ]
+  },
+  {
+   "args": "a > b c",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a >b c",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a 2>&1 b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a < b c",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "pay $5 now (or later) ok",
+   "words": [
+    "pay",
+    "now",
+    "ok"
+   ]
+  },
+  {
+   "args": "the 'quoted' word",
+   "words": [
+    "the",
+    "quoted",
+    "word"
+   ]
+  },
+  {
+   "args": "a ''",
+   "words": [
+    "a",
+    ""
+   ]
+  },
+  {
+   "args": "a \"\"",
+   "words": [
+    "a",
+    ""
+   ]
+  },
+  {
+   "args": "a \\'b c",
+   "words": [
+    "a",
+    "'b",
+    "c"
+   ]
+  },
+  {
+   "args": "a {b c}",
+   "words": [
+    "a",
+    "{b",
+    "c}"
+   ]
+  },
+  {
+   "args": "{",
+   "words": [
+    "{"
+   ]
+  },
+  {
+   "args": "a ( b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "a ) b",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "x &y",
+   "words": [
+    "x"
+   ]
+  },
+  {
+   "args": "a;b c",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "AT&T rocks",
+   "words": [
+    "AT"
+   ]
+  },
+  {
+   "args": "a$ b",
+   "words": [
+    "a$",
+    "b"
+   ]
+  },
+  {
+   "args": "a $. b",
+   "words": [
+    "a",
+    "$.",
+    "b"
+   ]
+  },
+  {
+   "args": "a $, b",
+   "words": [
+    "a",
+    "$,",
+    "b"
+   ]
+  },
+  {
+   "args": "a $% b",
+   "words": [
+    "a",
+    "$%",
+    "b"
+   ]
+  },
+  {
+   "args": "price $1,000 total",
+   "words": [
+    "price",
+    "$1,000",
+    "total"
+   ]
+  },
+  {
+   "args": "$100",
+   "words": [
+    "$100"
+   ]
+  },
+  {
+   "args": "$0",
+   "words": [
+    "$0"
+   ]
+  },
+  {
+   "args": "a $# b",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "a $? b",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "a $- b",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "if then x y",
+   "words": [
+    "x",
+    "y"
+   ]
+  },
+  {
+   "args": "for a in b c",
+   "words": [
+    "for",
+    "a",
+    "in",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "args": "for a; do b",
+   "words": [
+    "b"
+   ]
+  },
+  {
+   "args": "while x do y",
+   "words": [
+    "x",
+    "do",
+    "y"
+   ]
+  },
+  {
+   "args": "! ! x",
+   "words": [
+    "x"
+   ]
+  },
+  {
+   "args": "then",
+   "words": [
+    "then"
+   ]
+  },
+  {
+   "args": "do",
+   "words": [
+    "do"
+   ]
+  },
+  {
+   "args": "a\r b",
+   "words": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "args": "a b c",
+   "words": [
+    "a b",
+    "c"
+   ]
+  },
+  {
+   "args": "a b c",
+   "words": [
+    "a b",
+    "c"
+   ]
+  },
+  {
+   "args": "  lead space",
+   "words": [
+    "lead",
+    "space"
+   ]
+  },
+  {
+   "args": "trail space  ",
+   "words": [
+    "trail",
+    "space"
+   ]
+  },
+  {
+   "args": "x=1",
+   "words": [
+    "x=1"
+   ]
+  },
+  {
+   "args": "x=1 y=2 z w",
+   "words": [
+    "z",
+    "w"
+   ]
+  },
+  {
+   "args": "x=\"a b\" y",
+   "words": [
+    "y"
+   ]
+  },
+  {
+   "args": "A_B=c d",
+   "words": [
+    "d"
+   ]
+  },
+  {
+   "args": "1x=2 y",
+   "words": [
+    "1x=2",
+    "y"
+   ]
+  },
+  {
+   "args": "`code` here",
+   "words": [
+    "code` here"
+   ]
+  },
+  {
+   "args": "`a` b c",
+   "words": [
+    "a` b c"
+   ]
+  },
+  {
+   "args": "a `b` c",
+   "words": [
+    "a"
+   ]
+  },
+  {
+   "args": "x \\# y",
+   "words": [
+    "x",
+    "#",
+    "y"
+   ]
+  },
+  {
+   "args": "x '#' y",
+   "words": [
+    "x",
+    "#",
+    "y"
+   ]
+  },
+  {
+   "args": "#a b\nc d",
+   "words": [
+    "c",
+    "d"
+   ]
+  },
+  {
+   "args": "$(x) y",
+   "words": [
+    "$(x)",
+    "y"
+   ]
+  },
+  {
+   "args": "a$(b)c d",
+   "words": [
+    "a$(b)c",
+    "d"
+   ]
+  },
+  {
+   "args": "~user",
+   "words": [
+    "~user"
+   ]
+  },
+  {
+   "args": "-",
+   "words": [
+    "-"
+   ]
+  },
+  {
+   "args": "--",
+   "words": [
+    "--"
+   ]
+  },
+  {
+   "args": "...",
+   "words": [
+    "..."
+   ]
+  },
+  {
+   "args": "?",
+   "words": [
+    "?"
+   ]
+  },
+  {
+   "args": "a?",
+   "words": [
+    "a?"
+   ]
+  },
+  {
+   "args": "Isn't it great? Yes!",
+   "words": [
+    "Isn't it great? Yes!"
+   ]
+  },
+  {
+   "args": "We'll refund $45.50 by Friday.",
+   "words": [
+    "We'll refund $45.50 by Friday."
+   ]
+  },
+  {
+   "args": "Customer #4521 (VIP) wants a refund; order is 45 days old.",
+   "words": [
+    "Customer"
+   ]
+  },
+  {
+   "args": "Customer is asking why they were charged twice for order #88231",
+   "words": [
+    "Customer",
+    "is",
+    "asking",
+    "why",
+    "they",
+    "were",
+    "charged",
+    "twice",
+    "for",
+    "order"
+   ]
+  },
+  {
+   "args": "She's upset — the package arrived broken and she wants a replacement ASAP",
+   "words": [
+    "She's upset — the package arrived broken and she wants a replacement ASAP"
+   ]
+  },
+  {
+   "args": "Refund request: $249.99, purchased 2026-09-14, unopened",
+   "words": [
+    "Refund",
+    "request:",
+    "$249.99,",
+    "purchased",
+    "2026-09-14,",
+    "unopened"
+   ]
+  },
+  {
+   "args": "Can you draft a polite 'no' to a refund after 90 days?",
+   "words": [
+    "Can",
+    "you",
+    "draft",
+    "a",
+    "polite",
+    "no",
+    "to",
+    "a",
+    "refund",
+    "after",
+    "90",
+    "days?"
+   ]
+  },
+  {
+   "args": "Explain our return policy to a customer who bought a $35 sweater",
+   "words": [
+    "Explain",
+    "our",
+    "return",
+    "policy",
+    "to",
+    "a",
+    "customer",
+    "who",
+    "bought",
+    "a",
+    "$35",
+    "sweater"
+   ]
+  },
+  {
+   "args": "user says: \"I never received my order\"",
+   "words": [
+    "user",
+    "says:",
+    "I never received my order"
+   ]
+  },
+  {
+   "args": "Translate the reply into Spanish (formal tone)",
+   "words": [
+    "Translate",
+    "the",
+    "reply",
+    "into",
+    "Spanish"
+   ]
+  },
+  {
+   "args": "Escalate to tier 2 if the amount is over $500",
+   "words": [
+    "Escalate",
+    "to",
+    "tier",
+    "2",
+    "if",
+    "the",
+    "amount",
+    "is",
+    "over",
+    "$500"
+   ]
+  },
+  {
+   "args": "The customer's card was declined 3 times; what should I tell them?",
+   "words": [
+    "The",
+    "customer's card was declined 3 times; what should I tell them?"
+   ]
+  },
+  {
+   "args": "Write a short apology email for the delayed shipment",
+   "words": [
+    "Write",
+    "a",
+    "short",
+    "apology",
+    "email",
+    "for",
+    "the",
+    "delayed",
+    "shipment"
+   ]
+  },
+  {
+   "args": "order 77412 - wrong size - wants exchange",
+   "words": [
+    "order",
+    "77412",
+    "-",
+    "wrong",
+    "size",
+    "-",
+    "wants",
+    "exchange"
+   ]
+  },
+  {
+   "args": "Is a 15% restocking fee allowed for opened electronics?",
+   "words": [
+    "Is",
+    "a",
+    "15%",
+    "restocking",
+    "fee",
+    "allowed",
+    "for",
+    "opened",
+    "electronics?"
+   ]
+  },
+  {
+   "args": "Summarize this ticket: login fails with error code 403 on mobile",
+   "words": [
+    "Summarize",
+    "this",
+    "ticket:",
+    "login",
+    "fails",
+    "with",
+    "error",
+    "code",
+    "403",
+    "on",
+    "mobile"
+   ]
+  },
+  {
+   "args": "He wrote 'this is unacceptable!!!' — how do I de-escalate?",
+   "words": [
+    "He",
+    "wrote",
+    "this is unacceptable!!!",
+    "—",
+    "how",
+    "do",
+    "I",
+    "de-escalate?"
+   ]
+  },
+  {
+   "args": "Price-match request vs. Amazon at $19.99",
+   "words": [
+    "Price-match",
+    "request",
+    "vs.",
+    "Amazon",
+    "at",
+    "$19.99"
+   ]
+  },
+  {
+   "args": "Customer wants to cancel subscription & get prorated refund",
+   "words": [
+    "Customer",
+    "wants",
+    "to",
+    "cancel",
+    "subscription"
+   ]
+  },
+  {
+   "args": "Reply in <100 words",
+   "words": [
+    "Reply",
+    "in"
+   ]
+  },
+  {
+   "args": "Use the template for damaged items",
+   "words": [
+    "Use",
+    "the",
+    "template",
+    "for",
+    "damaged",
+    "items"
+   ]
+  },
+  {
+   "args": "What's the SLA for priority tickets?",
+   "words": [
+    "What's the SLA for priority tickets?"
+   ]
+  },
+  {
+   "args": "Do we ship to Canada and Mexico?",
+   "words": [
+    "Do",
+    "we",
+    "ship",
+    "to",
+    "Canada",
+    "and",
+    "Mexico?"
+   ]
+  },
+  {
+   "args": "If the item is final sale, decline politely",
+   "words": [
+    "If",
+    "the",
+    "item",
+    "is",
+    "final",
+    "sale,",
+    "decline",
+    "politely"
+   ]
+  },
+  {
+   "args": "for a customer in Germany, VAT included?",
+   "words": [
+    "customer",
+    "in",
+    "Germany,",
+    "VAT",
+    "included?"
+   ]
+  },
+  {
+   "args": "Agent notes: called twice, no answer; left voicemail",
+   "words": [
+    "Agent",
+    "notes:",
+    "called",
+    "twice,",
+    "no",
+    "answer"
+   ]
+  },
+  {
+   "args": "Respond to: \"Where is my refund?? It's been 2 weeks\"",
+   "words": [
+    "Respond",
+    "to:",
+    "Where is my refund?? It's been 2 weeks"
+   ]
+  },
+  {
+   "args": "Make it friendlier :)",
+   "words": [
+    "Make",
+    "it",
+    "friendlier",
+    ":"
+   ]
+  },
+  {
+   "args": "refund 50% of $80",
+   "words": [
+    "refund",
+    "50%",
+    "of",
+    "$80"
+   ]
+  },
+  {
+   "args": "Hi, I'd like to return item SKU-1192-B",
+   "words": [
+    "Hi,",
+    "I'd like to return item SKU-1192-B"
+   ]
+  },
+  {
+   "args": "tone=empathetic length=short",
+   "words": [
+    "tone=empathetic",
+    "length=short"
+   ]
+  },
+  {
+   "args": "customer=Jane Doe order=#5521",
+   "words": [
+    "Doe",
+    "order=#5521"
+   ]
+  },
+  {
+   "args": "~$40 credit as goodwill?",
+   "words": [
+    "~$40",
+    "credit",
+    "as",
+    "goodwill?"
+   ]
+  },
+  {
+   "args": "Q3 policy update (effective Oct 1) applies?",
+   "words": [
+    "Q3",
+    "policy",
+    "update",
+    "applies?"
+   ]
+  },
+  {
+   "args": "[URGENT] chargeback filed",
+   "words": [
+    "chargeback",
+    "filed"
+   ]
+  },
+  {
+   "args": "They said they're a 'gold member' — verify?",
+   "words": [
+    "They",
+    "said",
+    "theyre a gold",
+    "member' — verify?"
+   ]
+  },
+  {
+   "args": "Draft reply: thank them, confirm refund of $12 within 5-7 business days",
+   "words": [
+    "Draft",
+    "reply:",
+    "thank",
+    "them,",
+    "confirm",
+    "refund",
+    "of",
+    "$12",
+    "within",
+    "5-7",
+    "business",
+    "days"
+   ]
+  },
+  {
+   "args": "1) apologize 2) offer credit 3) close ticket",
+   "words": [
+    "1"
+   ]
+  },
+  {
+   "args": "Respond w/ steps to reset password",
+   "words": [
+    "Respond",
+    "w/",
+    "steps",
+    "to",
+    "reset",
+    "password"
+   ]
+  },
+  {
+   "args": "Customer used promo code SAVE20 but it didn't apply",
+   "words": [
+    "Customer",
+    "used",
+    "promo",
+    "code",
+    "SAVE20",
+    "but",
+    "it",
+    "didn't apply"
+   ]
+  },
+  {
+   "args": "warranty claim — bought 13 months ago, warranty is 12 months",
+   "words": [
+    "warranty",
+    "claim",
+    "—",
+    "bought",
+    "13",
+    "months",
+    "ago,",
+    "warranty",
+    "is",
+    "12",
+    "months"
+   ]
+  },
+  {
+   "args": "Write it as a bullet list",
+   "words": [
+    "Write",
+    "it",
+    "as",
+    "a",
+    "bullet",
+    "list"
+   ]
+  },
+  {
+   "args": "Shipping address is wrong; can we reroute?",
+   "words": [
+    "Shipping",
+    "address",
+    "is",
+    "wrong"
+   ]
+  },
+  {
+   "args": "Answer in French please!",
+   "words": [
+    "Answer",
+    "in",
+    "French",
+    "please!"
+   ]
+  },
+  {
+   "args": "is a partial refund ok if they keep the item",
+   "words": [
+    "is",
+    "a",
+    "partial",
+    "refund",
+    "ok",
+    "if",
+    "they",
+    "keep",
+    "the",
+    "item"
+   ]
+  },
+  {
+   "args": "Combine orders #1001 and #1002 into one shipment",
+   "words": [
+    "Combine",
+    "orders"
+   ]
+  },
+  {
+   "args": "Customer is a minor; parent wants refund",
+   "words": [
+    "Customer",
+    "is",
+    "a",
+    "minor"
+   ]
+  },
+  {
+   "args": "Policy for items over $1,000?",
+   "words": [
+    "Policy",
+    "for",
+    "items",
+    "over",
+    "$1,000?"
+   ]
+  },
+  {
+   "args": "Make sure to mention the 30-day window",
+   "words": [
+    "Make",
+    "sure",
+    "to",
+    "mention",
+    "the",
+    "30-day",
+    "window"
+   ]
+  },
+  {
+   "args": "Edge case: gift card purchases (non-refundable?)",
+   "words": [
+    "Edge",
+    "case:",
+    "gift",
+    "card",
+    "purchases"
+   ]
+  },
+  {
+   "args": "Reply to a 1-star review saying 'worst service ever'",
+   "words": [
+    "Reply",
+    "to",
+    "a",
+    "1-star",
+    "review",
+    "saying",
+    "worst service ever"
+   ]
+  },
+  {
+   "args": "Use 'we' not 'I'",
+   "words": [
+    "Use",
+    "we",
+    "not",
+    "I"
+   ]
+  },
+  {
+   "args": "cc: billing@example.com",
+   "words": [
+    "cc:",
+    "billing@example.com"
+   ]
+  },
+  {
+   "args": "Refund to original payment method, not store credit",
+   "words": [
+    "Refund",
+    "to",
+    "original",
+    "payment",
+    "method,",
+    "not",
+    "store",
+    "credit"
+   ]
+  },
+  {
+   "args": "Can I offer free shipping on the replacement?",
+   "words": [
+    "Can",
+    "I",
+    "offer",
+    "free",
+    "shipping",
+    "on",
+    "the",
+    "replacement?"
+   ]
+  },
+  {
+   "args": "Customer insists the item was 'never delivered' but tracking says delivered",
+   "words": [
+    "Customer",
+    "insists",
+    "the",
+    "item",
+    "was",
+    "never delivered",
+    "but",
+    "tracking",
+    "says",
+    "delivered"
+   ]
+  },
+  {
+   "args": "Lost package, $60 value, insured",
+   "words": [
+    "Lost",
+    "package,",
+    "$60",
+    "value,",
+    "insured"
+   ]
+  },
+  {
+   "args": "Calculate refund for 3 of 5 items at $14 each",
+   "words": [
+    "Calculate",
+    "refund",
+    "for",
+    "3",
+    "of",
+    "5",
+    "items",
+    "at",
+    "$14",
+    "each"
+   ]
+  },
+  {
+   "args": "Respond kindly; they're elderly and confused",
+   "words": [
+    "Respond",
+    "kindly"
+   ]
+  },
+  {
+   "args": "Explain why the discount doesn't stack",
+   "words": [
+    "Explain",
+    "why",
+    "the",
+    "discount",
+    "doesn't stack"
+   ]
+  },
+  {
+   "args": "Handle: 'I want to speak to a manager'",
+   "words": [
+    "Handle:",
+    "I want to speak to a manager"
+   ]
+  },
+  {
+   "args": "Late fee waiver request — first offense",
+   "words": [
+    "Late",
+    "fee",
+    "waiver",
+    "request",
+    "—",
+    "first",
+    "offense"
+   ]
+  },
+  {
+   "args": "$5 off coupon for the inconvenience",
+   "words": [
+    "$5",
+    "off",
+    "coupon",
+    "for",
+    "the",
+    "inconvenience"
+   ]
+  }
+ ],
+ "renders": [
+  {
+   "case": "full_args",
+   "frontmatter": "arguments: [city, date]\n",
+   "body": "Fee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: [$ARGUMENTS]. Prefix: $ARGUMENTS_X. Escaped: \\$1 \\$ARGUMENTS \\\\$0. Word: $1st $0_ok. Named: $city on $date ($cityx).\nDir: ${CLAUDE_SKILL_DIR} Root: ${CLAUDE_PLUGIN_ROOT} Project: ${CLAUDE_PROJECT_DIR} Session: ${CLAUDE_SESSION_ID} Config: ${user_config.x}\n",
+   "args": "Paris tomorrow 'two words' x y z w v u",
+   "delivered": "\nFee: $12. First: Paris, second: tomorrow, tenth: $9. Index: tomorrow / v.\nAll: [Paris tomorrow 'two words' x y z w v u]. Prefix: Paris tomorrow 'two words' x y z w v u_X. Escaped: $1 $ARGUMENTS \\\\Paris. Word: $1st $0_ok. Named: Paris on tomorrow ($cityx).\nDir: <SKILL_DIR> Root: <PLUGIN_ROOT> Project: <PROJECT_DIR> Session: <SESSION_ID> Config: ${user_config.x}\n"
+  },
+  {
+   "case": "full_absent",
+   "frontmatter": "arguments: [city, date]\n",
+   "body": "Fee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: [$ARGUMENTS]. Prefix: $ARGUMENTS_X. Escaped: \\$1 \\$ARGUMENTS \\\\$0. Word: $1st $0_ok. Named: $city on $date ($cityx).\nDir: ${CLAUDE_SKILL_DIR} Root: ${CLAUDE_PLUGIN_ROOT} Project: ${CLAUDE_PROJECT_DIR} Session: ${CLAUDE_SESSION_ID} Config: ${user_config.x}\n",
+   "args": null,
+   "delivered": "\nFee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: []. Prefix: _X. Escaped: $1 $ARGUMENTS \\\\$0. Word: $1st $0_ok. Named:  on  ($cityx).\nDir: <SKILL_DIR> Root: <PLUGIN_ROOT> Project: <PROJECT_DIR> Session: <SESSION_ID> Config: ${user_config.x}\n"
+  },
+  {
+   "case": "full_empty",
+   "frontmatter": "arguments: [city, date]\n",
+   "body": "Fee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: [$ARGUMENTS]. Prefix: $ARGUMENTS_X. Escaped: \\$1 \\$ARGUMENTS \\\\$0. Word: $1st $0_ok. Named: $city on $date ($cityx).\nDir: ${CLAUDE_SKILL_DIR} Root: ${CLAUDE_PLUGIN_ROOT} Project: ${CLAUDE_PROJECT_DIR} Session: ${CLAUDE_SESSION_ID} Config: ${user_config.x}\n",
+   "args": "",
+   "delivered": "\nFee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: []. Prefix: _X. Escaped: $1 $ARGUMENTS \\\\$0. Word: $1st $0_ok. Named:  on  ($cityx).\nDir: <SKILL_DIR> Root: <PLUGIN_ROOT> Project: <PROJECT_DIR> Session: <SESSION_ID> Config: ${user_config.x}\n"
+  },
+  {
+   "case": "full_string_names",
+   "frontmatter": "arguments: city date\n",
+   "body": "Fee: $12. First: $0, second: $1, tenth: $9. Index: $ARGUMENTS[1] / $ARGUMENTS[7].\nAll: [$ARGUMENTS]. Prefix: $ARGUMENTS_X. Escaped: \\$1 \\$ARGUMENTS \\\\$0. Word: $1st $0_ok. Named: $city on $date ($cityx).\nDir: ${CLAUDE_SKILL_DIR} Root: ${CLAUDE_PLUGIN_ROOT} Project: ${CLAUDE_PROJECT_DIR} Session: ${CLAUDE_SESSION_ID} Config: ${user_config.x}\n",
+   "args": "Rome today",
+   "delivered": "\nFee: $12. First: Rome, second: today, tenth: $9. Index: today / $ARGUMENTS[7].\nAll: [Rome today]. Prefix: Rome today_X. Escaped: $1 $ARGUMENTS \\\\Rome. Word: $1st $0_ok. Named: Rome on today ($cityx).\nDir: <SKILL_DIR> Root: <PLUGIN_ROOT> Project: <PROJECT_DIR> Session: <SESSION_ID> Config: ${user_config.x}\n"
+  },
+  {
+   "case": "plain_args",
+   "frontmatter": "",
+   "body": "Refunds within 30 days. Costs $ money.\n",
+   "args": "7 days",
+   "delivered": "\nRefunds within 30 days. Costs $ money.\n\n\nARGUMENTS: 7 days"
+  },
+  {
+   "case": "plain_bang_args",
+   "frontmatter": "",
+   "body": "Refunds within 30 days. Costs $ money.\n",
+   "args": "!urgent 7 days",
+   "delivered": "\nRefunds within 30 days. Costs $ money.\n\n\nARGUMENTS: \\!urgent 7 days"
+  },
+  {
+   "case": "plain_absent",
+   "frontmatter": "",
+   "body": "Refunds within 30 days. Costs $ money.\n",
+   "args": null,
+   "delivered": "\nRefunds within 30 days. Costs $ money.\n"
+  },
+  {
+   "case": "price_long_args",
+   "frontmatter": "",
+   "body": "# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n",
+   "args": "Write a reply to a customer asking for a refund on a $12 item a week after delivery",
+   "delivered": "\n# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n"
+  },
+  {
+   "case": "price_short_args",
+   "frontmatter": "",
+   "body": "# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n",
+   "args": "refund 45 days",
+   "delivered": "\n# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n\n\nARGUMENTS: refund 45 days"
+  },
+  {
+   "case": "price_absent",
+   "frontmatter": "",
+   "body": "# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n",
+   "args": null,
+   "delivered": "\n# Support reply format\n\nOpen with the customer's name. A late fee is $12; refunds over $100 need approval. Close with the ticket number.\n"
+  },
+  {
+   "case": "effort",
+   "frontmatter": "",
+   "body": "Think at ${CLAUDE_EFFORT} effort about $0.\n",
+   "args": "x",
+   "delivered": "\nThink at medium effort about x.\n"
+  },
+  {
+   "case": "crlf",
+   "frontmatter": "",
+   "body": "line one $0\r\nline two $ARGUMENTS\r\n",
+   "args": "a b",
+   "delivered": "\nline one a\r\nline two a b\r\n"
+  },
+  {
+   "case": "bang",
+   "frontmatter": "",
+   "body": "First: $0. All: $ARGUMENTS.\n",
+   "args": "!x y`!z` w",
+   "delivered": "\nFirst: \\!x. All: \\!x y` \\!z` w.\n"
+  }
+ ]
+}

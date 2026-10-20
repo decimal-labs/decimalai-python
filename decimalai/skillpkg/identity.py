@@ -159,6 +159,9 @@ class ManagedIndex:
         self._by_id = _unique((s.skill_id, s) for s in self._skills)
         # install name -> (SKILL.md stat, body hash): the body as it is on disk now.
         self._observed: Dict[str, Tuple[Tuple[int, ...], Optional[str]]] = {}
+        # install name -> (SKILL.md stat, (body, frontmatter) while it is the locked body).
+        self._texts: Dict[str, Tuple[Tuple[int, ...],
+                                     Optional[Tuple[str, Dict[str, Any]]]]] = {}
         self._observed_lock = threading.Lock()
 
     @classmethod
@@ -250,6 +253,32 @@ class ManagedIndex:
             self._observed[skill.install_name] = (key, digest)
         return digest
 
+    def locked_text(self, skill: ManagedSkill) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """``(body, frontmatter)`` of the skill's ``SKILL.md`` as it is on disk now, when its
+        body is still the locked version's; None when it is not (a local edit, a newer
+        version), or there is no regular ``SKILL.md`` to read.
+
+        For a loader that rewrites a body before delivering it: the locked text is what it
+        rewrote. A frontmatter that does not parse reads as empty. Read again only when the
+        file's size or times change.
+        """
+        path = os.path.join(skill.path, "SKILL.md")
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_SKILL_MD:
+            return None
+        key = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        with self._observed_lock:
+            cached = self._texts.get(skill.install_name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        text = _locked_text_of(path, skill.body_sha256)
+        with self._observed_lock:
+            self._texts[skill.install_name] = (key, text)
+        return text
+
     # ── container ────────────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[ManagedSkill]:
@@ -305,6 +334,27 @@ def _body_sha256_of(path: str) -> Optional[str]:
     text = raw.decode("utf-8", errors="replace")
     parts = skillfmt.split_frontmatter(text)
     return skillfmt.body_sha256(parts[1] if parts is not None else text)
+
+
+def _locked_text_of(path: str, locked_sha256: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """``(body, frontmatter)`` of a SKILL.md whose body hashes to ``locked_sha256``."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_MAX_SKILL_MD + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_SKILL_MD:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    parts = skillfmt.split_frontmatter(text)
+    body = parts[1] if parts is not None else text
+    if skillfmt.body_sha256(body) != locked_sha256:
+        return None
+    try:
+        frontmatter, _ = skillfmt.parse_skill_md_text(text)
+    except Exception:  # noqa: BLE001 - no frontmatter, or one that does not parse
+        frontmatter = {}
+    return body, frontmatter
 
 
 # ── the working directory's index, cached ────────────────────────────────────

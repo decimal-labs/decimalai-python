@@ -170,6 +170,103 @@ class TestResolve:
         assert not [f for f in opened if f.endswith("SKILL.md")]
 
 
+TEMPLATE = "# Refunds\n\nA late fee is $12. The customer asked: $ARGUMENTS.\n"
+ASKED = "refund my late fee"
+
+
+def _filling(args: str, delivered: str, calls: Optional[List[Any]] = None):
+    """A loader's rewrite (``$ARGUMENTS`` -> ``args``) as a ``Load.renders`` check."""
+    def renders(body: str, frontmatter: Any) -> bool:
+        if calls is not None:
+            calls.append((body, frontmatter))
+        return (skillfmt.body_sha256(body.replace("$ARGUMENTS", args))
+                == skillfmt.body_sha256(delivered))
+    return renders
+
+
+class TestRendered:
+    """Step 4: a loader that rewrites a body before delivering it (Claude Code fills in
+    ``$ARGUMENTS``) delivers bytes no version hashes to; the locked version is named when
+    its rewrite is the delivered body, and never from a body that does not match."""
+
+    def _installed(self, tmp_path, on_disk: str = TEMPLATE, locked: str = TEMPLATE,
+                   frontmatter: str = "") -> ManagedIndex:
+        folder = tmp_path / ".agents" / "skills" / "acme-refund-policy"
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(
+            f"---\nname: acme-refund-policy\ndescription: Refunds.\n{frontmatter}---\n\n"
+            + on_disk)
+        skill = ManagedSkill(install_name="acme-refund-policy",
+                             registry_name="acme/refund-policy", skill_id=SKILL_ID,
+                             version_id=V1, body_sha256=skillfmt.body_sha256(locked),
+                             path=str(folder))
+        return ManagedIndex([skill], plugin_name="decimalai-skills", directory=str(tmp_path))
+
+    def test_a_rewritten_body_names_the_locked_version(self, tmp_path):
+        delivered = TEMPLATE.replace("$ARGUMENTS", ASKED)
+        got = resolve(Load(name="decimalai-skills:acme-refund-policy", body=delivered,
+                           renders=_filling(ASKED, delivered)),
+                      index=self._installed(tmp_path))
+        # The version's own hash, not the rewritten body's: that is the version delivered.
+        assert got == Activation("acme/refund-policy", SKILL_ID, V1,
+                                 skillfmt.body_sha256(TEMPLATE), _native.BY_RENDER)
+
+    def test_a_rewrite_that_is_not_the_delivered_body_names_no_version(self, tmp_path):
+        delivered = TEMPLATE.replace("$ARGUMENTS", "something else")
+        got = resolve(Load(name="acme-refund-policy", body=delivered,
+                           renders=_filling(ASKED, delivered.replace("else", "other"))),
+                      index=self._installed(tmp_path))
+        assert got == Activation("acme/refund-policy", SKILL_ID, None,
+                                 skillfmt.body_sha256(delivered), UNVERIFIED)
+
+    def test_a_folder_that_is_not_the_locked_version_is_no_template(self, tmp_path):
+        # Edited after install (or already the next version): its rewrite proves nothing
+        # about the locked version, so it is never tried.
+        edited = TEMPLATE.replace("late fee", "rebooking fee")
+        delivered = edited.replace("$ARGUMENTS", ASKED)
+        calls: List[Any] = []
+        got = resolve(Load(name="acme-refund-policy", body=delivered,
+                           renders=_filling(ASKED, delivered, calls)),
+                      index=self._installed(tmp_path, on_disk=edited))
+        assert (got.version_id, got.how, calls) == (None, UNVERIFIED, [])
+
+    def test_the_rewrite_gets_the_frontmatter(self, tmp_path):
+        calls: List[Any] = []
+        resolve(Load(name="acme-refund-policy", body="no match",
+                     renders=_filling(ASKED, "x", calls)),
+                index=self._installed(tmp_path, frontmatter="arguments: [city]\n"))
+        ((body, frontmatter),) = calls
+        assert skillfmt.body_sha256(body) == skillfmt.body_sha256(TEMPLATE)
+        assert frontmatter["arguments"] == ["city"]
+
+    def test_a_rewrite_that_raises_names_no_version(self, tmp_path):
+        def broken(body: str, frontmatter: Any) -> bool:
+            raise RuntimeError("boom")
+
+        got = resolve(Load(name="acme-refund-policy", body="delivered", renders=broken),
+                      index=self._installed(tmp_path))
+        assert (got.version_id, got.how) == (None, UNVERIFIED)
+
+    def test_a_body_a_version_hashes_to_is_never_rewritten(self, tmp_path, monkeypatch):
+        calls: List[Any] = []
+        opened: List[str] = []
+        real_open = open
+        index = self._installed(tmp_path)
+        monkeypatch.setattr("builtins.open",
+                            lambda f, *a, **k: opened.append(str(f)) or real_open(f, *a, **k))
+        got = resolve(Load(name="acme-refund-policy", body=TEMPLATE,
+                           renders=_filling(ASKED, TEMPLATE, calls)), index=index)
+        assert (got.version_id, got.how) == (V1, BY_LOCK)
+        assert calls == [] and not [f for f in opened if f.endswith("SKILL.md")]
+
+    def test_an_unknown_skill_is_never_rewritten(self, tmp_path):
+        calls: List[Any] = []
+        got = resolve(Load(name="someone-elses-skill", body="x",
+                           renders=_filling(ASKED, "x", calls)),
+                      index=self._installed(tmp_path))
+        assert (got.how, calls) == (UNMANAGED, [])
+
+
 class TestEntry:
     def test_only_the_keys_that_have_a_value(self):
         assert Activation("a", None, None, None, UNMANAGED).entry() == {"name": "a"}
