@@ -464,7 +464,7 @@ are (driver, shape) pairs, like the delivery axis's (driver, mode): a driver
 with no second shape has no cell rather than an N/A.
 
 Today's shapes: `adk:app_runner` (`InMemoryRunner(app=App(...))` as `adk web`
-builds it, then `Runner(app=App(..., plugins=[DecimalaiPlugin(...)]))`, both
+builds it, then `Runner(app=App(..., plugins=[DecimalAIPlugin(...)]))`, both
 after the global install), `openai-agents:sandbox_agent`,
 `openai-agents:init_flag_then_load_agent` and `anthropic:messages_stream`.
 
@@ -540,7 +540,7 @@ Five clauses, in the order a user meets them:
 4. **The agent's stored prompt reached the model.** The scaffold deliberately
    never copies the prompt text into the file, so the sentinel can only be there
    because the generated file read it at run time. A file that drops its
-   `load_agent()` call still runs, still traces and still delivers skills — and
+   `agent_config()` call still runs, still traces and still delivers skills — and
    fails only here.
 5. **The skill's body sentinel reached the model.** A menu row cannot contain it,
    which is what tells "the skill was offered" from "the skill was readable".

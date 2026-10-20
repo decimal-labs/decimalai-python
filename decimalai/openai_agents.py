@@ -4,16 +4,16 @@ An agent's prompt and skills from DecimalAI, attached explicitly — nothing in 
 Agents SDK is patched, and no other agent in the process is affected::
 
     from agents import Agent, Runner
-    from decimalai.openai_agents import load_agent
+    from decimalai.openai_agents import agent_config
 
-    support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+    support = agent_config("support", fallback=BASE_INSTRUCTIONS)
     agent = Agent(
         name=support.name,
         instructions=support.instructions,      # saved prompt + skill list, every run
         tools=[lookup_order, *support.tools],   # + load_skill
     )
 
-Tracing every run (what ``load_agent`` also registers, and all ``init(openai_agents=True)`` does)::
+Tracing every run (what ``agent_config`` also registers, and all ``init(openai_agents=True)`` does)::
 
     import decimalai
     decimalai.init()
@@ -29,7 +29,7 @@ Custom path (exclusive — replaces default OpenAI tracing)::
 Native skills: the sandbox's own ``Skills`` capability loads the skills
 ``decimalai skills add`` installed (:func:`sandbox_skills`). Each ``load_skill``
 becomes an activation naming the version of the copy the model can read, and the
-SkillRouter adds no menu or tool of its own to that agent::
+SkillRouter adds no skill list or tool of its own to that agent::
 
     from decimalai.openai_agents import sandbox_skills
     SandboxAgent(..., capabilities=[Shell(), sandbox_skills()], default_manifest=Manifest())
@@ -46,7 +46,7 @@ import time
 import weakref
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from ._agent_binding import AgentBinding, attach_prompt_records
@@ -274,7 +274,7 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 # model was shown; the server's own echo is preferred when the
                 # Responses API returns one. See `_attach_system_prompts`.
                 "system_prompts": [],
-                # Agent `name=` -> the prompt record `load_agent()` made for
+                # Agent `name=` -> the prompt record `agent_config()` made for
                 # that agent on this run (version, variables, source).
                 "decimal_prompts": {},
             }
@@ -371,7 +371,7 @@ def _wait_for_pending_routing(run_key: Optional[str]) -> None:
 
 
 def _run_decimal_agent(run_key: Optional[str], agent_name: Optional[str]) -> Optional[str]:
-    """The DecimalAI agent whose `load_agent()` config served ``agent_name`` on this run."""
+    """The DecimalAI agent whose agent config served ``agent_name`` on this run."""
     if not run_key or not agent_name:
         return None
     with _run_rails_lock:
@@ -476,7 +476,7 @@ def _drain_router_delivered_versions(scope: Optional[str]) -> List[Dict[str, str
     return versions
 
 
-# ── The SkillRouter behind load_agent() ──────────────────────
+# ── The SkillRouter behind agent_config() ──────────────────────
 
 _skill_router_singleton: Any = None
 
@@ -502,7 +502,7 @@ def _get_skill_router() -> Any:
             # Every routing call names its agent; no router default (see
             # `skill_router._AGENT_FROM_INIT`).
             agent_name=None,
-            # load_agent() gives every agent a load_skill tool; bodies are never
+            # agent_config() gives every agent a load_skill tool; bodies are never
             # pasted into the prompt.
             inject_body=False,
         )
@@ -680,7 +680,7 @@ def _handle_load_skill(name: str, *, agent_name: Optional[str] = None) -> str:
 
 _SKILL_TOOL_AGENT_ATTR = "__decimalai_skill_agent_name__"
 
-#: The name of `load_agent()`'s tool.
+#: The name of `agent_config()`'s tool.
 _TOOL_NAME = "load_skill"
 #: Every name this adapter's own tool can have. An SDK affordance, not part of
 #: the agent's declared contract, so the manifest never lists it.
@@ -841,7 +841,7 @@ def _warn_two_catalogs(agent_name: Optional[str]) -> None:
     _two_catalogs_warned = True
     logger.warning(
         "DecimalAI: a run of %r loaded a skill with the sandbox Skills capability and also "
-        "carried DecimalAI's routed skill menu, so two skill catalogs reached the model. "
+        "carried DecimalAI's routed skill list, so two skill catalogs reached the model. "
         "The capability was out of the adapter's sight when it injected (for instance on "
         "another agent of the run); give the skills to one of the two.",
         agent_name or "<unnamed>",
@@ -1022,8 +1022,8 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
         if tools_list:
             result["tools"] = tools_list
 
-    # Extract instructions as prompt. A `load_agent()` config's instructions is
-    # its bound method; declare the saved prompt TEMPLATE (placeholders unfilled),
+    # Extract instructions as prompt. An agent config's instructions is
+    # its bound method; declare the saved prompt TEMPLATE (variables unfilled),
     # which is what the dashboard versions.
     instructions = getattr(agent, "instructions", None)
     if callable(instructions):
@@ -1052,7 +1052,7 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
 
 
 #: The ONE `DecimalTracingProcessor` this process registers, shared by every
-#: `instrument()` and `load_agent()` call. Two on the provider would send each
+#: `instrument()` and `agent_config()` call. Two on the provider would send each
 #: run twice, and only the copy that ended first would carry the routing id and
 #: the loads (it pops the run's rail): double the trace volume, and per-skill
 #: rates computed over a population half of which could never show an activation.
@@ -1097,7 +1097,7 @@ def _register_processor(
     A repeat call reconfigures the existing processor rather than adding a
     second: its skills registry becomes this call's (the same registry a single
     call would have produced), and the process's DecimalAI agent name changes
-    only when this call names one — `instrument()` or `load_agent()` after
+    only when this call names one — `instrument()` or `agent_config()` after
     `init(agent_name="support", openai_agents=True)` keeps "support". With no
     name from this call or an earlier one, it is the agent `decimalai.init()`
     named (or DECIMAL_AGENT_NAME). ``agent_binding`` is ``(Agent name,
@@ -1143,7 +1143,7 @@ def instrument(
 
     After calling it, every ``Runner.run()`` / ``Runner.run_sync()`` call is
     traced and sent to DecimalAI. Tracing only: it changes no Agents SDK class
-    and gives no agent a prompt or skills. For those, use :func:`load_agent`.
+    and gives no agent a prompt or skills. For those, use :func:`agent_config`.
 
     Args:
         agent_name: The DecimalAI agent traces are filed under, over the Agent's
@@ -1152,7 +1152,7 @@ def instrument(
             alone, it is every Agent's, and so is the agent ``decimalai.init()``
             named (or ``DECIMAL_AGENT_NAME``) when no call names one; a later
             call that names none keeps it. A run of an agent built from
-            :func:`load_agent` is always filed under that config's name. With no
+            :func:`agent_config` is always filed under that config's name. With no
             DecimalAI name at all, a trace is named by its root Agent's ``name=``.
         agent: Optional ``agents.Agent`` instance. If provided, DecimalAI
             will introspect it for full tool schemas, instructions, model,
@@ -1170,7 +1170,7 @@ def instrument(
             for them to be read: ``disk_sync`` then defaults to on.
         disk_sync: Read the project's ``SKILL.md`` files and sync the ones you
             wrote to the platform. Off by default, because an OpenAI agent's
-            skills come from DecimalAI through :func:`load_agent`; on with
+            skills come from DecimalAI through :func:`agent_config`; on with
             ``skill_dirs``, or with ``init(skill_authority="harness")``.
 
     Safe to call more than once. There is only ever one DecimalAI processor,
@@ -1208,7 +1208,7 @@ def instrument(
             "pip install \"decimalai[openai-agents]\""
         )
 
-    # An OpenAI agent's skills come from DecimalAI's router, through load_agent(),
+    # An OpenAI agent's skills come from DecimalAI's router, through agent_config(),
     # so "auto" is router authority: local SKILL.md files are read only when asked
     # (disk_sync=True, skill_dirs=, or the harness authority). An explicit
     # disk_sync=... always wins.
@@ -1325,18 +1325,18 @@ def instrument(
     )
 
 
-# ── load_agent(): an agent's DecimalAI prompt and skills, attached by you ───
+# ── agent_config(): an agent's DecimalAI prompt and skills, attached by you ───
 #
 # The supported way to give an OpenAI Agents SDK agent its DecimalAI prompt and
 # skills. Nothing in the OpenAI SDK is patched: the developer puts the two pieces
 # into their own Agent(...), using features OpenAI documents —
 #
-#     support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+#     support = agent_config("support", fallback=BASE_INSTRUCTIONS)
 #     agent = Agent(name=support.name, instructions=support.instructions,
 #                   tools=[lookup_order, *support.tools])
 #
 # `support.instructions` is a dynamic-instructions function (OpenAI calls it
-# before each model request): the agent's saved prompt with any {{placeholders}}
+# before each model request): the agent's saved prompt with any {{variables}}
 # filled from `Runner.run(context=...)`, then the agent's skill list.
 #
 # Every run is routed on the customer's message. When the agent's whole menu fits
@@ -1359,7 +1359,7 @@ def _require_agents_sdk() -> None:
         import agents  # noqa: F401
     except ImportError:
         raise ImportError(
-            "load_agent() needs the OpenAI Agents SDK: "
+            "agent_config() needs the OpenAI Agents SDK: "
             "pip install \"decimalai[openai-agents]\""
         ) from None
 
@@ -1380,7 +1380,7 @@ def _ensure_tracing() -> None:
         from agents.tracing import add_trace_processor, set_trace_processors
     except ImportError:
         raise ImportError(
-            "load_agent() needs the OpenAI Agents SDK: "
+            "agent_config() needs the OpenAI Agents SDK: "
             "pip install \"decimalai[openai-agents]\""
         ) from None
     if _tracing_processor is not None and _processor_is_registered(_tracing_processor):
@@ -1395,16 +1395,16 @@ def _ensure_tracing() -> None:
 class OpenAIAgentConfig(AgentBinding):
     """One agent's prompt and skills in DecimalAI, for an OpenAI Agents SDK ``Agent``.
 
-    Made by :func:`load_agent`. Put its pieces into your own agent::
+    Made by :func:`agent_config`. Put its pieces into your own agent::
 
-        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        support = agent_config("support", fallback=BASE_INSTRUCTIONS)
         agent = Agent(name=support.name, instructions=support.instructions,
                       tools=[lookup_order, *support.tools])
 
     Attributes:
         name: The agent's canonical DecimalAI name.
         instructions: Pass as ``Agent(instructions=...)``. OpenAI calls it before
-            each model request; it returns the agent's prompt (placeholders
+            each model request; it returns the agent's prompt (variables
             filled from ``Runner.run(context=...)``), then its skill list.
         tools: The tools DecimalAI adds — today one, ``load_skill``.
         load_skill: That tool.
@@ -1502,7 +1502,7 @@ class OpenAIAgentConfig(AgentBinding):
             from agents import FunctionTool
         except ImportError:
             raise ImportError(
-                "load_agent() needs the OpenAI Agents SDK: "
+                "agent_config() needs the OpenAI Agents SDK: "
                 "pip install \"decimalai[openai-agents]\""
             ) from None
         from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
@@ -1544,7 +1544,7 @@ class OpenAIAgentConfig(AgentBinding):
         if not any(t is self.load_skill for t in tools):
             # A list that tells the model to call a tool it does not have: the
             # Agents SDK ends the run with "tool not found" when it tries.
-            return (f"its tools do not include load_agent({self.name!r}).tools, so it gets "
+            return (f"its tools do not include agent_config({self.name!r}).tools, so it gets "
                     "its prompt without the skill list. Add *support.tools to "
                     "Agent(tools=[...]) to give it its skills.")
         return None
@@ -1562,14 +1562,14 @@ class OpenAIAgentConfig(AgentBinding):
         if isinstance(getattr(agent, "instructions", None), str):
             self._warn_once(agent, (
                 "load_skill is on this agent, but its instructions are a fixed string, not "
-                f"load_agent({self.name!r}).instructions, so the model gets no skill list."
+                f"agent_config({self.name!r}).instructions, so the model gets no skill list."
             ))
         state = await self._prepare_run(context, agent, _current_run_key())
         return bool(state["names"]) and state["tool"]
 
 
 
-def load_agent(
+def agent_config(
     agent_name: str,
     *,
     fallback: Optional[str] = None,
@@ -1580,9 +1580,9 @@ def load_agent(
     ::
 
         from agents import Agent, Runner
-        from decimalai.openai_agents import load_agent
+        from decimalai.openai_agents import agent_config
 
-        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        support = agent_config("support", fallback=BASE_INSTRUCTIONS)
         agent = Agent(
             name=support.name,
             instructions=support.instructions,
@@ -1593,9 +1593,9 @@ def load_agent(
     Reads the agent's saved prompt here (so a misspelled name fails now) and
     keeps a local copy, re-read in the background at most once a minute. The
     skill list is routed on each run's message: an agent whose skills all fit
-    the menu shows a local copy and records each run's decision in the
+    the list shows a local copy and records each run's decision in the
     background, so no run waits; an agent with more skills than fit is routed
-    before each model call (about one HTTP round trip), so the menu is picked for
+    before each model call (about one HTTP round trip), so the list is picked for
     that message. The first run always routes. Nothing in the OpenAI SDK is
     patched and no other agent in the process is affected. Initializes the SDK
     from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
@@ -1630,6 +1630,15 @@ def load_agent(
     config = OpenAIAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
     _ensure_tracing()
     return config
+
+
+def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
+    """Renamed in decimalai 0.21: :func:`agent_config`."""
+    raise TypeError(
+        "decimalai.openai_agents.load_agent() was renamed agent_config() in decimalai 0.21; "
+        "it takes the same arguments and returns the same config: "
+        "from decimalai.openai_agents import agent_config"
+    )
 
 
 def _declare(
@@ -1895,7 +1904,7 @@ class _TraceAccumulator:
     def live_agent(self) -> Any:
         """The `agents.Agent` object this run is executing, if we saw it.
 
-        Recorded by a `load_agent()` config's instructions, which the runner
+        Recorded by an agent config's instructions, which the runner
         calls on every turn — including turns that go on to fail. It is the
         only source of the agent's declared model and tool schemas for runs
         whose spans carry neither.
@@ -1923,7 +1932,7 @@ class DecimalTracingProcessor:
     def __init__(self, agent_name: Optional[str] = None, skills_registry: Optional[List[Dict[str, Any]]] = None):
         # The process's DecimalAI name: `instrument(agent_name=...)` without
         # `agent=`, else the one init() named. When set it names every trace
-        # no `load_agent()` config served, over the root Agent's own `name=`.
+        # no agent config served, over the root Agent's own `name=`.
         self.default_agent_name = agent_name
         # Agent `name=` -> DecimalAI name, from `instrument(agent=a,
         # agent_name=...)`: a name given WITH an Agent is that Agent's, ahead of
@@ -1946,7 +1955,7 @@ class DecimalTracingProcessor:
         return own or self.default_agent_name
 
     def _agent_name(self, acc: _TraceAccumulator) -> Optional[str]:
-        """The agent this trace is filed under: the `load_agent()` config that
+        """The agent this trace is filed under: the agent config that
         served the root Agent on this run, else the root Agent's DecimalAI name,
         else its ``name=`` (the root agent span's), else the fallback.
 
@@ -2666,7 +2675,7 @@ class DecimalTracingProcessor:
             )
 
         # The run's routing decision and what it offered, off its rail: written
-        # by `load_agent()`'s instructions, which the runner calls AFTER
+        # by `agent_config()`'s instructions, which the runner calls AFTER
         # on_trace_start, in a Task of its own. Merged with any direct
         # `log_skill_offered` calls already on the accumulator.
         if acc.routing_id is None:
@@ -2891,7 +2900,7 @@ class DecimalTracingProcessor:
 
         Three sources, in descending order of authority:
 
-        1. The live ``Agent`` object, recorded by a `load_agent()` config's
+        1. The live ``Agent`` object, recorded by an agent config's
            instructions. It carries the declared model and full tool schemas
            even when the run produced no successful model call.
         2. Span data — model from the response/generation span, tool names

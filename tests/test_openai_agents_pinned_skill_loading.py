@@ -1,6 +1,6 @@
 """A skill load must fetch the loading agent's saved skill version.
 
-These tests use `load_agent()` tools, a real SkillRouter and real local HTTP.
+These tests use `agent_config()` tools, a real SkillRouter and real local HTTP.
 Two agents share one router and concurrently load the same skill at different
 pins. No provider or remote backend is contacted.
 """
@@ -114,7 +114,7 @@ async def invoke(config, *, scope, name=NAME):
 def test_concurrent_loads_fetch_each_agents_own_pin(scoped, body_server):
     router, requests, concurrent = body_server
     oa._skill_router_singleton = router
-    pinned, other = oa.load_agent("pinned-agent"), oa.load_agent("other-agent")
+    pinned, other = oa.agent_config("pinned-agent"), oa.agent_config("other-agent")
     concurrent.set()
 
     async def run():
@@ -135,7 +135,7 @@ def test_concurrent_loads_fetch_each_agents_own_pin(scoped, body_server):
 def test_parallel_distinct_skills_in_one_run_keep_every_body_witness(scoped, body_server, monkeypatch):
     router, requests, concurrent = body_server
     oa._skill_router_singleton = router
-    config = oa.load_agent("pinned-agent")
+    config = oa.agent_config("pinned-agent")
     concurrent.set()
     both_loaded = threading.Barrier(2)
     consume_versions = router.consume_delivered_versions
@@ -171,7 +171,7 @@ def test_a_handoff_in_one_run_uses_each_agents_menu_and_keeps_both_pins(scoped, 
     list, each load fetches its own agent's pin, and the run keeps both."""
     router, requests, _ = body_server
     oa._skill_router_singleton = router
-    configs = [oa.load_agent("pinned-agent"), oa.load_agent("other-agent")]
+    configs = [oa.agent_config("pinned-agent"), oa.agent_config("other-agent")]
     scope = "handoff-run"
 
     async def run():

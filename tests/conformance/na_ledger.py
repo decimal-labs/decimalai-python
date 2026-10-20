@@ -52,7 +52,7 @@ DECLARED_NA: Dict[str, str] = {
     # the correction that came out of the 2026-08-28 defect.
     "langchain:C13b": "model_can_load_skill_bodies",
     "anthropic:C13b": "model_can_load_skill_bodies",
-    # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.load_agent()`
+    # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.agent_config()`
     # gives the agent a real load_skill tool, so C13b is graded on its pulls.
     # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
     # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
@@ -129,7 +129,7 @@ DECLARED_NA: Dict[str, str] = {
 # Raised 30 -> 36 on 2026-10-14 by two new ITEMS, C18 and C19, which grade
 # routing and are N/A on exactly the three drivers that have no rail (the same
 # three, by the same flag, as C8). C17 added none: every driver has tools.
-# Lowered 36 -> 35 on 2026-10-20: ADK's C13b is graded, now that load_agent()
+# Lowered 36 -> 35 on 2026-10-20: ADK's C13b is graded, now that agent_config()
 # gives the model a load_skill tool to pull a body with.
 NA_BUDGET = 35
 
@@ -164,7 +164,7 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
 # on that same evidence: the driver asks for the tool loop in the tool_loaded
 # cell, and the N/A holds only while the adapter refuses on the run and no body
 # arrives by a tool. A load_skill tool on the Agent would retire this line.
-# Lowered 4 -> 3 on 2026-10-20: ADK's line retired. `decimalai.adk.load_agent()`
+# Lowered 4 -> 3 on 2026-10-20: ADK's line retired. `decimalai.adk.agent_config()`
 # gives the agent a load_skill tool, so its tool_loaded cell delivers and is graded.
 DELIVERY_NA_BUDGET = 3
 

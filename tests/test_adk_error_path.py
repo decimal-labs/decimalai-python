@@ -120,9 +120,9 @@ def _flushed_traces():
 
 class TestAdkErrorPathFinalization:
     def test_success_sends_one_trace_and_late_run_error_does_not_resend(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
 
-        plugin = DecimalaiPlugin(agent_name="test-agent")
+        plugin = DecimalAIPlugin(agent_name="test-agent")
         agent = _make_agent()
         ic = _invocation_context(agent)
 
@@ -143,9 +143,9 @@ class TestAdkErrorPathFinalization:
         assert len(_flushed_traces()) == 1
 
     def test_escaped_model_error_sends_one_error_trace(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
 
-        plugin = DecimalaiPlugin(agent_name="test-agent")
+        plugin = DecimalAIPlugin(agent_name="test-agent")
         agent = _make_agent()
         ic = _invocation_context(agent)
         err = RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
@@ -176,9 +176,9 @@ class TestAdkErrorPathFinalization:
         assert trace.llm_calls[0].finish_reason == FinishReason.ERROR
 
     def test_run_error_before_any_model_call_sends_error_trace(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
 
-        plugin = DecimalaiPlugin(agent_name="test-agent")
+        plugin = DecimalAIPlugin(agent_name="test-agent")
         agent = _make_agent()
         ic = _invocation_context(agent)
 
@@ -195,9 +195,9 @@ class TestAdkErrorPathFinalization:
         assert traces[0].error_message == "setup hook failed"
 
     def test_run_error_for_unknown_invocation_is_a_noop(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
 
-        plugin = DecimalaiPlugin(agent_name="test-agent")
+        plugin = DecimalAIPlugin(agent_name="test-agent")
         ic = _invocation_context(_make_agent(), inv_id="never-started")
 
         asyncio.run(

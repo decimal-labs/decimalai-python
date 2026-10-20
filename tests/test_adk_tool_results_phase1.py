@@ -127,7 +127,7 @@ def _run(steps: List[Step], tools: List[Any], *, plugins_before: List[Any] = (),
 
     agent = LlmAgent(name="shop", model=_scripted_model(steps),
                      instruction="You are a shop assistant.", tools=tools)
-    plugin = adk.DecimalaiPlugin(agent_name="shop", on_trace=on_trace)
+    plugin = adk.DecimalAIPlugin(agent_name="shop", on_trace=on_trace)
     runner = InMemoryRunner(agent=agent, app_name="tool-results",
                             plugins=[*plugins_before, plugin, *plugins_after])
 

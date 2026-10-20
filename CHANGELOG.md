@@ -6,6 +6,51 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed (breaking): `load_agent()` is now `agent_config()`, and each message is a `Run`
+
+The function never loaded an agent: you build your own, and it returns DecimalAI's half of
+it. The names below are the ones the Anthropic and LangChain releases will use too.
+
+- **`load_agent()` is `agent_config()`** in `decimalai`, `decimalai.openai_agents`,
+  `decimalai.pydantic_ai` and `decimalai.adk`, with the same arguments and the same result.
+  `load_agent` still imports; calling it raises `TypeError` naming `agent_config()`.
+- **`decimalai.adk.DecimalaiPlugin` is `DecimalAIPlugin`**; the old name raises `TypeError`
+  naming the new one.
+- **The neutral config starts a run per user message.** `support.run(message, variables=...)`
+  returns a `Run` (`decimalai.Run`) with `system`, `tool_spec` and `load_skill(name)`. They
+  replace `support.system(message, context=...)`, `support.tool_spec` and
+  `support.load_skill()`, which now raise `AttributeError` saying where they went. A run serves
+  its own `load_skill` calls from any thread or task; before, a load was served against the
+  latest `system()` of the thread or task that called it.
+- **`variables=`** is the parameter for the prompt's `{{name}}` values, and a
+  `MissingPromptVariable` says so. The framework modules keep their framework's own source:
+  `Runner.run(context=...)`, Pydantic AI's `deps`, ADK's session state.
+- **`prompt_source`** (and the `decimal.prompt.source` trace attribute) says what happened:
+  `"decimalai"`, `"decimalai (cached copy)"`, `"fallback (unreachable)"` and
+  `"fallback (none saved)"`, which were `"decimal"`, `"decimal (cached copy)"`, `"fallback"`
+  and `"code"`.
+- `decimalai init --framework openai-agents`, `pydantic-ai` and `adk` write the new names.
+
+Migration:
+
+```python
+# before
+from decimalai.openai_agents import load_agent
+from decimalai.adk import DecimalaiPlugin, load_agent
+support = decimalai.load_agent("support", fallback=BASE)
+system = support.system(question, context=customer)
+tools = [*my_tools, support.tool_spec]
+text = support.load_skill(name)
+
+# after
+from decimalai.openai_agents import agent_config
+from decimalai.adk import DecimalAIPlugin, agent_config
+support = decimalai.agent_config("support", fallback=BASE)
+run = support.run(question, variables=customer)
+system, tools = run.system, [*my_tools, run.tool_spec]
+text = run.load_skill(name)
+```
+
 ### Fixed
 
 - **Claude Agent SDK: one LLM call per model request.** The Claude Code CLI streams one API

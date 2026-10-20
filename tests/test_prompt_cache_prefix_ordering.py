@@ -367,7 +367,7 @@ class TestAnthropicOrdering:
 
 @pytest.fixture
 def openai_agents_config(monkeypatch):
-    """`load_agent()` configs for one saved prompt, on a router that routes per
+    """Agent configs for one saved prompt, on a router that routes per
     message: the menu of an agent with more skills than fit, so every run's
     menu is picked for its own message and differs between two queries."""
     pytest.importorskip("agents")
@@ -402,7 +402,7 @@ def _openai_instructions(config, query: str) -> str:
 
 
 class TestOpenAIAgentsOrdering:
-    """`load_agent(...).instructions` — decimalai/openai_agents.py."""
+    """`agent_config(...).instructions` — decimalai/openai_agents.py."""
 
     def test_instructions_prefix_is_byte_identical_across_queries(self, openai_agents_config):
         make, router = openai_agents_config

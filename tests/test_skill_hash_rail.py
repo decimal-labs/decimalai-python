@@ -451,7 +451,7 @@ class TestOtelRailCarriesTheVersion:
 
 class TestLoadAgentPassesTheHashes:
     def test_the_load_forwards_what_it_drained(self, monkeypatch):
-        """Every OpenTelemetry-rail load_agent() (decimalai's, Pydantic AI's)
+        """Every OpenTelemetry-rail agent_config() (decimalai's, Pydantic AI's)
         drains names and hashes from the same scope in one breath and hands both
         to the otel rail."""
         from decimalai._agent import _serve_and_record

@@ -7,7 +7,7 @@ agent run), with ``decimalai.pydantic_ai_harness.skills(project)`` in a
 use only what the harness told it (the ``Skill directory`` line of a loaded skill).
 
 ``column`` is the native column's scenario (``column.py`` describes the shape).
-``checks`` gives each agent ``decimalai.pydantic_ai.load_agent()``'s capability, with a
+``checks`` gives each agent ``decimalai.pydantic_ai.agent_config()``'s capability, with a
 skill to route, and returns what each model request was shown.
 """
 
@@ -149,7 +149,7 @@ def column(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """``load_agent()``'s capability on each Agent, with a skill to route: one with the
+    """``agent_config()``'s capability on each Agent, with a skill to route: one with the
     harness's Skills (made by the pointer helper), one with a plain ``Skills``, one without."""
     import logging
     import warnings
@@ -193,8 +193,8 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
         out[label] = {"instructions": script.instructions[0] if script.instructions else "",
                       "tools": script.tools[0] if script.tools else []}
 
-    harness = decimalai.pydantic_ai.load_agent("harness-agent")
-    plain = decimalai.pydantic_ai.load_agent("plain-agent")
+    harness = decimalai.pydantic_ai.agent_config("harness-agent")
+    plain = decimalai.pydantic_ai.agent_config("plain-agent")
     one("observed", lambda script: _agent(script, project, extra=(harness,)))
     one("plain_skills", lambda script: _agent(script, project, observed=False, extra=(harness,)))
     one("no_skills", lambda script: Agent(FunctionModel(script, model_name="scripted-harness"),

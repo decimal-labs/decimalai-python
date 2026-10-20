@@ -1,4 +1,4 @@
-"""`decimalai.openai_agents.load_agent`: an agent's prompt and skills, attached explicitly.
+"""`decimalai.openai_agents.agent_config`: an agent's prompt and skills, attached explicitly.
 
 Real OpenAI Agents SDK runner and the real SkillRouter; DecimalAI's HTTP answers
 and the model are scripted. Nothing here may change an Agents SDK class.
@@ -228,7 +228,7 @@ LOOKUP = ("call", "lookup_order", {"order_id": "ORD-1002"})
 
 
 def test_one_run_gets_prompt_skill_list_tool_and_a_full_record(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel([LOAD, LOOKUP, "answer"])
     Runner.run_sync(build(support, model), QUESTION)
 
@@ -250,12 +250,12 @@ def test_one_run_gets_prompt_skill_list_tool_and_a_full_record(decimal):
     assert any(v["name"] == "damaged-item" and v["hash"] == digest for v in trace.skills_delivered_versions)
     span = next(s for s in trace.spans if s.name == "support" and s.attributes.get("decimal.prompt.version"))
     assert span.attributes["decimal.prompt.version"] == 2
-    assert span.attributes["decimal.prompt.source"] == "decimal"
+    assert span.attributes["decimal.prompt.source"] == "decimalai"
     assert span.attributes["decimal.prompt.content_hash"] == "c" * 64
 
 
 def test_each_later_run_records_its_own_routing_decision(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     for _ in range(3):
         Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     traces = sent(decimal)
@@ -264,7 +264,7 @@ def test_each_later_run_records_its_own_routing_decision(decimal):
 
 
 def test_a_decision_offering_a_different_list_is_not_stamped(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     decimal.skills = ["order-support"]  # unassigned between the run's read and its decision
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
@@ -292,7 +292,7 @@ class OrderContext:
 def test_template_is_filled_from_the_run_context_and_only_names_are_recorded(decimal):
     decimal.prompt = {"system_prompt": "Help customers of {{store}}.\n\n## Customer\n- {{customer.name}} ({{customer.tier}})",
                       "version_number": 4, "content_hash": "d" * 64}
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     assert support.variables == ["customer.name", "customer.tier", "store"]
     model = ScriptedModel(["answer"])
     Runner.run_sync(build(support, model), "Hi", context=OrderContext("Demo Store", Customer("Ana", "gold")))
@@ -305,7 +305,7 @@ def test_template_is_filled_from_the_run_context_and_only_names_are_recorded(dec
 
 def test_a_missing_template_value_stops_the_run_before_any_model_call(decimal):
     decimal.prompt = {"system_prompt": "Help customers of {{store}}.", "version_number": 4, "content_hash": "d" * 64}
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel(["answer"])
     with pytest.raises(oa.MissingPromptVariable, match="store"):
         Runner.run_sync(build(support, model), "Hi", context={"other": 1})
@@ -314,23 +314,23 @@ def test_a_missing_template_value_stops_the_run_before_any_model_call(decimal):
 
 def test_no_saved_prompt_uses_the_fallback_and_says_so(decimal):
     decimal.prompt = {"system_prompt": None, "version_number": None, "content_hash": None}
-    support = oa.load_agent("support", fallback=BASE)
+    support = oa.agent_config("support", fallback=BASE)
     model = ScriptedModel(["answer"])
     Runner.run_sync(build(support, model), "Hi")
     assert model.instructions[0].startswith(BASE)
     [trace] = sent(decimal)
     span = next(s for s in trace.spans if s.attributes.get("decimal.prompt.source"))
-    assert span.attributes["decimal.prompt.source"] == "code"
+    assert span.attributes["decimal.prompt.source"] == "fallback (none saved)"
 
 
 def test_an_unknown_agent_fails_at_load_agent(decimal):
     with pytest.raises(AgentNotFoundError):
-        oa.load_agent("missing-agent", fallback=BASE)
+        oa.agent_config("missing-agent", fallback=BASE)
 
 
 def test_skills_unavailable_continue_or_fail(decimal):
     decimal.menu_down = True
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel(["answer"])
     Runner.run_sync(build(support, model), QUESTION)
     assert model.instructions[0] == BASE
@@ -339,13 +339,13 @@ def test_skills_unavailable_continue_or_fail(decimal):
     span = next(s for s in trace.spans if s.attributes.get("decimal.prompt.source"))
     assert "did not return" in span.attributes["decimal.skills.unavailable"]
 
-    strict = oa.load_agent("support", on_unavailable="fail")
+    strict = oa.agent_config("support", on_unavailable="fail")
     with pytest.raises(RuntimeError, match="unavailable"):
         Runner.run_sync(build(strict, ScriptedModel(["answer"])), QUESTION)
 
 
 def test_a_skill_loaded_twice_in_one_run_is_sent_once(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel([LOAD, LOAD, "answer"])
     Runner.run_sync(build(support, model), QUESTION)
     assert len(decimal.body_calls()) == 1
@@ -353,7 +353,7 @@ def test_a_skill_loaded_twice_in_one_run_is_sent_once(decimal):
 
 
 def test_stop_on_first_tool_agents_get_no_loader_and_a_warning(decimal, caplog):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel([LOOKUP])
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         result = Runner.run_sync(build(support, model, tool_use_behavior="stop_on_first_tool"), QUESTION)
@@ -363,7 +363,7 @@ def test_stop_on_first_tool_agents_get_no_loader_and_a_warning(decimal, caplog):
 
 
 def test_the_tool_without_the_instructions_warns(decimal, caplog):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     agent = Agent(name="support", instructions=BASE, tools=[lookup_order, *support.tools],
                   model=ScriptedModel(["answer"]))
     with caplog.at_level(logging.WARNING, logger="decimalai"):
@@ -375,7 +375,7 @@ def test_the_instructions_without_the_tool_get_the_prompt_alone_and_a_warning(de
     """The likeliest slip in the pull shape: ``*support.tools`` left out. A
     skill list would tell the model to call a tool it does not have, and the
     Agents SDK ends the run with "tool not found" when it tries."""
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel(["answer", "answer"])
     agent = Agent(name="support", instructions=support.instructions, tools=[lookup_order], model=model)
     with caplog.at_level(logging.WARNING, logger="decimalai"):
@@ -387,7 +387,7 @@ def test_the_instructions_without_the_tool_get_the_prompt_alone_and_a_warning(de
 
 
 def test_an_agent_with_another_name_is_filed_under_the_decimal_name(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     agent = Agent(name="Assistant", instructions=support.instructions, tools=[*support.tools],
                   model=ScriptedModel(["answer"]))
     Runner.run_sync(agent, "Hi")
@@ -398,7 +398,7 @@ def test_nothing_in_the_sdk_changes_and_other_agents_are_untouched(decimal):
     from agents.run_internal import turn_resolution
 
     tools = [lookup_order]
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     agent = Agent(name="support", instructions=support.instructions, tools=[*tools, *support.tools],
                   model=ScriptedModel(["answer"]))
     Runner.run_sync(agent, "Hi")
@@ -433,7 +433,7 @@ class WaitingModel(ScriptedModel):
 
 def test_the_background_decision_reaches_its_own_run_from_a_worker_thread(decimal, monkeypatch):
     monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     Runner.run_sync(build(support, WaitingModel(decimal, 2)), "Hi")
     binding._config_pool.shutdown(wait=True)
@@ -444,7 +444,7 @@ def test_a_run_faster_than_its_routing_request_still_ships_its_routing_id(decima
     import threading
 
     monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     release = threading.Event()
     answer = decimal.request
 
@@ -463,7 +463,7 @@ def test_a_run_faster_than_its_routing_request_still_ships_its_routing_id(decima
 
 def test_a_shut_down_worker_pool_never_fails_a_run(decimal, monkeypatch):
     monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     for _ in range(2):  # the second run is the first with background work
         Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     binding._config_pool.shutdown(wait=True)  # e.g. torn down at interpreter exit
@@ -473,7 +473,7 @@ def test_a_shut_down_worker_pool_never_fails_a_run(decimal, monkeypatch):
 
 
 def test_every_run_is_routed_on_its_own_message(decimal):
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     messages = ["Where is ORD-1001?", "My keyboard from ORD-1002 arrived cracked.", "Thanks!"]
     for message in messages:
         Runner.run_sync(build(support, ScriptedModel(["answer"])), message)
@@ -488,7 +488,7 @@ def test_a_catalog_bigger_than_the_menu_is_routed_before_each_model_call(decimal
     or (over its caps) a `smart_routing` answer, which carries no such field."""
     decimal.truncated = True
     decimal.smart_routing = answer == "smart_routing"
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     cracked, where = ScriptedModel(["answer"]), ScriptedModel(["answer"])
     Runner.run_sync(build(support, cracked), "My keyboard arrived cracked.")
     Runner.run_sync(build(support, where), "Where is my order?")
@@ -504,7 +504,7 @@ def test_a_catalog_bigger_than_the_menu_is_routed_before_each_model_call(decimal
 def test_without_turn_input_skills_keep_a_fixed_order_and_it_says_so_once(decimal, caplog):
     from types import SimpleNamespace
 
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     agent = build(support, ScriptedModel(["answer"]))
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         assert support._message(SimpleNamespace(context=None), agent) is None
@@ -532,7 +532,7 @@ def test_with_the_tool_switched_off_each_run_gets_its_skills_text_in_the_instruc
     leaves pasted text as the channel: every run is routed on its own message
     and the picked skill's text follows the list. Delivered, never "loaded"."""
     configure(monkeypatch, load_skill_tool=False)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel(["answer", "answer"])
     Runner.run_sync(build(support, model), QUESTION)
     Runner.run_sync(build(support, model), "Where is ORD-1003?")
@@ -551,7 +551,7 @@ def test_with_the_tool_switched_off_each_run_gets_its_skills_text_in_the_instruc
 
 def test_with_the_tool_and_pasting_both_off_skills_are_off_and_it_says_so(decimal, monkeypatch, caplog):
     configure(monkeypatch, load_skill_tool=False, inject_skill_body=False)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel(["answer"])
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         Runner.run_sync(build(support, model), QUESTION)
@@ -565,7 +565,7 @@ def test_text_pasted_into_the_instructions_is_not_sent_again_by_the_tool(decimal
     """Both channels on, by asking for both: the tool answers for a skill whose
     text is already in the instructions without fetching it again."""
     configure(monkeypatch, inject_skill_body=True)
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     model = ScriptedModel([LOAD, "answer"])
     Runner.run_sync(build(support, model), QUESTION)
     assert BODIES["damaged-item"] in model.instructions[0]

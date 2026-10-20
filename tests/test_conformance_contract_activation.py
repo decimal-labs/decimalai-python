@@ -525,7 +525,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
     the narrower and permanent fact this set records. `crewai` joined on
     2026-10-08 the same way, on the commit that shipped its rail (a
     before_llm_call hook): graded on C8/C13/C14, and no load_skill tool.
-    `adk` left with 0.20, when `load_agent()` gave it a load_skill tool.
+    `adk` left with 0.20, when `agent_config()` gave it a load_skill tool.
     """
     from tests.conformance.drivers import all_drivers
 

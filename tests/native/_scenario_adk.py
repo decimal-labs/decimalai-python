@@ -1,14 +1,14 @@
 """google-adk native mode, child side: ADK's own ``SkillToolset`` over
-``decimalai.adk.skills()``, a scripted ``BaseLlm``, and ``decimalai.adk.DecimalaiPlugin``
+``decimalai.adk.skills()``, a scripted ``BaseLlm``, and ``decimalai.adk.DecimalAIPlugin``
 in the ``App``, pointed at a probe. Runs in a child process (``_runner.run_scenario``)
 with the project as its working directory. Observes only; the assertions are the
 parent's.
 
 * :func:`column`: the native conformance column's scenario (see ``column.py``).
-* :func:`native`: the same two runs with ``decimalai.adk.load_agent()``'s instruction
+* :func:`native`: the same two runs with ``decimalai.adk.agent_config()``'s instruction
   and tools on the toolset agent too, plus what ``test_adk_native.py`` grades beyond
-  the column: the system instruction of every model call (does ``load_agent()`` stay
-  out of the agent with a toolset?), a control agent with ``load_agent()``'s pieces
+  the column: the system instruction of every model call (does ``agent_config()`` stay
+  out of the agent with a toolset?), a control agent with ``agent_config()``'s pieces
   and no toolset (does it list skills at all?), and the ``decimalai.adk`` log lines.
 * :func:`live`: the live native check's trials (``tests/native/live.py``): the same
   toolset with a real OpenAI model through ``LiteLlm``.
@@ -59,7 +59,7 @@ def _watch() -> _Logs:
 
 
 def _agent(name: str, *, toolset: bool, support: Any = None):
-    """An LlmAgent: ADK's SkillToolset when ``toolset``, and ``load_agent()``'s
+    """An LlmAgent: ADK's SkillToolset when ``toolset``, and ``agent_config()``'s
     instruction and load_skill when a ``support`` config is given."""
     from google.adk.agents import LlmAgent
     from google.adk.code_executors.unsafe_local_code_executor import (
@@ -87,7 +87,7 @@ def _runner(agent, app_name: str):
     import decimalai.adk
 
     return InMemoryRunner(app=App(name=app_name.replace("-", "_"), root_agent=agent,
-                                  plugins=[decimalai.adk.DecimalaiPlugin()]))
+                                  plugins=[decimalai.adk.DecimalAIPlugin()]))
 
 
 def _invoke(agent, steps, run: Run, calls: List[Dict[str, Any]]) -> None:
@@ -162,8 +162,8 @@ def native(ctx: Dict[str, Any]) -> Dict[str, Any]:
     for name in ("support", "plain"):
         s.probe.register_agent(name)
     calls: List[Dict[str, Any]] = []
-    _two_runs(s, calls, support=decimalai.adk.load_agent("support"))
-    plain = decimalai.adk.load_agent("plain")
+    _two_runs(s, calls, support=decimalai.adk.agent_config("support"))
+    plain = decimalai.adk.agent_config("plain")
 
     def control(run: Run) -> None:
         from tests.native_loaders.stubs.adk_llm import answer

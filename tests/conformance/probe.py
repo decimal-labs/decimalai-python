@@ -647,7 +647,7 @@ class Probe:
         if method == "GET" and m:
             # No `If-None-Match` / 304 arm, and the omission is deliberate
             # rather than a shortcut: the handler does not receive headers, and
-            # neither caller in this journey sends one — `load_agent()` never
+            # neither caller in this journey sends one — `agent_config()` never
             # does (a cache is what would break the no-redeploy property it is
             # sold on) and `init` does not either. Modelling a conditional
             # nobody sends would be untested probe code standing between the
@@ -932,7 +932,7 @@ class Probe:
     def _agent_prompt(
         self, agent_name: str, query: Dict[str, List[str]]
     ) -> Tuple[int, Any, List[str]]:
-        """`GET /api/v1/agents/{name}/prompt` — the route `load_agent()` reads.
+        """`GET /api/v1/agents/{name}/prompt` — the route `agent_config()` reads.
 
         Shape copied from the backend's `_GET_PROMPT_EXAMPLE`. The one field
         that must be present even when there is no prompt is `system_prompt`

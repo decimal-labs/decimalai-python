@@ -189,7 +189,7 @@ def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(mo
 
 
 def test_load_agent_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
-    """The load every OpenTelemetry-rail load_agent() shares (decimalai's and
+    """The load every OpenTelemetry-rail agent_config() shares (decimalai's and
     Pydantic AI's): two runs at once each record their own body's version."""
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry.sdk.trace import TracerProvider
@@ -261,7 +261,7 @@ def test_real_langchain_calls_keep_exact_witnesses_for_same_name_concurrently(mo
     assert_versions(sent(sdk), parents, observed=observed, loaded=loaded)
 
 
-# Since 0.18 a body reaches an OpenAI agent only through load_skill: load_agent()
+# Since 0.18 a body reaches an OpenAI agent only through load_skill: agent_config()
 # never puts one in the instructions, so there is no "prompt" case to prove here.
 @pytest.mark.parametrize("loaded", [True], ids=["tool"])
 def test_openai_copied_callback_uses_its_run_witness_not_shared_current_hash(monkeypatch, sdk, loaded):

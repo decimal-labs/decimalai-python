@@ -15,7 +15,7 @@ the real code path — the real imports, the real `instrument()`, the real
 
 A subprocess and not an in-process exec, because `instrument()` is a
 process-wide install: it monkey-patches `BaseChatModel.invoke` (langchain) and
-registers a global trace processor (every framework, `load_agent()` on
+registers a global trace processor (every framework, `agent_config()` on
 openai-agents included). Running that inside pytest would leak those into every
 test that came after it.
 
@@ -43,7 +43,7 @@ AGENT = "refund-bot"
 SKILLS = [{"skill_name": "refund-policy", "description": "When a refund is allowed",
            "scope": "agent"}]
 
-# The agent's own system prompt, which `decimalai.load_agent()` reads at run
+# The agent's own system prompt, which `decimalai.agent_config()` reads at run
 # time. Every framework below is run TWICE: once with this, and once with the
 # prompt unset — the state an agent created without one is in, where the file
 # must still run and must not invent instructions.
@@ -102,12 +102,12 @@ _stack.enter_context(patch.object(MultiProvider, "get_model", lambda self, name:
 """,
         "probe": """
 # What the model was handed, call by call. The Agent's instructions are
-# load_agent()'s function, resolved by the real runner, so the first call's
+# agent_config()'s function, resolved by the real runner, so the first call's
 # system_instructions is the agent's prompt followed by its skill list.
 _first = _sent[0]["instructions"] if _sent else ""
 _prompt = _first.split("## Available Skills")[0].strip()
 print("PROMPT_SEEN:", _prompt or "<none>")
-# The skills reach this agent only through load_agent()'s two pieces in
+# The skills reach this agent only through agent_config()'s two pieces in
 # Agent(...): the list in its instructions and the load_skill tool.
 print("LOADER:", bool(_sent) and "load_skill" in _sent[0]["tools"])
 print("TURNS:", len(_sent))
@@ -130,7 +130,7 @@ print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
         "requires": "pydantic_ai",
         # `infer_model` is where the MODEL string becomes a model object, so
         # patching it swaps the provider and leaves everything else — the real
-        # Agent, the real tool loop, load_agent()'s capability — on the path.
+        # Agent, the real tool loop, agent_config()'s capability — on the path.
         # Patching `Agent.run_sync` instead (the openai-agents shape) would skip
         # the loop, and the loop is the body channel on this framework.
         "stub": """
@@ -161,7 +161,7 @@ _stack.enter_context(patch(
     "pydantic_ai.models.infer_model", return_value=FunctionModel(_reply),
 ))
 
-# The name each DecimalAI run span is opened with. load_agent()'s capability
+# The name each DecimalAI run span is opened with. agent_config()'s capability
 # passes it to decimalai.otel.agent_run in wrap_run, and the exporter files the
 # run's trace under it.
 import decimalai.otel as _otel
@@ -177,7 +177,7 @@ def _named_run(agent_name=None, **kwargs):
 _stack.enter_context(patch.object(_otel, "agent_run", _named_run))
 """,
         "probe": """
-# What the model was handed, request by request. load_agent()'s capability puts
+# What the model was handed, request by request. agent_config()'s capability puts
 # the agent's prompt, then its skill list, into the instructions, and load_skill
 # into the tools: the two places its skills reach this agent.
 _first = (_sent[0][1].instructions or "") if _sent else ""
@@ -298,7 +298,7 @@ CANARY_SKILL = "restocking-policy"
 #: "the body never arrived" is a different investigation on each.
 BODY_CHANNEL_OBSERVABLE = {
     "openai-agents": (
-        "load_agent() hands the Agent a real load_skill tool and the Agents SDK "
+        "agent_config() hands the Agent a real load_skill tool and the Agents SDK "
         "owns the loop, so the body should have come back as a tool result mid-turn."
     ),
     "langchain": (
@@ -306,7 +306,7 @@ BODY_CHANNEL_OBSERVABLE = {
         "channel."
     ),
     "pydantic-ai": (
-        "load_agent()'s capability hands the Agent a real load_skill tool and "
+        "agent_config()'s capability hands the Agent a real load_skill tool and "
         "Pydantic AI owns the loop, so the body should have come back as a tool "
         "result mid-turn."
     ),
@@ -357,7 +357,7 @@ _init = _stack.enter_context(patch(
 ))
 _flush = _stack.enter_context(patch("decimalai.flush"))
 
-# load_agent() is the third network call the generated file makes, and it runs
+# agent_config() is the third network call the generated file makes, and it runs
 # at MODULE SCOPE — deliberately, because that is where the prompt is needed
 # and where a wrong name should fail. Unstubbed it would reach a real backend
 # from the test suite, so it is stubbed exactly like init().
@@ -367,7 +367,7 @@ _flush = _stack.enter_context(patch("decimalai.flush"))
 # ship a file that dies for the user on line one.
 _config = SavedPrompt(agent_name={agent!r}, system_prompt={prompt!r})
 _load = MagicMock(return_value=_config)
-# Every load_agent(), decimalai's and OpenAI's, reads the prompt through
+# Every agent_config(), decimalai's and OpenAI's, reads the prompt through
 # decimalai._agent.read_prompt, so one stub answers both.
 _stack.enter_context(patch("decimalai._agent.read_prompt", _load))
 
@@ -443,10 +443,10 @@ def test_generated_file_executes(framework, prompt, tmp_path):
 
     # The load-bearing one: the skills rail did not merely parse, it is ON.
     # Through `instrument(enable_skill_loader=True)` (langchain, adk) the
-    # adapter accepted it and the loader is INSTALLED; through load_agent()
+    # adapter accepted it and the loader is INSTALLED; through agent_config()
     # (openai-agents, pydantic-ai) load_skill was in the model's first request.
     # A template that passes an argument the adapter silently ignores, or
-    # builds an Agent without load_agent()'s pieces, would satisfy every AST
+    # builds an Agent without agent_config()'s pieces, would satisfy every AST
     # assertion in the sibling module and fail here.
     assert "LOADER: True" in out, out
 
@@ -797,7 +797,7 @@ _stack.enter_context(patch.object(
 @pytest.mark.parametrize("framework", sorted(RUNTIMES))
 def test_missing_provider_key_is_a_one_line_refusal(framework, tmp_path):
     """Without the guard a missing OPENAI_API_KEY is a traceback from inside the
-    provider client — after init(), instrument() and load_agent() have all made
+    provider client — after init(), instrument() and agent_config() have all made
     their network calls. The file must refuse on line one and point at the
     `Set:` block `decimalai init` printed."""
     spec = RUNTIMES[framework]

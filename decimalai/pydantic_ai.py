@@ -3,9 +3,9 @@
 ::
 
     from pydantic_ai import Agent
-    from decimalai.pydantic_ai import load_agent
+    from decimalai.pydantic_ai import agent_config
 
-    support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+    support = agent_config("support", fallback=BASE_INSTRUCTIONS)
     agent = Agent("openai:gpt-5.4-mini", name=support.name,
                   tools=[lookup_order], capabilities=[support])
     result = await agent.run(question, deps=customer)
@@ -13,7 +13,7 @@
 ``support`` is a Pydantic AI capability, built only from Pydantic AI's documented
 extension points:
 
-- its instructions are the agent's saved prompt (``{{placeholders}}`` filled from
+- its instructions are the agent's saved prompt (``{{variables}}`` filled from
   the run's ``deps``), then the skill list routed on the run's prompt, then one
   sentence naming the tool;
 - its toolset is ``load_skill``, which the model calls for a listed skill's text;
@@ -33,7 +33,7 @@ twice.
 
 The harness's ``Skills`` capability is the other way to give an agent skills: files the
 harness loads (``decimalai.pydantic_ai_harness.skills``). An agent that has it gets no
-DecimalAI skills from ``load_agent()``, and a warning says so once.
+DecimalAI skills from ``agent_config()``, and a warning says so once.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ import logging
 import threading
 from collections import OrderedDict
 from contextvars import ContextVar
-from typing import Any, List, Optional
+from typing import Any, List, NoReturn, Optional
 
 from decimalai._provider_recovery import retry_model_requests as retry_model_requests
 
@@ -116,7 +116,7 @@ def _require_pydantic_ai() -> None:
         import pydantic_ai  # noqa: F401
     except ImportError:
         raise ImportError(
-            "load_agent() needs Pydantic AI: pip install \"decimalai[pydantic-ai]\""
+            "agent_config() needs Pydantic AI: pip install \"decimalai[pydantic-ai]\""
         ) from None
 
 
@@ -230,7 +230,7 @@ class _PydanticAIBinding(AgentBinding):
     """Everything of `PydanticAIAgentConfig` except Pydantic AI's base class.
 
     Kept apart so this module imports without Pydantic AI installed: the class
-    `load_agent()` returns mixes in ``AbstractCapability`` when it is first needed.
+    `agent_config()` returns mixes in ``AbstractCapability`` when it is first needed.
     """
 
     _log = logger
@@ -372,9 +372,9 @@ def _config_class() -> Any:
             class PydanticAIAgentConfig(_PydanticAIBinding, AbstractCapability):
                 """One agent's prompt and skills in DecimalAI, as a Pydantic AI capability.
 
-                Made by :func:`load_agent`. Pass it in ``Agent(capabilities=[...])``::
+                Made by :func:`agent_config`. Pass it in ``Agent(capabilities=[...])``::
 
-                    support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+                    support = agent_config("support", fallback=BASE_INSTRUCTIONS)
                     agent = Agent(model, name=support.name, tools=[lookup_order],
                                   capabilities=[support])
 
@@ -398,7 +398,7 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def load_agent(
+def agent_config(
     agent_name: str,
     *,
     fallback: Optional[str] = None,
@@ -409,9 +409,9 @@ def load_agent(
     ::
 
         from pydantic_ai import Agent
-        from decimalai.pydantic_ai import load_agent
+        from decimalai.pydantic_ai import agent_config
 
-        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        support = agent_config("support", fallback=BASE_INSTRUCTIONS)
         agent = Agent("openai:gpt-5.4-mini", name=support.name,
                       tools=[lookup_order], capabilities=[support])
         result = await agent.run(question, deps=customer)
@@ -420,7 +420,7 @@ def load_agent(
     a local copy, re-read in the background at most once a minute. Each run is
     routed on its own prompt: the first run before its first model request, later
     runs from a local copy while their decision is recorded in the background, and
-    every run of an agent with more skills than fit the list. ``{{placeholders}}``
+    every run of an agent with more skills than fit the list. ``{{variables}}``
     are filled from the run's ``deps`` (attributes or dict keys). Initializes the SDK
     from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
 
@@ -450,3 +450,12 @@ def load_agent(
     _ensure_initialized()
     prompt = read_prompt(agent_name, fallback=fallback)
     return _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)
+
+
+def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
+    """Renamed in decimalai 0.21: :func:`agent_config`."""
+    raise TypeError(
+        "decimalai.pydantic_ai.load_agent() was renamed agent_config() in decimalai 0.21; "
+        "it takes the same arguments and returns the same capability: "
+        "from decimalai.pydantic_ai import agent_config"
+    )

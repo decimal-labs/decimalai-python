@@ -1,10 +1,10 @@
-"""What every framework's ``load_agent()`` shares: one agent's prompt and skills.
+"""What every framework's ``agent_config()`` shares: one agent's prompt and skills.
 
 An :class:`AgentBinding` holds one DecimalAI agent's saved prompt and skill list
 for one process, and serves them run by run:
 
 - the prompt is a local copy, re-read in the background at most once every
-  ``_PROMPT_REFRESH_SECONDS``; ``{{placeholders}}`` in it are filled per run;
+  ``_PROMPT_REFRESH_SECONDS``; its ``{{variables}}`` are filled per run;
 - every run is routed on its own message. The first run is routed before its
   model call. Later runs show the local copy of the list at once and record
   their own decision, ranked on their message, in the background. An agent whose
@@ -12,14 +12,14 @@ for one process, and serves them run by run:
   because which skills fit depends on the message;
 - the model reads a listed skill's full text with ``load_skill``. A load waits
   briefly for its run's own decision and never names another agent's;
-- each run's record (prompt version, placeholder names, skills offered and
+- each run's record (prompt version, variable names, skills offered and
   delivered, routing id) goes wherever the framework's trace is built.
 
 Nothing here knows a framework. A framework module subclasses
 :class:`AgentBinding` and supplies the seams: how to name the current run, read
-its message and its placeholder values, where the record goes, which router
+its message and its variables' values, where the record goes, which router
 serves it, and what would make DecimalAI's skills misleading for one of its
-agents. ``decimalai.openai_agents.load_agent`` is the first such subclass.
+agents. ``decimalai.openai_agents.agent_config`` is the first such subclass.
 """
 
 from __future__ import annotations
@@ -55,19 +55,19 @@ _config_pool_lock = threading.Lock()
 
 
 class MissingPromptVariable(KeyError):
-    """The saved prompt has a ``{{placeholder}}`` the run does not supply a value for."""
+    """The saved prompt has a ``{{variable}}`` the run does not supply a value for."""
 
     def __str__(self) -> str:  # KeyError would quote the whole message
         return str(self.args[0]) if self.args else ""
 
 
 def template_variables(text: Optional[str]) -> List[str]:
-    """The ``{{name}}`` / ``{{a.b}}`` placeholders in a prompt, sorted and unique."""
+    """The ``{{name}}`` / ``{{a.b}}`` variables in a prompt, sorted and unique."""
     return sorted(set(_TEMPLATE_PLACEHOLDER.findall(text or "")))
 
 
 def _fill_template(text: str, values: Any, *, where: str, how: str) -> str:
-    """Fill placeholders from ``values``' attributes or keys, dotted paths included.
+    """Fill variables from ``values``' attributes or keys, dotted paths included.
 
     A missing value raises `MissingPromptVariable` naming every gap, before any
     model call: a half-filled prompt is a prompt nobody wrote. ``how`` tells the
@@ -127,10 +127,10 @@ def _clean_names(names: Any) -> List[str]:
 
 
 def attach_prompt_records(spans: List[Any], records: Any) -> None:
-    """Put each `load_agent()` prompt record on its agent's span, as attributes.
+    """Put each `agent_config()` prompt record on its agent's span, as attributes.
 
     The backend stores span attributes as they come, so a trace says which
-    prompt version a run used, with which placeholder NAMES (never values:
+    prompt version a run used, with which variable NAMES (never values:
     those are often personal data), without a column of its own. An agent with
     no span of its own gets a span named ``decimalai.prompt``.
     """
@@ -173,8 +173,8 @@ class AgentBinding:
     #: Where this binding's warnings go: the framework module's own logger.
     _log = logger
 
-    #: How a caller passes placeholder values, said in `MissingPromptVariable`.
-    _VALUES_HINT = "Pass them as context=..., as attributes or dict keys."
+    #: How a caller passes variables' values, said in `MissingPromptVariable`.
+    _VALUES_HINT = "Pass them as variables=..., as attributes or dict keys."
 
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         self.name: str = prompt.agent_name
@@ -210,7 +210,7 @@ class AgentBinding:
         raise NotImplementedError
 
     def _values(self, context: Any) -> Any:
-        """Where this run's placeholder values come from. Override."""
+        """Where this run's variables' values come from. Override."""
         return context
 
     def _agent_label(self, agent: Any) -> Optional[str]:
@@ -261,9 +261,11 @@ class AgentBinding:
     def prompt_source(self) -> str:
         """Where the prompt in use came from.
 
-        ``"decimal"`` (read from DecimalAI), ``"decimal (cached copy)"`` (DecimalAI was
-        unreachable at the last read), ``"fallback"`` (unreachable, nothing cached:
-        the ``fallback=`` text), or ``"code"`` (no prompt saved: the ``fallback=`` text).
+        ``"decimalai"`` (read from DecimalAI), ``"decimalai (cached copy)"`` (DecimalAI
+        was unreachable at the last read, so the copy read before it),
+        ``"fallback (unreachable)"`` (DecimalAI unreachable and nothing cached: the
+        ``fallback=`` text), or ``"fallback (none saved)"`` (the agent has no saved
+        prompt: the ``fallback=`` text).
         """
         with self._lock:
             prompt = self._prompt
@@ -272,21 +274,21 @@ class AgentBinding:
     @staticmethod
     def _source_of(prompt: Any) -> str:
         if getattr(prompt, "system_prompt", None) is None:
-            return "code"
+            return "fallback (none saved)"
         if getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
-            return "fallback"
+            return "fallback (unreachable)"
         if getattr(prompt, "is_fallback", False):
-            return "decimal (cached copy)"
-        return "decimal"
+            return "decimalai (cached copy)"
+        return "decimalai"
 
     @property
     def variables(self) -> List[str]:
-        """The placeholders the prompt in use needs a value for on each run."""
+        """The variables (``{{name}}``) the prompt in use needs a value for on each run."""
         return template_variables(self._template())
 
     @property
     def skill_names(self) -> List[str]:
-        """The skills on the agent's list, in menu order."""
+        """The skills on the agent's skill list, in its order."""
         with self._lock:
             return list(self._menu_names)
 
@@ -410,7 +412,7 @@ class AgentBinding:
         if state["unavailable"] and self._on_unavailable == "fail":
             raise RuntimeError(
                 f"DecimalAI skills for agent {self.name!r} are unavailable ({state['unavailable']}) "
-                "and load_agent(on_unavailable='fail') was set."
+                "and agent_config(on_unavailable='fail') was set."
             )
         with self._lock:
             prompt = self._prompt

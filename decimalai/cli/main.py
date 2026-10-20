@@ -323,7 +323,7 @@ def _scaffold_agent_file(
     # 4. Read its prompt.
     #
     #    Two failures, two answers, and telling them apart is the whole point
-    #    of this block. The generated file calls `decimalai.load_agent()` at
+    #    of this block. The generated file calls `decimalai.agent_config()` at
     #    module scope, so it needs the route to EXIST; but it reads the value
     #    itself at run time, so it does not need this read to have SUCCEEDED.
     from .._client import AgentNotFoundError
@@ -351,7 +351,7 @@ def _scaffold_agent_file(
         raise SystemExit(1)
     except Exception:  # noqa: BLE001 — cosmetic; the run-time read is the loud one
         # A timeout or a 5xx does NOT prove the generated file cannot run: it
-        # reads the prompt itself at run time, and `load_agent()` raises there
+        # reads the prompt itself at run time, and `agent_config()` raises there
         # rather than returning an empty prompt. Cost a comment, not the
         # scaffold. Nothing is written INTO the file from this read except a
         # character count and a version number.

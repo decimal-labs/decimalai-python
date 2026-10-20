@@ -3,7 +3,7 @@
 ADK (the Agent Development Kit) is Gemini-native and ships its own plugin
 system: a ``BasePlugin`` registered on the ``Runner`` receives before/after
 callbacks for the run, every model generation, and every tool call. The
-DecimalAI adapter (``decimalai.adk.DecimalaiPlugin``, put in ``App(plugins=[...])``)
+DecimalAI adapter (``decimalai.adk.DecimalAIPlugin``, put in ``App(plugins=[...])``)
 builds **one** :class:`RunTrace` per ADK invocation from those callbacks — capturing
 the LLM steps, the tool calls, and an auto-detected manifest of the root
 agent (model / instruction / tools / sub-agents).
@@ -11,7 +11,7 @@ agent (model / instruction / tools / sub-agents).
 This test proves that path end-to-end with a **real Gemini-backed ADK agent**:
 
   * Build a 2-tool (`get_price`, `calculate`) shopping agent on a Gemini model.
-  * Put ``DecimalaiPlugin`` in the ``App`` an ``InMemoryRunner`` runs, and run it.
+  * Put ``DecimalAIPlugin`` in the ``App`` an ``InMemoryRunner`` runs, and run it.
   * Assert the assembled backend trace carries ≥1 LLM step, ≥1 tool call, and
     records the Gemini model — i.e. the native-plugin trace build works, not
     just that the agent ran.
@@ -36,7 +36,7 @@ from . import _live_helpers as h
 @pytest.mark.adk
 @pytest.mark.parametrize("provider, model", h.matrix("adk"))
 def test_adk_agent_traces_through_native_plugin(provider, model):
-    """A real ADK agent on Gemini → DecimalaiPlugin callbacks → one backend
+    """A real ADK agent on Gemini → DecimalAIPlugin callbacks → one backend
     trace with the LLM step(s), the tool call(s), and the Gemini model."""
     h.require_key_for(provider)
     pytest.importorskip("google.adk")
@@ -54,7 +54,7 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
-    from decimalai.adk import DecimalaiPlugin
+    from decimalai.adk import DecimalAIPlugin
 
     # DecimalAI agent label (hyphenated, what we poll for) vs. ADK's node name,
     # which must be a valid Python identifier — keep them parallel but distinct.
@@ -81,7 +81,7 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
 
     app_name = "decimal_adk_test"
     runner = InMemoryRunner(app=App(
-        name=app_name, root_agent=agent, plugins=[DecimalaiPlugin(agent_name=agent_name)],
+        name=app_name, root_agent=agent, plugins=[DecimalAIPlugin(agent_name=agent_name)],
     ))
 
     user_msg = types.Content(role="user", parts=[types.Part(text=(

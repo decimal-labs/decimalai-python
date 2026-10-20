@@ -123,9 +123,9 @@ handler.
 
 ```python
 from agents import Agent, Runner
-from decimalai.openai_agents import load_agent
+from decimalai.openai_agents import agent_config
 
-support = load_agent("support", fallback=BASE_INSTRUCTIONS)   # reads DECIMAL_API_KEY
+support = agent_config("support", fallback=BASE_INSTRUCTIONS)   # reads DECIMAL_API_KEY
 
 agent = Agent(
     name=support.name,
@@ -135,23 +135,23 @@ agent = Agent(
 result = Runner.run_sync(agent, "Where is ORD-1001?")
 ```
 
-`load_agent()` reads the agent's prompt and keeps a local copy, re-read in the background, so a
+`agent_config()` reads the agent's prompt and keeps a local copy, re-read in the background, so a
 prompt saved in the dashboard reaches the next run (within a minute) with no redeploy. Each run's
 skill list is routed on that run's own message: the first run before its model call, later runs from
 a local copy while their decision is recorded in the background, and an agent with more skills than
-the menu holds before every model call. `{{placeholders}}` in the prompt are filled from
+its skill list holds before every model call. Prompt variables (`{{name}}`) are filled from
 `Runner.run(..., context=...)`; a missing value stops the run before the model call. Nothing in the
 OpenAI SDK is patched and other agents in the process are untouched. Each run is traced with its
 prompt version and the skills offered, loaded and delivered. `init(openai_agents=True)` (or
-`instrument()`) traces runs and changes no agent; skills come only from `load_agent()`.
+`instrument()`) traces runs and changes no agent; skills come only from `agent_config()`.
 
 ### Pydantic AI
 
 ```python
 from pydantic_ai import Agent
-from decimalai.pydantic_ai import load_agent
+from decimalai.pydantic_ai import agent_config
 
-support = load_agent("support", fallback=BASE_INSTRUCTIONS)   # reads DECIMAL_API_KEY
+support = agent_config("support", fallback=BASE_INSTRUCTIONS)   # reads DECIMAL_API_KEY
 
 agent = Agent(
     "openai:gpt-5.4-mini",
@@ -162,7 +162,7 @@ agent = Agent(
 result = agent.run_sync("Where is ORD-1001?", deps=customer)
 ```
 
-`support` is a Pydantic AI capability: its instructions are the saved prompt (`{{placeholders}}`
+`support` is a Pydantic AI capability: its instructions are the saved prompt (its `{{variables}}`
 filled from the run's `deps`), then the skill list routed on the run's prompt, and its toolset is
 `load_skill`. It wraps each run in one DecimalAI run span, so a run's model calls are one trace filed
 under the DecimalAI agent. Nothing in Pydantic AI is patched. Traces come from DecimalAI's OpenTelemetry
@@ -175,9 +175,9 @@ provider), or a provider instrumentor such as `decimalai.init(openai=True)`; pic
 from google.adk.agents import LlmAgent
 from google.adk.apps import App
 from google.adk.runners import InMemoryRunner
-from decimalai.adk import DecimalaiPlugin, load_agent
+from decimalai.adk import DecimalAIPlugin, agent_config
 
-support = load_agent("support", fallback=BASE_INSTRUCTION)   # reads DECIMAL_API_KEY
+support = agent_config("support", fallback=BASE_INSTRUCTION)   # reads DECIMAL_API_KEY
 
 agent = LlmAgent(
     name="support_agent",                  # ADK's own name, a Python identifier
@@ -185,14 +185,14 @@ agent = LlmAgent(
     instruction=support.instruction,       # the agent's saved prompt, then its skill list
     tools=[lookup_order, *support.tools],  # + load_skill
 )
-app = App(name="support_app", root_agent=agent, plugins=[DecimalaiPlugin()])
+app = App(name="support_app", root_agent=agent, plugins=[DecimalAIPlugin()])
 runner = InMemoryRunner(app=app)
 ```
 
 `support.instruction` is an ADK instruction provider: ADK calls it before each model request, and
-each invocation's skill list is routed once, on that invocation's message. `{{placeholders}}` are
-filled from the session's state (ADK fills no `{var}` of its own in a provider's text); a missing
-value stops the run before the model call. `DecimalaiPlugin()` in the `App` makes each invocation one
+each invocation's skill list is routed once, on that invocation's message. Prompt variables
+(`{{name}}`) are filled from the session's state (ADK fills no `{var}` of its own in a provider's text); a missing
+value stops the run before the model call. `DecimalAIPlugin()` in the `App` makes each invocation one
 trace, filed under the DecimalAI agent with its prompt version and the skills offered, loaded and
 delivered; a runner built without it is not traced. Nothing in ADK is patched. An agent that carries
 ADK's own `SkillToolset` gets no DecimalAI skills.
@@ -200,22 +200,23 @@ ADK's own `SkillToolset` gets no DecimalAI skills.
 ### Your own model calls
 
 For code that calls a model itself (a provider SDK, your own tool loop), the top-level
-`decimalai.load_agent()` hands over the same prompt and skills as plain values:
+`decimalai.agent_config()` hands over the same prompt and skills as plain values:
 
 ```python
 import decimalai
 
-support = decimalai.load_agent("support", fallback=BASE_PROMPT)
+support = decimalai.agent_config("support", fallback=BASE_PROMPT)
 
-system = support.system(question, context=customer)  # the prompt, filled, then this turn's skill list
-tools = [*my_tools, support.tool_spec]                # load_skill as {name, description, parameters}
+run = support.run(question, variables=customer)  # one user message
+system = run.system                              # the prompt, filled, then this run's skill list
+tools = [*my_tools, run.tool_spec]               # load_skill as {name, description, parameters}
 # ...and when the model calls load_skill:
-text = support.load_skill(tool_input["name"])
+text = run.load_skill(tool_input["name"])
 ```
 
-Each `system()` call is one turn, routed on its message the way an OpenAI Agents run is, with
-`{{placeholders}}` filled from `context=`. `support.prompt` is the saved prompt as written, for code
-that wants only the text.
+Each `support.run()` is one run, routed on its message the way an OpenAI Agents run is, with the
+prompt's variables (`{{name}}`) filled from `variables=`. A run serves its own `load_skill` calls,
+from any thread. `support.prompt` is the saved prompt as written, for code that wants only the text.
 
 `init(langchain=True)` and `init(crewai=True)` install the same thing as that adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both.
 
@@ -248,7 +249,7 @@ export DECIMAL_AUTO_TRACE=langchain   # or "openai-agents", "crewai", "llamainde
 python app.py
 ```
 
-`DECIMAL_AUTO_TRACE=<framework>` runs the matching `decimalai.init()` framework flag at import. On `langchain` and `crewai` that includes the skill loader: each turn's message (on CrewAI, the task description) goes to the platform's router, and a skills menu (plus a skill body) is added to the prompt. `openai-agents` traces only; an OpenAI agent gets its skills from `load_agent()`. Google ADK has no flag: put `DecimalaiPlugin()` in your `App` ([above](#google-adk)). `DECIMALAI_SKILLS=0` (or `false`/`no`/`off`) keeps it to tracing; it is the default of `init(skills=...)`, so it applies to the flags in code too, and an explicit `skills=` argument wins over it.
+`DECIMAL_AUTO_TRACE=<framework>` runs the matching `decimalai.init()` framework flag at import. On `langchain` and `crewai` that includes the skill loader: each turn's message (on CrewAI, the task description) goes to the platform's router, and a skills menu (plus a skill body) is added to the prompt. `openai-agents` traces only; an OpenAI agent gets its skills from `agent_config()`. Google ADK has no flag: put `DecimalAIPlugin()` in your `App` ([above](#google-adk)). `DECIMALAI_SKILLS=0` (or `false`/`no`/`off`) keeps it to tracing; it is the default of `init(skills=...)`, so it applies to the flags in code too, and an explicit `skills=` argument wins over it.
 
 ## What It Does
 
@@ -366,7 +367,7 @@ No adapter writes skills to disk on its own: `decimalai skills add` (or `router.
 
 ### Skill Delivery at Runtime (`enable_skill_loader`)
 
-Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, use the framework flag on `init()` (LangChain and CrewAI turn the loader on with it), or enable the skill loader on your adapter's `instrument()`. OpenAI Agents SDK, Pydantic AI and Google ADK agents use their framework's `load_agent()` instead ([above](#openai-agents-sdk)):
+Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, use the framework flag on `init()` (LangChain and CrewAI turn the loader on with it), or enable the skill loader on your adapter's `instrument()`. OpenAI Agents SDK, Pydantic AI and Google ADK agents use their framework's `agent_config()` instead ([above](#openai-agents-sdk)):
 
 ```python
 import decimalai
@@ -385,35 +386,35 @@ decimalai.init()
 from decimalai.crewai import instrument
 instrument(agent_name="support", enable_skill_loader=True)
 
-support = decimalai.load_agent("support")
+support = decimalai.agent_config("support")
 agent = Agent(role="Support", goal="Resolve the ticket", backstory=support.prompt or "", llm=llm)
 Crew(agents=[agent], tasks=[Task(description=question, expected_output="the answer", agent=agent)]).kickoff()
 ```
 
 Tracing needs the OpenInference CrewAI instrumentor (`pip install openinference-instrumentation-crewai`) plus the one for your model's provider SDK (`openinference-instrumentation-openai`, …), exactly as for `init(crewai=True)`.
 
-You can read each run's trace as the LangChain adapter and ADK's `DecimalaiPlugin(on_trace=fn)` let you: `instrument(..., on_trace=fn)` calls `fn` once per CrewAI run, failed runs included, with a copy of the finished trace (a `RunTrace` with its `id`, `parent_trace_id`, routing id and delivered skills) before it is exported. An `fn` that raises is logged and changes nothing else. A run made inside `decimalai.start_trace()` is filed as that trace's child (`parent_trace_id`), with or without an observer. CrewAI's trace is built from OpenTelemetry spans that wait in a batch queue, so call `decimalai.flush()` before a short-lived process reports or exits: it exports those spans first, waiting at most five seconds, and then sends.
+You can read each run's trace as the LangChain adapter and ADK's `DecimalAIPlugin(on_trace=fn)` let you: `instrument(..., on_trace=fn)` calls `fn` once per CrewAI run, failed runs included, with a copy of the finished trace (a `RunTrace` with its `id`, `parent_trace_id`, routing id and delivered skills) before it is exported. An `fn` that raises is logged and changes nothing else. A run made inside `decimalai.start_trace()` is filed as that trace's child (`parent_trace_id`), with or without an observer. CrewAI's trace is built from OpenTelemetry spans that wait in a batch queue, so call `decimalai.flush()` before a short-lived process reports or exits: it exports those spans first, waiting at most five seconds, and then sends.
 
-With the loader on, the router adds a ranked **menu** of relevant skills to the prompt (one short row per skill: name + when to use it). A menu row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
+With the loader on, the router adds a ranked **skill list** to the prompt (one short row per skill: name + when to use it). A row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
 
-- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the menu alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole menu is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `crewai` — none of them register a `load_skill` tool) and **off** for agents set up with a framework's `load_agent()` (OpenAI Agents, Pydantic AI, Google ADK), which fetch bodies with `load_skill` rather than double-deliver; switching that tool off makes injection take over there too. An explicit `True`/`False` always wins.
-- **`load_skill` tool** — an agent set up with a framework's `load_agent()` (OpenAI Agents, Pydantic AI, Google ADK) gets a `load_skill` tool beside its skill list, so the model can fetch an offered skill's body mid-turn. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the menu cap left off this turn's menu), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself; a load from a router that has never routed (a hand-built menu, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. An agent whose own skill loader serves its skills (an OpenAI `SandboxAgent` with `Skills`, ADK's `SkillToolset`, CrewAI's `skills=`, Deep Agents, the Pydantic AI harness) gets neither the tool nor the menu. A `load_agent()` agent that has another tool named `load_skill` gets no DecimalAI skills on OpenAI Agents and Google ADK (with one warning); Pydantic AI refuses to run it, since two of its tools would share a name. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** a `load_agent()` parameter.
+- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the skill list alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole skill list is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `crewai` — none of them register a `load_skill` tool) and **off** for agents set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK), which fetch bodies with `load_skill` rather than double-deliver; switching that tool off makes injection take over there too. An explicit `True`/`False` always wins.
+- **`load_skill` tool** — an agent set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK) gets a `load_skill` tool beside its skill list, so the model can fetch an offered skill's body mid-run. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the list's cap left off this run's skill list), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself; a load from a router that has never routed (a hand-built list, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. An agent whose own skill loader serves its skills (an OpenAI `SandboxAgent` with `Skills`, ADK's `SkillToolset`, CrewAI's `skills=`, Deep Agents, the Pydantic AI harness) gets neither the tool nor the skill list. An `agent_config()` agent that has another tool named `load_skill` gets no DecimalAI skills on OpenAI Agents and Google ADK (with one warning); Pydantic AI refuses to run it, since two of its tools would share a name. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `agent_config()` parameter.
 - **Native loading from disk** — for runtimes that load SKILL.md folders themselves (Claude Code, Google ADK, ...), install skills with `decimalai skills add` and point the runtime at `decimalai.skills_dir()` (see [Skills on Disk](https://github.com/decimal-labs/decimalai-python#skills-on-disk)), and let the runtime deliver them; each framework's helper also records every load as an activation of the version delivered. No copy is taken and no fork is needed; you can install a skill you only linked.
 
 Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop the adapter controls):
 
-| Adapter | Menu + body injection | `load_skill` tool | Notes |
+| Adapter | Skill list + body injection | `load_skill` tool | Notes |
 |---|---|---|---|
-| `decimalai.openai_agents` | ✅ | ✅ | from `load_agent()`: `instructions` carries the menu, `tools` the `load_skill` tool; bodies arrive via `load_skill` unless the tool is off |
-| `decimalai.pydantic_ai` | ✅ | ✅ | from `load_agent()`, a capability: routed once per run on the run's prompt, every turn of a conversation included; bodies arrive via `load_skill` unless the tool is off |
+| `decimalai.openai_agents` | ✅ | ✅ | from `agent_config()`: `instructions` carries the skill list, `tools` the `load_skill` tool; bodies arrive via `load_skill` unless the tool is off |
+| `decimalai.pydantic_ai` | ✅ | ✅ | from `agent_config()`, a capability: routed once per run on the run's prompt, every turn of a conversation included; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns); on Python 3.10, async `create_agent` runs route their model calls without the run (warns once; see [Installation](https://github.com/decimal-labs/decimalai-python#installation)) |
-| `decimalai.adk` | ✅ | ✅ | from `load_agent()`: `instruction` carries the menu, `tools` the `load_skill` tool; routed once per invocation on its message; bodies arrive via `load_skill` unless the tool is off |
+| `decimalai.adk` | ✅ | ✅ | from `agent_config()`: `instruction` carries the skill list, `tools` the `load_skill` tool; routed once per invocation on its message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ❌ injection-only | patches `messages.create()`, `.stream()` and `.parse()` (sync and async; not `client.beta`) — no loop to route a tool result back |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
 
-Honest-measurement note: menu-only (loader on, no body injection, no `load_skill` tool) means the model sees that a skill *exists* but never its content. Usage from that channel counts as **offered**, not **activated** — don't expect activation stats from prompt-injection-only setups.
+Honest-measurement note: list-only (loader on, no body injection, no `load_skill` tool) means the model sees that a skill *exists* but never its content. Usage from that channel counts as **offered**, not **activated** — don't expect activation stats from prompt-injection-only setups.
 
 ### Other Ways to Use Skills (No SDK)
 
@@ -487,10 +488,10 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Framework | Status | Setup |
 |-----------|--------|-------|
 | LangChain / LangGraph | ✅ | `init(langchain=True)` |
-| OpenAI Agents SDK | ✅ | `load_agent(name)` (tracing only: `init(openai_agents=True)`) |
-| Google ADK | ✅ (native) | `load_agent(name)` + `DecimalaiPlugin()` in `App(plugins=[...])` |
+| OpenAI Agents SDK | ✅ | `agent_config(name)` (tracing only: `init(openai_agents=True)`) |
+| Google ADK | ✅ (native) | `agent_config(name)` + `DecimalAIPlugin()` in `App(plugins=[...])` |
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
-| Pydantic AI | ✅ | `load_agent(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
+| Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |

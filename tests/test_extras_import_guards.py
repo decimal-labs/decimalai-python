@@ -67,7 +67,7 @@ class TestWarningGuards:
         assert 'decimalai[claude-agent-sdk]' in caplog.text
 
     def test_adk_load_agent_and_plugin_name_the_extra_before_any_call(self, monkeypatch):
-        """ADK's skills come from load_agent() and its traces from DecimalaiPlugin, and
+        """ADK's skills come from agent_config() and its traces from DecimalAIPlugin, and
         both need the framework outright: they raise, naming the extra, before init()
         or any request."""
         import decimalai._agent as agent_mod
@@ -78,12 +78,12 @@ class TestWarningGuards:
         monkeypatch.setattr(agent_mod, "_ensure_initialized",
                             lambda: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
-            adk.load_agent("support")
+            adk.agent_config("support")
         with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
-            adk.DecimalaiPlugin()
+            adk.DecimalAIPlugin()
 
     def test_pydantic_ai_load_agent_names_the_extra_before_any_call(self, monkeypatch):
-        """Pydantic AI's skills come from load_agent(), which needs the framework
+        """Pydantic AI's skills come from agent_config(), which needs the framework
         outright: it raises, naming the extra, before init() or any request."""
         import decimalai._agent as agent_mod
         import decimalai.pydantic_ai as pai
@@ -92,7 +92,7 @@ class TestWarningGuards:
         monkeypatch.setattr(agent_mod, "_ensure_initialized",
                             lambda: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[pydantic-ai\]'):
-            pai.load_agent("support")
+            pai.agent_config("support")
 
     def test_langchain_loader_warns_with_extra(self, monkeypatch, caplog):
         import decimalai.langchain as lc
@@ -104,7 +104,7 @@ class TestWarningGuards:
         assert 'decimalai[langchain]' in caplog.text
 
     def test_openai_agents_load_agent_names_the_extra_before_any_call(self, monkeypatch):
-        """Since 0.18 the skills come from load_agent(), which needs the SDK
+        """Since 0.18 the skills come from agent_config(), which needs the SDK
         outright: it raises, naming the extra, before init() or any request."""
         import decimalai.openai_agents as oa
 
@@ -112,7 +112,7 @@ class TestWarningGuards:
         monkeypatch.setattr(oa, "_ensure_initialized",
                             lambda: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[openai-agents\]'):
-            oa.load_agent("support")
+            oa.agent_config("support")
 
 
 class TestCoreImportSurvivesMissingFrameworks:

@@ -297,7 +297,7 @@ def test_langchain_loader_stops_routing_after_a_disabled_reinit(monkeypatch, fre
 
 
 def test_openai_agents_load_agent_skills_stop_after_a_disabled_reinit(monkeypatch, tmp_path):
-    """A `load_agent()` config built while enabled keeps a copy of its skill
+    """An agent config built while enabled keeps a copy of its skill
     list. After `init(enabled=False)` it neither routes nor shows that copy;
     the prompt it read still runs."""
     agents = pytest.importorskip("agents")
@@ -325,7 +325,7 @@ def test_openai_agents_load_agent_skills_stop_after_a_disabled_reinit(monkeypatc
     monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
         "agent_name": name, "system_prompt": "You help.", "version_number": 1,
     })
-    support = oa.load_agent("support")
+    support = oa.agent_config("support")
     agent = agents.Agent(name="support", instructions=support.instructions, tools=[*support.tools])
 
     def prompt(text):

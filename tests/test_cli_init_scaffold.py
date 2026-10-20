@@ -13,9 +13,9 @@ The four things that must never regress:
      `instrument()` call. It defaults to False on the adapters, so a file
      without it traces perfectly and delivers none of the agent's skills —
      silently. That is the single most important line in the template. On
-     openai-agents (0.18+) the equivalent is `load_agent()`'s two pieces in
-     `Agent(...)`, on pydantic-ai (0.19+) `load_agent()`'s capability in
-     `Agent(capabilities=[...])`, and on adk (0.20+) `load_agent()`'s instruction
+     openai-agents (0.18+) the equivalent is `agent_config()`'s two pieces in
+     `Agent(...)`, on pydantic-ai (0.19+) `agent_config()`'s capability in
+     `Agent(capabilities=[...])`, and on adk (0.20+) `agent_config()`'s instruction
      and tools in `LlmAgent(...)`: nothing else gives those agents their skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
@@ -277,7 +277,7 @@ class TestTemplateIsCode:
 # ── 2. the flag that makes the whole thing worth shipping ────────────
 
 
-#: The templates with no instrument() at all: `load_agent()` hands the pieces to the
+#: The templates with no instrument() at all: `agent_config()` hands the pieces to the
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20).
 LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk")
 
@@ -286,7 +286,7 @@ LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAM
 
 
 def _support_attr(node: ast.AST, attr: str) -> bool:
-    """``node`` is ``support.<attr>``, the config ``load_agent()`` returned."""
+    """``node`` is ``support.<attr>``, the config ``agent_config()`` returned."""
     return isinstance(node, ast.Attribute) and node.attr == attr and reads(node.value, "support")
 
 
@@ -310,7 +310,7 @@ class TestSkillLoaderIsOn:
     #: flag here is a SECOND install of the same adapter: on langchain the first
     #: one wins and the explicit call's other options are dropped with a warning,
     #: and on openai-agents the adapter is installed twice. On pydantic-ai nothing
-    #: else installs one: `load_agent()`'s capability opens the run span and
+    #: else installs one: `agent_config()`'s capability opens the run span and
     #: Pydantic AI's own instrumentation emits the rest, through the exporter
     #: `otel=True` installs. So it is the first span source rather than the second
     #: — and without it the generated file runs, delivers every skill, and traces
@@ -346,12 +346,12 @@ class TestSkillLoaderIsOn:
 
     def test_openai_agents_plugs_load_agent_into_the_agent(self):
         """Nothing patches the Agents SDK since 0.18: the skills reach the model
-        only because the file passes `load_agent()`'s instructions and tools
+        only because the file passes `agent_config()`'s instructions and tools
         into its own `Agent(...)`. Without either, it traces and delivers no
         skills — the same silent failure a missing loader flag was."""
         tree = parse(render_agent_file(AGENT, "openai-agents", SKILLS))
         assert calls(tree, "instrument") == []
-        (load,) = calls(tree, "load_agent")
+        (load,) = calls(tree, "agent_config")
         holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
         assert [t.id for t in holder.targets] == ["support"]
         (agent,) = calls(tree, "Agent")
@@ -363,12 +363,12 @@ class TestSkillLoaderIsOn:
 
     def test_pydantic_ai_passes_load_agent_to_the_agent_as_a_capability(self):
         """Nothing patches Pydantic AI since 0.19: the prompt, the skill list and
-        load_skill reach the model only because the file passes `load_agent()`'s
+        load_skill reach the model only because the file passes `agent_config()`'s
         capability into its own `Agent(capabilities=[...])`. Without it, it
         traces and delivers no skills."""
         tree = parse(render_agent_file(AGENT, "pydantic-ai", SKILLS))
         assert calls(tree, "instrument") == []
-        (load,) = calls(tree, "load_agent")
+        (load,) = calls(tree, "agent_config")
         assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
         holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
         assert [t.id for t in holder.targets] == ["support"]
@@ -379,11 +379,11 @@ class TestSkillLoaderIsOn:
 
     def test_adk_passes_load_agent_to_the_llm_agent_and_the_plugin_to_the_app(self):
         """Nothing patches ADK since 0.20: the skills reach the model only because the
-        file passes `load_agent()`'s instruction and tools into its own `LlmAgent`,
-        and the run is traced only because `DecimalaiPlugin()` is in its `App`."""
+        file passes `agent_config()`'s instruction and tools into its own `LlmAgent`,
+        and the run is traced only because `DecimalAIPlugin()` is in its `App`."""
         tree = parse(render_agent_file(AGENT, "adk", SKILLS))
         assert calls(tree, "instrument") == []
-        (load,) = calls(tree, "load_agent")
+        (load,) = calls(tree, "agent_config")
         assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
         holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
         assert [t.id for t in holder.targets] == ["support"]
@@ -394,7 +394,7 @@ class TestSkillLoaderIsOn:
                    for e in keywords["tools"].elts)
         (app,) = calls(tree, "App")
         plugins = {kw.arg: kw.value for kw in app.keywords}["plugins"]
-        assert [ast.unparse(e) for e in plugins.elts] == ["DecimalaiPlugin()"]
+        assert [ast.unparse(e) for e in plugins.elts] == ["DecimalAIPlugin()"]
         (runner,) = calls(tree, "InMemoryRunner")
         assert [kw.arg for kw in runner.keywords] == ["app"]
 
@@ -412,8 +412,8 @@ class TestPromptIsRead:
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_load_agent_is_called_once_with_the_bound_name(self, framework):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        loads = calls(tree, "load_agent")
-        assert len(loads) == 1, "expected exactly one load_agent() call"
+        loads = calls(tree, "agent_config")
+        assert len(loads) == 1, "expected exactly one agent_config() call"
         assert len(loads[0].args) == 1 and reads(loads[0].args[0], "AGENT_NAME")
         assert not loads[0].keywords
         assert assigned(tree, "AGENT_NAME") == AGENT
@@ -429,7 +429,7 @@ class TestPromptIsRead:
             id(c)
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for c in calls(node, "load_agent")  # type: ignore[arg-type]
+            for c in calls(node, "agent_config")  # type: ignore[arg-type]
         }
         assert not in_a_function
 
@@ -443,7 +443,7 @@ class TestPromptIsRead:
         assert len(instructions) == 1
         value = instructions[0].value
         assert not isinstance(value, ast.Constant), (
-            "instructions= must come from load_agent(), not a literal"
+            "instructions= must come from agent_config(), not a literal"
         )
         assert _support_attr(value, "instructions")
 
@@ -468,7 +468,7 @@ class TestPromptIsRead:
         )
         compile(source, "agent.py", "exec")
         assert "no system prompt set" in source
-        assert len(calls(parse(source), "load_agent")) == 1
+        assert len(calls(parse(source), "agent_config")) == 1
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_an_unreadable_prompt_says_nothing_rather_than_guessing(self, framework):
@@ -477,7 +477,7 @@ class TestPromptIsRead:
         wrong one sends someone to write a prompt they already have."""
         source = render_agent_file(AGENT, framework, SKILLS, prompt=None)
         assert "system prompt" not in source.lower().split("import decimalai")[0]
-        assert len(calls(parse(source), "load_agent")) == 1
+        assert len(calls(parse(source), "agent_config")) == 1
 
 
 # ── 3. the agent name is bound, and survives escaping ────────────────
@@ -991,7 +991,7 @@ class TestCliWritesTheFile:
         self, exc, tmp_path, monkeypatch
     ):
         """A timeout or a 5xx does NOT prove the generated file cannot run —
-        it reads the prompt itself at run time, and `load_agent()` raises
+        it reads the prompt itself at run time, and `agent_config()` raises
         there rather than returning an empty prompt. So this read feeds ONE
         header comment, and losing it costs a comment, not the scaffold."""
         monkeypatch.chdir(tmp_path)
@@ -1003,7 +1003,7 @@ class TestCliWritesTheFile:
         # Silent about a prompt it could not read — and still reads it at run time.
         assert "System prompt:" not in source
         assert "no system prompt set" not in source
-        assert "decimalai.load_agent(AGENT_NAME)" in source
+        assert "decimalai.agent_config(AGENT_NAME)" in source
         # Said out loud, because a silently missing comment is indistinguishable
         # from an agent that has no prompt.
         assert "Could not read" in result.output
@@ -1015,7 +1015,7 @@ class TestCliWritesTheFile:
         structural reason rather than a string heuristic: step 1 already
         proved this agent is in this workspace, so a 404 on its prompt can
         only mean the route is missing. The generated file calls
-        `load_agent()` at module scope, so writing it anyway would hand
+        `agent_config()` at module scope, so writing it anyway would hand
         someone a program that dies on line one, every run, in silence."""
         monkeypatch.chdir(tmp_path)
         result = _run_cli(
@@ -1344,11 +1344,11 @@ class TestConsistencyWithFrontendSnippets:
         assert kwarg_reads(init_calls[0], "agent_name", "AGENT_NAME")
         inst = calls(tree, "instrument")
         if framework in LOAD_AGENT_FRAMEWORKS:
-            # The load_agent() shape (openai-agents 0.18, pydantic-ai 0.19), which
+            # The agent_config() shape (openai-agents 0.18, pydantic-ai 0.19), which
             # the dashboard snippet adopts with each release: no instrument() at
-            # all, one load_agent(AGENT_NAME).
+            # all, one agent_config(AGENT_NAME).
             assert inst == []
-            (load,) = calls(tree, "load_agent")
+            (load,) = calls(tree, "agent_config")
             assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
             return
         assert len(inst) == 1

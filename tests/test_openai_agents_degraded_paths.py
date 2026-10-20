@@ -15,12 +15,12 @@ before the fix:
 3. CONSTRUCTOR — the skill loader patched `Agent.__init__`, so an Agent
    built before `instrument()` (i.e. any module-level agent) got 0 skills
    offered and no `load_skill` tool. Since 0.18 nothing is patched:
-   `load_agent()` hands its pieces to the developer's own Agent, so the
+   `agent_config()` hands its pieces to the developer's own Agent, so the
    class here now checks the one thing that path still owes the manifest,
    the agent's prompt.
 4. EXTRACTION — the query was probed from `ctx.input` / `user_input` /
    `query`, none of which `RunContextWrapper` defines; the turn is on
-   `ctx.turn_input`, which `load_agent()` reads through
+   `ctx.turn_input`, which `agent_config()` reads through
    `_query_from_input_items`. Routing logged `strategy: full_menu`, 30
    skills offered, an empty query.
 
@@ -116,7 +116,7 @@ def _ingested(client):
 
 
 class TestQueryFromTurnInput:
-    """The message a `load_agent()` run is routed on, from ``turn_input``."""
+    """The message an `agent_config()` run is routed on, from ``turn_input``."""
 
     def test_reads_turn_input_the_runner_actually_stamps(self):
         from decimalai.openai_agents import _query_from_input_items
@@ -516,7 +516,7 @@ class TestRailsArePerRun:
         assert list(router._budget_for("run_b").loaded) == ["s2"]
 
 
-# ── 3. A load_agent() agent still declares its prompt ───────
+# ── 3. An agent_config() agent still declares its prompt ───────
 
 
 class TestALoadAgentPromptIsDeclared:
@@ -525,7 +525,7 @@ class TestALoadAgentPromptIsDeclared:
         (None, "BASE INSTRUCTIONS"),           # no saved prompt: the fallback runs
     ])
     def test_the_prompt_in_use_is_the_agents_prompt_component(self, saved, expected):
-        """`load_agent()` instructions are a method, not a string, and
+        """`agent_config()` instructions are a method, not a string, and
         `_introspect_agent` used to record only `isinstance(..., str)`: the
         prompt component would vanish from the manifest, and prompt-drift
         detection go blind, for exactly the agents whose prompt DecimalAI serves."""

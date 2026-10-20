@@ -1,4 +1,4 @@
-"""The framework-neutral half of every ``load_agent()``: ``decimalai._agent_binding``.
+"""The framework-neutral half of every ``agent_config()``: ``decimalai._agent_binding``.
 
 The OpenAI Agents SDK tests exercise it through ``OpenAIAgentConfig`` on the
 async path. These run it through a binding with no framework at all, on the
@@ -210,4 +210,17 @@ def test_init_enabled_false_stops_routing_and_skills_but_not_the_prompt(platform
 def test_the_fallback_prompt_is_used_when_none_is_saved(platform):
     support = Binding(prompt(text=None, version=None), platform.router, fallback="Be brief.")
     assert support.run("Hi").startswith("Be brief.\n\n## Available Skills")
-    assert support.records[0]["prompt"]["source"] == "code"
+    assert support.records[0]["prompt"]["source"] == "fallback (none saved)"
+
+
+@pytest.mark.parametrize("text, version, is_fallback, source", [
+    ("Saved.", 3, False, "decimalai"),
+    ("Saved.", 3, True, "decimalai (cached copy)"),
+    ("Be brief.", None, True, "fallback (unreachable)"),
+    (None, None, False, "fallback (none saved)"),
+])
+def test_prompt_source_says_where_the_prompt_came_from(text, version, is_fallback, source):
+    """Each value says what happened, not where the text was typed."""
+    read = SimpleNamespace(agent_name="support", system_prompt=text, version_number=version,
+                           content_hash=None, is_fallback=is_fallback)
+    assert Binding(read, None, fallback="Be brief.").prompt_source == source

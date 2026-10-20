@@ -22,7 +22,7 @@ pydantic_ai, and in openai_agents' loaded rail too. All five now release through
 
 Every test here runs ``_MAX_SCOPED_RAILS + 4`` runs through the adapter's own
 entry point — ADK's plugin callbacks, Anthropic's patched ``messages.create``,
-a `load_agent()` config and the openai_agents trace processor, the pydantic_ai
+an agent config and the openai_agents trace processor, the pydantic_ai
 system-prompt hook, CrewAI's ``before_llm_call`` hook — against a REAL
 ``SkillRouter`` whose two network calls are stubbed. The adapters' delivery
 tests use a stand-in router, which has no slots to leak; that is how this went
@@ -183,7 +183,7 @@ def adk_plugin(monkeypatch, router, client):
     for name, value in (("_PluginClass", None), ("_manifest_ids", {}), ("_manifest_trackers", {}),
                         ("_pending_manifests", {}), ("_live_runs", {})):
         monkeypatch.setattr(adk, name, value)
-    return adk.DecimalaiPlugin(agent_name="support")
+    return adk.DecimalAIPlugin(agent_name="support")
 
 
 class TestAdk:
@@ -196,7 +196,7 @@ class TestAdk:
         monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
         monkeypatch.setattr(agent_mod, "read_prompt",
                             lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=None))
-        support = adk.load_agent("support")
+        support = adk.agent_config("support")
         agent = SimpleNamespace(name="root_agent", model="gemini-3.6-flash", instruction=support.instruction,
                                 tools=[], sub_agents=[])
         prompts: List[str] = []
@@ -298,7 +298,7 @@ class TestOpenAIAgents:
     def test_runs_past_the_cap_hold_no_slot(
         self, monkeypatch, router, client, overflow_warnings,
     ):
-        """Both rails: the routing decision a `load_agent()` config files (before
+        """Both rails: the routing decision an agent config files (before
         the model call on the first run, then for each later run), and the load
         its ``load_skill`` tool files, each under the Agents-SDK trace id."""
         pytest.importorskip("agents")
@@ -362,7 +362,7 @@ class TestPydanticAI:
         monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
         monkeypatch.setattr(agent_mod, "read_prompt",
                             lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=None))
-        support = pa.load_agent("support")
+        support = pa.agent_config("support")
         instructions = support.get_instructions()
         tracer = pipeline.get_tracer("fake-model")
         prompts: List[str] = []

@@ -578,7 +578,7 @@ class TestInitIntegration:
 
     def test_init_with_openai_agents_flag(self, monkeypatch):
         """init(openai_agents=True) registers the trace processor, and that is
-        all it installs: since 0.18 skills come from `load_agent()`."""
+        all it installs: since 0.18 skills come from `agent_config()`."""
         mock_add = MagicMock()
 
         with patch.dict("sys.modules", {

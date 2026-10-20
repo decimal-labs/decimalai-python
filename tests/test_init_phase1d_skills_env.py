@@ -156,7 +156,7 @@ class TestAutoTraceOptOut:
     @pytest.mark.parametrize("skills_env", ["0", None])
     def test_openai_agents_auto_trace_installs_tracing_either_way(self, monkeypatch, skills_env):
         """Since 0.18 the OpenAI Agents flag has no skill loader to turn off:
-        skills come from `load_agent()` in the developer's own code."""
+        skills come from `agent_config()` in the developer's own code."""
         calls = _record_instrument(monkeypatch, "openai_agents")
         _auto_trace(monkeypatch, "openai-agents", skills_env)
         assert len(calls) == 1, "DECIMAL_AUTO_TRACE=openai-agents installed nothing"

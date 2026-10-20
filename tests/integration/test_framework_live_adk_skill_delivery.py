@@ -1,6 +1,6 @@
 """Live-LLM — a skill's BODY reaches a real Gemini-backed ADK agent's ANSWER.
 
-An agent built from ``decimalai.adk.load_agent()`` gets its saved prompt, the
+An agent built from ``decimalai.adk.agent_config()`` gets its saved prompt, the
 list of skills it may load, and a ``load_skill`` tool. This proves the whole
 path against a real model and a real backend: the model reads the list, calls
 ``load_skill``, and answers from the body it got back.
@@ -18,7 +18,7 @@ returns it. A correct answer is therefore only reachable through the body
 ``load_skill`` served.
 
 The negative control is a plain ADK agent with the same instruction and no
-``load_agent()``: same question, no skills. If the control also answers with
+``agent_config()``: same question, no skills. If the control also answers with
 the token, the token leaked from somewhere other than the skill and the
 positive result means nothing — so the control failing to produce it is part
 of the proof, not a nicety.
@@ -85,17 +85,17 @@ def _run_agent(model: str, agent_name: str, *, skills: bool) -> str:
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
-    from decimalai.adk import DecimalaiPlugin, load_agent
+    from decimalai.adk import DecimalAIPlugin, agent_config
 
     node = agent_name.replace("-", "_")
     if skills:
-        support = load_agent(agent_name)
+        support = agent_config(agent_name)
         agent = LlmAgent(name=node, model=model, instruction=support.instruction,
                          tools=[*support.tools])
-        plugin = DecimalaiPlugin()
+        plugin = DecimalAIPlugin()
     else:
         agent = LlmAgent(name=node, model=model, instruction=_INSTRUCTION, tools=[])
-        plugin = DecimalaiPlugin(agent_name=agent_name)
+        plugin = DecimalAIPlugin(agent_name=agent_name)
     runner = InMemoryRunner(app=App(name=_APP, root_agent=agent, plugins=[plugin]))
 
     async def _go() -> str:
@@ -158,7 +158,7 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
         author=f"live-adk/{agent_name}",
         conflict_policy="local_wins",
     )
-    # load_agent() reads the agent's saved prompt, so the agent has to exist.
+    # agent_config() reads the agent's saved prompt, so the agent has to exist.
     h.create_agent(agent_name, _INSTRUCTION)
 
     # ── The negative control runs FIRST, so a leak cannot be explained away
@@ -166,7 +166,7 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
     control_name = h.unique_agent("adk-skill-delivery-control")
     control_text = _run_agent(model, control_name, skills=False)
     assert _TOKEN not in control_text.upper(), (
-        "the control answered with the token WITHOUT load_agent(), so the "
+        "the control answered with the token WITHOUT agent_config(), so the "
         "token reached the model by some other route and this test proves "
         f"nothing about delivery. Control answer: {control_text!r}"
     )
@@ -174,7 +174,7 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
     answer = _run_agent(model, agent_name, skills=True)
 
     assert _TOKEN in answer.upper(), (
-        "the agent was built from load_agent() and the model's answer does not "
+        "the agent was built from agent_config() and the model's answer does not "
         f"contain the token that exists only in the skill body. Answer: {answer!r}"
     )
 

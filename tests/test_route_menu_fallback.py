@@ -104,7 +104,7 @@ def test_a_slow_or_erroring_route_serves_the_agents_menu(monkeypatch, route_fail
 
 
 def test_the_load_agent_call_gets_the_menu_as_its_prefix(monkeypatch):
-    """`load_agent()` routes through `build_prompt_parts`; its first run used to
+    """`agent_config()` routes through `build_prompt_parts`; its first run used to
     record "skills unavailable" here."""
     monkeypatch.setattr(sr.httpx, "request", _Platform(httpx.ReadTimeout("slow"), _ok(MENU)))
 

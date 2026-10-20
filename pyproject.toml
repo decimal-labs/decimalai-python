@@ -129,7 +129,7 @@ openai-agents = ["openai-agents>=0.23.1"]
 # Runtime extra for the native Claude Agent SDK integration
 # (decimalai.init(claude_agent_sdk=True)).
 claude-agent-sdk = ["claude-agent-sdk>=0.2.166"]
-# Runtime extra for the Pydantic AI integration (decimalai.pydantic_ai.load_agent).
+# Runtime extra for the Pydantic AI integration (decimalai.pydantic_ai.agent_config).
 # pydantic-ai-SLIM, not the `pydantic-ai` meta package: the meta package always
 # pulls slim's `logfire` extra, which needs opentelemetry-instrumentation-httpx
 # >=0.65b0 and so opentelemetry-api>=1.44, while google-adk 2.12 caps
@@ -138,7 +138,7 @@ claude-agent-sdk = ["claude-agent-sdk>=0.2.166"]
 # promises need no second install line (decimalai/cli/scaffold.py,
 # _PYDANTIC_AI_PROVIDERS).
 pydantic-ai = ["pydantic-ai-slim[openai,google,anthropic]>=2.56.0"]
-# Runtime extra for Google ADK (decimalai.adk.load_agent() and DecimalaiPlugin).
+# Runtime extra for Google ADK (decimalai.adk.agent_config() and DecimalAIPlugin).
 adk = ["google-adk>=2.12.0"]
 langgraph = ["langgraph>=1.2.15"]
 # Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).

@@ -474,7 +474,7 @@ class TestOpenAIAgentsTraceName:
         """``instrument(agent=a, agent_name=X)`` once per agent — a process that
         serves several — names each Agent's runs, not the whole process's: as a
         process-wide name the last install would file every run (conformance C9).
-        Routing is named by ``load_agent(name)`` alone."""
+        Routing is named by ``agent_config(name)`` alone."""
         from agents.tracing import get_trace_provider, set_trace_processors
 
         import decimalai.openai_agents as oa
@@ -521,7 +521,7 @@ class TestOpenAIAgentsTraceName:
 
 class TestOpenAIAgentsRunEndToEnd:
     """A real ``Runner.run_sync`` with a scripted model: the routing call, the
-    ``load_skill`` call and the trace all name the ``load_agent()`` agent."""
+    ``load_skill`` call and the trace all name the ``agent_config()`` agent."""
 
     SKILL = "refund-policy"
 
@@ -628,7 +628,7 @@ class TestOpenAIAgentsRunEndToEnd:
                 return []
 
         def _run(*, init_name: Optional[str], load_names: List[Optional[str]]) -> tuple:
-            """One run per entry, concurrently: ``load_agent(name)``'s agent, or
+            """One run per entry, concurrently: ``agent_config(name)``'s agent, or
             for None a plain agent with its own instructions. Every Agent is
             ``Agent(name="Assistant")``."""
             client = configured(init_name)
@@ -642,7 +642,7 @@ class TestOpenAIAgentsRunEndToEnd:
             runs = []
             for load_name in load_names:
                 if load_name:
-                    support = oa.load_agent(load_name)
+                    support = oa.agent_config(load_name)
                     runs.append(agents.Agent(name="Assistant", instructions=support.instructions,
                                              tools=[*support.tools],
                                              model=Scripted(loads=True, together=together)))
@@ -681,7 +681,7 @@ class TestOpenAIAgentsRunEndToEnd:
         assert sorted(trace.agent_name for trace in traces) == ["billing", "support"]
 
     def test_with_no_decimalai_name_the_agent_names_its_trace(self, run):
-        """No ``load_agent()`` and no ``init(agent_name=...)``: ``Agent(name=...)``
+        """No ``agent_config()`` and no ``init(agent_name=...)``: ``Agent(name=...)``
         is the only name, and nothing is routed."""
         router, [trace] = run(init_name=None, load_names=[None])
         assert router.routes == [] and router.loads == []

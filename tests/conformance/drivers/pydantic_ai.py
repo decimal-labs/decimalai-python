@@ -4,7 +4,7 @@ Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/p
 the agent's prompt and skills pulled from DecimalAI as one capability and handed to
 the developer's own ``Agent``::
 
-    support = load_agent(name)
+    support = agent_config(name)
     agent = Agent(model, name=support.name, tools=[...], capabilities=[support])
 
 The capability is the whole integration: its instructions (the saved prompt, then
@@ -81,16 +81,16 @@ def _tool(ctx: Ctx) -> Any:
 
 
 def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None, named: bool = True) -> Any:
-    """The documented snippet: this agent's ``load_agent()`` capability on the
+    """The documented snippet: this agent's ``agent_config()`` capability on the
     developer's own ``Agent``. ``configs`` shares one config per agent name, as a
     module-level one would be."""
     from pydantic_ai import Agent
 
-    from decimalai.pydantic_ai import load_agent
+    from decimalai.pydantic_ai import agent_config
 
     configs = {} if configs is None else configs
     if ctx.agent_name not in configs:
-        configs[ctx.agent_name] = load_agent(ctx.agent_name)
+        configs[ctx.agent_name] = agent_config(ctx.agent_name)
     support = configs[ctx.agent_name]
     return Agent(
         _model(),
@@ -198,7 +198,7 @@ def run_unnamed(ctx: Ctx) -> Any:
 
     ``Agent(model, ...)`` with no ``name=``: Pydantic AI then infers one from the
     variable the Agent is assigned to, which is nothing anybody chose. The run
-    is still the DecimalAI agent's, named once in ``load_agent()``: the trace and
+    is still the DecimalAI agent's, named once in ``agent_config()``: the trace and
     the routing call must both carry that name.
     """
     _setup(ctx, skills_rail=True)
@@ -229,7 +229,7 @@ DRIVER = Driver(
     # tracing path the environment never turned on.
     requires=("pydantic_ai", "openai", "openinference"),
     frameworks=("pydantic-ai-slim",),
-    entrypoint="decimalai.pydantic_ai.load_agent(name) + decimalai.init(openai=True)",
+    entrypoint="decimalai.pydantic_ai.agent_config(name) + decimalai.init(openai=True)",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
@@ -247,7 +247,7 @@ DRIVER = Driver(
         has_invocation_observer=False,
         reasons={
             "has_invocation_observer": (
-                "decimalai/pydantic_ai.py hands its caller no run: load_agent() takes "
+                "decimalai/pydantic_ai.py hands its caller no run: agent_config() takes "
                 "no on_trace, so C15 has no observer to grade. Its traces are built on "
                 "the OTel rail, which links a run to an enclosing decimalai.start_trace() "
                 "only where an adapter recorded that link when the run started "

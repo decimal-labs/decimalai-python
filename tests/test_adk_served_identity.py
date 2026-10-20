@@ -24,7 +24,7 @@ def test_a_loaded_skill_keeps_its_served_identity_through_observer_and_http(plat
     from decimalai._client import DecimalAIClient
 
     observed: list = []
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     run(support, model(("call", "damaged-item"), "answer"), "My keyboard arrived cracked.",
         traces=observed)
     sent = platform.client.ingest_trace.call_args.args[0]

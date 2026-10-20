@@ -1,4 +1,4 @@
-"""`DecimalaiPlugin`'s traces: the observer, the parent link, and a refused manifest.
+"""`DecimalAIPlugin`'s traces: the observer, the parent link, and a refused manifest.
 
 Every invocation the plugin sees becomes exactly one trace, its observer gets a
 detached copy of that trace, and the trace links to the DecimalAI trace that was
@@ -71,7 +71,7 @@ def _drive_one_turn(plugin: Any, *, inv_id: str = "inv-1") -> None:
 
 class TestInvocationObserver:
     def test_the_observer_gets_one_detached_copy_and_cannot_change_the_export(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
 
         seen = []
 
@@ -79,7 +79,7 @@ class TestInvocationObserver:
             seen.append(trace.model_copy(deep=True))
             trace.agent_name = "observer-mutation"
 
-        plugin = DecimalaiPlugin(agent_name="support", on_trace=observe)
+        plugin = DecimalAIPlugin(agent_name="support", on_trace=observe)
         _drive_one_turn(plugin)
         # A late completion signal for the same invocation is not a second trace.
         asyncio.run(plugin.after_run_callback(invocation_context=SimpleNamespace(invocation_id="inv-1")))
@@ -92,7 +92,7 @@ class TestInvocationObserver:
         assert sent[0].agent_name == "support"
 
     def test_an_error_invocation_is_observed_once_and_a_failing_observer_keeps_it(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
         from decimalai.schema.common import Status
 
         seen = []
@@ -101,7 +101,7 @@ class TestInvocationObserver:
             seen.append(trace)
             raise RuntimeError("observer failed")
 
-        plugin = DecimalaiPlugin(on_trace=broken_observer)
+        plugin = DecimalAIPlugin(on_trace=broken_observer)
         ic = SimpleNamespace(agent=_agent(), invocation_id="error", user_content=USER_QUESTION)
         cc = SimpleNamespace(invocation_id="error")
         request = SimpleNamespace(model="gemini-3.6-flash", contents=[],
@@ -120,11 +120,11 @@ class TestInvocationObserver:
         assert seen[0].status == sent[0].status == Status.ERROR
 
     def test_the_parent_is_captured_at_invocation_start_before_executor_finalization(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
         from decimalai.generic import start_trace
 
         seen = []
-        plugin = DecimalaiPlugin(on_trace=seen.append)
+        plugin = DecimalAIPlugin(on_trace=seen.append)
         ic = SimpleNamespace(agent=_agent(), invocation_id="parent", user_content=USER_QUESTION)
         with start_trace(agent_name="outer", auto_send=False) as outer:
             parent_id = outer.get_trace_id()
@@ -137,22 +137,22 @@ class TestInvocationObserver:
     def test_an_explicit_parent_wins_and_a_standalone_invocation_stays_a_root(self):
         from uuid import uuid4
 
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
         from decimalai.generic import start_trace
 
         parent_id = str(uuid4())
         seen = []
         with start_trace(agent_name="outer", auto_send=False):
-            _drive_one_turn(DecimalaiPlugin(parent_trace_id=parent_id, on_trace=seen.append))
-        _drive_one_turn(DecimalaiPlugin(on_trace=seen.append), inv_id="standalone")
+            _drive_one_turn(DecimalAIPlugin(parent_trace_id=parent_id, on_trace=seen.append))
+        _drive_one_turn(DecimalAIPlugin(on_trace=seen.append), inv_id="standalone")
         assert [trace.parent_trace_id for trace in seen] == [parent_id, None]
 
     def test_concurrent_generic_contexts_keep_their_own_parent(self):
-        from decimalai.adk import DecimalaiPlugin
+        from decimalai.adk import DecimalAIPlugin
         from decimalai.generic import start_trace
 
         seen, parents = [], {}
-        plugin = DecimalaiPlugin(on_trace=seen.append)
+        plugin = DecimalAIPlugin(on_trace=seen.append)
 
         async def run(invocation_id):
             with start_trace(agent_name=invocation_id, auto_send=False) as outer:
@@ -229,7 +229,7 @@ class TestRealAdkParentLink:
                 ))
 
         plugins = [
-            adk.DecimalaiPlugin(agent_name="parent_probe", parent_trace_id=explicit_parent,
+            adk.DecimalAIPlugin(agent_name="parent_probe", parent_trace_id=explicit_parent,
                                 on_trace=observed.append),
             CaptureConfig(),
         ]

@@ -17,7 +17,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    langchain template sent no system message at all and the openai-agents one
    hardcoded "You are <name>. Use the skills you are given." — so whatever the
    user typed at /agents/new was silently discarded by the file we generated
-   for them. Both now read it with `decimalai.load_agent(...)`.
+   for them. Both now read it with `decimalai.agent_config(...)`.
 
    EXPLICITLY, and that is the design, not an implementation detail: the
    prompt lands in a variable in THEIR file and is passed to the model by a
@@ -26,10 +26,10 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    silently replacing one means their repo says "Never issue refunds over $500"
    while the model receives something else, which is unfixable from their
    side. On openai-agents, pydantic-ai and adk nothing is injected:
-   `load_agent()` returns the prompt and the skills together, and the file
+   `agent_config()` returns the prompt and the skills together, and the file
    hands both to its own agent.
 
-   `load_agent()` runs at process start, so the no-redeploy property survives:
+   `agent_config()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
    prompt set (a real state — it is optional at creation) the file still runs
    and sends nothing rather than inventing one.
@@ -43,7 +43,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
    one stops. The openai-agents (0.18+), pydantic-ai (0.19+) and adk (0.20+)
    files have no loader to turn on: their skills reach the model only through
-   the `load_agent()` pieces they pass to their agent, which the same tests
+   the `agent_config()` pieces they pass to their agent, which the same tests
    check.
    (`init(langchain=True)` and `init(crewai=True)` turn the loader on
    themselves since 2026-10-14; the langchain template keeps the explicit
@@ -57,7 +57,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 
    Written once because a second copy is the same bug on a delay. Until
    2026-10-19 the name was a literal in `instrument(agent_name=...)`, in
-   `load_agent(...)` and in the framework's own `Agent(name=...)`, beside an
+   `agent_config(...)` and in the framework's own `Agent(name=...)`, beside an
    `AGENT_NAME` constant only error strings read — so renaming the agent meant
    finding every copy, and a missed one filed traces under the old name with no
    error. Now each file assigns `AGENT_NAME` once and passes it to
@@ -92,7 +92,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    /agents/<name>", which is a promise about the file it just wrote. The
    langchain and openai-agents adapters keep it themselves — their `instrument()`
    installs a callback handler / a trace processor. `decimalai.pydantic_ai`
-   deliberately does not: its `load_agent()` capability ships the prompt, the
+   deliberately does not: its `agent_config()` capability ships the prompt, the
    skills and the run BOUNDARY (one DecimalAI run span per run) and leaves the
    span content to Pydantic AI's own instrumentation or a provider instrumentor. `init()` with no flags installs no
    exporter at all (see `decimalai/__init__.py` — the exporter is built inside
@@ -123,7 +123,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
        span and a Pydantic AI span on the same model call.
 
    `Agent.instrument_all()` lives in the generated file rather than inside
-   `decimalai.pydantic_ai.load_agent()` on purpose: turning it on inside the
+   `decimalai.pydantic_ai.agent_config()` on purpose: turning it on inside the
    adapter would silently double up for every existing user who already pairs a
    provider instrumentor, which is the failure this point is about.
 
@@ -140,15 +140,15 @@ share is identical, deliberately:
     `instrument(enable_skill_loader=True)`. `init(langchain=True)` is the same
     install, so passing it as well installs twice: the first one wins, and the
     explicit call's other arguments are dropped with a warning.
-  * openai-agents: no `instrument()` at all. `load_agent(AGENT_NAME)`'s
+  * openai-agents: no `instrument()` at all. `agent_config(AGENT_NAME)`'s
     instructions and tools go into the file's own `Agent(...)`, and init()
     carries no framework flag.
-  * pydantic-ai: `load_agent(AGENT_NAME)` passed as `Agent(capabilities=[support])`,
+  * pydantic-ai: `agent_config(AGENT_NAME)` passed as `Agent(capabilities=[support])`,
     with `init(..., otel=True)` and `Agent.instrument_all()` for the spans.
     That is the same rule: exactly one span source per file. On langchain and
     openai-agents the adapter IS the span source; here it is not (point 4).
-  * adk: `load_agent(AGENT_NAME)`'s instruction and tools go into the file's own
-    `LlmAgent(...)`, and `DecimalaiPlugin()` into its `App(plugins=[...])`, the one
+  * adk: `agent_config(AGENT_NAME)`'s instruction and tools go into the file's own
+    `LlmAgent(...)`, and `DecimalAIPlugin()` into its `App(plugins=[...])`, the one
     span source; init() carries no framework flag.
 
 Two differences are intentional. The snippets name the agent on
@@ -164,7 +164,7 @@ WHY ONLY THESE FRAMEWORKS
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
 loader can use. Six adapters have one: `enable_skill_loader` on three
-(langchain, anthropic, crewai) and a `load_agent()` binding on three
+(langchain, anthropic, crewai) and an agent config on three
 (openai_agents, pydantic_ai, adk). The rest — llamaindex, claude_agent_sdk,
 autogen/otel — trace and version but have no loader, and generating a file for
 them would hand someone a program that looks correct and quietly ignores every
@@ -373,7 +373,7 @@ def _prompt_comment_lines(prompt: Optional["SavedPrompt"]) -> List[str]:
 
     Never the prompt TEXT. A copy pasted into the file is a second source of
     truth that goes stale the moment someone edits it in the dashboard — the
-    exact problem `load_agent()` exists to remove — and a prompt can carry
+    exact problem `agent_config()` exists to remove — and a prompt can carry
     material nobody meant to commit.
 
     `None` means the scaffold could not read it (an older backend, a 5xx), and
@@ -394,7 +394,7 @@ def _prompt_comment_lines(prompt: Optional["SavedPrompt"]) -> List[str]:
     return [
         "#",
         f"# System prompt: {len(prompt.system_prompt):,} characters{version}. Read at run",
-        "# time by the load_agent() call below, so editing it in the dashboard changes",
+        "# time by the agent_config() call below, so editing it in the dashboard changes",
         "# the next run — this file does not change and does not carry a copy.",
     ]
 
@@ -437,14 +437,14 @@ def _header_lines(
 def _agent_name_lines(agent_name: str, *, load_agent_routes: bool = False) -> List[str]:
     """The one place a generated file writes the agent's name (point 2).
 
-    ``load_agent_routes``: the template's ``load_agent()`` call brings the
+    ``load_agent_routes``: the template's ``agent_config()`` call brings the
     skills as well as the prompt (OpenAI Agents, Pydantic AI), so init() only
     traces.
     """
     second = (
-        "# to everything that traces, and load_agent() reads its prompt and skills."
+        "# to everything that traces, and agent_config() reads its prompt and skills."
         if load_agent_routes else
-        "# to everything that traces or routes skills, and load_agent() reads its prompt."
+        "# to everything that traces or routes skills, and agent_config() reads its prompt."
     )
     return [
         "# The DecimalAI agent this file runs as. Named once, here: init() passes it",
@@ -527,7 +527,7 @@ def _render_langchain(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "support = decimalai.load_agent(AGENT_NAME)",
+        "support = decimalai.agent_config(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, the skills rail delivers, and adding a tool later needs no",
@@ -593,7 +593,7 @@ def _render_openai_agents(
         "import decimalai",
         "from agents import Agent, Runner",
         "from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError",
-        "from decimalai.openai_agents import load_agent",
+        "from decimalai.openai_agents import agent_config",
         "",
         "# Change this to any model your OpenAI key can reach.",
         f"MODEL = {_py(model)}",
@@ -612,13 +612,13 @@ def _render_openai_agents(
         "#   support.instructions  the prompt saved in the dashboard, then the list of",
         "#                         this agent's skills. Re-read at most once a minute,",
         "#                         so a prompt saved in the dashboard reaches a run",
-        "#                         within a minute, with no redeploy. {{placeholders}}",
+        "#                         within a minute, with no redeploy. {{variables}}",
         "#                         in it are filled from",
         "#                         Runner.run(..., context=...).",
         "#   support.tools         the load_skill tool the model reads a skill with.",
         "# With no prompt saved, the agent gets only the skill list: nothing this file",
-        "# made up. Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
-        "support = load_agent(AGENT_NAME)",
+        "# made up. Pass agent_config(AGENT_NAME, fallback=...) to supply one.",
+        "support = agent_config(AGENT_NAME)",
         "",
         "agent = Agent(",
         "    name=support.name,",
@@ -674,7 +674,7 @@ def _render_pydantic_ai(
         "import os",
         "",
         "import decimalai",
-        "from decimalai.pydantic_ai import load_agent, retry_model_requests",
+        "from decimalai.pydantic_ai import agent_config, retry_model_requests",
         "from pydantic_ai import Agent",
         "from pydantic_ai.exceptions import UsageLimitExceeded",
         "from pydantic_ai.usage import UsageLimits",
@@ -720,10 +720,10 @@ def _render_pydantic_ai(
         "#",
         "# The prompt is re-read in the background at most once a minute, so",
         "# editing it in the dashboard changes the next runs of this process.",
-        "# {{placeholders}} in it are filled from the run's deps=. With no prompt",
+        "# {{variables}} in it are filled from the run's deps=. With no prompt",
         "# saved, the agent gets only the skill list: nothing this file made up.",
-        "# Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
-        "support = load_agent(AGENT_NAME)",
+        "# Pass agent_config(AGENT_NAME, fallback=...) to supply one.",
+        "support = agent_config(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, load_skill sits beside your tools, and adding a tool later",
@@ -743,7 +743,7 @@ def _render_pydantic_ai(
         "def run(question: str) -> str:",
         '    """One turn: the loop runs until the model answers.',
         "",
-        "    Add tools to TOOLS above; load_agent()'s capability adds load_skill",
+        "    Add tools to TOOLS above; agent_config()'s capability adds load_skill",
         "    beside them.",
         '    """',
         "    async def bounded_turn():",
@@ -784,7 +784,7 @@ def _render_adk(
         "import re",
         "",
         "import decimalai",
-        "from decimalai.adk import DecimalaiPlugin, load_agent",
+        "from decimalai.adk import DecimalAIPlugin, agent_config",
         "from google.adk.agents import LlmAgent",
         "from google.adk.apps import App",
         "from google.adk.runners import InMemoryRunner",
@@ -795,7 +795,7 @@ def _render_adk(
         f"MODEL = {_py(model)}",
         *_agent_name_lines(agent_name, load_agent_routes=True),
         "# ADK node names must be Python identifiers, and not \"user\"; the DecimalAI",
-        "# name need not be. Traces still file under AGENT_NAME: load_agent() names them.",
+        "# name need not be. Traces still file under AGENT_NAME: agent_config() names them.",
         "NODE_NAME = re.sub(r\"\\W\", \"_\", AGENT_NAME)",
         "if not NODE_NAME.isidentifier() or NODE_NAME == \"user\":",
         "    NODE_NAME = \"agent_\" + NODE_NAME",
@@ -820,12 +820,12 @@ def _render_adk(
         "#                        this agent's skills picked for each message. Re-read",
         "#                        at most once a minute, so a prompt saved in the",
         "#                        dashboard reaches a run within a minute, with no",
-        "#                        redeploy. {{placeholders}} in it are filled from the",
+        "#                        redeploy. {{variables}} in it are filled from the",
         "#                        session's state.",
         "#   support.tools        the load_skill tool the model reads a skill with.",
         "# With no prompt saved, the agent gets only the skill list: nothing this file",
-        "# made up. Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
-        "support = load_agent(AGENT_NAME)",
+        "# made up. Pass agent_config(AGENT_NAME, fallback=...) to supply one.",
+        "support = agent_config(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, and load_skill sits beside your tools.",
@@ -839,9 +839,9 @@ def _render_adk(
         "    tools=[*TOOLS, *support.tools],",
         ")",
         "",
-        "# DecimalaiPlugin makes each run one trace, filed under AGENT_NAME. ADK's App",
+        "# DecimalAIPlugin makes each run one trace, filed under AGENT_NAME. ADK's App",
         "# is where plugins go: runners built from this app are traced, nothing else.",
-        "app = App(name=NODE_NAME, root_agent=agent, plugins=[DecimalaiPlugin()])",
+        "app = App(name=NODE_NAME, root_agent=agent, plugins=[DecimalAIPlugin()])",
         "runner = InMemoryRunner(app=app)",
         "",
         "",

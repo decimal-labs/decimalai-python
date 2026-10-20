@@ -1018,7 +1018,7 @@ OBSERVER_SURFACES: Dict[str, str] = {
     "openai-agents": "decimalai.openai_agents",
     "llamaindex": "decimalai.llamaindex",
     # ADK has no instrument() since 0.20: its runs come from the plugin in the App.
-    "adk": "decimalai.adk:DecimalaiPlugin",
+    "adk": "decimalai.adk:DecimalAIPlugin",
     "crewai": "decimalai.crewai",
     "generic-otel": "decimalai.otel",
     "claude-agent-sdk": "decimalai.claude_agent_sdk",

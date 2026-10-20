@@ -167,7 +167,7 @@ def test_openai_agents_still_passes_agent_name_at_call_time():
     import decimalai.openai_agents as oa
 
     # Was `agent_name=getattr(agent, "name", None)`: `Agent(name=...)` won
-    # routing outright. Since 0.18 the name is the one `load_agent(name)` was
+    # routing outright. Since 0.18 the name is the one `agent_config(name)` was
     # given, on every routing call and every load, whatever the Agent's own
     # `name=` — graded end to end in tests/test_init_agent_name_defaults.py.
     src = inspect.getsource(oa.OpenAIAgentConfig)

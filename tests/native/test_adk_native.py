@@ -3,12 +3,12 @@ trace DecimalAI sends names the version the model received.
 
 The scenario (``_scenario_adk.native``) runs once, in a child process: the real ADK
 runner, ``SkillToolset(skills=decimalai.adk.skills())``, a scripted model, and
-``decimalai.adk.DecimalaiPlugin`` in the App, pointed at a probe. The toolset agent also
-carries ``decimalai.adk.load_agent()``'s instruction and tools. Run 1 lists, loads the
+``decimalai.adk.DecimalAIPlugin`` in the App, pointed at a probe. The toolset agent also
+carries ``decimalai.adk.agent_config()``'s instruction and tools. Run 1 lists, loads the
 target twice, reads its resource and runs its script; then the target is updated to
 version 2 on disk; run 2 loads it again with the same agent object. A third run, an
-agent with ``load_agent()``'s pieces and no toolset, is the control that shows
-``load_agent()`` lists skills at all. Everything below grades what the probe received
+agent with ``agent_config()``'s pieces and no toolset, is the control that shows
+``agent_config()`` lists skills at all. Everything below grades what the probe received
 and what the scripted model was handed.
 
 The pointer helper's tests run in this process: they only read files.
@@ -103,7 +103,7 @@ def test_load_agent_gives_the_agent_with_a_skill_toolset_no_decimal_skills(scena
     assert native, "the native agent made no model call"
     for call in native:
         for text in (ROUTER_SENTINEL, MENU_INSTRUCTION, ROUTER_SKILL["name"]):
-            assert text not in call["system"], f"load_agent() put {text!r} in the request"
+            assert text not in call["system"], f"agent_config() put {text!r} in the request"
     for i in (0, 1):
         trace = _trace(scenario, i)
         assert trace.get("routing_id") is None
@@ -114,7 +114,7 @@ def test_load_agent_gives_the_agent_with_a_skill_toolset_no_decimal_skills(scena
 
 
 def test_load_agent_still_lists_skills_for_an_agent_without_a_toolset(scenario):
-    """The control: without it, the test above would pass on a load_agent() that lists nothing."""
+    """The control: without it, the test above would pass on an agent config that lists nothing."""
     (call,) = _calls(scenario, "plain")
     assert ROUTER_SKILL["name"] in call["system"] and MENU_INSTRUCTION in call["system"]
     assert ROUTER_SENTINEL not in call["system"], "a body arrives by load_skill, not in the prompt"

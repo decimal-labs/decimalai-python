@@ -161,9 +161,9 @@ def _model_recovery_attributes(span: Any) -> Dict[str, Any]:
     return {"decimalai.model_requests": attempts} if attempts else {}
 
 
-#: The run record a ``load_agent()`` binding sets on the span that is current when
-#: it composes a turn (see ``decimalai._agent._prompt_attributes``). Content-free
-#: by construction: an agent name, a prompt version and hash, placeholder NAMES
+#: The run record an agent config sets on the span that is current when
+#: it composes a run (see ``decimalai._agent._prompt_attributes``). Content-free
+#: by construction: an agent name, a prompt version and hash, variable NAMES
 #: (never their values) and why skills were unavailable. Carried through as-is;
 #: every other attribute stays behind, as for the recovery events above.
 _DECIMAL_RECORD_ATTRIBUTES = (

@@ -291,7 +291,7 @@ class TestGenericAutoLoading:
 class TestOpenAIAgentsAutoLoading:
     """instrument() reads local skills when asked, and wires them to the processor.
 
-    An OpenAI agent's skills come from DecimalAI through `load_agent()`, so the
+    An OpenAI agent's skills come from DecimalAI through `agent_config()`, so the
     project's SKILL.md files are read only when asked: `skill_dirs=`,
     `disk_sync=True`, or the harness skill authority.
     """

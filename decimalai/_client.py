@@ -356,7 +356,7 @@ class DecimalAPIError(httpx.HTTPStatusError):
 class AgentNotFoundError(DecimalAPIError):
     """A 404 from an agent-scoped route: this workspace has no such agent.
 
-    Its own class because it is the ONE failure of ``load_agent()`` the caller
+    Its own class because it is the ONE failure of ``agent_config()`` the caller
     can fix without leaving their editor — a typo, or a name that belongs to a
     different workspace than the key. Everything else (network, key, 5xx) is
     environmental, and a caller who wants to special-case the fixable one
@@ -1021,7 +1021,7 @@ class DecimalAIClient:
         version: Optional[int] = None,
         if_none_match: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """The agent's configured system prompt. Backs :func:`decimalai.load_agent`.
+        """The agent's configured system prompt. Backs :func:`decimalai.agent_config`.
 
         Deliberately its OWN endpoint rather than a scan of ``list_agents()``:
         passing a ``limit`` there activates a truncating pagination path whose
@@ -1037,7 +1037,7 @@ class DecimalAIClient:
                 answers 304 when it still matches; this method then returns
                 ``None`` — "unchanged", distinct from a payload whose
                 ``system_prompt`` is ``None`` ("no prompt set"). Only useful to
-                a caller polling for edits; ``load_agent()`` never sends it,
+                a caller polling for edits; ``agent_config()`` never sends it,
                 because a cache is what would break the no-redeploy property it
                 is sold on.
 

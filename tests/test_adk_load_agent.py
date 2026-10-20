@@ -1,9 +1,9 @@
-"""`decimalai.adk.load_agent()`: an agent's prompt and skills as ADK objects.
+"""`decimalai.adk.agent_config()`: an agent's prompt and skills as ADK objects.
 
 Driven through the real Google ADK runner with a scripted ``BaseLlm``: the model
 records what each request was given (the system instruction, the tools and the
 load_skill schema, the tool results) and calls ``load_skill`` when told to. Traces
-come from the real ``DecimalaiPlugin`` in ``App(plugins=[...])``, captured with its
+come from the real ``DecimalAIPlugin`` in ``App(plugins=[...])``, captured with its
 ``on_trace`` observer. DecimalAI's answers come from the fake platform the
 framework-neutral tests use, so nothing leaves the process.
 """
@@ -97,7 +97,7 @@ def run(support, llm, question, *, state=None, tools=(), plugin=None, traces=Non
     agent = LlmAgent(name="support_agent", model=llm, instruction=support.instruction,
                      tools=[*tools, *support.tools])
     plugins = [plugin] if plugin is not None else (
-        [adk.DecimalaiPlugin(on_trace=traces.append)] if traces is not None else [])
+        [adk.DecimalAIPlugin(on_trace=traces.append)] if traces is not None else [])
     runner = InMemoryRunner(app=App(name="support_app", root_agent=agent, plugins=plugins))
     if session is None:
         session = runner.session_service.create_session_sync(
@@ -116,7 +116,7 @@ def run(support, llm, question, *, state=None, tools=(), plugin=None, traces=Non
 
 
 def test_the_agent_gets_its_prompt_skill_list_and_load_skill(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     assert type(support).__name__ == "ADKAgentConfig" and support.name == "support"
     llm = model(("call", "damaged-item"), "answer")
     answer, _ = run(support, llm, "My keyboard arrived cracked.")
@@ -130,21 +130,21 @@ def test_the_agent_gets_its_prompt_skill_list_and_load_skill(platform):
 
 
 def test_each_invocation_is_routed_on_its_own_message(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     _, session = run(support, model("answer"), "My keyboard arrived cracked.")
     run(support, model("answer"), "Where is my order?", session=session)
     assert list(platform.queries.values()) == ["My keyboard arrived cracked.", "Where is my order?"]
 
 
 def test_a_missing_placeholder_says_the_values_come_from_session_state(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     with pytest.raises(decimalai.MissingPromptVariable, match=r"customer\.name\. Put them in the session's state"):
         run(support, model("answer"), "Hi", state={})
 
 
 def test_without_a_list_the_agent_gets_its_prompt_and_no_load_skill(platform):
     platform.down = True
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     llm = model("answer")
     run(support, llm, "Hi")
     assert ours(llm.requests[0]) == "Hello Sam."
@@ -153,7 +153,7 @@ def test_without_a_list_the_agent_gets_its_prompt_and_no_load_skill(platform):
 
 def test_an_agent_with_adks_skill_toolset_gets_no_decimal_skills_and_is_told_once(platform, monkeypatch, caplog):
     monkeypatch.setattr(adk, "_has_skill_toolset", lambda agent: True)
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     with caplog.at_level(logging.WARNING, logger="decimalai.adk"):
         for _ in range(2):
             llm = model("answer")
@@ -169,7 +169,7 @@ def test_another_tool_named_load_skill_gets_no_decimal_skills(platform, caplog):
         """Theirs."""
         return "theirs"
 
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     llm = model("answer")
     with caplog.at_level(logging.WARNING, logger="decimalai.adk"):
         run(support, llm, "Hi", tools=[load_skill])
@@ -181,7 +181,7 @@ def test_another_tool_named_load_skill_gets_no_decimal_skills(platform, caplog):
 def test_init_enabled_false_stops_skills_but_not_the_prompt(platform, monkeypatch):
     import decimalai._config as cfg
 
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     monkeypatch.setattr(cfg, "_disabled_by_init", lambda: True)
     llm = model("answer")
     run(support, llm, "Hi")
@@ -191,9 +191,9 @@ def test_init_enabled_false_stops_skills_but_not_the_prompt(platform, monkeypatc
 
 def test_an_invocation_is_one_trace_filed_under_the_decimalai_agent_with_its_record(platform):
     traces: list = []
-    support = adk.load_agent("support")
-    # The plugin's own label and ADK's agent name both lose to the load_agent() name.
-    plugin = adk.DecimalaiPlugin(agent_name="runner-label", on_trace=traces.append)
+    support = adk.agent_config("support")
+    # The plugin's own label and ADK's agent name both lose to the agent_config() name.
+    plugin = adk.DecimalAIPlugin(agent_name="runner-label", on_trace=traces.append)
     run(support, model(("call", "damaged-item"), "answer"), "My keyboard arrived cracked.", plugin=plugin)
     (trace,) = traces
     assert trace.agent_name == "support"
@@ -209,7 +209,7 @@ def test_an_invocation_is_one_trace_filed_under_the_decimalai_agent_with_its_rec
 
 
 def test_the_load_names_the_decimalai_agent_and_the_invocation_routes_once(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     run(support, model(("call", "damaged-item"), "answer"), "My keyboard arrived cracked.", traces=[])
     (body,) = [params for _method, path, params in platform.requests if path.endswith("/body")]
     assert body.get("agent_name") == "support"
@@ -217,7 +217,7 @@ def test_the_load_names_the_decimalai_agent_and_the_invocation_routes_once(platf
 
 
 def test_the_manifest_declares_the_saved_prompt_template(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     run(support, model("answer"), "Hi", traces=[])
     (snapshot,) = [c.args[0] for c in platform.client.register_manifest.call_args_list]
     assert snapshot.agent_name == "support"
@@ -227,7 +227,7 @@ def test_the_manifest_declares_the_saved_prompt_template(platform):
 
 
 def test_without_the_plugin_the_agent_still_gets_its_prompt_and_skills(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     llm = model(("call", "damaged-item"), "answer")
     run(support, llm, "My keyboard arrived cracked.")
     assert llm.requests[1]["returns"][0]["result"].startswith("## Skill: damaged-item")
@@ -235,7 +235,7 @@ def test_without_the_plugin_the_agent_still_gets_its_prompt_and_skills(platform)
 
 
 def test_a_copied_agent_shares_its_config(platform):
-    support = adk.load_agent("support")
+    support = adk.agent_config("support")
     assert copy.copy(support) is support and copy.deepcopy(support) is support
     (tool,) = support.tools
     assert support.tools == [tool], "one load_skill per config"

@@ -1,5 +1,5 @@
 """Phase 1d, OpenAI Agents SDK adapter: every skill load names its own run's
-routing decision, for `load_agent()` agents.
+routing decision, for `agent_config()` agents.
 
 Driven through the REAL Agents SDK with a scripted in-process model, so nothing
 here contacts a provider or the DecimalAI backend.
@@ -20,7 +20,7 @@ not bookkeeping. Two ways it went wrong before:
    recorded under ``"no-op"`` was never popped.
 
 2. **A load named no decision.** The old process-wide loader routed only some
-   agents, and their loads named none. A `load_agent()` agent's loads name the
+   agents, and their loads named none. An `agent_config()` agent's loads name the
    run's own decision: made before the model call on the first run (or for a
    menu cut to fit), or in the background on later runs, which a load waits
    for. And a developer's own instructions function around
@@ -252,7 +252,7 @@ class TestUntracedRunsDoNotShareARunScope:
     def test_concurrent_untraced_runs_route_and_load_under_their_own_scope(self, sdk, untraced):
         router = _Router()
         oa._skill_router_singleton = router
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         async def many():
             await asyncio.gather(*(
@@ -277,7 +277,7 @@ class TestUntracedRunsDoNotShareARunScope:
         """No processor ever sees a NoOpTrace end, so nothing would pop a rail
         recorded for one: it would be held until evicted, and read by nobody."""
         oa._skill_router_singleton = _Router()
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         for i in range(5):
             Runner.run_sync(_agent(support, _ScriptedModel([_call("load_skill", {"name": SKILL}),
@@ -291,7 +291,7 @@ class TestUntracedRunsDoNotShareARunScope:
     def test_an_agents_memory_of_finished_runs_is_bounded(self, sdk, untraced, monkeypatch):
         monkeypatch.setattr(binding, "_MAX_CONFIG_RUNS", 3)
         oa._skill_router_singleton = _Router()
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         for i in range(6):
             Runner.run_sync(_agent(support, _ScriptedModel([_text("ok")])),
@@ -308,7 +308,7 @@ class TestUntracedRunsDoNotShareARunScope:
         group: List[str] = []
 
         def agent(name, other_skill, own_skill):
-            return _agent(oa.load_agent(name), _Rendezvous([
+            return _agent(oa.agent_config(name), _Rendezvous([
                 _turn(("load_skill", {"name": other_skill}), ("load_skill", {"name": own_skill})),
                 _text("ok"),
             ], group, 2))
@@ -339,7 +339,7 @@ class TestUntracedRunsDoNotShareARunScope:
         still sends its trace, with its own routing decision and load."""
         router = _Router()
         oa._skill_router_singleton = router
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         def run(question, config):
             return Runner.run(_agent(support, _ScriptedModel([_call("load_skill", {"name": SKILL}),
@@ -379,7 +379,7 @@ class TestALoadNamesThisRunsDecision:
         nobody offered it. The load names this run's decision, so the platform
         refuses it, and an owned skill below the menu cut still loads."""
         platform.truncated = True          # a menu cut to fit: no name list on the tool
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         model = _loading(PLANTED, OWNED)
         agent = _agent(support, model)
         if shape == "your_own_function_around_them":
@@ -401,7 +401,7 @@ class TestALoadNamesThisRunsDecision:
         background. Its load waits for that decision and names it, not the
         first run's, so what the platform serves follows THIS run's offer."""
         platform.fresh_ids = True
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         Runner.run_sync(_agent(support, _ScriptedModel([_text("ok")])), ASK_A)   # routes now
         platform.delay = 0.3               # the model asks before the decision is in
         model = _loading(PLANTED, "pub/refunds")
@@ -418,7 +418,7 @@ class TestALoadNamesThisRunsDecision:
         """Two agents in one process; B routed last, so the router's latest
         decision is B's. A later run of A whose own decision was never made
         (no worker pool) names A's latest decision, never B's."""
-        support_a, support_b = oa.load_agent("support-a"), oa.load_agent("support-b")
+        support_a, support_b = oa.agent_config("support-a"), oa.agent_config("support-b")
         Runner.run_sync(_agent(support_a, _ScriptedModel([_text("ok")])), ASK_A)
         Runner.run_sync(_agent(support_b, _ScriptedModel([_text("ok")])), ASK_B)
         monkeypatch.setattr(binding, "_in_background", lambda fn, *args: None)
@@ -439,7 +439,7 @@ class TestYourOwnInstructionsFunction:
     def test_the_skill_list_follows_what_your_function_adds(self, sdk):
         router = _Router()
         oa._skill_router_singleton = router
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         calls: List[Any] = []
         mine = _wrapping(support, calls)
         model = _ScriptedModel([_text("ok")])
@@ -461,7 +461,7 @@ class TestYourOwnInstructionsFunction:
         router = _Router()
         oa._skill_router_singleton = router
         oa.instrument(disk_sync=False)
-        oa.load_agent("support")
+        oa.agent_config("support")
         model = _ScriptedModel([_text("ok")])
 
         Runner.run_sync(agents.Agent(name="other", instructions="MY PROMPT", model=model), QUESTION)
@@ -478,7 +478,7 @@ class TestYourOwnInstructionsFunction:
                 return "", ROUTING_ID
 
         oa._skill_router_singleton = _NoSkills()
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         model = _ScriptedModel([_text("ok")])
 
         Runner.run_sync(_agent(support, model), QUESTION)

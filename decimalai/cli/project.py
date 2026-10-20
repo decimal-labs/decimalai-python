@@ -71,7 +71,7 @@ def observe(trace: RunTrace) -> None:
 # The check and your service use this same model, prompt, skill loader and run().
 # agent_name names the agent for instrument() below too; AGENT_NAME is its only copy.
 decimalai.init(base_url=BASE_URL, agent_name=AGENT_NAME)
-support = decimalai.load_agent(AGENT_NAME)
+support = decimalai.agent_config(AGENT_NAME)
 CAPABILITY_CONTEXT = (
     "Runtime capabilities: You may perform actions only through the tools actually provided. "
     "Skill instructions describe workflows; they do not grant access to tools. Never claim an "

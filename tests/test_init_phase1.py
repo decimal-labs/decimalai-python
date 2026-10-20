@@ -8,7 +8,7 @@ Two defects from the 2026-10-13 framework-integration audit, both silent:
    followed the docs got good traces and zero skills, with nothing anywhere
    saying so. The flag form now turns the loader on; `skills=False` keeps the
    tracing-only install for anyone who wants it. `openai_agents=True` is the
-   exception since 0.18: it traces only, skills come from `load_agent()`, and
+   exception since 0.18: it traces only, skills come from `agent_config()`, and
    the first such init() says so.
 
 2. **Re-init kept the previous org's router.** `init()` rebuilds the trace
@@ -139,7 +139,7 @@ class TestFlagFormDeliversSkills:
     @pytest.mark.parametrize("skills", [None, True, False])
     def test_openai_agents_flag_traces_only(self, openai_agents_flag, caplog, skills):
         """The flag registers one trace processor and changes no Agents SDK
-        class: skills come from ``load_agent()``, which only the developer's
+        class: skills come from ``agent_config()``, which only the developer's
         own Agent sees, so ``skills=`` does not apply and nothing is said."""
         processors, untouched, agents = openai_agents_flag
         kwargs = {} if skills is None else {"skills": skills}
@@ -149,7 +149,7 @@ class TestFlagFormDeliversSkills:
 
         assert len(processors) == 1, f"one init() registered {len(processors)} trace processors"
         assert {name: getattr(agents.Agent, name) for name in untouched} == untouched
-        assert not [r for r in caplog.records if "load_agent" in r.getMessage()]
+        assert not [r for r in caplog.records if "agent_config" in r.getMessage()]
 
     @pytest.mark.parametrize("authority, reads_local_skills", [(None, False), ("harness", True)])
     def test_openai_agents_flag_reads_local_skills_only_under_the_harness_authority(
@@ -315,14 +315,14 @@ class TestOpenAIAgentsRepeatInstall:
         assert len(processors()) == 1
 
     def test_flag_then_load_agent_registers_one_processor(self, processors, monkeypatch):
-        """The documented pair: `init(openai_agents=True)`, then `load_agent()`."""
-        from decimalai.openai_agents import instrument, load_agent
+        """The documented pair: `init(openai_agents=True)`, then `agent_config()`."""
+        from decimalai.openai_agents import instrument, agent_config
 
         _init(openai_agents=True, agent_name="support")
         monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
             "agent_name": name, "system_prompt": "Be helpful.", "version_number": 1,
         })
-        load_agent("support")
+        agent_config("support")
         instrument(agent_name="support")
         assert len(processors()) == 1
 

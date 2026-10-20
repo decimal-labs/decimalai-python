@@ -8,7 +8,7 @@ its own (so an injection would show). ``native``: run 1 loads the target, reads 
 ``SKILL.md``, loads it again, reads its resource and runs its script; then
 ``decimalai skills update`` replaces it with version 2 and run 2, with the same agent,
 loads and reads it again. ``two_catalogs``: the same agent is also handed
-``load_agent()``'s instructions and tool, and DecimalAI's skills stay off for it.
+``agent_config()``'s instructions and tool, and DecimalAI's skills stay off for it.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ def test_router_injection_is_off_for_an_agent_with_the_sandbox_skills_capability
 
 def test_load_agent_skills_stay_off_beside_the_sandbox_skills_capability(two_catalogs,
                                                                          native_project):
-    """An agent handed ``load_agent()``'s instructions and tool AND the sandbox's own
+    """An agent handed ``agent_config()``'s instructions and tool AND the sandbox's own
     ``Skills``: DecimalAI's skills turn off for it, said once, and the sandbox's catalog
     is the only one that reaches the model, still graded as its activation."""
     notes = two_catalogs["notes"]

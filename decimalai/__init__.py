@@ -846,7 +846,7 @@ def init(
     ``init()``; do one or the other, not both. ``skills=False``, or
     ``DECIMALAI_SKILLS=0`` in the environment, keeps the flag to tracing only.
     ``openai_agents`` traces only: an OpenAI agent gets its prompt and skills
-    from ``decimalai.openai_agents.load_agent(name)``.
+    from ``decimalai.openai_agents.agent_config(name)``.
 
     ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
     a supported integration: the flag is now an alias for ``otel=True`` that
@@ -880,7 +880,7 @@ def init(
             skills into every chat-model call (see ``skills``).
         openai_agents: If ``True``, trace the OpenAI Agents SDK. Tracing only:
             an agent gets its DecimalAI prompt and skills from
-            ``decimalai.openai_agents.load_agent(name)``, which you pass into
+            ``decimalai.openai_agents.agent_config(name)``, which you pass into
             your own ``Agent(...)``. ``skills`` does not apply to it.
         llamaindex: If ``True``, instrument LlamaIndex. Tracing only: this
             adapter has no skill loader.
@@ -922,7 +922,7 @@ def init(
             default wherever a name is not given: the framework flags above,
             a later ``instrument()`` of any adapter, ``start_trace()``,
             ``@trace`` and ``SkillRouter``. On OpenAI Agents it names the trace
-            of an agent no ``load_agent()`` config built, over ``Agent(name=...)``.
+            of an agent no agent config built, over ``Agent(name=...)``.
             An explicit name passed to any of those still wins over this one.
         verify: If ``True`` (default), synchronously probe the backend
             during init to (a) validate the API key, (b) detect a
@@ -2158,11 +2158,12 @@ def push_langsmith_scores(
         from . import _config as _cfg
         client = _cfg._get_client()
     return _adapters.push_langsmith_scores(client, trace_id, run_scores)
-# Eager, unlike SkillRouter below: `load_agent()` and the binding it returns cost
+# Eager, unlike SkillRouter below: `agent_config()` and the binding it returns cost
 # the `import decimalai` path nothing (the router and the HTTP client load at call
 # time), and `AgentConfig` being a real symbol at import is what makes a misspelt
 # attribute fail at the attribute instead of deep inside user code later.
-from ._agent import AgentConfig, load_agent  # noqa: E402, F401
+# `load_agent` is the 0.20 name, kept so an old call fails with the new one's name in the error.
+from ._agent import AgentConfig, Run, agent_config, load_agent  # noqa: E402, F401
 from ._agent_binding import MissingPromptVariable  # noqa: E402, F401
 from .dataset import Dataset  # noqa: E402, F401
 from .generic import (  # noqa: E402, F401
@@ -2200,7 +2201,7 @@ def __getattr__(name: str):
         return SkillRouter
     if name == "AgentNotFoundError":
         # Lazy for the same reason: it lives in `_client`, which imports httpx.
-        # Exported at all because it is the one `load_agent()` failure the
+        # Exported at all because it is the one `agent_config()` failure the
         # caller can fix themselves, and catching it should not require
         # string-matching a message or importing a private module.
         from ._client import AgentNotFoundError
@@ -2216,13 +2217,14 @@ def __getattr__(name: str):
 
 __all__ = [
     "AgentConfig",
+    "Run",
     "AgentNotFoundError",
     "MissingPromptVariable",
     "SkillRouter",
     "skills_dir",
     "__version__",
     "init",
-    "load_agent",
+    "agent_config",
     "flush",
     "last_send_error",
     "export_status",
@@ -2291,8 +2293,8 @@ def _auto_init_from_env() -> None:
         # quietly trace nothing.
         logger.warning(
             "DecimalAI: DECIMAL_AUTO_TRACE=adk traces nothing since decimalai 0.20. Add "
-            "decimalai.adk.DecimalaiPlugin() to your App(plugins=[...]); an agent gets its "
-            "prompt and skills from decimalai.adk.load_agent(name)."
+            "decimalai.adk.DecimalAIPlugin() to your App(plugins=[...]); an agent gets its "
+            "prompt and skills from decimalai.adk.agent_config(name)."
         )
     if auto_trace:
         if not api_key:

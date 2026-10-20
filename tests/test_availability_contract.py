@@ -73,13 +73,13 @@ def _stop(srv):
 
 
 class TestLoadAgentSurvivesAnOutage:
-    """`load_agent()` runs at import in a worker's boot path. An unreachable
+    """`agent_config()` runs at import in a worker's boot path. An unreachable
     platform used to mean the customer's agent could not start at all."""
 
     def test_a_fallback_lets_the_agent_boot_with_the_platform_down(self):
         _reset_prompt_cache()
         decimalai.init(api_key="dai_sk_t", base_url=UNREACHABLE, verify=False)
-        cfg = decimalai.load_agent("bot", fallback="You are a returns agent.")
+        cfg = decimalai.agent_config("bot", fallback="You are a returns agent.")
         assert cfg.prompt == "You are a returns agent."
         assert cfg.prompt_version is None
         assert read_prompt("bot", fallback="You are a returns agent.").is_fallback is True
@@ -90,7 +90,7 @@ class TestLoadAgentSurvivesAnOutage:
         _reset_prompt_cache()
         decimalai.init(api_key="dai_sk_t", base_url=UNREACHABLE, verify=False)
         with pytest.raises(Exception):
-            decimalai.load_agent("bot")
+            decimalai.agent_config("bot")
 
     def test_a_previously_read_prompt_is_served_when_the_platform_goes_away(self):
         class Ok(BaseHTTPRequestHandler):
@@ -111,13 +111,13 @@ class TestLoadAgentSurvivesAnOutage:
         srv, url = _serve(Ok)
         try:
             decimalai.init(api_key="dai_sk_t", base_url=url, verify=False)
-            live = decimalai.load_agent("bot")
+            live = decimalai.agent_config("bot")
             assert live.prompt == "LIVE"
             assert live.prompt_version == 3
         finally:
             _stop(srv)
 
-        stale = decimalai.load_agent("bot")
+        stale = decimalai.agent_config("bot")
         assert stale.prompt == "LIVE"
         assert stale.prompt_version == 3
         again = read_prompt("bot")
@@ -142,7 +142,7 @@ class TestLoadAgentSurvivesAnOutage:
         try:
             decimalai.init(api_key="dai_sk_t", base_url=url, verify=False)
             with pytest.raises(Exception):
-                decimalai.load_agent("bot", fallback="invented")
+                decimalai.agent_config("bot", fallback="invented")
         finally:
             _stop(srv)
 

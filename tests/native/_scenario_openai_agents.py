@@ -5,7 +5,7 @@ A ``SandboxAgent`` with the sandbox's own ``Skills`` capability, built by
 ``ScriptedModel``; DecimalAI's instrumentation (``decimalai.init(openai_agents=True)``)
 sends each run's trace to a probe. Nothing here asserts: the parent grades what comes back.
 Since 0.18 that init gives no agent skills of its own, so DecimalAI's skills reach an agent
-only through ``load_agent()`` (the ``two_catalogs`` scenario).
+only through ``agent_config()`` (the ``two_catalogs`` scenario).
 
 The sandbox's ``load_skill`` returns only a status; the model reads the body by opening
 ``SKILL.md`` in the copy the load made, so a "load" here is ``load_skill`` and then
@@ -199,18 +199,18 @@ def native(ctx: dict) -> dict:
 
 
 def two_catalogs(ctx: dict) -> dict:
-    """The same agent also given DecimalAI's skills with ``load_agent()``: its
+    """The same agent also given DecimalAI's skills with ``agent_config()``: its
     instructions and its ``load_skill`` tool, beside the sandbox's own ``Skills``.
     DecimalAI's skills turn off for it (D7), so one catalog reaches the model."""
     from tests.conformance.isolation import CONFORMANCE_SKILLS
 
-    from decimalai.openai_agents import load_agent
+    from decimalai.openai_agents import agent_config
 
     logs = watch_logs()
     s = col.Session("openai-agents", distributions=DISTRIBUTIONS, openai_agents=True)
     s.probe.skills = [dict(sk) for sk in CONFORMANCE_SKILLS]
     s.probe.register_agent(AGENT, system_prompt=INSTRUCTIONS)
-    support = load_agent(AGENT)
+    support = agent_config(AGENT)
     turns = Turns()
     the_agent = agent(turns.model, instructions=support.instructions, tools=[*support.tools])
     seen: Dict[str, Any] = {}

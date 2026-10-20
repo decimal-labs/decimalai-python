@@ -1,6 +1,6 @@
 """`read_prompt()` — the agent's saved prompt, read at run time.
 
-Every `load_agent()` starts with this read and re-runs it to refresh its copy.
+Every `agent_config()` starts with this read and re-runs it to refresh its copy.
 
 THE ONE INVARIANT THIS MODULE EXISTS FOR: `prompt.system_prompt is None` means
 the agent exists and has no prompt set, and it means nothing else. It is a real
@@ -371,7 +371,7 @@ class TestTheRequest:
         assert seen[0].url.params["version"] == "2"
 
     def test_load_agent_never_sends_a_conditional_request(self, monkeypatch):
-        """The route supports ETag / If-None-Match, and `load_agent()`
+        """The route supports ETag / If-None-Match, and `agent_config()`
         deliberately does not use it. It runs once per process, so there is
         nothing cached to revalidate — and a cache is precisely what would
         break the no-redeploy property the call is sold on."""

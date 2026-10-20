@@ -3493,7 +3493,7 @@ class SkillRouter:
         the pin.
 
         Args:
-            agent_name: The name your code runs the agent under (``load_agent(name)``,
+            agent_name: The name your code runs the agent under (``agent_config(name)``,
                 ``Agent(name=...)``). An agent DecimalAI has not seen yet is created.
             skill_id: The skill's UUID: one of your organization's skills, or a
                 public registry skill, which is then linked for this agent only.

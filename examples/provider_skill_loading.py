@@ -2,14 +2,14 @@
 
 Demonstrates how each provider integration gives an agent its DecimalAI
 skills: ``instrument(enable_skill_loader=True)`` on the Anthropic SDK, and
-``load_agent()`` on the OpenAI Agents SDK and Pydantic AI. Their ``load_skill``
-tool is not a ``load_agent()`` argument: it is config-driven via
+``agent_config()`` on the OpenAI Agents SDK and Pydantic AI. Their ``load_skill``
+tool is not an ``agent_config()`` argument: it is config-driven via
 ``decimalai.init(load_skill_tool=...)`` / ``DECIMALAI_LOAD_SKILL_TOOL``.
 
 This example shows:
 - Anthropic SDK with skill injection into system prompts (no tool loop)
 - OpenAI Agents SDK with the live load_skill tool
-- Pydantic AI with load_agent()'s capability (skill list + load_skill tool)
+- Pydantic AI with agent_config()'s capability (skill list + load_skill tool)
 
 Prerequisites:
     pip install "decimalai[openai-agents,pydantic-ai]" anthropic
@@ -64,9 +64,9 @@ def example_anthropic_skill_loader():
 
 
 def example_openai_agents_skill_loading():
-    """OpenAI Agents SDK: the agent's prompt and skills from load_agent().
+    """OpenAI Agents SDK: the agent's prompt and skills from agent_config().
 
-    Since 0.18 nothing is installed or patched for this framework. load_agent()
+    Since 0.18 nothing is installed or patched for this framework. agent_config()
     returns the two pieces you put into your own Agent(...):
     1. ``instructions`` — the agent's saved prompt, then its skill list
     2. ``tools`` — the load_skill tool the model fetches a skill's body with
@@ -75,7 +75,7 @@ def example_openai_agents_skill_loading():
     the model mid-turn.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 2: OpenAI Agents SDK with load_agent()")
+    print("EXAMPLE 2: OpenAI Agents SDK with agent_config()")
     print("="*70)
 
     import decimalai
@@ -84,14 +84,14 @@ def example_openai_agents_skill_loading():
     try:
         from agents import Agent, function_tool
 
-        from decimalai.openai_agents import load_agent
+        from decimalai.openai_agents import agent_config
 
         @function_tool
         def check_account_status(customer_id: str) -> str:
             """Check the status of a customer account."""
             return f"Account {customer_id}: Active, good standing"
 
-        support = load_agent(
+        support = agent_config(
             "support-agent",
             fallback="You are a helpful customer support agent. Use tools to help.",
         )
@@ -114,9 +114,9 @@ def example_openai_agents_skill_loading():
 
 
 async def example_pydantic_ai_skill_loading():
-    """Pydantic AI example with load_agent()'s capability.
+    """Pydantic AI example with agent_config()'s capability.
 
-    ``decimalai.pydantic_ai.load_agent(name)`` returns a Pydantic AI capability
+    ``decimalai.pydantic_ai.agent_config(name)`` returns a Pydantic AI capability
     you pass in your own ``Agent(capabilities=[...])``:
     1. its instructions — the agent's saved prompt, then the skill list picked
        for each run's prompt
@@ -126,7 +126,7 @@ async def example_pydantic_ai_skill_loading():
     model mid-run. Nothing in Pydantic AI is patched.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 3: Pydantic AI with load_agent()")
+    print("EXAMPLE 3: Pydantic AI with agent_config()")
     print("="*70)
 
     import decimalai
@@ -135,13 +135,13 @@ async def example_pydantic_ai_skill_loading():
     try:
         from pydantic_ai import Agent
 
-        from decimalai.pydantic_ai import load_agent
+        from decimalai.pydantic_ai import agent_config
 
         def check_account_status(customer_id: str) -> str:
             """Check the status of a customer account."""
             return f"Account {customer_id}: Active, good standing"
 
-        support = load_agent(
+        support = agent_config(
             "support-agent",
             fallback="You are a helpful customer support agent. Use tools to help.",
         )
@@ -207,8 +207,8 @@ def main():
     print("="*70)
     print("\nThis script demonstrates the provider skill-loading options:")
     print("  - instrument(enable_skill_loader=True): Auto-inject skills into prompts")
-    print("  - OpenAI Agents SDK: decimalai.openai_agents.load_agent(name)")
-    print("  - Pydantic AI: decimalai.pydantic_ai.load_agent(name), a capability")
+    print("  - OpenAI Agents SDK: decimalai.openai_agents.agent_config(name)")
+    print("  - Pydantic AI: decimalai.pydantic_ai.agent_config(name), a capability")
     print("  - load_skill tool on both: config-driven via init(load_skill_tool=) /")
     print("    DECIMALAI_LOAD_SKILL_TOOL")
 
@@ -252,12 +252,12 @@ Provider-specific options summary:
      stays on prompt injection.
 
 2. OPENAI AGENTS (decimalai.openai_agents)
-   - load_agent(name) → pass .instructions and .tools into your own Agent(...)
+   - agent_config(name) → pass .instructions and .tools into your own Agent(...)
      (the agent owns its tool loop, so load_skill results go back to the model).
      Nothing is installed or patched for this framework.
 
 3. PYDANTIC AI (decimalai.pydantic_ai)
-   - load_agent(name) → pass it in your own Agent(capabilities=[...]): its
+   - agent_config(name) → pass it in your own Agent(capabilities=[...]): its
      instructions carry the prompt and skill list, its toolset load_skill.
      Nothing is installed or patched for this framework.
 

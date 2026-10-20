@@ -1,4 +1,4 @@
-"""OpenAI Agents SDK adapter: one tracing processor, and `load_agent()` agents in
+"""OpenAI Agents SDK adapter: one tracing processor, and `agent_config()` agents in
 the places the old process-wide skill loader broke.
 
 Driven through the REAL Agents SDK (no stand-in ``agents`` module) with a
@@ -6,11 +6,11 @@ scripted in-process model, so nothing here contacts a provider or the DecimalAI
 backend. Until 0.18 the adapter patched the Agents SDK; the 2026-10-13 audit
 found three silent failures in that loader (``SandboxAgent`` got no skills, a
 second ``instrument()`` sent every run twice, routing ran on the event loop).
-These tests keep the guarantees, for the explicit `load_agent()` shape:
+These tests keep the guarantees, for the explicit `agent_config()` shape:
 
 1. ``instrument()`` is idempotent: one ``DecimalTracingProcessor`` however often
-   it is called, and beside ``load_agent()``.
-2. ``SandboxAgent``: a ``load_agent()`` menu reaches a sandbox run; an agent
+   it is called, and beside ``agent_config()``.
+2. ``SandboxAgent``: an agent config's skill list reaches a sandbox run; an agent
    whose own ``Skills`` capability serves its skills gets no second catalog.
 3. Routing never runs on the event loop.
 4. ``tool_use_behavior`` stays the developer's: ``stop_on_first_tool`` turns
@@ -249,7 +249,7 @@ class TestInstrumentIsIdempotent:
         set_trace_processors([other])
 
         oa.instrument(agent_name="support", disk_sync=False)        # what init() does
-        oa.load_agent("support")
+        oa.agent_config("support")
 
         assert len(_ours()) == 1
         assert other in get_trace_provider()._multi_processor._processors
@@ -271,7 +271,7 @@ class TestInstrumentIsIdempotent:
 
     def test_one_run_sends_one_trace_after_instrument_and_load_agent(self, router, sdk):
         oa.instrument(agent_name="support", disk_sync=False)
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         Runner.run_sync(agents.Agent(name=support.name, instructions=support.instructions,
                                      tools=[*support.tools],
@@ -287,7 +287,7 @@ class TestInstrumentIsIdempotent:
 
 class TestSandboxAgents:
     def test_a_sandbox_run_shows_the_menu_and_can_load(self, router):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         model = _ScriptedModel([_call("load_skill", {"name": SKILL}), _text("ok")])
         _sandbox_run(SandboxAgent(name="support", instructions=support.instructions,
                                   tools=[*support.tools], model=model))
@@ -301,7 +301,7 @@ class TestSandboxAgents:
     def test_an_agent_with_its_own_skills_capability_gets_no_second_catalog(
         self, router, lazy_skills_dir, caplog,
     ):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         model = _ScriptedModel([_text("ok")])
         agent = SandboxAgent(
             name="support", instructions=support.instructions, tools=[*support.tools],
@@ -325,7 +325,7 @@ class TestRoutingDoesNotBlockTheEventLoop:
     def test_the_first_runs_routing_is_made_on_a_worker_thread(self, sdk):
         router = _Router(wait=threading.Event())
         oa._skill_router_singleton = router
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         agent = agents.Agent(name="support", instructions=support.instructions, tools=[*support.tools])
 
         async def resolve():
@@ -369,7 +369,7 @@ class TestToolUseBehavior:
         )
 
     def test_stop_on_first_tool_turns_skills_off_for_that_agent(self, router, caplog):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         agent = self._agent(support, [_turn(("lookup_order", {"order_id": "42"}))], "stop_on_first_tool")
         with caplog.at_level(logging.WARNING, logger="decimalai"):
             result = Runner.run_sync(agent, "refund status for order 42?")
@@ -380,14 +380,14 @@ class TestToolUseBehavior:
         assert sum("StopAtTools" in r.getMessage() for r in caplog.records) == 1
 
     def test_run_llm_again_reads_the_body_then_answers(self, router):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         agent = self._agent(support, [_turn(("load_skill", {"name": SKILL})), _text("final answer")],
                             "run_llm_again")
         assert Runner.run_sync(agent, QUESTION).final_output == "final answer"
         assert "REFUND BODY SENTINEL" in json.dumps(agent.model.calls[1]["input"], default=str)
 
     def test_stop_at_tool_names_still_stops_at_the_named_tool(self, router):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         agent = self._agent(
             support,
             [_turn(("load_skill", {"name": SKILL})), _turn(("lookup_order", {"order_id": "42"}))],
@@ -397,7 +397,7 @@ class TestToolUseBehavior:
         assert [load["name"] for load in router.loads] == [SKILL]
 
     def test_a_custom_function_is_warned_that_it_sees_load_skill(self, router, caplog):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
         seen: List[List[str]] = []
 
         def first_order_lookup(context, tool_results):
@@ -418,7 +418,7 @@ class TestToolUseBehavior:
         assert any("tool_use_behavior function" in r.getMessage() for r in caplog.records)
 
     def test_the_developers_own_load_skill_tool_is_never_shadowed(self, router, caplog):
-        support = oa.load_agent("support")
+        support = oa.agent_config("support")
 
         @agents.function_tool
         def load_skill(name: str) -> str:

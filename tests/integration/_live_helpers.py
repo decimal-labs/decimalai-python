@@ -330,7 +330,7 @@ def _send(method: str, path: str, body: dict) -> dict:
 
 
 def create_agent(agent_name: str, system_prompt: str) -> dict:
-    """Make ``agent_name`` exist with a saved prompt, which is what ``load_agent()`` reads.
+    """Make ``agent_name`` exist with a saved prompt, which is what ``agent_config()`` reads.
 
     Not ``POST /api/v1/agents``: it refuses the ``live-`` prefix every live test's
     agent carries (a fixture prefix, hidden from the agents list). A manifest makes

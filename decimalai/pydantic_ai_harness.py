@@ -247,7 +247,7 @@ def _warn_if_router_injected(ctx: Any, name: str) -> None:
         _double_catalog_warned = True
     logger.warning(
         "decimalai: the model loaded the skill %s through the harness's Skills, on a run "
-        "decimalai.pydantic_ai.load_agent() also put its skill list into, so it saw two "
-        "catalogs of skills. load_agent() leaves an Agent built with Skills alone; this "
+        "decimalai.pydantic_ai.agent_config() also put its skill list into, so it saw two "
+        "catalogs of skills. agent_config() leaves an Agent built with Skills alone; this "
         "one got its Skills some other way (a capability function, or capabilities passed "
         "to the run). Logged once.", name)

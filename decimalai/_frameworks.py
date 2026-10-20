@@ -194,10 +194,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
     ),
     Framework(
         key="openai-agents",
-        title="OpenAI Agents (with `load_agent(...)`)",
+        title="OpenAI Agents (with `agent_config(...)`)",
         cli_label="OpenAI Agents",
         module="decimalai.openai_agents",
-        entry_point="`load_agent(name)`",
+        entry_point="`agent_config(name)`",
         init_flag="openai_agents",
         extra="openai-agents",
         scaffold=TEMPLATE,
@@ -220,7 +220,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             handoffs="✅",
             skills_rail="`load_skill` tool",
         ),
-        use_for="OpenAI Agents SDK — `load_agent(name)` returns the agent's prompt and "
+        use_for="OpenAI Agents SDK — `agent_config(name)` returns the agent's prompt and "
                 "skills to pass as `Agent(instructions=..., tools=[...])`, nothing patched "
                 "(0.18+); `sandbox_skills()` is a `SandboxAgent`'s Skills capability over "
                 "installed skills (0.16+)",
@@ -257,10 +257,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
     ),
     Framework(
         key="pydantic-ai",
-        title="Pydantic AI (with `load_agent(...)`)",
+        title="Pydantic AI (with `agent_config(...)`)",
         cli_label="Pydantic AI",
         module="decimalai.pydantic_ai",
-        entry_point="`load_agent(name)`",
+        entry_point="`agent_config(name)`",
         init_flag=None,
         init_flag_note="— (no flag; tracing is `otel=True` + `Agent.instrument_all()`)",
         extra="pydantic-ai",
@@ -299,17 +299,17 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             handoffs="—",
             skills_rail="`load_skill` tool",
         ),
-        use_for="Pydantic AI — `load_agent(name)` returns the agent's prompt and skills "
+        use_for="Pydantic AI — `agent_config(name)` returns the agent's prompt and skills "
                 "as one capability for `Agent(capabilities=[...])`, nothing patched (0.19+)",
     ),
     Framework(
         key="adk",
-        title="Google ADK (with `load_agent(...)`)",
+        title="Google ADK (with `agent_config(...)`)",
         cli_label="Google ADK",
         module="decimalai.adk",
-        entry_point="`load_agent(name)` + `DecimalaiPlugin()`",
+        entry_point="`agent_config(name)` + `DecimalAIPlugin()`",
         init_flag=None,
-        init_flag_note="— (no flag; tracing is `DecimalaiPlugin()` in `App(plugins=[...])`)",
+        init_flag_note="— (no flag; tracing is `DecimalAIPlugin()` in `App(plugins=[...])`)",
         extra="adk",
         # moved from NO_PROMPT_SEAM on 2026-09-03 (seam proven by C14 and a live Gemini
         # end-to-end test) and to TEMPLATE on 2026-09-05: google-genai reads
@@ -339,9 +339,9 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             handoffs="✅",
             skills_rail="`load_skill` tool",
         ),
-        use_for="Google ADK — `load_agent(name)` returns the agent's prompt and skills as an "
+        use_for="Google ADK — `agent_config(name)` returns the agent's prompt and skills as an "
                 "instruction provider and `load_skill` for your own `LlmAgent`; "
-                "`DecimalaiPlugin()` in `App(plugins=[...])` makes one trace per invocation, "
+                "`DecimalAIPlugin()` in `App(plugins=[...])` makes one trace per invocation, "
                 "nothing patched (0.20+); `skills()` feeds ADK's `SkillToolset` (0.16+)",
     ),
     Framework(

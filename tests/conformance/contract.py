@@ -1979,7 +1979,7 @@ def grade_journey(capture: Any) -> Result:
     * the agent's stored PROMPT reached the model. The scaffold deliberately
       never writes the prompt text into the file, so this sentence can only be
       there because the generated file READ it at run time. A file that dropped
-      its ``load_agent()`` call still runs, still traces and still delivers
+      its ``agent_config()`` call still runs, still traces and still delivers
       skills — and fails only here.
     * the skill's BODY sentinel reached the model. A menu row cannot contain it
       (menu rows are name + description), which is what tells "the skill was

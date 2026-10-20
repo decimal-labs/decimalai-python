@@ -1,4 +1,4 @@
-"""`decimalai.pydantic_ai.load_agent()`: an agent's prompt and skills as a Pydantic AI capability.
+"""`decimalai.pydantic_ai.agent_config()`: an agent's prompt and skills as a Pydantic AI capability.
 
 Driven through the real Pydantic AI with its offline ``FunctionModel``: the model
 records what each request was given (instructions, tools, their schemas) and calls
@@ -78,7 +78,7 @@ SAM = {"customer": {"name": "Sam"}}
 
 
 def test_the_capability_gives_the_agent_its_prompt_skill_list_and_load_skill(platform):
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     assert type(support).__name__ == "PydanticAIAgentConfig" and support.name == "support"
     model = Model(("call", "damaged-item"), "answer")
     result = agent_with(support, model).run_sync("My keyboard arrived cracked.", deps=SAM)
@@ -92,7 +92,7 @@ def test_the_capability_gives_the_agent_its_prompt_skill_list_and_load_skill(pla
 
 
 def test_each_run_is_routed_on_its_own_prompt(platform):
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     agent = agent_with(support, Model("answer", "answer"))
     first = agent.run_sync("My keyboard arrived cracked.", deps=SAM)
     agent.run_sync("Where is my order?", deps=SAM, message_history=first.all_messages())
@@ -100,7 +100,7 @@ def test_each_run_is_routed_on_its_own_prompt(platform):
 
 
 def test_a_missing_placeholder_says_the_values_come_from_deps(platform):
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     with pytest.raises(decimalai.MissingPromptVariable, match=r"customer\.name\. Pass them as the run's deps="):
         agent_with(support, Model("answer")).run_sync("Hi", deps={})
     model = Model("answer")
@@ -110,7 +110,7 @@ def test_a_missing_placeholder_says_the_values_come_from_deps(platform):
 
 def test_without_a_list_the_agent_gets_its_prompt_and_no_load_skill(platform):
     platform.down = True
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     model = Model("answer")
     agent_with(support, model).run_sync("Hi", deps=SAM)
     assert model.requests[0]["instructions"] == "Hello Sam."
@@ -119,7 +119,7 @@ def test_without_a_list_the_agent_gets_its_prompt_and_no_load_skill(platform):
 
 def test_an_agent_with_the_harness_skills_gets_no_decimal_skills_and_is_told_once(platform, monkeypatch, caplog):
     monkeypatch.setattr(pai, "_native_skills", lambda agent: True)
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     with caplog.at_level(logging.WARNING, logger="decimalai.pydantic_ai"):
         for _ in range(2):
             model = Model("answer")
@@ -133,7 +133,7 @@ def test_an_agent_with_the_harness_skills_gets_no_decimal_skills_and_is_told_onc
 def test_init_enabled_false_stops_skills_but_not_the_prompt(platform, monkeypatch):
     import decimalai._config as cfg
 
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     monkeypatch.setattr(cfg, "_disabled_by_init", lambda: True)
     model = Model("answer")
     agent_with(support, model).run_sync("Hi", deps=SAM)
@@ -162,7 +162,7 @@ def test_a_run_is_one_trace_named_for_the_decimalai_agent_with_its_record(platfo
         return real_record(**kwargs)
 
     monkeypatch.setattr(otel, "record_skill_rail", record)
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     # An Agent with no name of its own: the trace is still the DecimalAI agent's.
     Agent(FunctionModel(Model(("call", "damaged-item"), "answer")), capabilities=[support],
           deps_type=dict).run_sync("My keyboard arrived cracked.", deps=SAM)
@@ -196,7 +196,7 @@ def test_under_pydantic_ais_own_instrumentation_the_trace_is_still_the_decimalai
     provider.add_span_processor(otel._AgentNameStamper())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     monkeypatch.setattr(trace_api, "get_tracer_provider", lambda: provider)
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     agent = Agent(FunctionModel(Model("answer")), name="pydantic-agent", capabilities=[support],
                   deps_type=dict)
     # The per-agent form of Agent.instrument_all(), which would leave a global switch on.
@@ -217,13 +217,13 @@ def test_under_pydantic_ais_own_instrumentation_the_trace_is_still_the_decimalai
 
 
 def test_two_configs_never_compare_equal(platform):
-    first, second = pai.load_agent("support"), pai.load_agent("support")
+    first, second = pai.agent_config("support"), pai.agent_config("support")
     assert first != second and first == first
     assert len({first, second}) == 2
 
 
 def test_the_load_names_the_decimalai_agent_and_the_run_routes_once(platform):
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     Agent(FunctionModel(Model(("call", "damaged-item"), "answer")), capabilities=[support],
           deps_type=dict).run_sync("My keyboard arrived cracked.", deps=SAM)
     (body,) = [params for _method, path, params in platform.requests if path.endswith("/body")]
@@ -239,13 +239,13 @@ def test_another_tool_named_load_skill_fails_the_run_loudly(platform):
     def load_skill(name: str) -> str:
         return "theirs"
 
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     with pytest.raises(UserError, match="load_skill"):
         agent_with(support, Model("answer"), tools=[load_skill]).run_sync("Hi", deps=SAM)
 
 
 def test_the_callers_own_instructions_stay_a_leading_unedited_prefix(platform):
-    support = pai.load_agent("support")
+    support = pai.agent_config("support")
     model = Model("answer", "answer")
     agent = agent_with(support, model, instructions="CALLER RULES.")
     agent.run_sync("My keyboard arrived cracked.", deps=SAM)

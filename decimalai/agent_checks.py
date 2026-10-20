@@ -427,7 +427,7 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
         receipt["base_url"] = module.BASE_URL
         snapshot = configuration_snapshot(client, module.AGENT_NAME)
         support = module.support
-        if (support.prompt_source != "decimal" or support.prompt != snapshot["prompt"]["system_prompt"]
+        if (support.prompt_source != "decimalai" or support.prompt != snapshot["prompt"]["system_prompt"]
                 or support.prompt_hash != snapshot["prompt"]["content_hash"]):
             raise ValueError("Runtime prompt differs from the current resolved prompt; restart and retry.")
         if set(bindings.values()) - {s["name"] for s in snapshot["skills"]}:

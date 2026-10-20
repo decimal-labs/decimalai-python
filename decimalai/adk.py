@@ -5,16 +5,16 @@
     from google.adk.agents import LlmAgent
     from google.adk.apps import App
     from google.adk.runners import Runner
-    from decimalai.adk import DecimalaiPlugin, load_agent
+    from decimalai.adk import DecimalAIPlugin, agent_config
 
-    support = load_agent("support", fallback=BASE_INSTRUCTION)
+    support = agent_config("support", fallback=BASE_INSTRUCTION)
     agent = LlmAgent(name="support", model="gemini-3.5-flash",
                      instruction=support.instruction, tools=[lookup_order, *support.tools])
-    app = App(name="support", root_agent=agent, plugins=[DecimalaiPlugin()])
+    app = App(name="support", root_agent=agent, plugins=[DecimalAIPlugin()])
     runner = Runner(app=app, session_service=session_service)
 
 ``support.instruction`` is an ADK instruction provider. Before each model request it
-returns the agent's saved prompt (``{{placeholders}}`` filled from the session's state),
+returns the agent's saved prompt (``{{variables}}`` filled from the session's state),
 then the skill list routed on the invocation's user message, then one sentence naming the
 tool. ``support.tools`` is ``load_skill``, which the model calls for a listed skill's text.
 Each invocation is routed on its own message: the first one before its first model
@@ -23,10 +23,10 @@ background, and every one of an agent with more skills than fit the list. ADK fi
 ``{var}`` of its own into an instruction provider's text, so ``{{name}}`` is the only
 template syntax in play.
 
-``DecimalaiPlugin`` traces: one DecimalAI trace per ADK invocation, with its model calls,
+``DecimalAIPlugin`` traces: one DecimalAI trace per ADK invocation, with its model calls,
 tool calls and sub-agents, and the root agent's manifest (model, instruction, tools,
-sub-agents). An invocation whose agent was given ``load_agent()``'s instruction is filed
-under that DecimalAI agent and carries the prompt version, its placeholder names and the
+sub-agents). An invocation whose agent was given ``agent_config()``'s instruction is filed
+under that DecimalAI agent and carries the prompt version, its variable names and the
 skills offered and loaded. Nothing in ADK is patched: the plugin goes where ADK puts
 plugins, ``App(plugins=[...])``, so only the runners built from that app are traced.
 
@@ -53,7 +53,7 @@ in one invocation is one activation. The names ``list_skills`` returns (or the
 catalog an ``EAGER`` toolset writes into the system instruction) are recorded
 as offered.
 
-An agent that carries a ``SkillToolset`` gets no DecimalAI skills from ``load_agent()``,
+An agent that carries a ``SkillToolset`` gets no DecimalAI skills from ``agent_config()``,
 and one warning says so: the toolset already offers the skills, and a second catalog in
 the same prompt would give the model two sets of instructions for one job.
 
@@ -82,7 +82,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, Union
 from uuid import UUID, uuid4
 
 from ._agent_binding import AgentBinding, attach_prompt_records
@@ -153,7 +153,7 @@ def _reregister_refused(agent: str) -> Optional[str]:
 # google-adk to be installed).
 _PluginClass: Any = None
 
-#: The SkillRouter behind every load_agent() config. `init()` drops it when a re-init
+#: The SkillRouter behind every agent config. `init()` drops it when a re-init
 #: changes the key or workspace (`decimalai._drop_adapter_skill_routers`).
 _skill_router_singleton: Any = None
 
@@ -455,7 +455,7 @@ def _wire_names(names: List[str]) -> List[str]:
     return out
 
 
-#: Said once per process: a native load in a run a load_agent() config also listed skills in.
+#: Said once per process: a native load in a run an agent config also listed skills in.
 _both_catalogs_warned = False
 _native_log_lock = threading.Lock()
 
@@ -468,10 +468,10 @@ def _warn_both_catalogs(skill_name: Optional[str]) -> None:
         _both_catalogs_warned = True
     logger.warning(
         "DecimalAI ADK: ADK's SkillToolset loaded %r in an invocation that also "
-        "listed DecimalAI skills from load_agent(), so two skill catalogs reached the "
-        "model. load_agent() leaves an agent alone only when its own tools include the "
+        "listed DecimalAI skills from agent_config(), so two skill catalogs reached the "
+        "model. agent_config() leaves an agent alone only when its own tools include the "
         "SkillToolset; give the toolset to the agent that uses it, or that agent no "
-        "load_agent() instruction. Logged once per process.", skill_name,
+        "agent_config() instruction. Logged once per process.", skill_name,
     )
 
 
@@ -588,8 +588,8 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
 
         instruction = getattr(agent, "instruction", None)
         if callable(instruction):
-            # A load_agent() config's instruction is its bound method: declare the saved
-            # prompt TEMPLATE (placeholders unfilled), which is what the dashboard versions.
+            # An agent config's instruction is its bound method: declare the saved
+            # prompt TEMPLATE (variables unfilled), which is what the dashboard versions.
             owner = getattr(instruction, "__self__", None)
             instruction = owner._template() if isinstance(owner, ADKAgentConfig) else None
         if isinstance(instruction, str) and instruction.strip():
@@ -620,10 +620,10 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
     return info
 
 
-# ── where a load_agent() config's record goes ──────────────
+# ── where an agent config's record goes ──────────────
 
 def _get_skill_router() -> Any:
-    """The SkillRouter behind every load_agent() config, built on first use; None when off."""
+    """The SkillRouter behind every agent config, built on first use; None when off."""
     global _skill_router_singleton
     # The kill switch: a later init(enabled=False) withholds the router (kept for a
     # re-enable) from configs built before it.
@@ -670,8 +670,8 @@ def _system_instruction_text(llm_request: Any) -> str:
     return _content_to_text(si) or str(getattr(si, "text", "") or "")
 
 
-#: The invocations a DecimalaiPlugin is tracing right now, by invocation id: where a
-#: load_agent() config's record goes. Bound in `before_run_callback`, unbound once the
+#: The invocations a DecimalAIPlugin is tracing right now, by invocation id: where an
+#: agent config's record goes. Bound in `before_run_callback`, unbound once the
 #: trace is built, so a record that arrives after that is dropped, not misfiled.
 _live_runs: Dict[str, "_RunState"] = {}
 _live_runs_lock = threading.Lock()
@@ -694,9 +694,9 @@ def _clean_names(names: Any) -> List[str]:
 
 
 def _record_adk(run_key: Optional[str], fields: Dict[str, Any]) -> bool:
-    """Put one piece of a load_agent() config's record on its invocation's trace.
+    """Put one piece of an agent config's record on its invocation's trace.
 
-    False when no DecimalaiPlugin is tracing that invocation: the record is dropped.
+    False when no DecimalAIPlugin is tracing that invocation: the record is dropped.
     Names offered or delivered in a composed instruction count only when they are in
     its text, the way the OpenTelemetry rail checks them.
     """
@@ -805,7 +805,7 @@ class _RunState:
         self.error_message: Optional[str] = None
         # Manifest config introspected from the root agent in before_run.
         self.manifest: Dict[str, Any] = {}
-        # The skills rails of this invocation, from the load_agent() configs of its
+        # The skills rails of this invocation, from the agent configs of its
         # agents (`_record_adk`), stamped onto the RunTrace in `_finalize`. Sets, so
         # a model turn that calls a tool reports each skill once.
         self.routing_id: Optional[str] = None
@@ -842,10 +842,10 @@ def _plugin_class() -> Any:
         from google.adk.plugins.base_plugin import BasePlugin
     except ImportError:
         raise ImportError(
-            'DecimalaiPlugin needs Google ADK: pip install "decimalai[adk]"'
+            'DecimalAIPlugin needs Google ADK: pip install "decimalai[adk]"'
         ) from None
 
-    class _DecimalaiPlugin(BasePlugin):
+    class _DecimalAIPlugin(BasePlugin):
         """ADK BasePlugin that emits one DecimalAI RunTrace per invocation."""
 
         def __init__(
@@ -929,8 +929,8 @@ def _plugin_class() -> Any:
             if not _config._is_enabled():
                 return None
             agent = getattr(invocation_context, "agent", None)
-            # The DecimalAI agent the trace is filed under, unless a load_agent()
-            # config names it during the run: this plugin's label, else the agent
+            # The DecimalAI agent the trace is filed under, unless an agent config
+            # names it during the run: this plugin's label, else the agent
             # init() named (or DECIMAL_AGENT_NAME), else ADK's own agent name (a
             # constrained Python identifier).
             from ._config import default_agent_name
@@ -1098,7 +1098,7 @@ def _plugin_class() -> Any:
             # The system instruction FIRST, and it is not optional bookkeeping.
             #
             # `llm_request.contents` holds the conversation turns only. ADK puts
-            # the agent's own `instruction` — a load_agent() config's prompt and
+            # the agent's own `instruction` — an agent config's prompt and
             # skill list included — in `config.system_instruction`, which is a
             # separate field. Recording only `contents` meant the trace omitted
             # the entire system prompt the model was actually shown.
@@ -1366,7 +1366,7 @@ def _plugin_class() -> Any:
 
         # ── finalize (runs in executor thread) ─────────────
         def _finalize_and_unbind(self, inv_id: Optional[str], state: _RunState) -> None:
-            """Build and send the trace, then stop taking load_agent() records for it."""
+            """Build and send the trace, then stop taking agent_config() records for it."""
             try:
                 self._finalize(state)
             finally:
@@ -1451,7 +1451,7 @@ def _plugin_class() -> Any:
                         for name in sorted(loaded) if loaded_hashes.get(name)
                     ],
                 )
-                # Each config's prompt version and placeholder names (never values)
+                # Each config's prompt version and variable names (never values)
                 # on its agent's span.
                 attach_prompt_records(trace.spans, prompts)
                 try:
@@ -1539,18 +1539,18 @@ def _plugin_class() -> Any:
                     tracker.reset()
             return _manifest_ids.get(agent)
 
-    _PluginClass = _DecimalaiPlugin
+    _PluginClass = _DecimalAIPlugin
     return _PluginClass
 
 
-def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomics
+def DecimalAIPlugin(  # noqa: N802 — factory presents as a class for ergonomics
     agent_name: Optional[str] = None,
     *,
     name: str = "decimalai",
     parent_trace_id: Optional[str] = None,
     on_trace: Optional[Callable[[RunTrace], None]] = None,
 ) -> Any:
-    """Construct a DecimalAI ADK plugin, for ``App(..., plugins=[DecimalaiPlugin()])``.
+    """Construct a DecimalAI ADK plugin, for ``App(..., plugins=[DecimalAIPlugin()])``.
 
     Every invocation of a runner built from that app becomes one DecimalAI trace.
 
@@ -1558,7 +1558,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
         agent_name: The DecimalAI agent the traces are filed under. Default: the
             agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``), else the
             ADK root agent's name. An invocation whose agent was given
-            ``load_agent()``'s instruction is filed under that DecimalAI agent.
+            ``agent_config()``'s instruction is filed under that DecimalAI agent.
         name: ADK plugin name (must be unique among a Runner's plugins).
         parent_trace_id: When this Runner runs as a sub-agent of another,
             the parent's trace id — links the child traces in the backend.
@@ -1571,7 +1571,7 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
 
     ⚠ This factory's signature is a SECOND place every parameter must be
     listed. It forwards by explicit keyword, so a parameter added to
-    ``_DecimalaiPlugin.__init__`` and not to this signature does not merely
+    ``_DecimalAIPlugin.__init__`` and not to this signature does not merely
     get ignored — the call raises TypeError and the plugin is never built, so
     the Runner traces NOTHING. That is not hypothetical: adding a parameter to
     the class alone once took every ADK conformance item from green to "the
@@ -1583,8 +1583,16 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     )
 
 
+def DecimalaiPlugin(*args: Any, **kwargs: Any) -> NoReturn:  # noqa: N802 — the factory's old name
+    """Renamed in decimalai 0.21: :func:`DecimalAIPlugin`."""
+    raise TypeError(
+        "decimalai.adk.DecimalaiPlugin() was renamed DecimalAIPlugin() in decimalai 0.21; "
+        "it takes the same arguments: from decimalai.adk import DecimalAIPlugin"
+    )
 
-# ── load_agent(): an agent's prompt and skills, as ADK objects ─────────
+
+
+# ── agent_config(): an agent's prompt and skills, as ADK objects ─────────
 
 #: The ADK invocation whose instruction or load_skill call is running in this context.
 #: Set around each call ADK makes into a config, so its record and its loads reach that
@@ -1636,7 +1644,7 @@ def _load_skill_tool_class() -> Any:
         from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
 
         class DecimalaiLoadSkillTool(BaseTool):
-            """``load_skill`` for one ``load_agent()`` config: a listed skill's text."""
+            """``load_skill`` for one agent config: a listed skill's text."""
 
             def __init__(self, config: Any) -> None:
                 super().__init__(name=LOAD_SKILL_TOOL_NAME, description=LOAD_SKILL_TOOL_DESCRIPTION)
@@ -1677,9 +1685,9 @@ def _load_skill_tool_class() -> Any:
 class ADKAgentConfig(AgentBinding):
     """One agent's prompt and skills in DecimalAI, as ADK objects.
 
-    Made by :func:`load_agent`. Put its two pieces in your own ``LlmAgent``::
+    Made by :func:`agent_config`. Put its two pieces in your own ``LlmAgent``::
 
-        support = load_agent("support", fallback=BASE_INSTRUCTION)
+        support = agent_config("support", fallback=BASE_INSTRUCTION)
         agent = LlmAgent(name="support", model="gemini-3.5-flash",
                          instruction=support.instruction, tools=[lookup_order, *support.tools])
 
@@ -1714,7 +1722,7 @@ class ADKAgentConfig(AgentBinding):
         """The agent's prompt, filled, then its skill list: an ADK instruction provider.
 
         Pass it as ``LlmAgent(instruction=support.instruction)``; ADK calls it before
-        each model request. ``{{placeholders}}`` are filled from the session's state.
+        each model request. ``{{variables}}`` are filled from the session's state.
         """
         run_key = getattr(ctx, "invocation_id", None)
         agent = _invocation_agent(ctx)
@@ -1787,7 +1795,7 @@ class ADKAgentConfig(AgentBinding):
         )
 
 
-def load_agent(
+def agent_config(
     agent_name: str,
     *,
     fallback: Optional[str] = None,
@@ -1798,9 +1806,9 @@ def load_agent(
     ::
 
         from google.adk.agents import LlmAgent
-        from decimalai.adk import load_agent
+        from decimalai.adk import agent_config
 
-        support = load_agent("support", fallback=BASE_INSTRUCTION)
+        support = agent_config("support", fallback=BASE_INSTRUCTION)
         agent = LlmAgent(name="support", model="gemini-3.5-flash",
                          instruction=support.instruction, tools=[lookup_order, *support.tools])
 
@@ -1808,9 +1816,9 @@ def load_agent(
     local copy, re-read in the background at most once a minute. Each invocation is
     routed on its own user message: the first before its first model request, later
     ones from the local copy while their decision is recorded in the background, and
-    every one of an agent with more skills than fit the list. ``{{placeholders}}`` are
+    every one of an agent with more skills than fit the list. ``{{variables}}`` are
     filled from the session's state (attributes or dict keys). Traces come from
-    :func:`DecimalaiPlugin` in ``App(plugins=[...])``: an invocation of this agent is
+    :func:`DecimalAIPlugin` in ``App(plugins=[...])``: an invocation of this agent is
     filed under ``support.name`` with its prompt version and its skills. Initializes
     the SDK from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
 
@@ -1837,9 +1845,18 @@ def load_agent(
     try:
         import google.adk  # noqa: F401 — before any setup or network call
     except ImportError:
-        raise ImportError('load_agent() needs Google ADK: pip install "decimalai[adk]"') from None
+        raise ImportError('agent_config() needs Google ADK: pip install "decimalai[adk]"') from None
     from ._agent import _ensure_initialized, read_prompt
 
     _ensure_initialized()
     prompt = read_prompt(agent_name, fallback=fallback)
     return ADKAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
+
+
+def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
+    """Renamed in decimalai 0.21: :func:`agent_config`."""
+    raise TypeError(
+        "decimalai.adk.load_agent() was renamed agent_config() in decimalai 0.21; "
+        "it takes the same arguments and returns the same config: "
+        "from decimalai.adk import agent_config"
+    )

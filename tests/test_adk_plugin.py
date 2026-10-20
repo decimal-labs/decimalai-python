@@ -1,4 +1,4 @@
-"""`DecimalaiPlugin` in ``App(plugins=[...])``: the only way ADK is traced since 0.20.
+"""`DecimalAIPlugin` in ``App(plugins=[...])``: the only way ADK is traced since 0.20.
 
 google-adk 2.12.0 drives every test here, with a ``BaseLlm`` subclass that
 answers offline. ``App`` is ADK's own place for plugins (``Runner(plugins=...)`` is
@@ -86,7 +86,7 @@ def _runner(plugin: Any, name: str = "app_probe") -> Any:
 def test_a_plugin_in_the_app_traces_each_invocation_once(client):
     import decimalai.adk as adk
 
-    runner = _runner(adk.DecimalaiPlugin(agent_name="explicit_label"))
+    runner = _runner(adk.DecimalAIPlugin(agent_name="explicit_label"))
     asyncio.run(_one_turn(runner))
     plugins = [p for p in runner.plugin_manager.plugins if isinstance(p, adk._plugin_class())]
     assert len(plugins) == 1
@@ -98,11 +98,11 @@ def test_the_trace_is_filed_under_init_s_agent_else_adk_s(client, monkeypatch):
     import decimalai.adk as adk
     from decimalai._config import DecimalConfig
 
-    asyncio.run(_one_turn(_runner(adk.DecimalaiPlugin(), name="adk_node")))
+    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin(), name="adk_node")))
     monkeypatch.setattr(cfg, "_config", DecimalConfig(  # init(agent_name="from-init")
         api_key="dai_sk_test", base_url="http://localhost:8000", enabled=True, agent_name="from-init",
     ))
-    asyncio.run(_one_turn(_runner(adk.DecimalaiPlugin(), name="adk_node")))
+    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin(), name="adk_node")))
     assert [t.agent_name for t in _flushed(client)] == ["adk_node", "from-init"]
 
 
@@ -115,7 +115,7 @@ def test_nothing_in_adk_is_patched(client):
 
     before = (Runner.__init__, Runner.run, Runner.run_async, InMemoryRunner.__init__,
               LlmAgent.canonical_instruction)
-    asyncio.run(_one_turn(_runner(adk.DecimalaiPlugin())))
+    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin())))
     adk._load_skill_tool_class()
     assert (Runner.__init__, Runner.run, Runner.run_async, InMemoryRunner.__init__,
             LlmAgent.canonical_instruction) == before
@@ -143,7 +143,7 @@ def test_a_sync_run_links_its_parent_through_adks_own_context_copy(client):
     from decimalai.generic import start_trace
 
     runner = InMemoryRunner(app=App(name="sync_probe", root_agent=_agent("sync_probe"),
-                                    plugins=[adk.DecimalaiPlugin(agent_name="sync_probe")]))
+                                    plugins=[adk.DecimalAIPlugin(agent_name="sync_probe")]))
     runner.session_service.create_session_sync(app_name="sync_probe", user_id="u", session_id="s")
     with start_trace(agent_name="outer", auto_send=False) as outer:
         parent_id = outer.get_trace_id()
@@ -174,6 +174,6 @@ def test_the_process_wide_install_is_gone(client, monkeypatch, caplog):
     monkeypatch.setattr(decimalai, "init", init)
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         decimalai._auto_init_from_env()
-    assert any("DECIMAL_AUTO_TRACE=adk traces nothing" in r.getMessage() and "DecimalaiPlugin()" in r.getMessage()
+    assert any("DECIMAL_AUTO_TRACE=adk traces nothing" in r.getMessage() and "DecimalAIPlugin()" in r.getMessage()
                for r in caplog.records)
     assert "adk" not in init.call_args.kwargs

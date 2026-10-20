@@ -2,14 +2,14 @@
 
 Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/adk``:
 
-    support = load_agent("support")
+    support = agent_config("support")
     agent = LlmAgent(name=..., model=..., instruction=support.instruction,
                      tools=[lookup, *support.tools])
-    app = App(name=..., root_agent=agent, plugins=[DecimalaiPlugin()])
+    app = App(name=..., root_agent=agent, plugins=[DecimalAIPlugin()])
     runner = Runner(app=app, session_service=...)
 
-The agent's prompt and skills come from the platform through ``load_agent()`` (an
-instruction provider and ``load_skill``), and its traces from ``DecimalaiPlugin`` in
+The agent's prompt and skills come from the platform through ``agent_config()`` (an
+instruction provider and ``load_skill``), and its traces from ``DecimalAIPlugin`` in
 the ``App``, ADK's own place for plugins. Nothing in ADK is patched, so a runner is
 traced only when its app carries the plugin.
 
@@ -220,16 +220,16 @@ def _node_name(ctx: Ctx) -> str:
 
 
 def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None) -> Any:
-    """This agent's ``load_agent()`` instruction and tools on the developer's own
+    """This agent's ``agent_config()`` instruction and tools on the developer's own
     ``LlmAgent``. ``configs`` shares one config per agent name, as a module-level
     one would be."""
     from google.adk.agents import LlmAgent
 
-    from decimalai.adk import load_agent
+    from decimalai.adk import agent_config
 
     configs = {} if configs is None else configs
     if ctx.agent_name not in configs:
-        configs[ctx.agent_name] = load_agent(ctx.agent_name)
+        configs[ctx.agent_name] = agent_config(ctx.agent_name)
     support = configs[ctx.agent_name]
 
     def lookup(query: str) -> dict:
@@ -272,15 +272,15 @@ def _skill_script(ctx: Ctx) -> List[Any]:
 
 
 def _runner(ctx: Ctx, agent: Any, *, on_trace: Any = None) -> Any:
-    """``InMemoryRunner(app=App(..., plugins=[DecimalaiPlugin(...)]))``."""
+    """``InMemoryRunner(app=App(..., plugins=[DecimalAIPlugin(...)]))``."""
     from google.adk.apps import App
     from google.adk.runners import InMemoryRunner
 
-    from decimalai.adk import DecimalaiPlugin
+    from decimalai.adk import DecimalAIPlugin
 
     return InMemoryRunner(app=App(
         name=_node_name(ctx), root_agent=agent,
-        plugins=[DecimalaiPlugin(agent_name=ctx.agent_name, on_trace=on_trace)],
+        plugins=[DecimalAIPlugin(agent_name=ctx.agent_name, on_trace=on_trace)],
     ))
 
 
@@ -394,17 +394,17 @@ def run_unnamed(ctx: Ctx) -> Any:
     ADK requires every agent to have a name, and it must be a Python identifier,
     so the ADK agent here is called ``conformance_adk_…`` while the DecimalAI agent
     is ``conformance-adk-…``. Nothing on the plugin names it: the DecimalAI name is
-    given once, in ``load_agent()``, and the trace and the routing call must both
+    given once, in ``agent_config()``, and the trace and the routing call must both
     carry it.
     """
     from google.adk.apps import App
     from google.adk.runners import InMemoryRunner
 
-    from decimalai.adk import DecimalaiPlugin
+    from decimalai.adk import DecimalAIPlugin
 
     _HANDLER.register(ctx, script=_skill_script(ctx))
     runner = InMemoryRunner(app=App(
-        name=_node_name(ctx), root_agent=_agent(ctx), plugins=[DecimalaiPlugin()],
+        name=_node_name(ctx), root_agent=_agent(ctx), plugins=[DecimalAIPlugin()],
     ))
     return asyncio.run(_drive(ctx, runner))
 
@@ -440,22 +440,22 @@ def _app_runner_shape(ctxs: Sequence[Ctx]) -> Any:
     """``Runner(app=App(...))`` — the shape ``adk web``, ``adk run`` and
     ``adk api_server`` build — through both runner classes.
 
-    Lane 0: ``InMemoryRunner(app=App(name, root_agent, plugins=[DecimalaiPlugin()]))``,
-    the plugin naming nothing, so the trace is ``load_agent()``'s agent. Lane 1:
-    ``Runner(app=App(..., plugins=[DecimalaiPlugin(agent_name=...)]),
+    Lane 0: ``InMemoryRunner(app=App(name, root_agent, plugins=[DecimalAIPlugin()]))``,
+    the plugin naming nothing, so the trace is ``agent_config()``'s agent. Lane 1:
+    ``Runner(app=App(..., plugins=[DecimalAIPlugin(agent_name=...)]),
     session_service=...)``, the SDK's documented path.
     """
     from google.adk.apps import App
     from google.adk.runners import InMemoryRunner, Runner
     from google.adk.sessions import InMemorySessionService
 
-    from decimalai.adk import DecimalaiPlugin
+    from decimalai.adk import DecimalAIPlugin
 
     out = []
     first, second = ctxs
     _HANDLER.register(first)
     in_memory = InMemoryRunner(app=App(
-        name=_node_name(first), root_agent=_agent(first), plugins=[DecimalaiPlugin()],
+        name=_node_name(first), root_agent=_agent(first), plugins=[DecimalAIPlugin()],
     ))
     out.append(asyncio.run(_drive(first, in_memory)))
 
@@ -463,7 +463,7 @@ def _app_runner_shape(ctxs: Sequence[Ctx]) -> Any:
     explicit = Runner(
         app=App(
             name=_node_name(second), root_agent=_agent(second),
-            plugins=[DecimalaiPlugin(agent_name=second.agent_name)],
+            plugins=[DecimalAIPlugin(agent_name=second.agent_name)],
         ),
         session_service=InMemorySessionService(),
     )
@@ -476,7 +476,7 @@ DRIVER = Driver(
     covers=frozenset({"google-adk"}),
     requires=("google.adk", "litellm"),
     frameworks=("google-adk",),
-    entrypoint="decimalai.adk.load_agent(name) + DecimalaiPlugin() in App(plugins=[...])",
+    entrypoint="decimalai.adk.agent_config(name) + DecimalAIPlugin() in App(plugins=[...])",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
@@ -491,8 +491,8 @@ DRIVER = Driver(
             name="app_runner",
             doc=(
                 "Runner(app=App(...)): InMemoryRunner(app=App(name, root_agent, "
-                "plugins=[DecimalaiPlugin()])), then "
-                "Runner(app=App(..., plugins=[DecimalaiPlugin(agent_name=...)]), session_service=...)"
+                "plugins=[DecimalAIPlugin()])), then "
+                "Runner(app=App(..., plugins=[DecimalAIPlugin(agent_name=...)]), session_service=...)"
             ),
             run=_app_runner_shape,
             lanes=2,

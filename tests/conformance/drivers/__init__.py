@@ -483,7 +483,7 @@ class Driver:
     run_conversation: Optional[FanoutFn] = None
     #: Second documented shapes, each its own phase — see ``Shape``.
     shapes: Tuple[Shape, ...] = ()
-    #: The documented snippet loads its agent FROM DecimalAI (``load_agent(name)``),
+    #: The documented snippet loads its agent FROM DecimalAI (``agent_config(name)``),
     #: which fails fast on an agent the workspace does not hold. So, as for a user
     #: who created the agent in the dashboard, each phase's agent exists there
     #: first: the harness registers it on the probe with ``SYSTEM_PROMPT`` saved.

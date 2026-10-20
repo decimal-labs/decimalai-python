@@ -1,6 +1,6 @@
 """Adapter registration tests for the native load_skill tool.
 
-  - openai_agents and pydantic_ai patch nothing: ``load_agent()`` hands the tool
+  - openai_agents and pydantic_ai patch nothing: ``agent_config()`` hands the tool
     to the developer, and tests/test_openai_agents_load_agent.py and
     tests/test_pydantic_ai_load_agent.py drive it through the real frameworks.
   - anthropic + langchain: instrument(enable_load_skill_tool=True) is
