@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.19.0] — 2026-10-20
 
 ### Changed (breaking): Pydantic AI agents get their prompt and skills from `load_agent()`
 

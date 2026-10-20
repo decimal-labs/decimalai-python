@@ -502,7 +502,7 @@ class AgentConfig(AgentBinding):
     cut to fit), fills the prompt's ``{{placeholders}}`` from ``context``, and
     returns the prompt, then the skill list, then a sentence naming the tool.
     With an OpenTelemetry run live (``decimalai.init(openai=True)``,
-    ``decimalai.agent_run()``), the turn's record goes on that run's trace.
+    ``decimalai.providers.agent_run()``), the turn's record goes on that run's trace.
 
     Attributes:
         name: The agent's canonical DecimalAI name.
