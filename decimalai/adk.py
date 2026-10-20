@@ -23,6 +23,13 @@ background, and every one of an agent with more skills than fit the list. ADK fi
 ``{var}`` of its own into an instruction provider's text, so ``{{name}}`` is the only
 template syntax in play.
 
+On a Claude model, a session keeps its first invocation's instruction and ``load_skill``:
+Claude rejects a conversation whose system prompt or tools changed once a thinking block
+is in its history (HTTP 400, "bound to a different conversation"). A newer saved prompt or
+skill list reaches the next session. ``DecimalAIPlugin`` keeps what the session was shown
+in its state (``_decimalai_conversation``), so any process serving the session shows the
+same; without the plugin the copy is this process's own.
+
 ``DecimalAIPlugin`` traces: one DecimalAI trace per ADK invocation, with its model calls,
 tool calls and sub-agents, and the root agent's manifest (model, instruction, tools,
 sub-agents). An invocation whose agent was given ``agent_config()``'s instruction is filed
@@ -78,6 +85,8 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -85,7 +94,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, Union
 from uuid import UUID, uuid4
 
-from ._agent_binding import AgentBinding, attach_prompt_records
+from ._agent_binding import (
+    AgentBinding,
+    ConversationRecord,
+    attach_prompt_records,
+    is_claude,
+)
 from ._native import Load, NativeLoads, record
 from ._skill_witness import copy_delivered_versions
 from .schema.common import CallRole, FinishReason, SpanType, Status
@@ -1089,6 +1103,10 @@ def _plugin_class() -> Any:
 
         # ── model boundary ─────────────────────────────────
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any):  # noqa: ANN001
+            try:
+                _save_conversations(callback_context)
+            except Exception:  # noqa: BLE001 — keeping a record must never cost the request
+                logger.debug("could not keep the conversation in session state", exc_info=True)
             state = self._get_run(getattr(callback_context, "invocation_id", None))
             if state is None:
                 return None
@@ -1599,6 +1617,66 @@ def DecimalaiPlugin(*args: Any, **kwargs: Any) -> NoReturn:  # noqa: N802 — th
 #: invocation's trace (`_record_adk`).
 _RUN: "ContextVar[Optional[str]]" = ContextVar("decimalai_adk_run", default=None)
 
+#: The names `load_skill` declares for the request being built (the run's own).
+_DECLARED_NAMES: "ContextVar[Optional[List[str]]]" = ContextVar("decimalai_adk_load_skill_names", default=None)
+
+#: The session state key a Claude conversation's records live under, by DecimalAI agent.
+_STATE_KEY = "_decimalai_conversation"
+
+#: Records `DecimalAIPlugin` has yet to write into their session's state, by invocation.
+_UNSAVED: "OrderedDict[str, Dict[str, Dict[str, Any]]]" = OrderedDict()
+_UNSAVED_MAX = 256
+_unsaved_lock = threading.Lock()
+
+#: Conversations one config remembers in this process, newest last.
+_MAX_CONVERSATIONS = 1024
+
+
+def _model_name(agent: Any) -> Optional[str]:
+    """The model an ADK agent calls, by name (inherited from its parent when unset)."""
+    for attr in ("canonical_model", "model"):
+        try:
+            model = getattr(agent, attr, None)
+        except Exception:  # noqa: BLE001 — canonical_model raises when no ancestor has one
+            continue
+        name = model if isinstance(model, str) else getattr(model, "model", None)
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _session_id(ctx: Any) -> Optional[str]:
+    session = getattr(ctx, "session", None)
+    if session is None:
+        session = getattr(getattr(ctx, "_invocation_context", None), "session", None)
+    session_id = getattr(session, "id", None)
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _note_unsaved(invocation_id: Optional[str], agent_name: str, record: ConversationRecord) -> None:
+    """Hand a record to the plugin, which writes it into the session's state."""
+    if not invocation_id:
+        return
+    with _unsaved_lock:
+        _UNSAVED.setdefault(invocation_id, {})[agent_name] = record.to_state(agent_name)
+        _UNSAVED.move_to_end(invocation_id)
+        while len(_UNSAVED) > _UNSAVED_MAX:
+            _UNSAVED.popitem(last=False)
+
+
+def _save_conversations(callback_context: Any) -> None:
+    """Write this invocation's records into its session's state (a plugin callback's
+    state changes travel with the model's response event, so they are persisted)."""
+    with _unsaved_lock:
+        unsaved = _UNSAVED.pop(getattr(callback_context, "invocation_id", None), None)
+    if not unsaved:
+        return
+    state = callback_context.state
+    kept = dict(state.get(_STATE_KEY) or {})
+    if any(kept.get(name) != record for name, record in unsaved.items()):
+        kept.update(unsaved)
+        state[_STATE_KEY] = kept
+
 
 def _invocation_agent(ctx: Any) -> Any:
     """The ADK agent a context belongs to.
@@ -1651,8 +1729,10 @@ def _load_skill_tool_class() -> Any:
                 self.config = config
 
             def _get_declaration(self) -> Any:
-                with self.config._lock:
-                    names = list(self.config._tool_names)
+                names = _DECLARED_NAMES.get()
+                if names is None:
+                    with self.config._lock:
+                        names = list(self.config._tool_names)
                 return types.FunctionDeclaration(
                     name=self.name, description=self.description,
                     parameters_json_schema=self.config._tool_schema(names),
@@ -1668,7 +1748,12 @@ def _load_skill_tool_class() -> Any:
                 finally:
                     _RUN.reset(token)
                 if state["names"] and state["tool"]:
-                    llm_request.append_tools([self])
+                    # The run's own names: a Claude conversation keeps its first tool.
+                    names = _DECLARED_NAMES.set(list(state.get("tool_names") or []))
+                    try:
+                        llm_request.append_tools([self])
+                    finally:
+                        _DECLARED_NAMES.reset(names)
 
             async def run_async(self, *, args: Dict[str, Any], tool_context: Any) -> Any:
                 token = _RUN.set(getattr(tool_context, "invocation_id", None))
@@ -1702,6 +1787,8 @@ class ADKAgentConfig(AgentBinding):
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
         self._tool_names: List[str] = []
         self._tool: Any = None
+        #: Claude conversations this process has seen: (session id, agent) -> record.
+        self._chats: "OrderedDict[Tuple[str, Optional[str]], ConversationRecord]" = OrderedDict()
 
     def __repr__(self) -> str:
         return (
@@ -1784,6 +1871,33 @@ class ADKAgentConfig(AgentBinding):
     def _on_menu(self, names: List[str]) -> None:
         with self._lock:
             self._tool_names = list(names)
+
+    def _conversation(self, context: Any, agent: Any) -> Optional[ConversationRecord]:
+        session_id = _session_id(context)
+        if session_id is None or not is_claude(_model_name(agent)):
+            return None
+        kept = getattr(context, "state", None)
+        kept = kept.get(_STATE_KEY) if kept is not None else None
+        if isinstance(kept, Mapping):
+            record = ConversationRecord.from_state(kept.get(self.name), self.name)
+            if record is not None:
+                return record
+        with self._lock:
+            record = self._chats.get((session_id, self._agent_label(agent)))
+        if record is not None:
+            _note_unsaved(getattr(context, "invocation_id", None), self.name, record)
+        return record
+
+    def _keep_conversation(self, context: Any, agent: Any, run_key: Optional[str],
+                           record: ConversationRecord) -> None:
+        session_id = _session_id(context)
+        if session_id is None or not is_claude(_model_name(agent)):
+            return
+        with self._lock:
+            self._chats[(session_id, self._agent_label(agent))] = record
+            while len(self._chats) > _MAX_CONVERSATIONS:
+                self._chats.popitem(last=False)
+        _note_unsaved(run_key, self.name, record)
 
     def _serve_load(self, name: str) -> str:
         from ._agent import _serve_and_record

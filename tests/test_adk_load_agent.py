@@ -239,3 +239,75 @@ def test_a_copied_agent_shares_its_config(platform):
     assert copy.copy(support) is support and copy.deepcopy(support) is support
     (tool,) = support.tools
     assert support.tools == [tool], "one load_skill per config"
+
+
+# ── sessions on Claude ──────────────────────────────────────
+
+
+def claude(*steps):
+    return Model(model="claude-haiku-5-5", steps=list(steps), requests=[])
+
+
+def save_prompt(platform, support, text, version):
+    platform.saved = SavedPrompt(agent_name="support", system_prompt=text, version_number=version,
+                                 content_hash=str(version) * 64)
+    support._refresh_prompt()
+
+
+def change_everything(platform, support):
+    """A version saved in the dashboard, a skill unassigned, and both reach the local copy."""
+    save_prompt(platform, support, "Hi {{customer.name}}, be brief.", 5)
+    platform.skills = ["damaged-item"]
+    support._route_run(None, [], "anything")
+
+
+def test_on_claude_a_session_keeps_its_instruction_and_load_skill(platform):
+    support = adk.agent_config("support")
+    llm = claude("answer", ("call", "order-support"), "answer", "answer")
+    traces: list = []
+    _, session = run(support, llm, "My keyboard arrived cracked.", traces=traces)
+    change_everything(platform, support)
+    run(support, llm, "Where is my order?", traces=traces, session=session)
+    one, two, three = llm.requests[:3]
+    assert ours(two) == ours(three) == ours(one), "Claude rejects a conversation whose system prompt changed"
+    assert two["tools"] == one["tools"] and one["tools"]["load_skill"]["properties"]["name"]["enum"] == [
+        "damaged-item", "order-support"]
+    assert three["returns"][-1]["result"].startswith("## Skill: order-support")
+    assert list(platform.queries.values())[-1] == "Where is my order?", "still routed, for the record"
+
+    run(support, llm, "Hello", traces=traces)  # a new session
+    assert ours(llm.requests[3]).startswith("Hi Sam, be brief.")
+    assert llm.requests[3]["tools"]["load_skill"]["properties"]["name"]["enum"] == ["damaged-item"]
+
+
+def test_on_claude_the_plugin_keeps_the_session_in_its_state_for_another_process(platform):
+    support = adk.agent_config("support")
+    llm = claude("answer", "answer")
+    _, (session, service) = run(support, llm, "My keyboard arrived cracked.", traces=[])
+    stored = service.get_session_sync(app_name="support_app", user_id="u1", session_id=session.id)
+    assert stored.state[adk._STATE_KEY]["support"]["prompt"]["version"] == 4
+    change_everything(platform, support)
+
+    elsewhere = adk.agent_config("support")  # another worker: no memory of the session
+    run(elsewhere, llm, "Where is my order?", traces=[], session=(session, service))
+    assert ours(llm.requests[1]) == ours(llm.requests[0])
+
+
+def test_on_claude_without_the_plugin_this_process_keeps_the_session(platform):
+    support = adk.agent_config("support")
+    llm = claude("answer", "answer")
+    _, session = run(support, llm, "My keyboard arrived cracked.")
+    change_everything(platform, support)
+    run(support, llm, "Where is my order?", session=session)
+    assert ours(llm.requests[1]) == ours(llm.requests[0])
+
+
+def test_on_gemini_each_invocation_shows_the_newest_prompt_as_before(platform):
+    support = adk.agent_config("support")
+    llm = model("answer", "answer")
+    _, session = run(support, llm, "My keyboard arrived cracked.", traces=[])
+    save_prompt(platform, support, "Hi {{customer.name}}.", 5)
+    run(support, llm, "Where is my order?", traces=[], session=session)
+    assert ours(llm.requests[1]).startswith("Hi Sam.")
+    assert adk._STATE_KEY not in session[1].get_session_sync(
+        app_name="support_app", user_id="u1", session_id=session[0].id).state
