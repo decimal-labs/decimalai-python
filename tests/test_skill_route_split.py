@@ -121,7 +121,7 @@ class TestInvariant1FragmentUnchanged:
 
 
 class TestInvariant2StablePrefix:
-    """§3.2 — byte-identical across turns for a given (eligible set, hinted set)."""
+    """§3.2 — byte-identical across turns for a given (eligible set, union set)."""
 
     def test_prefix_is_identical_across_turns(self):
         r = _router()
@@ -216,7 +216,8 @@ class TestInvariant6DeliveredSubsetOfferedSubsetText:
 
     def test_a_body_delivered_from_outside_the_menu_is_still_reported_offered(self):
         """The edge the menu cap creates: bodies come from the router's ranked
-        pick, the menu is capped, and only HINTED names are unioned back. A
+        pick, the menu is capped, and only the router's top few picks are
+        unioned back (§3.3b; an older server unions back only HINTED names). A
         body-delivered skill below the cap would otherwise be `delivered` but
         not `offered` — while its `## Skill:` header sits in the prefix, so the
         model can plainly see it."""

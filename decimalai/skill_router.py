@@ -3118,12 +3118,13 @@ class SkillRouter:
         #
         # A skill whose BODY was delivered can legitimately sit outside the
         # menu: bodies come from the router's ranked pick, and the menu is
-        # capped and unions back only the HINTED names. Its `## Skill: <name>`
+        # capped and unions back only the router's top few picks (contract
+        # §3.3b; an older server, only the HINTED names). Its `## Skill: <name>`
         # header is in the prefix either way, so the name genuinely is in the
         # injected text — it is `offered` that would be understating what the
-        # model can see. Widening the menu on the server instead would make the
-        # prefix depend on the routed set, which is the one thing it must not
-        # do (invariant 2).
+        # model can see. Unioning every routed row on the server instead would
+        # make the prefix vary with the whole routed list, not its top few
+        # (invariant 2).
         if _want_parts and split_prefix and delivered_names:
             for name in delivered_names:
                 if name not in offered_names:
@@ -3179,7 +3180,7 @@ class SkillRouter:
         if not isinstance(menu_truncated, bool):
             # Over the menu caps the platform answers by retrieval for THIS
             # message ("smart_routing"): a fixed head of the eligible set plus the
-            # rows hinted for the message, with no `truncated` field. Which rows
+            # router's top picks for the message, with no `truncated` field. Which rows
             # appear depends on the message, which is what the flag reports.
             menu_truncated = (
                 True if isinstance(result, dict) and result.get("strategy") == "smart_routing"
