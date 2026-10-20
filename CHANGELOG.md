@@ -33,6 +33,20 @@ and patch releases are fixes.
   - Args appended to a body with no placeholder are taken off when they start with `!` too
     (Claude Code escapes it as `\!`), and a call without args no longer strips a body's own last
     line when that line starts with `ARGUMENTS:`.
+- **Plain Anthropic tracing keeps the prompt and the completion on anthropic 1.15 and later.**
+  anthropic 1.15 traces its own API calls, and by default its span leaves the messages out
+  (`content_mode` is `metadata_only`). Under `decimalai.init(anthropic=True)` each call then
+  arrives as two spans, the SDK's inside OpenInference's, and DecimalAI kept the inner one as the
+  LLM call so that a stacked pair counts once. The trace then had no `user_input_preview` or
+  `final_output_preview`, its call had no `rendered_input` or `output`, and the agent's manifest
+  got no system prompt. With anthropic 1.13 the same run was complete. The Claude prod prober,
+  which pins anthropic 1.15.0, found it on 2026-10-20. This was not a privacy default:
+  OpenInference records the messages, and DecimalAI dropped them. Now a call span with no
+  content takes it from the span around it, when that span wraps this one call only.
+  - The conformance `anthropic` driver now gives the client its own TracerProvider, so the SDK's
+    spans reach the driver's exporter as they reach the global provider in production. Before,
+    they went elsewhere and the driver stayed green on anthropic 1.15.0. With them, it fails C4,
+    C8, C9, C14, C19 and D1 without the fix, and passes with it.
 
 - **One lost packet no longer costs an agent its skill.** `SkillRouter` gave every request one
   attempt, with 1 s to open the connection. The operating system re-sends a lost first packet

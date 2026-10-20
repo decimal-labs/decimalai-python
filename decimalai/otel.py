@@ -1291,8 +1291,19 @@ class DecimalSpanExporter:
         # innermost span — the one closest to the wire — is kept. This also
         # stays correct if a wrapper genuinely issues several calls: it has
         # several LLM children, and those children are the calls.
+        #
+        # The innermost span is not always the one with the content. anthropic
+        # >= 1.15 traces its own API calls, and by default its span carries the
+        # model and the tokens but not the messages (its `content_mode` is
+        # `metadata_only`); under `init(anthropic=True)` that span sits inside
+        # OpenInference's, which has the prompt and the completion. Keeping the
+        # inner span alone shipped the call with no rendered_input, no output
+        # and no previews. So a call whose span carries no content takes it from
+        # its wrapper, when the wrapper wraps that one call and nothing else.
         llm_span_ids: set = set()
         llm_parent_ids: set = set()
+        llm_children: Dict[str, List[str]] = {}
+        llm_attrs: Dict[str, Dict[str, Any]] = {}
         for otel_span in otel_spans:
             _a = dict(getattr(otel_span, "attributes", None) or {})
             _op = str(_a.get("gen_ai.operation.name") or "").lower()
@@ -1303,10 +1314,21 @@ class DecimalSpanExporter:
             _sid = _get_span_id(otel_span)
             if _sid is not None:
                 llm_span_ids.add(_sid)
+                llm_attrs[_sid] = _a
             _pid = _get_parent_span_id(otel_span)
             if _pid is not None:
                 llm_parent_ids.add(_pid)
+                if _sid is not None:
+                    llm_children.setdefault(_pid, []).append(_sid)
         wrapper_llm_span_ids = llm_span_ids & llm_parent_ids
+        content_from_wrapper: Dict[str, Dict[str, Any]] = {}
+        for _wid in wrapper_llm_span_ids:
+            _kids = llm_children.get(_wid) or []
+            if len(_kids) != 1:
+                continue
+            _wrapper, _call = llm_attrs.get(_wid) or {}, llm_attrs.get(_kids[0]) or {}
+            if _carries_content(_wrapper) and not _carries_content(_call):
+                content_from_wrapper[_kids[0]] = _wrapper
 
         # ── Whose run was this? ──
         # The exporter's own ``default_agent_name`` is fixed when the exporter
@@ -1411,6 +1433,10 @@ class DecimalSpanExporter:
                 model = None
 
             if model:
+                # The call's content, from its wrapper when its own span has none.
+                wrapper_attrs = content_from_wrapper.get(span_id_str or "")
+                if wrapper_attrs is not None:
+                    attrs = _with_content_from(attrs, wrapper_attrs)
                 # This is an LLM call — create LlmCallRecord
                 llm_call = self._make_llm_call(
                     attrs, name, model, started_at, ended_at, otel_span,
@@ -2227,6 +2253,20 @@ def _messages_from_attrs(
         }
         for idx in sorted(found)
     ]
+
+
+def _carries_content(attrs: Dict[str, Any]) -> bool:
+    """Whether an LLM span carries any of its request's or its response's content."""
+    return bool(_rendered_input_from_attrs(attrs) or _output_message_from_attrs(attrs)
+                or _preview_from_attrs(attrs, "input") or _preview_from_attrs(attrs, "output"))
+
+
+def _with_content_from(attrs: Dict[str, Any], wrapper: Dict[str, Any]) -> Dict[str, Any]:
+    """A call span's attributes with what only its wrapper span has: the call's own values
+    win, and the wrapper's fill in the content (messages, tools) the call left out."""
+    merged = dict(wrapper)
+    merged.update({k: v for k, v in attrs.items() if v not in (None, "")})
+    return merged
 
 
 def _rendered_input_from_attrs(

@@ -34,6 +34,16 @@ route through OTel in one process, means one run's spans reach another driver's
 exporter and every count doubles. Nothing about the traced path changes: same
 instrumentor, same exporter, same ``SimpleSpanProcessor``.
 
+**The SDK's own spans go there too.** anthropic >= 1.15 traces its own API calls, on
+the provider registered with the OpenTelemetry API unless the client is given one.
+Under the documented ``init(anthropic=True)`` that is the provider DecimalAI's
+exporter is on, so every call arrives as two spans: the SDK's (model and tokens, no
+messages by default) inside OpenInference's (the prompt and the completion). A driver
+that left the SDK's spans on the global provider would grade one span where
+production exports two, and stayed green while those traces lost their content
+(2026-10-20). So a client that has the ``open_telemetry`` option is given this
+driver's provider.
+
 **Instrumented once, on purpose.** The OpenInference instrumentor is a
 process-wide singleton that binds its tracer the first time it is enabled, so
 ``agent_name`` is fixed for the process at that moment — a property of the rail,
@@ -250,11 +260,19 @@ def _instrument(ctx: Ctx) -> None:
 
 
 def _client(base_url: str) -> Any:
+    import inspect
+
     import anthropic
 
+    kwargs: Dict[str, Any] = {}
+    if "open_telemetry" in inspect.signature(anthropic.Anthropic.__init__).parameters:
+        # The SDK's own spans, on the provider the exporter is on (see the module
+        # docstring): what the global provider gets in production.
+        kwargs["open_telemetry"] = {"tracer_provider": _pipeline}
     # A placeholder the SDK accepts; the stub service never looks at it, and no
     # request leaves 127.0.0.1.
-    return anthropic.Anthropic(api_key="sk-ant-conformance-stub", base_url=base_url)
+    return anthropic.Anthropic(api_key="sk-ant-conformance-stub", base_url=base_url,
+                               **kwargs)
 
 
 def _send(client: Any, *, stream: bool, **kwargs: Any) -> Any:
