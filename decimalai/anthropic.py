@@ -45,8 +45,10 @@ keeps no chat in memory resume the conversation exactly.
 Nothing DecimalAI does changes the SDK's behaviour, and other clients get no
 skills. ``agent_config()`` turns on Anthropic tracing (OpenInference's
 instrumentor, which wraps the SDK's classes for the process; installed by
-``decimalai[anthropic]``) and sends only the calls made inside its runs, unless
-``decimalai.init(anthropic=True)`` asked for every call.
+``decimalai[anthropic]``) on the same pipeline as ``decimalai.init(anthropic=True)``,
+the global tracer provider (an app with its own sets it up first), and sends only its
+runs: no Claude call made outside one and none of the app's own spans, unless
+``init(anthropic=True)`` asked for every Claude call (``init(otel=True)``: the app's spans).
 
 Anthropic's own Agent Skills (``container={"skills": [...]}``) are the other way
 to give an agent skills; an agent that uses both shows the model two lists.
@@ -56,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import logging
 import threading
 import time
@@ -63,7 +66,8 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 from uuid import uuid4
 
-from ._agent_binding import AgentBinding, ConversationRecord
+from ._agent_binding import AgentBinding, ConversationRecord, _in_thread
+from .skill_router import _load_routing_id_ctx
 
 logger = logging.getLogger("decimalai.anthropic")
 
@@ -132,16 +136,18 @@ def _turn_on_tracing() -> None:
 
     if _disabled_by_init():
         return
+    # Held while tracing is set up: a second first agent_config() on another thread
+    # waits for it, rather than opening a run before there is anything to trace it.
     with _tracing_lock:
         if _tracing_turned_on:
             return
-        _tracing_turned_on = True
-    try:
-        from .providers import instrument_for_runs
+        try:
+            from .providers import instrument_for_runs
 
-        instrument_for_runs("anthropic")
-    except Exception:
-        logger.warning("DecimalAI could not turn on Anthropic tracing (continuing)", exc_info=True)
+            instrument_for_runs("anthropic")
+        except Exception:
+            logger.warning("DecimalAI could not turn on Anthropic tracing (continuing)", exc_info=True)
+        _tracing_turned_on = True
 
 
 def _enclosing_trace_id() -> Optional[str]:
@@ -168,10 +174,18 @@ def _is_error(text: str) -> bool:
 
 
 def _event_loop_running() -> bool:
+    """Whether this thread is running async code: asyncio's loop, or trio's (via sniffio)."""
     try:
         asyncio.get_running_loop()
         return True
     except RuntimeError:
+        pass
+    try:
+        import sniffio
+
+        sniffio.current_async_library()
+        return True
+    except Exception:
         return False
 
 
@@ -204,16 +218,20 @@ def _finish_later(run: "Run", pending: Any, end_ns: int) -> None:
     pending.add_done_callback(finish)
 
 
-def _drain_finishing(timeout: float = _EXIT_WAITS_FOR_ROUTING_S + 0.5) -> None:
+def _drain_finishing(timeout: float = _EXIT_WAITS_FOR_ROUTING_S + 0.5, *, at_exit: bool = False) -> None:
     """Wait for closed runs whose trace is still waiting on a decision; end the rest now.
 
     ``decimalai.flush()`` calls it, so a short script reports on traces that exist.
     """
     deadline = time.monotonic() + timeout
     with _finishing_lock:
-        while _finishing and time.monotonic() < deadline:
+        # A flush waits for the runs closed before it: a run another thread closes
+        # meanwhile keeps its own timer, so a flush neither ends it early nor waits
+        # on a stream of new ones. At exit no timer will fire, so every run counts.
+        waiting = _finishing if at_exit else set(_finishing)
+        while waiting & _finishing and time.monotonic() < deadline:
             _finishing_done.wait(timeout=max(0.0, deadline - time.monotonic()))
-        left = list(_finishing)
+        left = list(waiting & _finishing)
     for run in left:
         run._end(run._exit_ns or time.time_ns())
         with _finishing_lock:
@@ -222,12 +240,13 @@ def _drain_finishing(timeout: float = _EXIT_WAITS_FOR_ROUTING_S + 0.5) -> None:
 
 def _register_drain_at_exit() -> None:
     """Drain during ``threading._shutdown()``, before the OTel pipelines shut down (see otel)."""
+    drain = functools.partial(_drain_finishing, at_exit=True)
     try:
-        threading._register_atexit(_drain_finishing)  # type: ignore[attr-defined]
+        threading._register_atexit(drain)  # type: ignore[attr-defined]
     except Exception:
         import atexit
 
-        atexit.register(_drain_finishing)
+        atexit.register(drain)
 
 
 # ── a conversation ───────────────────────────────────────────
@@ -403,7 +422,9 @@ class Run:
             return
         name = self._config.name
         try:
-            provider = providers._last_provider or trace_api.get_tracer_provider()
+            # The provider this process's Anthropic calls are traced on, so the
+            # calls nest under the run (not whichever provider was attached last).
+            provider = providers._run_provider("anthropic") or trace_api.get_tracer_provider()
             current = trace_api.get_current_span().get_span_context()
             links = [trace_api.Link(current)] if current.is_valid else None
             attributes = {
@@ -412,7 +433,7 @@ class Run:
             }
             # A new root, not a child of whatever is open (a web server's request
             # span, another run): one run, one trace.
-            span = provider.get_tracer("decimalai").start_span(
+            span = provider.get_tracer(otel.RUN_TRACER).start_span(
                 otel.RUN_SPAN_NAME, context=otel_context.Context(), attributes=attributes, links=links)
             self._span = span
             self._otel_ctx = trace_api.set_span_in_context(span, otel_context.get_current())
@@ -422,7 +443,6 @@ class Run:
             self._config._log.debug("could not start the run's span", exc_info=True)
 
     def _exit(self, exc_type: Any, exc: Any) -> None:
-        config = self._config
         with self._lock:
             if self._exited:
                 return
@@ -503,14 +523,20 @@ class Run:
         try:
             from . import otel, providers
 
-            if "anthropic" not in providers._instrumented:
+            if not providers._traced_for_runs("anthropic"):
                 return
-            if otel.spans_started(self._span.get_span_context().trace_id) <= 1:
-                config._warn_once(None, (
+            started = otel.spans_started(self._span.get_span_context().trace_id)
+            if started is not None and started <= 1:  # None: evicted by newer traces, unknown
+                advice = (
                     "no Claude request was traced inside this run. Make the model calls inside "
                     "the `with` block (a Tool Runner is lazy: consume it there). On AnthropicVertex "
                     "and the legacy AnthropicBedrock client, the Tool Runner's requests are not "
-                    "traced; a hand-written messages.create loop is."))
+                    "traced; a hand-written messages.create loop is.")
+                if "anthropic" in providers._runs_via_another_tool:
+                    advice += (" Anthropic tracing was turned on outside DecimalAI: DecimalAI "
+                               "receives those calls only if that tracing sends its spans to the "
+                               "global tracer provider.")
+                config._warn_once(None, advice)
         except Exception:
             pass
 
@@ -533,7 +559,7 @@ class Run:
         config, ctx = self._config, self._context()
         record = self._conversation._current()
         if record is not None and config._routes_later(record):
-            ctx["routed"] = await asyncio.to_thread(config._route_later_run, self.key, ctx)
+            ctx["routed"] = await _in_thread(config._route_later_run, self.key, ctx)
         state = await config._prepare_run(ctx, None, self.key)
         if state.get("conversation") is None:
             config._compose(ctx, None, self.key, state)
@@ -669,29 +695,36 @@ class Run:
         ctx = self._otel_ctx if (self._otel_ctx is not None and not self._exited) else otel_context.Context()
         return otel_context, ctx
 
-    def _name_the_showing_decision(self, name: str) -> None:
-        """A skill shown by an earlier message of the conversation is loaded under that decision."""
+    def _decision_for(self, name: str) -> Optional[str]:
+        """The routing decision a load of ``name`` names, in a cut-list conversation.
+
+        The platform serves a public-registry skill only to a load whose decision
+        offered it. A skill this message's decision offered names that one; a skill
+        an earlier message showed names the decision that showed it. None leaves
+        the load to the run's latest decision (a whole list has one per run).
+        """
         state, record = self._state or {}, self._record
-        if record is None or state.get("offered_now") is None or name in state["offered_now"]:
-            return
+        if record is None or not record.cut:
+            return None
+        key = name.lower()
+        if any(key == offered.lower() for offered in state.get("offered_now") or ()):
+            return state.get("routing_now") or None
         with self._conversation._lock:
-            origin = record.shown.get(name)
-        router = self._config._router()
-        remember = getattr(router, "_remember_run_routing", None)
-        if origin and callable(remember):
-            remember(self.key, origin)
+            origin = next((rid for shown, rid in record.shown.items() if shown.lower() == key), None)
+        return origin or None
 
     def _serve(self, tool_input: Any) -> Tuple[str, bool]:
         name, answer = self._requested(tool_input)
         if name is None:
             return answer or "", True
-        self._name_the_showing_decision(name)
         otel_context, ctx = self._load_context()
         otel_token = otel_context.attach(ctx) if otel_context is not None else None
         token = _RUN.set(self.key)
+        decision = _load_routing_id_ctx.set(self._decision_for(name))
         try:
-            text = self._config._load_sync(name)
+            text = self._config._load_sync(name, self._state)
         finally:
+            _load_routing_id_ctx.reset(decision)
             _RUN.reset(token)
             if otel_token is not None:
                 otel_context.detach(otel_token)
@@ -701,13 +734,14 @@ class Run:
         name, answer = self._requested(tool_input)
         if name is None:
             return answer or "", True
-        self._name_the_showing_decision(name)
         otel_context, ctx = self._load_context()
         otel_token = otel_context.attach(ctx) if otel_context is not None else None
         token = _RUN.set(self.key)
+        decision = _load_routing_id_ctx.set(self._decision_for(name))
         try:
-            text = await self._config._load(name)
+            text = await self._config._load(name, self._state)
         finally:
+            _load_routing_id_ctx.reset(decision)
             _RUN.reset(token)
             if otel_token is not None:
                 otel_context.detach(otel_token)

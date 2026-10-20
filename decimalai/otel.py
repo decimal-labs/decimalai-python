@@ -42,6 +42,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
 )
 from uuid import uuid4
 
@@ -518,14 +519,93 @@ def _note_span_started(span: Any) -> None:
     with _spans_started_lock:
         _spans_started[tid] = _spans_started.get(tid, 0) + 1
         _spans_started.move_to_end(tid)
-        while len(_spans_started) > _SPANS_STARTED_MAX:
-            _spans_started.popitem(last=False)
+        _evict_oldest(_spans_started, _SPANS_STARTED_MAX)
 
 
-def spans_started(trace_id: int) -> int:
-    """How many spans a DecimalAI pipeline saw start in this trace (0 if none or evicted)."""
+#: The traces of DecimalAI runs still open: the bounded tables here never evict them,
+#: however many later traces start while one runs.
+_open_runs: Set[int] = set()
+
+
+def _evict_oldest(table: "OrderedDict[int, Any]", limit: int) -> None:
+    """Trim ``table`` to ``limit``, oldest first, skipping the traces of open runs."""
+    while len(table) > limit:
+        victim = next((tid for tid in table if tid not in _open_runs), None)
+        if victim is None:
+            return
+        del table[victim]
+
+
+def spans_started(trace_id: int) -> Optional[int]:
+    """How many spans a DecimalAI pipeline saw start in this trace, or None when it
+    saw none (or the count was evicted by newer traces)."""
     with _spans_started_lock:
-        return _spans_started.get(trace_id, 0)
+        return _spans_started.get(trace_id)
+
+
+#: Traces rooted in a DecimalAI run span (tracer ``RUN_TRACER``: ``agent_config()``
+#: runs, ``agent_run()``), noted when the root starts. A runs-only exporter sends
+#: these alone; held back from every exporter outside them: the calls of a
+#: provider traced for runs only (``providers._runs_only``). Bounded like the rail.
+_RUN_TRACES_MAX = 4096
+_run_traces: "OrderedDict[int, None]" = OrderedDict()
+_run_traces_lock = threading.Lock()
+
+
+def _run_root_trace_id(span: Any) -> Optional[int]:
+    try:
+        if getattr(span, "parent", None) is not None or _scope_name(span) != RUN_TRACER:
+            return None
+        return span.get_span_context().trace_id
+    except Exception:
+        return None
+
+
+def _note_run_trace(span: Any) -> None:
+    """At a DecimalAI run's root span start: its trace is a run's, and open."""
+    tid = _run_root_trace_id(span)
+    if tid is None:
+        return
+    with _spans_started_lock, _run_traces_lock:
+        _open_runs.add(tid)
+        _run_traces[tid] = None
+        _run_traces.move_to_end(tid)
+        _evict_oldest(_run_traces, _RUN_TRACES_MAX)
+
+
+def _note_run_ended(span: Any) -> None:
+    """At the run's root span end: its trace may be evicted again (after its export)."""
+    tid = _run_root_trace_id(span)
+    if tid is not None:
+        with _spans_started_lock, _run_traces_lock:
+            _open_runs.discard(tid)
+
+
+def _is_run_trace(trace_id: Any) -> bool:
+    with _run_traces_lock:
+        return trace_id in _run_traces
+
+
+def _held_back(span: Any, exporter: Any) -> bool:
+    """Whether ``exporter`` keeps ``span`` from DecimalAI because it is outside a run.
+
+    Inside a DecimalAI run every span is sent. Outside one, an exporter that exists
+    for ``agent_config()`` runs alone (``runs_only``) sends nothing, and any exporter
+    holds back the calls of a provider ``agent_config()`` traces for its runs only,
+    wherever they sit (under the app's own request span, at the root).
+    """
+    if _is_run_trace(_get_trace_id(span)):
+        return False
+    if getattr(exporter, "runs_only", False):
+        return True
+    try:
+        from .providers import _runs_only_scopes
+
+        scopes = _runs_only_scopes()
+    except Exception:
+        return False
+    scope = _scope_name(span)
+    return bool(scopes) and any(scope.startswith(prefix) for prefix in scopes)
 
 
 #: The run span's attribute naming the conversation it belongs to; the exporter
@@ -550,6 +630,7 @@ class _AgentNameStamper:
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         _note_span_started(span)
+        _note_run_trace(span)
         try:
             name = _active_agent_name.get()
             if not name:
@@ -565,7 +646,7 @@ class _AgentNameStamper:
         return None
 
     def on_end(self, span: Any) -> None:
-        return None
+        _note_run_ended(span)
 
     def shutdown(self) -> None:
         return None
@@ -673,7 +754,7 @@ def agent_run(
             span_attrs.update(attributes)
 
         provider = tracer_provider or trace_api.get_tracer_provider()
-        tracer = provider.get_tracer("decimalai")
+        tracer = provider.get_tracer(RUN_TRACER)
         # start_as_current_span records the exception and sets ERROR status by
         # default, which is what C10 ("a failing run produces exactly ONE trace,
         # marked errored") needs — the raising run still emits its one trace.
@@ -782,6 +863,11 @@ def instrument(
     _register_flush_atexit(provider)
     with _installed_providers_lock:
         _installed_providers.append(provider)
+    # Asked for every trace: if a agent_config() already put an exporter for its runs
+    # on the global provider (which this one cannot replace), it sends them all.
+    from . import providers as _providers
+
+    _providers._all_traces_wanted()
 
     logger.info(
         "DecimalAI OTEL exporter installed (agent_name=%s, service=%s)",
@@ -989,25 +1075,8 @@ class _AgentManifestState:
         self.adoption_checked = False
 
 
-def _dropped_outside_a_run(root: Any) -> bool:
-    """Whether a finished trace's root is a provider call DecimalAI should not send.
-
-    True only for a call whose instrumentor a ``agent_config()`` turned on for its own
-    runs (``decimalai.providers._runs_only``) and that happened outside such a run.
-    ``init(<provider>=True)`` asks for every call and clears that.
-    """
-    if root is None:
-        return False
-    try:
-        from .providers import _runs_only_scopes
-
-        scopes = _runs_only_scopes()
-        if not scopes:
-            return False
-        scope = getattr(getattr(root, "instrumentation_scope", None), "name", None) or ""
-        return any(scope.startswith(prefix) for prefix in scopes)
-    except Exception:
-        return False
+#: The tracer DecimalAI's own run spans come from (`agent_config()` runs, `agent_run()`).
+RUN_TRACER = "decimalai"
 
 
 class DecimalSpanExporter:
@@ -1048,6 +1117,13 @@ class DecimalSpanExporter:
         # The tracer provider this exporter was attached to, when DecimalAI attached
         # it (`otel.instrument()`, `decimalai.providers`). See _without_sdk_duplicates.
         self._provider: Any = None
+        # Set by `decimalai.providers` on an exporter it attached only for
+        # agent_config() runs, and cleared once anything asks for more: the
+        # exporter then sends only traces rooted in a DecimalAI run.
+        self.runs_only = False
+        # Traces whose root was held back (`_held_back`): their other spans are
+        # dropped too, rather than buffered for a root that will not come.
+        self._held_traces: "OrderedDict[int, None]" = OrderedDict()
 
     def export(self, spans: Sequence[Any]) -> Any:
         """Export a batch of OTEL spans, grouped into DecimalAI traces.
@@ -1064,6 +1140,27 @@ class DecimalSpanExporter:
             # If somehow called without OTEL installed, just succeed silently
             return None
 
+        # Outside a DecimalAI run, what agent_config()'s runs-only tracing must not
+        # send is dropped here, before it is buffered: nothing waits for a root that
+        # is not DecimalAI's to send.
+        held = [span for span in spans if _held_back(span, self)]
+        if held:
+            held_ids = {id(span) for span in held}
+            spans = [span for span in spans if id(span) not in held_ids]
+            # A held-back root ends last: what was buffered under it (an HTTP
+            # client's spans) goes with it, and so does anything later in its trace.
+            gone = {_get_trace_id(span) for span in held if _get_parent_span_id(span) is None}
+            if gone:
+                with self._pending_lock:
+                    for tid in gone:
+                        self._pending.pop(tid, None)
+                        self._held_traces[tid] = None
+                        self._held_traces.move_to_end(tid)
+                    while len(self._held_traces) > _RUN_TRACES_MAX:
+                        self._held_traces.popitem(last=False)
+        if self._held_traces:
+            with self._pending_lock:
+                spans = [span for span in spans if _get_trace_id(span) not in self._held_traces]
         if not spans:
             return SpanExportResult.SUCCESS
 
@@ -1106,12 +1203,6 @@ class DecimalSpanExporter:
         # leave its native loads in the shared store until the cap evicts them.
         native = _pop_native_rail(tid)
         root = next((span for span in group if _get_parent_span_id(span) is None), None)
-        if _dropped_outside_a_run(root):
-            # Traced only because a agent_config() turned the provider's tracing on, and
-            # not inside one of its runs: this call is not DecimalAI's to send.
-            _pop_skill_rail(tid)
-            _pop_run_link(tid)
-            return
         try:
             result = self._assemble_trace(group)
             if result is not None:
@@ -1427,7 +1518,7 @@ class DecimalSpanExporter:
         for otel_span in otel_spans:
             _a = dict(getattr(otel_span, "attributes", None) or {})
             _op = str(_a.get("gen_ai.operation.name") or "").lower()
-            if _op in _NON_LLM_OPERATIONS:
+            if _op in _NON_LLM_OPERATIONS or _is_anthropic_sdk_non_call(otel_span, _op):
                 continue
             if not _get_first(_a, _GENAI_MODEL, *_ALT_MODEL_KEYS):
                 continue
@@ -1542,7 +1633,7 @@ class DecimalSpanExporter:
             # _NON_LLM_OPERATIONS.
             model = _get_first(attrs, _GENAI_MODEL, *_ALT_MODEL_KEYS)
             operation = str(attrs.get("gen_ai.operation.name") or "").lower()
-            if operation in _NON_LLM_OPERATIONS:
+            if operation in _NON_LLM_OPERATIONS or _is_anthropic_sdk_non_call(otel_span, operation):
                 model = None
 
             if model and _get_span_id(otel_span) in wrapper_llm_span_ids:
@@ -2387,6 +2478,12 @@ _OPENINFERENCE_ANTHROPIC_SCOPE = "openinference.instrumentation.anthropic"
 
 def _scope_name(span: Any) -> str:
     return getattr(getattr(span, "instrumentation_scope", None), "name", None) or ""
+
+
+def _is_anthropic_sdk_non_call(span: Any, operation: str) -> bool:
+    """The Anthropic SDK's own span of a request that is no model call (``count_tokens``,
+    ``models.list``): it names a model but has no ``chat`` operation."""
+    return operation != "chat" and _scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE)
 
 
 def _is_anthropic_sdk_call(span: Any) -> bool:

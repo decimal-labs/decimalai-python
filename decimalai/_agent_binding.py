@@ -848,9 +848,15 @@ class AgentBinding:
             with self._lock:
                 loaded.add(name)
 
-    async def _load(self, name: str) -> str:
+    async def _load(self, name: str, state: Optional[Dict[str, Any]] = None) -> str:
+        """Serve one load_skill call of the current run.
+
+        ``state`` is the run's own, when the caller holds it: the binding keeps
+        only its latest runs' states, and a long run would otherwise lose its own.
+        """
         run_key = self._run_key()
-        state = self._run_state(run_key)
+        if state is None:
+            state = self._run_state(run_key)
         repeat = self._already_loaded(name, state)
         if repeat is not None:
             return repeat
@@ -859,10 +865,11 @@ class AgentBinding:
         self._mark_loaded(name, state, result)
         return result
 
-    def _load_sync(self, name: str) -> str:
+    def _load_sync(self, name: str, state: Optional[Dict[str, Any]] = None) -> str:
         """`_load` for a caller that is not on an event loop."""
         run_key = self._run_key()
-        state = self._run_state(run_key)
+        if state is None:
+            state = self._run_state(run_key)
         repeat = self._already_loaded(name, state)
         if repeat is not None:
             return repeat

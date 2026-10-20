@@ -44,9 +44,11 @@ instrumentor sees exactly what it would see in production. No key is used, no
 ``api.anthropic.com`` request is made, and the DecimalAI wire stays a real
 socket to the probe.
 
-**Why tracing is on the process-global provider.** ``agent_config()`` turns
-tracing on with ``providers.instrument(anthropic=True)``, the global-provider
-path. This driver used to pass a ``tracer_provider=`` of its own, so that other
+**Why tracing is on the process-global provider.** The tracing half runs the
+documented ``init(anthropic=True)`` (``providers.instrument(anthropic=True)``), the
+global-provider path, and the rail's ``agent_config()`` traces its runs on the same
+pipeline (on its own it builds that pipeline, runs-only; the unit tests cover that).
+This driver used to pass a ``tracer_provider=`` of its own, so that other
 drivers' spans in the same process could not reach its exporter; each driver now
 runs in its own process (``isolation.py``), and the two cannot be mixed: an
 explicit provider leaves the rail unmarked as instrumented, so ``agent_config()``

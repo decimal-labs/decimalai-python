@@ -359,8 +359,9 @@ def test_the_run_is_one_trace_named_for_the_decimalai_agent_with_its_record(plat
 
 
 def test_a_late_routing_decision_is_waited_for_and_never_left_behind(platform, monkeypatch):
-    """A later run shows the local copy at once and routes in the background; closing the run
-    waits for that decision, so it lands on the run's own trace instead of an orphan record."""
+    """A later run shows the local copy at once and routes in the background. Its trace is
+    ended once that decision lands (off the caller's path), so the decision is on the run's
+    own trace instead of an orphan record."""
     pytest.importorskip("opentelemetry.sdk.trace")
     from concurrent.futures import ThreadPoolExecutor
 
@@ -386,6 +387,7 @@ def test_a_late_routing_decision_is_waited_for_and_never_left_behind(platform, m
     exporter.clear()
     with support.run("It arrived cracked.", variables=SAM) as run:
         assert run._state.get("pending") is not None
+    da._drain_finishing(timeout=5)  # the span ends when the decision lands, not at the block's end
     (span,) = [s for s in exporter.get_finished_spans() if s.parent is None]
     rail = otel._pop_skill_rail(span.context.trace_id)
     assert rail["routing_id"], "the background decision landed on its own run"
@@ -397,10 +399,10 @@ def test_load_agent_turns_on_anthropic_tracing_once(platform, monkeypatch):
 
     calls = []
     monkeypatch.setattr(da, "_tracing_turned_on", False)
-    monkeypatch.setattr(providers, "instrument", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(providers, "instrument_for_runs", calls.append)
     da.agent_config("support")
     da.agent_config("support")
-    assert calls == [{"anthropic": True}]
+    assert calls == ["anthropic"]
 
 
 def test_the_load_names_the_decimalai_agent_and_the_run_routes_once(platform):
@@ -706,8 +708,10 @@ def test_closing_a_run_does_not_wait_for_a_routing_decision_in_flight(platform, 
         pass
     assert time.monotonic() - started < 1.0, "the caller is not held for the decision"
     assert not [s for s in exporter.get_finished_spans() if s.parent is None], "the trace waits"
-    gate.set()
-    da._drain_finishing(timeout=5)
+    threading.Timer(0.3, gate.set).start()
+    import decimalai
+
+    decimalai.flush()  # a short script's flush waits for it, as it does at interpreter exit
     (root,) = [s for s in exporter.get_finished_spans() if s.parent is None]
     assert otel._pop_skill_rail(root.context.trace_id)["routing_id"], "the late decision is on it"
 
@@ -740,29 +744,30 @@ def test_the_run_trace_carries_the_conversation_as_its_session(platform, monkeyp
     assert {s.attributes[otel.SESSION_ID_ATTRIBUTE] for s in runs} == {chat.id}
 
 
-def test_traces_outside_a_run_are_dropped_only_when_load_agent_turned_tracing_on(monkeypatch):
+def test_outside_a_run_what_is_held_back_and_from_whom(monkeypatch):
     from types import SimpleNamespace
 
     import decimalai.otel as otel
     import decimalai.providers as providers
 
-    anthropic_root = SimpleNamespace(instrumentation_scope=SimpleNamespace(
-        name="openinference.instrumentation.anthropic"))
-    run_root = SimpleNamespace(instrumentation_scope=SimpleNamespace(name="decimalai"))
+    def span(scope, trace_id):
+        return SimpleNamespace(instrumentation_scope=SimpleNamespace(name=scope),
+                               context=SimpleNamespace(trace_id=trace_id))
+
+    run = SimpleNamespace(instrumentation_scope=SimpleNamespace(name="decimalai"), parent=None,
+                          get_span_context=lambda: SimpleNamespace(trace_id=0xAB))
+    otel._note_run_trace(run)
     monkeypatch.setattr(providers, "_runs_only", {"anthropic"})
-    assert otel._dropped_outside_a_run(anthropic_root)
-    assert not otel._dropped_outside_a_run(run_root)
+    exporter = otel.DecimalSpanExporter()
+    exporter.runs_only = True
+    assert not otel._held_back(span("openinference.instrumentation.anthropic", 0xAB), exporter)
+    assert otel._held_back(span("app", 0xCD), exporter), "a runs-only exporter sends only runs"
+    exporter.runs_only = False
+    assert not otel._held_back(span("app", 0xCD), exporter), "init(otel=True): the app's spans go"
+    assert otel._held_back(span("openinference.instrumentation.anthropic", 0xCD), exporter)
+    assert otel._held_back(span("com.anthropic.sdk.python", 0xCD), exporter)
     monkeypatch.setattr(providers, "_runs_only", set())
-    assert not otel._dropped_outside_a_run(anthropic_root), "init(anthropic=True) sends every call"
-
-
-def test_an_explicit_instrument_call_sends_every_call_again(monkeypatch):
-    import decimalai.providers as providers
-
-    monkeypatch.setattr(providers, "_runs_only", {"anthropic"})
-    monkeypatch.setattr(providers, "_instrumented", {"anthropic"})
-    providers.instrument(anthropic=True)
-    assert providers._runs_only == set()
+    assert not otel._held_back(span("openinference.instrumentation.anthropic", 0xCD), exporter)
 
 
 def test_a_load_agent_runs_rendered_prompt_never_becomes_the_manifest_prompt(platform, monkeypatch):
@@ -901,3 +906,602 @@ def test_a_state_without_the_newer_fields_still_resumes(platform):
     with support.conversation(state=old).run("It arrived cracked.") as run:
         (block,) = run.system
         assert block["text"] == old["system"]
+
+
+# ── what the pre-landing review found (2026-10-21) ───────────────────────────
+
+
+@pytest.fixture
+def traced(platform, monkeypatch):
+    """DecimalAI's real tracing for agent_config(): the OpenInference instrumentor and the
+    exporter, with a provider standing in for the app's global one. Yields (that provider, sent
+    traces)."""
+    pytest.importorskip("openinference.instrumentation.anthropic")
+    from openinference.instrumentation.anthropic import AnthropicInstrumentor
+    from opentelemetry import trace as trace_api
+    from opentelemetry.sdk.trace import TracerProvider
+
+    import decimalai.otel as otel
+    import decimalai.providers as providers
+
+    AnthropicInstrumentor().uninstrument()
+    provider = TracerProvider()
+    monkeypatch.setattr(trace_api, "get_tracer_provider", lambda: provider)
+    for name in ("_pipeline_provider", "_last_provider", "_pipeline_exporter"):
+        monkeypatch.setattr(providers, name, None)
+    for name in ("_instrumented", "_runs_via_another_tool", "_runs_only"):
+        monkeypatch.setattr(providers, name, set())
+    for name in ("_run_providers", "_explicitly_traced", "_openinference_provider"):
+        monkeypatch.setattr(providers, name, {})
+    sent: list = []
+    monkeypatch.setattr(otel.DecimalSpanExporter, "_send", lambda self, trace: sent.append(trace))
+    monkeypatch.setattr(da, "_tracing_turned_on", False)
+    yield provider, sent
+    AnthropicInstrumentor().uninstrument()
+
+
+def _ask(client, **kwargs):
+    return client.messages.create(model="claude-haiku-5-5", max_tokens=16,
+                                  messages=[{"role": "user", "content": "PRIVATE question"}], **kwargs)
+
+
+def test_agent_config_sends_its_runs_and_nothing_else_from_the_process(traced, caplog):
+    """A11: agent_config() turns Anthropic tracing on for its runs. A Claude call made outside
+    one, the app's own spans on the tracer provider DecimalAI shares, and the SDK's own span of
+    a call outside a run (anthropic >= 1.14: the Tool Runner's root, count_tokens) stay in the
+    process; the run is one trace with its call."""
+    provider, sent = traced
+    support = da.agent_config("support")
+    _ask(Messages("answer").client())
+    with provider.get_tracer("app").start_as_current_span("GET /health"):
+        pass
+    with provider.get_tracer("com.anthropic.sdk.python").start_as_current_span("anthropic.messages.tool_runner"):
+        pass
+    assert sent == [], "nothing outside a run is DecimalAI's to send"
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        with support.run("It arrived cracked.", variables=SAM) as run:
+            tool_runner(Messages(("call", "damaged-item"), "answer").client(), run, "It arrived cracked.")
+    (trace,) = sent
+    assert trace.agent_name == "support" and len(trace.llm_calls) == 2
+    assert not [r for r in caplog.records if "no Claude request" in r.getMessage()]
+
+
+def test_an_explicit_init_anthropic_sends_every_call_again(traced):
+    import decimalai.providers as providers
+
+    provider, sent = traced
+    da.agent_config("support")
+    providers.instrument(anthropic=True)  # what init(anthropic=True) runs
+    _ask(Messages("answer").client())
+    (trace,) = sent
+    assert len(trace.llm_calls) == 1, "every call is sent, as that caller asked"
+
+
+def test_runs_whose_calls_were_made_after_the_block_warn_once(traced, caplog):
+    _provider, sent = traced
+    support = da.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        with support.run("It arrived cracked.", variables=SAM) as run:
+            lazy = run.system  # the developer read the run, and called the model after it
+        _ask(Messages("answer").client(), system=lazy)
+    assert any("no Claude request was traced" in r.getMessage() for r in caplog.records)
+
+
+def test_another_tools_instrumentor_still_gets_decimalai_its_runs(traced, caplog):
+    """Phoenix, Arize and Langfuse turn the same OpenInference instrumentor on. agent_config()
+    then adds its exporter to the global provider for its runs instead of tracing nothing."""
+    from openinference.instrumentation.anthropic import AnthropicInstrumentor
+
+    provider, sent = traced
+    AnthropicInstrumentor().instrument(tracer_provider=provider)  # the other tool, first
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        support = da.agent_config("support")
+    assert any("turned on outside DecimalAI" in r.getMessage() for r in caplog.records)
+    _ask(Messages("answer").client())
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        _ask(Messages("answer").client(), system=run.system)
+    (trace,) = sent
+    assert trace.agent_name == "support" and len(trace.llm_calls) == 1
+
+
+def test_a_provider_attached_later_does_not_split_a_run_from_its_calls(traced):
+    """A later providers.instrument(tracer_provider=X) moved run spans to X while the Claude
+    calls stayed on the provider their instrumentor was bound to: a run with no calls."""
+    from opentelemetry.sdk.trace import TracerProvider
+
+    import decimalai.providers as providers
+
+    openai_instrumentor = pytest.importorskip("openinference.instrumentation.openai").OpenAIInstrumentor()
+    was_on = openai_instrumentor.is_instrumented_by_opentelemetry
+    _provider, sent = traced
+    support = da.agent_config("support")
+    providers.instrument(openai=True, tracer_provider=TracerProvider())
+    try:
+        with support.run("It arrived cracked.", variables=SAM) as run:
+            _ask(Messages("answer").client(), system=run.system)
+    finally:
+        if not was_on:  # process-wide: left on, it traces every later test's OpenAI calls
+            openai_instrumentor.uninstrument()
+    (trace,) = sent
+    assert len(trace.llm_calls) == 1
+
+
+def _load(run, name):
+    return run.tool_result({"type": "tool_use", "id": name, "name": "load_skill", "input": {"name": name}})
+
+
+def _body_decisions(platform):
+    return [(path.split("/")[-2], params.get("routing_id"))
+            for _m, path, params in platform.requests if path.endswith("/body")]
+
+
+def _cut_chat_two_messages(platform):
+    """A cut-list chat: message 1 shows damaged-item, message 2 order-support. (chat, rt1, rt2)."""
+    platform.truncated = True
+    chat = da.agent_config("support").conversation(variables=SAM)
+    with chat.run("My keyboard arrived cracked."):
+        pass
+    rt1 = chat._current().routing_id
+    return chat, rt1
+
+
+def test_each_load_names_the_decision_that_showed_its_skill_in_either_order(platform):
+    """The platform serves a public-registry skill only to a load whose decision offered it.
+    Loading a skill an earlier message showed first must not make this message's own new skill
+    name that earlier decision."""
+    chat, rt1 = _cut_chat_two_messages(platform)
+    with chat.run("Where is my order?") as run:
+        for name in ("damaged-item", "order-support"):
+            assert _load(run, name)["content"].startswith(f"## Skill: {name}")
+    (rt2,) = [rid for rid, q in platform.queries.items() if q == "Where is my order?"]
+    assert _body_decisions(platform) == [("damaged-item", rt1), ("order-support", rt2)]
+
+
+def test_a_skill_shown_by_a_later_message_names_that_decision_when_this_routing_fails(platform):
+    chat, rt1 = _cut_chat_two_messages(platform)
+    with chat.run("Where is my order?") as run:
+        run.message
+    (rt2,) = [rid for rid, q in platform.queries.items() if q == "Where is my order?"]
+    platform.down = True  # message 3's own routing fails
+    with chat.run("Any update?") as run:
+        platform.down = False
+        assert _load(run, "order-support")["content"].startswith("## Skill: order-support")
+    assert _body_decisions(platform) == [("order-support", rt2)]
+
+
+def test_a_resumed_cut_list_chat_still_names_the_decision_that_showed_each_skill(platform):
+    """chat.state carries which decision showed which skill (skills_shown) to the next worker."""
+    chat, rt1 = _cut_chat_two_messages(platform)
+    with chat.run("Where is my order?") as run:
+        run.message
+    (rt2,) = [rid for rid, q in platform.queries.items() if q == "Where is my order?"]
+    saved = json.loads(json.dumps(chat.state))
+    resumed = da.agent_config("support").conversation(state=saved)
+    with resumed.run("It arrived cracked.") as run:
+        assert _load(run, "order-support")["content"].startswith("## Skill: order-support")
+    assert _body_decisions(platform) == [("order-support", rt2)]
+
+
+def test_an_async_cut_list_chat_routes_each_message_too(platform):
+    platform.truncated = True
+    chat = da.agent_config("support").conversation(variables=SAM)
+
+    async def go():
+        async with chat.run("My keyboard arrived cracked."):
+            pass
+        async with chat.run("Where is my order?") as run:
+            _question, extra = run.message["content"]
+            assert "| order-support |" in extra["text"]
+            return await run.atool_result({"type": "tool_use", "id": "t", "name": "load_skill",
+                                           "input": {"name": "order-support"}})
+
+    result = asyncio.run(go())
+    assert result["content"].startswith("## Skill: order-support")
+    (rt2,) = [rid for rid, q in platform.queries.items() if q == "Where is my order?"]
+    assert _body_decisions(platform) == [("order-support", rt2)]
+
+
+def test_without_an_asyncio_loop_anyio_carries_the_routing(platform, monkeypatch):
+    """AsyncAnthropic also runs under trio (it is built on anyio), where there is no asyncio loop
+    to hand the routing to; anyio's worker thread takes it there. Exercised on anyio's asyncio
+    backend with the asyncio branch switched off."""
+    import threading
+
+    monkeypatch.setattr(binding, "_running_asyncio_loop", lambda: None)
+
+    async def no_asyncio_loop(*args, **kwargs):  # what asyncio.to_thread does under trio
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(asyncio, "to_thread", no_asyncio_loop)
+    routed_in = []
+    real_route = da.AnthropicAgentConfig._route
+
+    def route(self, *args):
+        routed_in.append(threading.get_ident())
+        return real_route(self, *args)
+
+    monkeypatch.setattr(da.AnthropicAgentConfig, "_route", route)
+
+    async def go():
+        async with da.agent_config("support").run("It arrived cracked.", variables=SAM) as run:
+            return threading.get_ident(), run.tools, run.system
+
+    loop_thread, tools, system = asyncio.run(go())
+    assert tools and "## Available Skills" in system[-1]["text"], "the run got its skills"
+    assert routed_in and routed_in[0] != loop_thread
+
+
+def test_an_async_load_that_stops_waiting_leaves_the_decision_running(platform, monkeypatch):
+    """`asyncio.wait_for(wrap_future(...))` cancelled a decision still queued in the pool when
+    the load stopped waiting for it; the decision was then lost for good."""
+    import contextvars
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    support = da.agent_config("support")
+    with support.run("Where is my order?", variables=SAM):
+        pass  # the first run routes before it opens; later ones in the background
+    pool = ThreadPoolExecutor(max_workers=1)
+    gate = threading.Event()
+    pool.submit(gate.wait, 5)  # the one worker is busy: the decision queues
+    monkeypatch.setattr(binding, "_in_background",
+                        lambda fn, *args: pool.submit(contextvars.copy_context().run, fn, *args))
+    monkeypatch.setattr(binding, "_LOAD_WAITS_FOR_ROUTING_S", 0.2)
+
+    async def go():
+        async with support.run("It arrived cracked.", variables=SAM) as run:
+            pending = run._state["pending"]
+            await run.atool_result({"type": "tool_use", "id": "t", "name": "load_skill",
+                                    "input": {"name": "damaged-item"}})
+            return pending
+
+    pending = asyncio.run(go())
+    assert not pending.cancelled(), "the decision is still on its way"
+    gate.set()
+    pending.result(timeout=5)
+    pool.shutdown()
+
+
+def test_a_long_run_keeps_its_own_state_after_many_later_runs(platform, monkeypatch):
+    """The binding keeps only its latest runs' states; a run still open uses its own."""
+    monkeypatch.setattr(binding, "_MAX_CONFIG_RUNS", 3)
+    support = da.agent_config("support")
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        assert _load(run, "damaged-item")["content"].startswith("## Skill: damaged-item")
+        for _ in range(5):
+            with support.run("Where is my order?", variables=SAM):
+                pass
+        assert "already loaded earlier in this run" in _load(run, "damaged-item")["content"]
+
+
+def test_a_load_after_its_run_closed_is_not_credited_to_the_run_open_now(platform, monkeypatch):
+    import decimalai.otel as otel
+
+    exporter, _provider = _memory_pipeline(monkeypatch)
+    support = da.agent_config("support")
+    with support.run("It arrived cracked.", variables=SAM) as first:
+        pass
+    with support.run("Where is my order?", variables=SAM):
+        _load(first, "damaged-item")  # a Tool Runner consumed after its run closed
+    for root in (s for s in exporter.get_finished_spans() if s.parent is None):
+        assert "damaged-item" not in ((otel._pop_skill_rail(root.context.trace_id) or {}).get("loaded") or [])
+
+
+def test_a_flush_waits_for_the_runs_closed_before_it_and_leaves_later_ones_to_their_timer(monkeypatch):
+    import threading
+    import time
+
+    ended: list = []
+
+    class FakeRun:
+        _exit_ns = 1
+
+        def __init__(self, name):
+            self.name = name
+
+        def _end(self, end_ns):
+            ended.append(self.name)
+
+    class Never:
+        def add_done_callback(self, fn):
+            pass
+
+    monkeypatch.setattr(da, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
+    monkeypatch.setattr(da, "_register_drain_at_exit", lambda: None)
+    before, during = FakeRun("before"), FakeRun("during")
+    da._finish_later(before, Never(), 1)
+    threading.Timer(0.1, lambda: da._finish_later(during, Never(), 1)).start()
+    started = time.monotonic()
+    da._drain_finishing(timeout=0.4)
+    assert time.monotonic() - started < 1.0
+    assert ended == ["before"], "a run closed during the flush keeps its own timer"
+    with da._finishing_lock:
+        da._finishing.discard(during)
+
+
+def test_a_claude_call_under_the_apps_own_span_outside_a_run_is_not_sent(traced):
+    """Its root is the app's request span, which DecimalAI's provider never sees: the group has
+    no run at its root even when it is flushed at exit."""
+    import decimalai.providers as providers
+
+    provider, sent = traced
+    da.agent_config("support")
+    with provider.get_tracer("app").start_as_current_span("POST /summarize"):
+        _ask(Messages("answer").client())
+    providers._pipeline_exporter.force_flush()
+    assert sent == []
+
+
+def test_asking_for_another_providers_calls_does_not_send_claude_calls_outside_runs(traced):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    import decimalai.providers as providers
+
+    openai_instrumentor = pytest.importorskip("openinference.instrumentation.openai").OpenAIInstrumentor()
+    was_on = openai_instrumentor.is_instrumented_by_opentelemetry
+    _provider, sent = traced
+    da.agent_config("support")
+    try:
+        providers.instrument(openai=True, tracer_provider=TracerProvider())
+        _ask(Messages("answer").client())
+    finally:
+        if not was_on:
+            openai_instrumentor.uninstrument()
+    assert sent == [], "init(openai=True) asks for OpenAI's calls, not Claude's"
+
+
+def test_agent_config_traces_on_the_apps_global_provider_when_there_is_one(traced, monkeypatch):
+    """One pipeline for the process: the app's spans, another tool's and DecimalAI's runs
+    share the global provider, so no span points at a parent its backend never gets."""
+    from opentelemetry import trace as trace_api
+
+    import decimalai.providers as providers
+
+    provider, _sent = traced
+    set_calls = []
+    monkeypatch.setattr(trace_api, "set_tracer_provider", set_calls.append)
+    da.agent_config("support")
+    assert set_calls == [], "the app's provider stays the global one"
+    assert providers._run_provider("anthropic") is provider
+    assert providers._openinference_provider["anthropic"] is provider
+
+
+def test_agent_run_and_a_later_init_anthropic_use_agent_configs_pipeline(traced):
+    import decimalai.providers as providers
+
+    _provider, sent = traced
+    da.agent_config("support")
+    with providers.agent_run("billing"):
+        _ask(Messages("answer").client())
+    (grouped,) = sent
+    assert grouped.agent_name == "billing" and len(grouped.llm_calls) == 1
+    sent.clear()
+    providers.instrument(anthropic=True)  # what init(anthropic=True) runs
+    _ask(Messages("answer").client())
+    (alone,) = sent
+    assert len(alone.llm_calls) == 1, "every Claude call, as init(anthropic=True) asks"
+
+
+def test_asking_for_the_apps_spans_still_holds_back_claude_calls_outside_runs(traced):
+    """init(otel=True) asks for the app's spans; a Claude call outside a run still needs
+    init(anthropic=True)."""
+    import decimalai.providers as providers
+
+    provider, sent = traced
+    da.agent_config("support")
+    providers._all_traces_wanted()  # what init(otel=True) runs
+    with provider.get_tracer("app").start_as_current_span("GET /health"):
+        pass
+    with provider.get_tracer("app").start_as_current_span("POST /summarize"):
+        _ask(Messages("answer").client())
+    names = sorted(span.name for trace in sent for span in trace.spans)
+    assert names == ["GET /health", "POST /summarize"], names
+
+
+def test_a_run_another_tools_tracing_never_reached_says_so(traced, caplog, monkeypatch):
+    """Another tool turned the instrumentor on, onto a provider of its own that is not the
+    global one: the run cannot get its calls, and the warning names that, not the `with` block.
+    (anthropic >= 1.14 also traces its own calls onto the global provider, where the run then
+    gets a record of each call without its content; switched off here, as on 1.13.)"""
+    from openinference.instrumentation.anthropic import AnthropicInstrumentor
+    from opentelemetry.sdk.trace import TracerProvider
+
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY", "false")
+    _provider, _sent = traced
+    AnthropicInstrumentor().instrument(tracer_provider=TracerProvider())  # not the global one
+    support = da.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        with support.run("It arrived cracked.", variables=SAM) as run:
+            _ask(Messages("answer").client(), system=run.system)
+    assert any("turned on outside DecimalAI" in r.getMessage() for r in caplog.records)
+
+
+class _NeverDecided:
+    def add_done_callback(self, fn):
+        pass
+
+
+class _FinishingRun:
+    _exit_ns = 1
+
+    def __init__(self, name, ended):
+        self.name, self.ended = name, ended
+
+    def _end(self, end_ns):
+        self.ended.append(self.name)
+
+
+def test_at_exit_the_drain_waits_for_runs_other_threads_close_during_it(monkeypatch):
+    """No run's own timer fires after exit, so the exit drain takes every run still finishing,
+    not only those closed before it started (as a flush does)."""
+    import threading
+
+    ended: list = []
+    monkeypatch.setattr(da, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
+    monkeypatch.setattr(da, "_register_drain_at_exit", lambda: None)
+    before, during = _FinishingRun("before", ended), _FinishingRun("during", ended)
+    da._finish_later(before, _NeverDecided(), 1)
+    threading.Timer(0.1, lambda: da._finish_later(during, _NeverDecided(), 1)).start()
+    da._drain_finishing(timeout=0.4, at_exit=True)
+    assert sorted(ended) == ["before", "during"]
+
+
+def test_the_drain_is_registered_for_exit_as_the_exit_drain(monkeypatch):
+    import threading
+
+    registered = []
+    monkeypatch.setattr(threading, "_register_atexit", registered.append, raising=False)
+    da._register_drain_at_exit()
+    (drain,) = registered
+    assert drain.func is da._drain_finishing and drain.keywords == {"at_exit": True}
+
+
+def test_interpreter_exit_ends_a_run_still_waiting_for_its_decision(tmp_path):
+    """The exit drain really runs at exit (threading's atexit, before the OTel pipelines
+    shut down): a run whose decision never landed is ended, so its trace is sent."""
+    import subprocess
+    import sys
+
+    out = tmp_path / "ended.txt"
+    script = f"""
+import sys
+sys.path.insert(0, {str(__import__("pathlib").Path(da.__file__).parents[1])!r})
+import decimalai.anthropic as da
+da._drain_finishing.__defaults__ = (0.3,)
+class Never:
+    def add_done_callback(self, fn): pass
+class Run:
+    _exit_ns = 1
+    def _end(self, end_ns):
+        open({str(out)!r}, "a").write("ended\\n")
+da._finish_later(Run(), Never(), 1)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
+    assert out.read_text() == "ended\n"
+
+
+def test_a_load_after_its_run_closed_says_to_consume_the_runner_inside_the_block(platform, caplog):
+    support = da.agent_config("support")
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        pass
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        _load(run, "damaged-item")
+    assert any("load_skill was called after its run closed" in r.getMessage() for r in caplog.records)
+
+
+def test_an_evicted_span_count_is_not_read_as_no_claude_request(traced, caplog, monkeypatch):
+    """The count is kept for the latest traces only; a long run may outlive its entry."""
+    import decimalai.otel as otel
+
+    _provider, _sent = traced
+    support = da.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        with support.run("It arrived cracked.", variables=SAM) as run:
+            run.system
+            monkeypatch.setattr(otel, "spans_started", lambda trace_id: None)
+    assert not [r for r in caplog.records if "no Claude request" in r.getMessage()]
+
+
+def test_an_async_run_names_each_loads_own_decision_too(platform):
+    chat, rt1 = _cut_chat_two_messages(platform)
+
+    async def go():
+        async with chat.run("Where is my order?") as run:
+            for name in ("damaged-item", "order-support"):
+                result = await run.atool_result({"type": "tool_use", "id": name, "name": "load_skill",
+                                                 "input": {"name": name}})
+                assert result["content"].startswith(f"## Skill: {name}")
+
+    asyncio.run(go())
+    (rt2,) = [rid for rid, q in platform.queries.items() if q == "Where is my order?"]
+    assert _body_decisions(platform) == [("damaged-item", rt1), ("order-support", rt2)]
+
+
+def test_after_init_otel_agent_configs_exporter_is_not_runs_only(traced, monkeypatch):
+    """init(otel=True) asked for every trace before agent_config(): its own provider lost the
+    global slot to the app's, so the exporter agent_config() puts there is the one that sends."""
+    import decimalai.otel as otel
+    import decimalai.providers as providers
+
+    provider, sent = traced
+    monkeypatch.setattr(otel, "_installed_providers", [object()])
+    da.agent_config("support")
+    assert providers._pipeline_exporter.runs_only is False
+    with provider.get_tracer("app").start_as_current_span("GET /health"):
+        pass
+    assert [s.name for t in sent for s in t.spans] == ["GET /health"]
+
+
+def test_a_sync_run_inside_trio_code_is_seen_as_inside_an_event_loop(monkeypatch):
+    sniffio = pytest.importorskip("sniffio")
+    monkeypatch.setattr(sniffio, "current_async_library", lambda: "trio")
+    assert da._event_loop_running()
+    monkeypatch.setattr(sniffio, "current_async_library",
+                        lambda: (_ for _ in ()).throw(sniffio.AsyncLibraryNotFoundError()))
+    assert not da._event_loop_running()
+
+
+def test_a_run_stays_a_run_however_many_later_runs_start_while_it_is_open(traced, monkeypatch, caplog):
+    """The run registry and the span counts are bounded; an open run is never evicted from
+    either, or its late Claude calls would be held back as outside a run."""
+    import decimalai.otel as otel
+
+    monkeypatch.setattr(otel, "_RUN_TRACES_MAX", 3)
+    monkeypatch.setattr(otel, "_SPANS_STARTED_MAX", 3)
+    _provider, sent = traced
+    support = da.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
+        with support.run("It arrived cracked.", variables=SAM) as long_run:
+            for _ in range(6):
+                with support.run("Where is my order?", variables=SAM):
+                    pass
+            _ask(Messages("answer").client(), system=long_run.system)
+    (trace,) = [t for t in sent if t.llm_calls]
+    assert len(trace.llm_calls) == 1
+    assert not [r for r in caplog.records if "no Claude request" in r.getMessage()]
+    with support.run("Any update?", variables=SAM):
+        pass  # closed runs are evictable again: the tables stay bounded
+    assert len(otel._run_traces) <= 3 and len(otel._spans_started) <= 3
+
+
+def test_what_was_buffered_under_a_held_back_call_goes_with_it(traced):
+    """init(otel=True) beside agent_config(): a Claude call outside a run is held back, and
+    the spans recorded under it (an HTTP client's) are dropped too, not buffered without end."""
+    import decimalai.providers as providers
+
+    provider, sent = traced
+    da.agent_config("support")
+    providers._all_traces_wanted()  # what init(otel=True) runs
+    exporter = providers._pipeline_exporter
+    oi = provider.get_tracer("openinference.instrumentation.anthropic")
+    with oi.start_as_current_span("messages.create") as call:
+        with provider.get_tracer("opentelemetry.instrumentation.httpx").start_as_current_span("POST"):
+            pass
+    tid = call.get_span_context().trace_id
+    assert tid not in exporter._pending
+    exporter.force_flush()
+    assert sent == []
+
+
+def test_two_first_agent_configs_at_once_both_get_tracing(platform, monkeypatch):
+    import threading
+    import time
+
+    import decimalai.providers as providers
+
+    done = []
+
+    def slow_setup(name):
+        time.sleep(0.3)
+        done.append(time.monotonic())
+
+    monkeypatch.setattr(da, "_tracing_turned_on", False)
+    monkeypatch.setattr(providers, "instrument_for_runs", slow_setup)
+    returned = []
+    threads = [threading.Thread(target=lambda: (da.agent_config("support"), returned.append(time.monotonic())))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(done) == 1 and all(at >= done[0] for at in returned), "neither returned before tracing was up"

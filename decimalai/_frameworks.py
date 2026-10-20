@@ -366,9 +366,11 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         default_model="claude-haiku-5-5",
         capability=Capability(
             tier="Supported",
-            # What the exporter registers from the traced requests: the model, the system
-            # text and each tool, tools by name (no schema hash or description).
-            manifest="✅ full (model, system prompt, tools)",
+            # What the exporter registers from the traced requests: the model and each
+            # tool, by name (no schema hash or description). Not the system text: a
+            # run's prompt is the saved one, whose version each trace names, and the
+            # text the model saw has its values filled in and the skill list after it.
+            manifest="✅ partial (model, tools; the prompt by its saved version)",
             schema_depth="Names only",
             handoffs="—",
             skills_rail="`load_skill` tool",

@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [0.22.2] — 2026-10-21
+## [Unreleased]
 
 ### Changed (breaking): Anthropic Messages API agents get their prompt and skills from `agent_config()`
 
@@ -19,9 +19,17 @@ and patch releases are fixes.
   model can fetch a skill's text mid-turn for the first time.
 - Each run is one trace filed under the DecimalAI agent, with its prompt version and the skills
   offered and loaded; `on_trace=fn` is called with each finished trace before it is sent.
-  `agent_config()` turns on Anthropic tracing (OpenInference's instrumentor) and sends only the calls
-  made inside its runs; `init(anthropic=True)` still sends every call. `decimalai.flush()` waits a
-  few seconds at most for a run that closed while its routing decision was still on its way.
+  `agent_config()` turns on Anthropic tracing (OpenInference's instrumentor) on the same pipeline
+  as `init(anthropic=True)`, the global tracer provider, and sends only its runs. A Claude call
+  made outside one is held back, even under the app's own request span, and so is anything else
+  that reaches that exporter outside a run. `init(anthropic=True)` sends every Claude call, and
+  `init(otel=True)` the app's spans. Set up tracing first: the app's own global tracer provider,
+  and `decimalai.init(otel=True)` or `init(crewai=True)`, go before the first `agent_config()`, as
+  before `init(anthropic=True)`. OpenTelemetry sets the global provider once. When the instrumentor was turned on outside DecimalAI (the app, Phoenix,
+  Langfuse), the runs are still traced, as long as that tracing sends its spans to the global
+  tracer provider, and a run that got none of its calls says so. `decimalai.flush()` waits a few
+  seconds at most for a run that closed while its routing decision was still on its way, and so
+  does interpreter exit.
 - **Chats:** `chat = support.conversation(variables=values)`, then `with chat.run(question) as run:`
   for each message. A conversation keeps the system blocks and tool definition its first message
   got, byte for byte: Anthropic answers HTTP 400 when either changes once a thinking block is in
@@ -29,7 +37,9 @@ and patch releases are fixes.
   `chat.state` is the conversation as JSON-ready data, and `support.conversation(state=saved)`
   resumes it in another process. Every message is still routed on its own text: for an agent whose
   list is cut to fit, the skills a later message picks that the chat has not shown ride in that
-  message's user turn, `run.message`, which a chat sends instead of its own user dict.
+  message's user turn, `run.message`, which a chat sends instead of its own user dict. Each
+  `load_skill` names the routing decision that showed its skill, whichever message that was,
+  because the platform serves a public-registry skill only to a decision that offered it.
 - `cache_control=` is the prompt-caching breakpoint DecimalAI puts on `run.system`, at its end
   and, when later runs share the prompt but not the list, after the prompt (two of a request's
   four): `{"type": "ephemeral"}` by default, `None` for none.
@@ -64,6 +74,29 @@ with support.run(question) as run:
 
 A chat that sent its history with every request keeps one `support.conversation()` beside that
 history and opens `chat.run(question)` for each message.
+
+
+### Fixed: the OpenTelemetry exporter
+
+- A message that answers a tool call is recorded as a `tool` message. OpenInference's Anthropic
+  instrumentor records Anthropic's `tool_result` as a `user` message carrying a `tool_call_id`, so
+  a skill's text that the model loaded read as if the user had typed it. Any message with a
+  `tool_call_id` is now `tool`.
+- A `agent_config()` run no longer registers the system text the model saw as the agent's manifest
+  prompt. That text has the placeholder values filled in and the skill list appended, so the
+  manifest showed a changed prompt whenever a value or the skill list changed. The run's record
+  already names the saved prompt's version.
+- `init(otel=True)` beside a provider's tracing no longer sends each trace twice.
+  `init(anthropic=True)`, `init(openai=True)` and `init(google=True)` added a second DecimalAI
+  exporter to a tracer provider that `init(otel=True)` had already given one. They now use that
+  one.
+- A run span's `decimal.session_id` becomes the trace's `session_id`. Anthropic runs set it to
+  their conversation's id, so a chat's messages group together.
+- `messages.count_tokens()` and the other requests the Anthropic SDK traces itself without a
+  model call (anthropic 1.14 and later) are no longer recorded as LLM calls.
+
+
+## [0.22.2] — 2026-10-21
 
 ### Fixed
 
@@ -114,24 +147,6 @@ history and opens `chat.run(question)` for each message.
   process. They now initialize only a process that never called `init()`. Under the kill switch,
   `agent_config()` asks DecimalAI nothing: the agent runs on its `fallback=` text, and with no
   fallback `agent_config()` raises `RuntimeError` saying to pass one.
-
-### Fixed: the OpenTelemetry exporter
-
-- A message that answers a tool call is recorded as a `tool` message. OpenInference's Anthropic
-  instrumentor records Anthropic's `tool_result` as a `user` message carrying a `tool_call_id`, so
-  a skill's text that the model loaded read as if the user had typed it. Any message with a
-  `tool_call_id` is now `tool`.
-- A `agent_config()` run no longer registers the system text the model saw as the agent's manifest
-  prompt. That text has the placeholder values filled in and the skill list appended, so the
-  manifest showed a changed prompt whenever a value or the skill list changed. The run's record
-  already names the saved prompt's version.
-- `init(otel=True)` beside a provider's tracing no longer sends each trace twice.
-  `init(anthropic=True)`, `init(openai=True)` and `init(google=True)`, and the tracing
-  `decimalai.anthropic.agent_config()` turns on, added a second DecimalAI exporter to a tracer
-  provider that `init(otel=True)` had already given one. They now use that one.
-- A run span's `decimal.session_id` becomes the trace's `session_id`. Anthropic runs set it to
-  their conversation's id, so a chat's messages group together.
-
 
 ## [0.22.0] — 2026-10-21
 

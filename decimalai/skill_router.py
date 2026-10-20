@@ -1233,6 +1233,14 @@ _body_budget_ctx: ContextVar[Optional[_BodyLoadBudget]] = ContextVar(
     "decimalai_skill_router_body_budget", default=None,
 )
 
+#: The routing decision one load_skill call names, when its caller knows it better
+#: than the run's latest: a later message of a conversation, loading a skill an
+#: earlier message showed. Set around that one call, so loads cannot change
+#: each other's (see `load_skill`).
+_load_routing_id_ctx: ContextVar[Optional[str]] = ContextVar(
+    "decimalai_skill_router_load_routing_id", default=None,
+)
+
 
 # ── ambient run scope ───────────────────────────────────────
 #
@@ -2334,7 +2342,8 @@ class SkillRouter:
         # keyword on `get_skill_body` would break every stub of it. Set for
         # exactly this call and cleared even if it raises, so no other fetch
         # on this thread (an injected body, an export) ever carries it.
-        _body_hash_tls.load_routing_id = self._run_routing_id(scope)
+        _body_hash_tls.load_routing_id = (
+            _load_routing_id_ctx.get() or self._run_routing_id(scope))
         try:
             body = self.get_skill_body(
                 name,

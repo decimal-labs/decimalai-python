@@ -288,3 +288,14 @@ def test_a_trace_with_openinferences_record_drops_the_sdks_sibling_wherever_it_i
     trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace([*_stream_spans(), run])
     (call,) = trace.llm_calls
     assert call.output == {"role": "assistant", "content": "pong-COMPLETION-SENTINEL"}
+
+
+def test_count_tokens_is_not_a_model_call():
+    # The SDK's span of messages.count_tokens() names a model and has no "chat" operation.
+    from decimalai.otel import DecimalSpanExporter
+
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    count = _scoped(_Span("anthropic.messages.count_tokens", 0xDDD1, ROOT,
+                          {"gen_ai.request.model": "claude-haiku-4-5"}), SDK_SCOPE)
+    trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace([count, run])
+    assert trace.llm_calls == []

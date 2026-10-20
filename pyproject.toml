@@ -143,10 +143,10 @@ adk = ["google-adk>=2.12.0"]
 # Runtime extra for the Anthropic Messages API (decimalai.anthropic.agent_config()): the
 # SDK, and the OpenInference instrumentor that agent_config() turns on to trace its runs.
 # Floored at 1.13.0, the release the default suite runs against. From 1.14.0 the
-# Anthropic SDK traces each call itself, by default without the messages, inside
-# OpenInference's span; the exporter fills that call from the span around it (otel.py,
-# _with_content_from). Without that, the anthropic conformance column fails 10 items on
-# 1.15.0; with it, 1.15.0 passes all 27 (2026-10-21, openinference 3.0.3).
+# Anthropic SDK traces each call itself, by default without the messages, beside
+# OpenInference's span; the exporter merges or drops that duplicate (otel.py,
+# _with_content_from and _without_sdk_duplicates). Without that, the anthropic
+# conformance column fails 10 items on 1.15.0; with it, 1.15.0 passes all 27.
 anthropic = ["anthropic>=1.13.0", "openinference-instrumentation-anthropic>=3.0.3"]
 langgraph = ["langgraph>=1.2.15"]
 # Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).

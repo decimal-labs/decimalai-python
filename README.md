@@ -254,8 +254,11 @@ saved = chat.state                              # JSON: support.conversation(sta
 
 A server that keeps no chat in memory stores `chat.state` beside the history. Nothing in the
 Anthropic SDK is patched, and other clients get no skills. `agent_config()` turns on Anthropic tracing
-(OpenInference's instrumentor, installed by `decimalai[anthropic]`) and sends only the calls made
-inside its runs; `init(anthropic=True)` traces every call and changes no request.
+(OpenInference's instrumentor, installed by `decimalai[anthropic]`) on the same pipeline as
+`init(anthropic=True)` and sends only its runs, not other Claude calls or the app's own spans;
+`init(anthropic=True)` traces every call and changes no request. Set up tracing before the first
+`agent_config()`: your own OpenTelemetry tracer provider, and `decimalai.init(otel=True)` or
+`init(crewai=True)`.
 
 ### Your own model calls
 
