@@ -25,6 +25,7 @@ from openai.types.responses import (  # noqa: E402
     ResponseOutputText,
 )
 
+import decimalai._agent_binding as binding  # noqa: E402
 import decimalai.openai_agents as oa  # noqa: E402
 import decimalai.skill_router as sr  # noqa: E402
 from decimalai._client import AgentNotFoundError  # noqa: E402
@@ -194,8 +195,8 @@ def decimal(monkeypatch):
     monkeypatch.setattr(oa, "_tracing_processor", None, raising=False)
     monkeypatch.setattr(oa, "_tracing_processor_added", False, raising=False)
     monkeypatch.setattr(oa, "_run_rails", OrderedDict())
-    monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
-    monkeypatch.setattr(oa, "_config_pool", None)
+    monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(binding, "_config_pool", None)
     provider = get_trace_provider()
     saved = list(provider._multi_processor._processors)
     set_trace_processors([])
@@ -431,18 +432,18 @@ class WaitingModel(ScriptedModel):
 
 
 def test_the_background_decision_reaches_its_own_run_from_a_worker_thread(decimal, monkeypatch):
-    monkeypatch.setattr(oa, "_in_background", ORIGINAL_IN_BACKGROUND)
+    monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
     support = oa.load_agent("support")
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     Runner.run_sync(build(support, WaitingModel(decimal, 2)), "Hi")
-    oa._config_pool.shutdown(wait=True)
+    binding._config_pool.shutdown(wait=True)
     assert [t.routing_id for t in sent(decimal)] == ["rt_" + f"{n:024x}" for n in (1, 2)]
 
 
 def test_a_run_faster_than_its_routing_request_still_ships_its_routing_id(decimal, monkeypatch):
     import threading
 
-    monkeypatch.setattr(oa, "_in_background", ORIGINAL_IN_BACKGROUND)
+    monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
     support = oa.load_agent("support")
     release = threading.Event()
     answer = decimal.request
@@ -455,19 +456,19 @@ def test_a_run_faster_than_its_routing_request_still_ships_its_routing_id(decima
     monkeypatch.setattr(oa._skill_router_singleton, "_request", slow_menu)
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
-    oa._config_pool.shutdown(wait=True)
+    binding._config_pool.shutdown(wait=True)
     assert [t.routing_id for t in sent(decimal)] == ["rt_" + f"{n:024x}" for n in (1, 2)]
     assert not oa._run_rails, "a late routing result must not leave a rail behind"
 
 
 def test_a_shut_down_worker_pool_never_fails_a_run(decimal, monkeypatch):
-    monkeypatch.setattr(oa, "_in_background", ORIGINAL_IN_BACKGROUND)
+    monkeypatch.setattr(binding, "_in_background", ORIGINAL_IN_BACKGROUND)
     support = oa.load_agent("support")
     for _ in range(2):  # the second run is the first with background work
         Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
-    oa._config_pool.shutdown(wait=True)  # e.g. torn down at interpreter exit
+    binding._config_pool.shutdown(wait=True)  # e.g. torn down at interpreter exit
     Runner.run_sync(build(support, ScriptedModel(["answer"])), "Hi")
-    oa._config_pool.shutdown(wait=True)
+    binding._config_pool.shutdown(wait=True)
     assert len(sent(decimal)) == 3
 
 
@@ -512,7 +513,7 @@ def test_without_turn_input_skills_keep_a_fixed_order_and_it_says_so_once(decima
     assert support._message(SimpleNamespace(turn_input=[{"role": "user", "content": "Hi there"}]), agent) == "Hi there"
 
 
-ORIGINAL_IN_BACKGROUND = oa._in_background
+ORIGINAL_IN_BACKGROUND = binding._in_background
 
 
 # ── the documented channel settings ──────────────────────────────────────────

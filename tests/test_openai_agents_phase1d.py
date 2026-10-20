@@ -49,6 +49,7 @@ from agents.tracing import get_trace_provider, set_tracing_disabled  # noqa: E40
 from agents.usage import Usage  # noqa: E402
 from openai.types.responses import ResponseFunctionToolCall  # noqa: E402
 
+import decimalai._agent_binding as binding  # noqa: E402
 import decimalai.openai_agents as oa  # noqa: E402
 from decimalai import skill_router as sr  # noqa: E402
 from decimalai.skill_router import SkillRouter  # noqa: E402
@@ -70,7 +71,7 @@ from tests.test_openai_agents_phase1 import (  # noqa: E402
 sdk = phase1.sdk
 
 #: The real background helper, before any fixture replaces it.
-_REAL_IN_BACKGROUND = oa._in_background
+_REAL_IN_BACKGROUND = binding._in_background
 
 #: A host no other test routes to, so no other test's circuit-breaker state applies.
 BASE = "http://phase1d-platform.test"
@@ -201,11 +202,11 @@ def platform(sdk, monkeypatch):
 @pytest.fixture
 def real_background(monkeypatch):
     """Background routing on the adapter's own worker pool, as in production."""
-    monkeypatch.setattr(oa, "_in_background", _REAL_IN_BACKGROUND)
+    monkeypatch.setattr(binding, "_in_background", _REAL_IN_BACKGROUND)
     try:
         yield
     finally:
-        pool = oa._config_pool
+        pool = binding._config_pool
         if pool is not None:
             pool.shutdown(wait=True)
 
@@ -288,7 +289,7 @@ class TestUntracedRunsDoNotShareARunScope:
         assert len(oa._untraced_run_keys) == 0, "a finished run's key outlived its trace"
 
     def test_an_agents_memory_of_finished_runs_is_bounded(self, sdk, untraced, monkeypatch):
-        monkeypatch.setattr(oa, "_MAX_CONFIG_RUNS", 3)
+        monkeypatch.setattr(binding, "_MAX_CONFIG_RUNS", 3)
         oa._skill_router_singleton = _Router()
         support = oa.load_agent("support")
 
@@ -420,7 +421,7 @@ class TestALoadNamesThisRunsDecision:
         support_a, support_b = oa.load_agent("support-a"), oa.load_agent("support-b")
         Runner.run_sync(_agent(support_a, _ScriptedModel([_text("ok")])), ASK_A)
         Runner.run_sync(_agent(support_b, _ScriptedModel([_text("ok")])), ASK_B)
-        monkeypatch.setattr(oa, "_in_background", lambda fn, *args: None)
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: None)
         model_a = _loading("pub/shipping", "pub/refunds")
 
         Runner.run_sync(_agent(support_a, model_a), ASK_A)

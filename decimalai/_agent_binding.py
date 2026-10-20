@@ -1,0 +1,627 @@
+"""What every framework's ``load_agent()`` shares: one agent's prompt and skills.
+
+An :class:`AgentBinding` holds one DecimalAI agent's saved prompt and skill list
+for one process, and serves them run by run:
+
+- the prompt is a local copy, re-read in the background at most once every
+  ``_PROMPT_REFRESH_SECONDS``; ``{{placeholders}}`` in it are filled per run;
+- every run is routed on its own message. The first run is routed before its
+  model call. Later runs show the local copy of the list at once and record
+  their own decision, ranked on their message, in the background. An agent whose
+  list the platform cut to fit its caps is routed before every model call,
+  because which skills fit depends on the message;
+- the model reads a listed skill's full text with ``load_skill``. A load waits
+  briefly for its run's own decision and never names another agent's;
+- each run's record (prompt version, placeholder names, skills offered and
+  delivered, routing id) goes wherever the framework's trace is built.
+
+Nothing here knows a framework. A framework module subclasses
+:class:`AgentBinding` and supplies the seams: how to name the current run, read
+its message and its placeholder values, where the record goes, which router
+serves it, and what would make DecimalAI's skills misleading for one of its
+agents. ``decimalai.openai_agents.load_agent`` is the first such subclass.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import logging
+import re
+import threading
+import time
+from collections import OrderedDict
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger("decimalai")
+
+_TEMPLATE_PLACEHOLDER = re.compile(
+    r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\}\}"
+)
+
+#: How old the local copy of a prompt may get before a run refreshes it.
+_PROMPT_REFRESH_SECONDS = 60.0
+
+#: Runs whose per-run state a binding keeps (instructions text, loaded skills).
+_MAX_CONFIG_RUNS = 256
+
+#: How long a load waits for its run's background routing decision.
+_LOAD_WAITS_FOR_ROUTING_S = 2.0
+
+_config_pool: Optional[ThreadPoolExecutor] = None
+_config_pool_lock = threading.Lock()
+
+
+class MissingPromptVariable(KeyError):
+    """The saved prompt has a ``{{placeholder}}`` the run does not supply a value for."""
+
+    def __str__(self) -> str:  # KeyError would quote the whole message
+        return str(self.args[0]) if self.args else ""
+
+
+def template_variables(text: Optional[str]) -> List[str]:
+    """The ``{{name}}`` / ``{{a.b}}`` placeholders in a prompt, sorted and unique."""
+    return sorted(set(_TEMPLATE_PLACEHOLDER.findall(text or "")))
+
+
+def _fill_template(text: str, values: Any, *, where: str, how: str) -> str:
+    """Fill placeholders from ``values``' attributes or keys, dotted paths included.
+
+    A missing value raises `MissingPromptVariable` naming every gap, before any
+    model call: a half-filled prompt is a prompt nobody wrote. ``how`` tells the
+    reader where their framework takes the values from.
+    """
+    missing: List[str] = []
+
+    def lookup(match: "re.Match[str]") -> str:
+        current = values
+        for part in match.group(1).split("."):
+            if isinstance(current, Mapping) and part in current:
+                current = current[part]
+            elif current is not None and not isinstance(current, Mapping) and hasattr(current, part):
+                current = getattr(current, part)
+            else:
+                missing.append(match.group(1))
+                return match.group(0)
+        return str(current)
+
+    filled = _TEMPLATE_PLACEHOLDER.sub(lookup, text)
+    if missing:
+        raise MissingPromptVariable(f"{where} needs {', '.join(sorted(set(missing)))}. {how}")
+    return filled
+
+
+def _in_background(fn: Any, *args: Any) -> Any:
+    """Run ``fn(*args)`` on a small worker pool, in a copy of this context.
+
+    The copy carries the current run (an OpenAI trace, an OpenTelemetry span), so
+    the run key and the run record still name the run that scheduled the work.
+    """
+    global _config_pool
+    for _attempt in range(2):
+        with _config_pool_lock:
+            if _config_pool is None:
+                _config_pool = ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="decimalai-agent-config",
+                )
+            pool = _config_pool
+        try:
+            return pool.submit(contextvars.copy_context().run, fn, *args)
+        except RuntimeError:
+            # Shut down (interpreter exit, or someone shut it): replace it once,
+            # and never fail a run over background bookkeeping.
+            with _config_pool_lock:
+                if _config_pool is pool:
+                    _config_pool = None
+    logger.debug("background work skipped: no worker pool available")
+    return None
+
+
+def _clean_names(names: Any) -> List[str]:
+    """Keep only non-blank strings."""
+    if not isinstance(names, (list, tuple, set)):
+        return []
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+
+class AgentBinding:
+    """One DecimalAI agent's prompt and skills, served per run.
+
+    A framework module subclasses this and overrides the seams below (the
+    methods that raise ``NotImplementedError`` or say "override"). The rest is
+    the shared behaviour described in the module docstring.
+    """
+
+    #: Where this binding's warnings go: the framework module's own logger.
+    _log = logger
+
+    #: How a caller passes placeholder values, said in `MissingPromptVariable`.
+    _VALUES_HINT = "Pass them as context=..., as attributes or dict keys."
+
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+        self.name: str = prompt.agent_name
+        self._fallback = fallback
+        self._on_unavailable = on_unavailable
+        self._lock = threading.Lock()
+        self._prompt = prompt
+        self._prompt_read_at = time.monotonic()
+        self._prompt_refreshing = False
+        self._menu_prefix = ""
+        self._menu_names: List[str] = []
+        self._menu_unavailable: Optional[str] = None
+        self._menu_loaded = False
+        #: The latest decision this agent was routed with (any run's).
+        self._menu_routing_id: Optional[str] = None
+        #: The platform cut this agent's menu to fit its caps: which rows make
+        #: it depends on the message, so every run is routed before its call.
+        self._menu_truncated = False
+        self._runs: "OrderedDict[Tuple[Any, Any], Dict[str, Any]]" = OrderedDict()
+        self._warned: Set[Tuple[str, str]] = set()
+
+    # ── the seams a framework supplies ───────────────────────
+    def _router(self) -> Any:
+        """The SkillRouter that routes and serves this binding, or None. Override."""
+        raise NotImplementedError
+
+    def _run_key(self) -> Optional[str]:
+        """The key naming the active run, or None outside one. Override."""
+        raise NotImplementedError
+
+    def _message(self, context: Any, agent: Any) -> Optional[str]:
+        """The run's latest user message, which routing ranks the skills on. Override."""
+        raise NotImplementedError
+
+    def _values(self, context: Any) -> Any:
+        """Where this run's placeholder values come from. Override."""
+        return context
+
+    def _agent_label(self, agent: Any) -> Optional[str]:
+        """The framework's own name for ``agent``, used in warnings and records."""
+        return getattr(agent, "name", None)
+
+    def _skills_blocked(self, agent: Any, *, tool: bool = True, inject: bool = False) -> Optional[str]:
+        """Why DecimalAI's skills cannot work on ``agent``, or None when they can."""
+        if not tool and not inject:
+            return ("the load_skill tool is switched off (DECIMALAI_LOAD_SKILL_TOOL=0 or "
+                    "init(load_skill_tool=False)) and so is inject_skill_body, so nothing "
+                    "could give the model a skill's text.")
+        return None
+
+    def _record(self, **fields: Any) -> bool:
+        """Put one piece of the run's record wherever its trace is built. Override."""
+        return False
+
+    def _note_pending(self, run_key: Optional[str], pending: Any) -> None:
+        """Keep the run's background routing request where its trace can wait for it."""
+
+    def _stamp_routing(self, run_key: Optional[str], routing_id: str) -> None:
+        """Name a background decision on its run's record, when the run is still open."""
+        self._record(routing_id=routing_id)
+
+    def _on_compose(self, agent: Any) -> None:
+        """Called once per composed run, before its record is made."""
+
+    def _on_menu(self, names: List[str]) -> None:
+        """The names ``load_skill`` should accept changed (empty: any name)."""
+
+    def _serve_load(self, name: str) -> str:
+        """Fetch one skill's text for the model, recording a delivery. Override."""
+        raise NotImplementedError
+
+    # ── what the agent currently gets ────────────────────────
+    @property
+    def prompt_version(self) -> Optional[int]:
+        """The saved prompt version in use, or None for the fallback text."""
+        return getattr(self._prompt, "version_number", None)
+
+    @property
+    def variables(self) -> List[str]:
+        """The placeholders the prompt in use needs a value for on each run."""
+        return template_variables(self._template())
+
+    @property
+    def skill_names(self) -> List[str]:
+        """The skills on the agent's list, in menu order."""
+        with self._lock:
+            return list(self._menu_names)
+
+    def _template(self) -> str:
+        text = getattr(self._prompt, "system_prompt", None)
+        return text if text is not None else (self._fallback or "")
+
+    # ── one run ─────────────────────────────────────────────
+    def _begin_run(self, context: Any, agent: Any, run_key: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """The cheap half of preparing a run: (finished state, or None and a plan)."""
+        key = (run_key, self._agent_label(agent))
+        if run_key is not None:
+            with self._lock:
+                state = self._runs.get(key)
+            if state is not None:
+                return state, {}
+        self._refresh_prompt_if_stale()
+        from ._config import _disabled_by_init
+
+        tool, inject = self._channels()
+        # The kill switch: a later init(enabled=False) stops routing and skills
+        # for agents built before it. The prompt read earlier still runs.
+        switched_off = _disabled_by_init()
+        blocked = None if switched_off else self._skills_blocked(agent, tool=tool, inject=inject)
+        if blocked:
+            self._warn_once(agent, f"DecimalAI skills are off for this agent: {blocked}")
+        if switched_off or blocked:
+            # Neither a list nor a loader: a list the model cannot load from, or
+            # a loader beside one that already serves the agent, only misleads.
+            state = {"query": None, "route_now": True, "routing_id": None, "prefix": "",
+                     "names": [], "unavailable": None, "text": None, "loaded": set(),
+                     "tool": False, "delivered": [], "delivered_versions": []}
+            if run_key is not None:
+                with self._lock:
+                    self._runs[key] = state
+            return state, {}
+        query = self._message(context, agent)
+        with self._lock:
+            # Pasted skill text depends on the message, so such a run is always
+            # routed for its own.
+            route_now = inject or not self._menu_loaded or (self._menu_truncated and query is not None)
+            unavailable = self._menu_unavailable
+        return None, {"key": key, "query": query, "tool": tool, "inject": inject,
+                      "route_now": route_now, "unavailable": unavailable}
+
+    def _finish_run(self, run_key: Optional[str], plan: Dict[str, Any], routed_result: Any) -> Dict[str, Any]:
+        """The rest of preparing a run, from the plan and its routing result (or None)."""
+        inject, tool, query = plan["inject"], plan["tool"], plan["query"]
+        unavailable = plan["unavailable"]
+        routing_id: Optional[str] = None
+        routed: Optional[Tuple[str, List[str]]] = None
+        delivered: List[str] = []
+        versions: List[Dict[str, str]] = []
+        if routed_result is not None:
+            prefix, offered, routing_id, truncated, delivered, versions = routed_result
+            if inject:
+                # This message's skill text is no other run's local copy.
+                unavailable = None if (prefix or routing_id) else (
+                    "DecimalAI did not return this agent's skills")
+            else:
+                self._store_menu(prefix, offered, routing_id, truncated)
+                with self._lock:
+                    unavailable = self._menu_unavailable
+            if prefix or routing_id:
+                routed = (prefix, list(offered))  # this run's own menu
+        if routed is None:
+            delivered, versions = [], []
+        with self._lock:
+            # Otherwise the local copy: the last good menu, whatever was asked.
+            menu = routed or (("", []) if inject else (self._menu_prefix, list(self._menu_names)))
+            state = {
+                "query": query, "route_now": plan["route_now"], "routing_id": routing_id,
+                "prefix": menu[0], "names": menu[1], "unavailable": unavailable,
+                "text": None, "tool": tool,
+                # A skill whose text is already in the instructions is not sent again.
+                "loaded": set(delivered) if tool else set(),
+                "delivered": delivered, "delivered_versions": versions,
+            }
+            if run_key is not None:
+                self._runs[plan["key"]] = state
+                while len(self._runs) > _MAX_CONFIG_RUNS:
+                    self._runs.popitem(last=False)
+        return state
+
+    async def _prepare_run(self, context: Any, agent: Any, run_key: Optional[str]) -> Dict[str, Any]:
+        """Once per run and agent: the menu the run shows, routed now when it must be.
+
+        Whichever comes first does it: a framework may ask for the tools before
+        the instructions, and both need the same answer.
+        """
+        state, plan = self._begin_run(context, agent, run_key)
+        if state is not None:
+            return state
+        routed_result = None
+        if plan["route_now"]:
+            # The first run, or an agent whose menu depends on the message: this
+            # run's own decision, ranked on its message, before the model call.
+            try:
+                routed_result = await asyncio.to_thread(
+                    self._route, run_key, plan["query"], plan["inject"],
+                )
+            except Exception:
+                self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+        return self._finish_run(run_key, plan, routed_result)
+
+    def _prepare_run_sync(self, context: Any, agent: Any, run_key: Optional[str]) -> Dict[str, Any]:
+        """`_prepare_run` for a caller that is not on an event loop."""
+        state, plan = self._begin_run(context, agent, run_key)
+        if state is not None:
+            return state
+        routed_result = None
+        if plan["route_now"]:
+            try:
+                routed_result = self._route(run_key, plan["query"], plan["inject"])
+            except Exception:
+                self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+        return self._finish_run(run_key, plan, routed_result)
+
+    def _compose(self, context: Any, agent: Any, run_key: Optional[str], state: Dict[str, Any]) -> str:
+        """The run's instructions: the prompt, filled, then its menu. Records the run."""
+        if state["unavailable"] and self._on_unavailable == "fail":
+            raise RuntimeError(
+                f"DecimalAI skills for agent {self.name!r} are unavailable ({state['unavailable']}) "
+                "and load_agent(on_unavailable='fail') was set."
+            )
+        with self._lock:
+            prompt = self._prompt
+        template = self._template()
+        text = template
+        if template_variables(template):
+            version = getattr(prompt, "version_number", None)
+            where = f"Prompt version {version} of {self.name!r}" if version else f"The fallback prompt of {self.name!r}"
+            text = _fill_template(template, self._values(context), where=where, how=self._VALUES_HINT)
+        if state["prefix"]:
+            from .skill_router import LOAD_SKILL_PROMPT_HINT
+
+            # The usage sentence names the load_skill tool, so only beside it.
+            menu = f"{state['prefix']}\n{LOAD_SKILL_PROMPT_HINT}" if state["tool"] else state["prefix"]
+            text = f"{text}\n\n{menu}" if text else menu
+        self._on_compose(agent)
+        self._record(
+            agent=agent, system_prompt=text, offered=state["names"],
+            routing_id=state["routing_id"], user_input=state["query"],
+            prompt=self._prompt_record(prompt, template, state["unavailable"], agent),
+            delivered=state["delivered"], delivered_versions=state["delivered_versions"],
+        )
+        if not state["route_now"]:
+            # The local copy is this agent's whole menu, whatever was asked. The
+            # run's own decision, ranked on its message, is recorded in the
+            # background so the run never waits on it.
+            pending = _in_background(self._route_run, run_key, state["names"], state["query"])
+            self._note_pending(run_key, pending)
+            state["pending"] = pending
+        return text
+
+    def _prompt_record(self, prompt: Any, template: str, unavailable: Optional[str], agent: Any) -> Dict[str, Any]:
+        if getattr(prompt, "system_prompt", None) is None:
+            source = "code"
+        elif getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
+            source = "fallback"
+        elif getattr(prompt, "is_fallback", False):
+            source = "decimal (cached copy)"
+        else:
+            source = "decimal"
+        return {
+            "agent": self._agent_label(agent) or self.name,
+            "decimal_agent": self.name,
+            "source": source,
+            "version": getattr(prompt, "version_number", None),
+            "content_hash": getattr(prompt, "content_hash", None),
+            "variables": template_variables(template),
+            "skills_unavailable": unavailable,
+        }
+
+    # ── the local copy ──────────────────────────────────────
+    def _route(
+        self, scope: Optional[str], query: Optional[str] = None, inject: bool = False,
+    ) -> Tuple[str, List[str], Optional[str], bool, List[str], List[Dict[str, str]]]:
+        """One routing decision: (menu text, offered names, routing id, menu was
+        cut, skills whose text it pasted in, and their versions). Text is pasted
+        in only with ``inject``."""
+        router = self._router()
+        if router is None:
+            return "", [], None, False, [], []
+        from ._skill_witness import copy_delivered_versions
+        from .skill_router import (
+            _release_scoped_routing_rail,
+            consume_last_delivered_names,
+            consume_last_delivered_versions,
+            consume_last_menu_truncated,
+            consume_last_offered_names,
+        )
+        try:
+            prefix, _tail, routing_id = router.build_prompt_parts(
+                query, agent_name=self.name, inject_body=inject, scope=scope,
+            )
+        finally:
+            _release_scoped_routing_rail(router, scope)
+        offered = _clean_names(consume_last_offered_names())
+        truncated = bool(consume_last_menu_truncated())
+        # Drained either way, so nothing leaks into a later call.
+        delivered = _clean_names(consume_last_delivered_names())
+        versions = copy_delivered_versions(consume_last_delivered_versions())
+        if not inject:
+            delivered, versions = [], []
+        return prefix or "", offered, routing_id, truncated, delivered, versions
+
+    def _store_menu(
+        self, prefix: str, offered: List[str], routing_id: Optional[str], truncated: bool,
+    ) -> None:
+        with self._lock:
+            if not prefix and not routing_id:
+                # No answer. Keep serving the last good list rather than none.
+                if not self._menu_loaded:
+                    self._menu_unavailable = "DecimalAI did not return this agent's skills"
+                return
+            self._menu_prefix, self._menu_names = prefix, list(offered)
+            self._menu_unavailable, self._menu_loaded = None, True
+            self._menu_truncated = truncated
+            if routing_id:
+                self._menu_routing_id = routing_id
+            names = list(offered)
+        # One tool serves every run. Its name list is the agent's whole menu when
+        # that fits; a menu picked per message would be another run's, so then it
+        # names none and the platform checks the name instead.
+        self._on_menu([] if truncated else names)
+
+    def _route_run(self, run_key: Optional[str], shown: List[str], query: Optional[str]) -> None:
+        """Background: this run's own decision on its message, and a fresh copy."""
+        try:
+            prefix, offered, routing_id, truncated, _delivered, _versions = self._route(run_key, query)
+        except Exception:
+            self._log.debug("background skill routing failed (non-fatal)", exc_info=True)
+            return
+        self._store_menu(prefix, offered, routing_id, truncated)
+        # Stamp the run only when the decision offered exactly what it was shown;
+        # otherwise the offer/activation join would describe another list.
+        if routing_id and sorted(offered) == sorted(shown):
+            self._stamp_routing(run_key, routing_id)
+
+    def _refresh_prompt_if_stale(self) -> None:
+        from ._config import _disabled_by_init
+
+        if _disabled_by_init():
+            return
+        with self._lock:
+            due = (
+                not self._prompt_refreshing
+                and time.monotonic() - self._prompt_read_at > _PROMPT_REFRESH_SECONDS
+            )
+            if due:
+                self._prompt_refreshing = True
+        if due:
+            _in_background(self._refresh_prompt)
+
+    def _refresh_prompt(self) -> None:
+        from ._agent import load_agent as _load_prompt
+        from ._client import AgentNotFoundError
+
+        try:
+            fresh = _load_prompt(self.name, fallback=self._fallback)
+            with self._lock:
+                self._prompt = fresh
+        except AgentNotFoundError:
+            self._log.warning(
+                "DecimalAI: agent %r no longer exists; still serving the prompt read earlier.",
+                self.name,
+            )
+        except Exception:
+            self._log.debug("prompt refresh failed (non-fatal); keeping the last copy", exc_info=True)
+        finally:
+            with self._lock:
+                self._prompt_read_at = time.monotonic()
+                self._prompt_refreshing = False
+
+    # ── load_skill ──────────────────────────────────────────
+    @staticmethod
+    def _tool_schema(names: List[str]) -> Dict[str, Any]:
+        name_schema: Dict[str, Any] = {
+            "type": "string",
+            "description": "The exact name of one skill listed under Available Skills.",
+        }
+        if names:
+            name_schema["enum"] = list(names)
+        return {
+            "type": "object",
+            "properties": {"name": name_schema},
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+
+    def _run_state(self, run_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if run_key is None:
+            return None
+        with self._lock:
+            return next((st for (key_run, _a), st in self._runs.items() if key_run == run_key), None)
+
+    def _already_loaded(self, name: str, state: Optional[Dict[str, Any]]) -> Optional[str]:
+        loaded = state["loaded"] if state is not None else None
+        if loaded is not None and name in loaded:
+            return (
+                f"{name!r} is already loaded earlier in this run. Follow those "
+                "instructions; do not load it again."
+            )
+        return None
+
+    def _mark_loaded(self, name: str, state: Optional[Dict[str, Any]], result: Any) -> None:
+        loaded = state["loaded"] if state is not None else None
+        if loaded is not None and isinstance(result, str) and result.startswith(f"## Skill: {name}"):
+            with self._lock:
+                loaded.add(name)
+
+    async def _load(self, name: str) -> str:
+        run_key = self._run_key()
+        state = self._run_state(run_key)
+        repeat = self._already_loaded(name, state)
+        if repeat is not None:
+            return repeat
+        await self._name_this_runs_decision(run_key, state)
+        result = await asyncio.to_thread(self._serve_load, name)
+        self._mark_loaded(name, state, result)
+        return result
+
+    def _load_sync(self, name: str) -> str:
+        """`_load` for a caller that is not on an event loop."""
+        run_key = self._run_key()
+        state = self._run_state(run_key)
+        repeat = self._already_loaded(name, state)
+        if repeat is not None:
+            return repeat
+        pending = state.get("pending") if state is not None else None
+        if pending is not None and not pending.done():
+            try:
+                pending.result(timeout=_LOAD_WAITS_FOR_ROUTING_S)
+            except Exception:
+                self._log.debug("this run's routing decision is not in yet", exc_info=True)
+        self._name_latest_decision(run_key)
+        result = self._serve_load(name)
+        self._mark_loaded(name, state, result)
+        return result
+
+    async def _name_this_runs_decision(self, run_key: Optional[str], state: Optional[Dict[str, Any]]) -> None:
+        """Make the load name a decision of THIS run, or at least of this agent.
+
+        The platform serves a public-registry skill only to a load whose routing
+        decision offered it. A run's own decision may still be in flight (it is
+        recorded in the background); its load waits for it briefly, and failing
+        that names this agent's latest decision — never the router's latest,
+        which another agent in the process may have made.
+        """
+        if run_key is None:
+            return
+        pending = state.get("pending") if state is not None else None
+        if pending is not None and not pending.done():
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(pending), _LOAD_WAITS_FOR_ROUTING_S)
+            except Exception:
+                self._log.debug("this run's routing decision is not in yet", exc_info=True)
+        self._name_latest_decision(run_key)
+
+    def _name_latest_decision(self, run_key: Optional[str]) -> None:
+        """Without a decision of its own, a run's loads name this agent's latest."""
+        if run_key is None:
+            return
+        router = self._router()
+        known = getattr(router, "_run_routing_ids", None)
+        remember = getattr(router, "_remember_run_routing", None)
+        if not isinstance(known, Mapping) or not callable(remember):
+            return
+        with self._lock:
+            fallback = self._menu_routing_id
+        with router._rail_lock:
+            has_own = run_key in known
+        if not has_own and fallback:
+            remember(run_key, fallback)
+
+    # ── settings ────────────────────────────────────────────
+    def _warn_once(self, agent: Any, message: str) -> None:
+        key = (self._agent_label(agent) or "", message)
+        if key not in self._warned:
+            self._warned.add(key)
+            self._log.warning("DecimalAI (%s): %s", key[0] or self.name, message)
+
+    @staticmethod
+    def _channels() -> Tuple[bool, bool]:
+        """(the load_skill tool is on, skill text is pasted into the instructions).
+
+        The two documented settings, read per run so a re-init applies: the
+        tool's kill switch (``DECIMALAI_LOAD_SKILL_TOOL=0`` /
+        ``init(load_skill_tool=False)``) and ``inject_skill_body``
+        (``DECIMALAI_INJECT_SKILL_BODY``), which is off while the tool is on
+        unless set, and on when the tool is off.
+        """
+        try:
+            from ._config import _get_config
+
+            config = _get_config()
+        except Exception:
+            return True, False
+        tool = bool(getattr(config, "load_skill_tool", True))
+        return tool, bool(config.resolve_inject_body(has_tool_loop=tool))

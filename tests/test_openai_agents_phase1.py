@@ -49,6 +49,7 @@ from openai.types.responses import (  # noqa: E402
     ResponseOutputText,
 )
 
+import decimalai._agent_binding as binding  # noqa: E402
 import decimalai.openai_agents as oa  # noqa: E402
 from decimalai import skill_router as sr  # noqa: E402
 
@@ -187,10 +188,10 @@ def sdk(monkeypatch):
         ("_tracing_processor", None),
         ("_tracing_processor_added", False),
         ("_run_rails", OrderedDict()),
-        ("_config_pool", None),
     ):
         monkeypatch.setattr(oa, name, value)
-    monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(binding, "_config_pool", None)
+    monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
     monkeypatch.setattr(oa, "_two_catalogs_warned", False, raising=False)
 
     provider = get_trace_provider()

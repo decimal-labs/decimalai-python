@@ -573,6 +573,7 @@ class TestOpenAIAgentsRunEndToEnd:
             ResponseOutputText,
         )
 
+        import decimalai._agent_binding as binding
         import decimalai.openai_agents as oa
         from decimalai import skill_router as sr
         from decimalai.schema.manifest import ManifestTracker
@@ -582,10 +583,10 @@ class TestOpenAIAgentsRunEndToEnd:
             ("_manifest_tracker", ManifestTracker()), ("_two_catalogs_warned", False),
             ("_tracing_processor", None), ("_tracing_processor_added", False),
             ("_run_rails", OrderedDict()), ("_name_overrides_noted", set()),
-            ("_config_pool", None),
         ):
             monkeypatch.setattr(oa, name, value)
-        monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(binding, "_config_pool", None)
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
         saved = list(get_trace_provider()._multi_processor._processors)
         set_trace_processors([])
         sr._last_offered_names_ctx.set(None)

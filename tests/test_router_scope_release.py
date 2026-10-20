@@ -331,6 +331,7 @@ class TestOpenAIAgents:
         the model call on the first run, then for each later run), and the load
         its ``load_skill`` tool files, each under the Agents-SDK trace id."""
         pytest.importorskip("agents")
+        import decimalai._agent_binding as binding
         import decimalai.openai_agents as oa
 
         current: dict = {"trace_id": None}
@@ -340,7 +341,7 @@ class TestOpenAIAgents:
         # all the adapter reads off it.
         monkeypatch.setattr(oa, "_current_run_key", lambda: current["trace_id"])
         # A later run's own decision is made in the background; here, inline.
-        monkeypatch.setattr(oa, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
 
         processor = oa.DecimalTracingProcessor(agent_name="support")
         saved = SimpleNamespace(agent_name="support", system_prompt=CALLER_PROMPT,
