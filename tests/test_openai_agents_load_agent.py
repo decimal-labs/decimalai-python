@@ -572,3 +572,40 @@ def test_text_pasted_into_the_instructions_is_not_sent_again_by_the_tool(decimal
     assert "load_skill" in model.tools[0]
     assert "already loaded" in str(model.inputs[1][-1].get("output"))
     assert len(decimal.body_calls()) == 1
+
+
+class ClaudeModel(ScriptedModel):
+    """A scripted model with Claude's name, as LiteLLM's model carries it."""
+
+    model = "anthropic/claude-haiku-5-5"
+
+
+REPLAYED_THINKING = [
+    {"role": "user", "content": "My keyboard arrived cracked."},
+    {"type": "reasoning", "id": "rs_1", "summary": [],
+     "provider_data": {"model": "anthropic/claude-haiku-5-5", "thinking_blocks": [
+         {"type": "thinking", "thinking": "", "signature": "sig"}]}},
+    {"role": "assistant", "content": "Sorry to hear that."},
+    {"role": "user", "content": "Where is my order?"},
+]
+
+
+def test_a_claude_chat_that_sends_thinking_back_is_warned_once(decimal, caplog):
+    support = oa.agent_config("support")
+    agent = build(support, ClaudeModel(["answer", "answer"]))
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        Runner.run_sync(agent, REPLAYED_THINKING)
+        Runner.run_sync(agent, REPLAYED_THINKING)
+    warned = [r.getMessage() for r in caplog.records if "bound to a different conversation" in r.getMessage()]
+    assert len(warned) == 1 and "ModelSettings.reasoning" in warned[0] and "drop_block" in warned[0]
+
+
+@pytest.mark.parametrize("model, items", [
+    (ScriptedModel, REPLAYED_THINKING),                     # not Claude
+    (ClaudeModel, [{"role": "user", "content": "Hi"}]),     # Claude, nothing sent back
+])
+def test_no_warning_where_nothing_binds(decimal, caplog, model, items):
+    support = oa.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        Runner.run_sync(build(support, model(["answer"])), items)
+    assert not any("bound to a different conversation" in r.getMessage() for r in caplog.records)

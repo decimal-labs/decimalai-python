@@ -27,6 +27,38 @@ and patch releases are fixes.
     in the live check).
   A call that fails both attempts still counts once in `routing_status()`.
 
+### Fixed: a saved prompt broke open Claude chats
+
+Claude rejects a conversation whose system prompt or tool definitions changed once a thinking
+block is in its history (HTTP 400, "The block is bound to a different conversation"), and
+Claude 5.x models think by default. Every `agent_config()` rebuilt the prompt and skill list per
+run, so a version saved in the dashboard, a skill assigned or removed, or a cut list picked
+again broke the next message of every open Claude chat. Reproduced live on `claude-haiku-5-5`
+for the four below.
+
+- **`decimalai.agent_config()`:** new `support.conversation(variables=, state=)`. Each
+  `chat.run(message)` returns a `Run` whose `system` and `tool_spec` are the first run's for the
+  whole chat; `chat.state` is JSON that continues it in another process. `support.run()` is
+  unchanged, for one-message runs and providers without the rule.
+- **Pydantic AI:** on a Claude model, a run given `message_history=` shows the instructions and
+  `load_skill` of that conversation's first run. The copy travels in the first request's
+  `metadata` inside `result.all_messages()`. No change to your code. (Pydantic AI 2.56+ retried
+  the 400 by dropping the reasoning, with an `AnthropicStaleThinkingBlockWarning`.)
+- **Google ADK:** on a Claude model, a session keeps its first invocation's instruction and
+  `load_skill`. `DecimalAIPlugin` keeps the copy in the session's state
+  (`_decimalai_conversation`), so any process serving the session uses it; without the plugin
+  the copy is the process's own.
+- **OpenAI Agents SDK (Claude through LiteLLM):** not fixed; the instructions are given no
+  conversation to keep. A warning says so once when a Claude chat sends thinking back, and the
+  docs give two settings that avoid the 400.
+- Later runs of a kept conversation are still routed on their own message for the record; with
+  a list cut to fit, they and their loads name the decision the list came from. A newer prompt
+  or list reaches the next conversation. Other models behave as before.
+- Each run's `load_skill` names are now fixed for the whole run, so a routing decision landing
+  mid-run no longer changes the tool between one run's model calls. `Run.tool_spec` names the
+  skills on that run's list; when the list is cut to fit it still takes any name, so a skill
+  the cap left off can be loaded.
+
 ## [0.21.0] — 2026-10-20
 
 ### Changed (breaking): `load_agent()` is now `agent_config()`, and each message is a `Run`

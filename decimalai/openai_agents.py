@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
-from ._agent_binding import AgentBinding, attach_prompt_records
+from ._agent_binding import AgentBinding, attach_prompt_records, is_claude
 from ._agent_binding import MissingPromptVariable as MissingPromptVariable
 from ._agent_binding import template_variables as template_variables
 from ._native import Load, NativeLoads
@@ -1431,7 +1431,32 @@ class OpenAIAgentConfig(AgentBinding):
         state = await self._prepare_run(context, agent, run_key)
         if state["text"] is None:
             state["text"] = self._compose(context, agent, run_key, state)
+            self._warn_if_claude_replays_thinking(context, agent)
         return state["text"]
+
+    def _warn_if_claude_replays_thinking(self, context: Any, agent: Any) -> None:
+        """Say once when a Claude chat sends thinking back: a saved prompt would break it.
+
+        Claude rejects a turn whose system prompt or tools changed since a thinking
+        block in its history was made (HTTP 400, "bound to a different conversation").
+        These instructions follow the newest saved prompt and skill list on every run,
+        and the Agents SDK gives them no conversation to keep them per chat by.
+        """
+        model = getattr(agent, "model", None)
+        if not is_claude(model if isinstance(model, str) else getattr(model, "model", None)):
+            return
+        items = getattr(context, "turn_input", None)
+        if not isinstance(items, list) or not any(
+                isinstance(item, dict) and item.get("type") == "reasoning" for item in items):
+            return
+        self._warn_once(agent, (
+            "this Claude chat sends earlier turns' thinking back, and Claude rejects a turn whose "
+            "instructions or tools changed since (HTTP 400, \"bound to a different "
+            "conversation\"). These instructions follow the newest saved prompt and skill list on "
+            "every run, so a prompt saved in DecimalAI breaks open chats. Leave "
+            "ModelSettings.reasoning unset (thinking is then not sent back), or set Anthropic's "
+            "thinking.block_binding.prefix_mismatch_behavior=\"drop_block\" (beta "
+            "thinking-binding-controls-2026-08-01) to drop the stale blocks instead."))
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
