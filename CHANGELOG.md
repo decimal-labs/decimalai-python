@@ -4,6 +4,18 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed: OpenAI Agents traces record OpenAI's cached input tokens
+
+- Each model call's `cache_read_tokens` now carries the cached-input count OpenAI reports
+  (`usage.input_tokens_details.cached_tokens`), so the trace's `total_cache_read_tokens` is no
+  longer always null. It is a subset of `input_tokens`, as OpenAI counts it.
+- On the Responses API (the default model) a reported 0 is recorded as 0, a measured cache miss.
+  On chat-completions models, LiteLLM, and streamed responses only the span's usage is available,
+  and `openai-agents` writes 0 there when the provider reported nothing; those record a positive
+  count only, and leave 0 as not reported.
+
 ## [0.19.0] — 2026-10-20
 
 ### Changed (breaking): Pydantic AI agents get their prompt and skills from `load_agent()`
@@ -1606,7 +1618,6 @@ Recorded retroactively on 2026-09-05. These three `skills` subcommands were drop
 
 Nothing replaced them in the CLI on purpose. Verification is a property of how a run
 was produced, not something a caller can assert about a run afterwards.
-
 
 ### Fixed
 

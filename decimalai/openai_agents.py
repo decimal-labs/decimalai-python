@@ -2142,6 +2142,7 @@ class DecimalTracingProcessor:
         # LiteLLM, any-llm) writes the Responses-style keys onto the span.
         input_tokens = usage.get("input_tokens")
         output_tokens = usage.get("output_tokens")
+        cache_read_tokens = _span_usage_cached_tokens(usage)
 
         # Latency
         latency_ms = None
@@ -2177,6 +2178,7 @@ class DecimalTracingProcessor:
             output=output_dict,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
             latency_ms=latency_ms,
             finish_reason=finish_reason,
             status=status,
@@ -2359,6 +2361,7 @@ class DecimalTracingProcessor:
         model = None
         input_tokens = None
         output_tokens = None
+        cache_read_tokens = None
         temperature = None
         max_output_tokens = None
         if response_obj is not None:
@@ -2371,6 +2374,7 @@ class DecimalTracingProcessor:
                 _out = getattr(usage, "output_tokens", None)
                 input_tokens = _in if isinstance(_in, int) else None
                 output_tokens = _out if isinstance(_out, int) else None
+                cache_read_tokens = _reported_cached_tokens(usage)
             _temp = getattr(response_obj, "temperature", None)
             temperature = _temp if isinstance(_temp, (int, float)) else None
             _max = getattr(response_obj, "max_output_tokens", None)
@@ -2384,6 +2388,7 @@ class DecimalTracingProcessor:
                 _out = usage_dict.get("output_tokens")
                 input_tokens = _in if isinstance(_in, int) else None
                 output_tokens = _out if isinstance(_out, int) else None
+                cache_read_tokens = _span_usage_cached_tokens(usage_dict)
 
         # Accumulate model info for manifest auto-detection
         if model and acc.seen_model is None:
@@ -2472,6 +2477,7 @@ class DecimalTracingProcessor:
                 output=output_dict,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
                 latency_ms=latency_ms,
                 finish_reason=finish_reason,
                 status=status,
@@ -3023,6 +3029,34 @@ def _response_output_text(response_obj: Any) -> Optional[str]:
     except Exception:
         logger.debug("Response output text extraction failed", exc_info=True)
         return None
+
+
+def _count(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _reported_cached_tokens(usage: Any) -> Optional[int]:
+    """The cached-input count a Responses API ``ResponseUsage`` reports, 0 included.
+
+    OpenAI's ``cached_tokens`` is a SUBSET of ``input_tokens`` (see
+    ``LlmCallRecord.cache_read_tokens``). None when the response carried no
+    ``input_tokens_details``: not reported is not a cache miss.
+    """
+    return _count(getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", None))
+
+
+def _span_usage_cached_tokens(usage: Any) -> Optional[int]:
+    """The cached-input count from a span's usage dict, when it can be told from a default.
+
+    ``openai-agents`` writes ``input_tokens_details`` with zeros when the
+    provider sent none (``agents.usage.Usage.__post_init__``), so a 0 here may
+    be a measured cache miss or nothing measured. A positive count can only have
+    come from the provider; a 0 reads as None, because recording it would claim
+    a cold cache nobody measured.
+    """
+    details = usage.get("input_tokens_details") if isinstance(usage, dict) else None
+    cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
+    return cached if cached else None
 
 
 def _requested_tool_calls(items: Any) -> List[Dict[str, Any]]:

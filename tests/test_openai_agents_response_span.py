@@ -88,11 +88,18 @@ class _FunctionToolCall:
         self.name = name
 
 
+class _InputTokensDetails:
+    def __init__(self, cached_tokens: int):
+        self.cached_tokens = cached_tokens
+
+
 class _Usage:
-    def __init__(self, input_tokens: int, output_tokens: int):
+    def __init__(self, input_tokens: int, output_tokens: int, cached_tokens: int | None = None):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.total_tokens = input_tokens + output_tokens
+        if cached_tokens is not None:  # absent entirely when not reported, as on the wire
+            self.input_tokens_details = _InputTokensDetails(cached_tokens)
 
 
 class _SyntheticResponse:
@@ -263,6 +270,65 @@ class TestResponseSpanLlmCall:
         _run_response_spans(processor, trace_id, [span])
 
         cfg._client.register_manifest.assert_called_once()
+
+
+class TestCachedInputTokens:
+    """OpenAI's cached-input count lands on `cache_read_tokens` (2026-10-20).
+
+    It never did: every OpenAI Agents trace stored null, so the trace's
+    `total_cache_read_tokens` was null even when OpenAI reported the count
+    (the tutorial's runs reported 0). None and 0 stay different facts: None is
+    "not reported", 0 is "reported, a cache miss" (`LlmCallRecord`).
+    """
+
+    def _call(self, *spans_data):
+        from decimalai.openai_agents import DecimalTracingProcessor
+
+        processor = DecimalTracingProcessor(agent_name="test-agent")
+        tid = f"trace_{uuid4().hex[:16]}"
+        spans = [_MockSpan(trace_id=tid, span_data=d) for d in spans_data]
+        (call,) = _run_response_spans(processor, tid, spans).llm_calls
+        return call
+
+    def _response(self, usage, span_usage=None):
+        return _MockSpanData(
+            "response", input="hi", usage=span_usage,
+            response=_SyntheticResponse(usage=usage, output=[_OutputMessage(_OutputText("ok"))]),
+        )
+
+    def test_the_responses_api_count_is_recorded(self):
+        call = self._call(self._response(_Usage(1200, 40, cached_tokens=1024)))
+        assert call.cache_read_tokens == 1024
+        assert call.input_tokens == 1200, "a subset of input_tokens, never added to it"
+        assert call.cache_creation_tokens is None, "OpenAI reports no cache writes"
+
+    def test_a_reported_zero_is_a_measured_miss(self):
+        assert self._call(self._response(_Usage(451, 20, cached_tokens=0))).cache_read_tokens == 0
+
+    def test_no_details_is_not_a_miss(self):
+        assert self._call(self._response(_Usage(451, 20))).cache_read_tokens is None
+
+    @pytest.mark.parametrize("cached, recorded", [(512, 512), (0, None)])
+    def test_the_streaming_fallback_keeps_only_a_count_it_can_trust(self, cached, recorded):
+        """The span dict is openai-agents' own, and it writes 0 when the provider
+        sent nothing, so only a positive count is known to be measured."""
+        span_usage = {"input_tokens": 900, "output_tokens": 12,
+                      "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0}}
+        assert self._call(self._response(None, span_usage)).cache_read_tokens == recorded
+
+    @pytest.mark.parametrize("usage, recorded", [
+        ({"input_tokens": 700, "output_tokens": 9,
+          "input_tokens_details": {"cached_tokens": 256, "cache_write_tokens": 0}}, 256),
+        ({"input_tokens": 700, "output_tokens": 9,
+          "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}, None),
+        ({}, None),
+    ])
+    def test_the_chat_completions_path_keeps_only_a_count_it_can_trust(self, usage, recorded):
+        call = self._call(_MockSpanData(
+            "generation", model="gpt-4o", model_config={}, usage=usage,
+            input=[{"role": "user", "content": "hi"}], output=[{"role": "assistant", "content": "ok"}],
+        ))
+        assert call.cache_read_tokens == recorded
 
 
 class TestResponseSpanFinalOutputPreview:
