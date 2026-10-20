@@ -293,7 +293,7 @@ class _RunState:
         "trace_id", "agent_name", "parent_trace_id",
         "started_at", "ended_at", "user_input_preview", "final_output_preview",
         "llm_calls", "spans", "pending_tools", "transcript", "root_span",
-        "saw_turn_usage",
+        "saw_turn_usage", "turns", "generated",
         "status", "error_message", "session_id", "init_data", "options", "finalized",
         "native", "skill_calls",
     )
@@ -343,6 +343,13 @@ class _RunState:
         # True once any AssistantMessage reported its own per-turn usage, which
         # makes the ResultMessage's CUMULATIVE totals a double count.
         self.saw_turn_usage = False
+        # message_id -> the request's (record, span, transcript entry). The CLI streams ONE
+        # API request as several AssistantMessages, one per content block, all carrying
+        # the request's id and its usage; see `_ingest_assistant`.
+        self.turns: Dict[str, Tuple[LlmCallRecord, TraceSpan, Dict[str, Any]]] = {}
+        # LlmCallRecord.id -> characters the request generated (thinking, text and tool
+        # input), the weights `_ingest_result` splits the run's output tokens by.
+        self.generated: Dict[UUID, int] = {}
         self.status: Status = Status.SUCCESS
         self.error_message: Optional[str] = None
         self.session_id: Optional[str] = None
@@ -524,33 +531,61 @@ def _note_listed(state: _RunState, init: Dict[str, Any]) -> None:
 
 
 def _ingest_assistant(state: _RunState, message: Any) -> None:
-    """One AssistantMessage = one model turn = one LlmCallRecord. Its
-    ToolUseBlocks become tool_calls on the record and open TOOL spans that the
-    following UserMessage's ToolResultBlocks close."""
+    """One model REQUEST = one LlmCallRecord. Its ToolUseBlocks become tool_calls
+    on the record and open TOOL spans that the following UserMessage's
+    ToolResultBlocks close.
+
+    A request is not an AssistantMessage. The CLI streams one API request as one
+    AssistantMessage PER CONTENT BLOCK (thinking, then text, then each tool use),
+    every one carrying the request's ``message_id`` and the same ``usage``
+    (measured: claude-agent-sdk 0.2.166, CLI 2.1.299, claude-haiku-4-5). Counting
+    each frame as a call recorded a two-request run as five calls with the input
+    and cache tokens repeated per frame. Frames that share an id are folded into
+    the call the first one opened; a frame with no id is its own call, as before.
+    """
     model = getattr(message, "model", None)
     content = getattr(message, "content", None) or []
     text_parts: List[str] = []
     tool_uses: List[Tuple[Optional[str], Optional[str], Any]] = []
+    generated = 0
     for block in content:
         bkind = type(block).__name__
         if bkind == "TextBlock":
             txt = getattr(block, "text", None)
             if txt:
                 text_parts.append(txt)
+                generated += len(txt)
         elif bkind == "ToolUseBlock":
-            tool_uses.append(
-                (getattr(block, "id", None), getattr(block, "name", None), getattr(block, "input", None))
-            )
-        # ThinkingBlock and other block types carry no trace-relevant fields.
+            tinput = getattr(block, "input", None)
+            tool_uses.append((getattr(block, "id", None), getattr(block, "name", None), tinput))
+            generated += len(_display(tinput) or "")
+        elif bkind == "ThinkingBlock":
+            # Not traced as content, but the model generated it: it counts toward the
+            # request's share of the run's output tokens.
+            thought = getattr(block, "thinking", None)
+            generated += len(thought) if isinstance(thought, str) else 0
 
-    text_joined = "\n".join(text_parts).strip()
+    turn_usage = _extract_usage(getattr(message, "usage", None))
+    mid = getattr(message, "message_id", None)
+    turn = state.turns.get(mid) if isinstance(mid, str) and mid else None
+    if turn is not None:
+        rec, llm_span, turn_entry = turn
+        # The same request's usage again. Fields only ever grow within a request, so
+        # keep the largest seen rather than adding.
+        for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+            value = getattr(turn_usage, field)
+            if value is not None and (getattr(rec, field) is None or value > getattr(rec, field)):
+                setattr(rec, field, value)
+        state.generated[rec.id] = state.generated.get(rec.id, 0) + generated
+        _add_to_turn(state, rec, llm_span, turn_entry, text_parts, tool_uses)
+        return
+
     started = _now()
     # What this turn was shown: everything on the transcript BEFORE it.
     rendered_input = [dict(entry) for entry in state.transcript]
     # Per-turn usage. The CLI reports usage on every assistant frame, so each
     # model turn can carry its own token counts; ResultMessage.usage is the
     # run TOTAL and is only a fallback (see _ingest_result).
-    turn_usage = _extract_usage(getattr(message, "usage", None))
     # Keyed on input/output only, exactly as before the cache split landed:
     # `saw_turn_usage` gates the run-total REDISTRIBUTION below, and only
     # input/output are ever redistributed. Widening it to "any of the four"
@@ -568,18 +603,15 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
         started_at=started,
         ended_at=started,
         input_preview=_transcript_text(rendered_input),
-        output_preview=_preview(text_joined) if text_joined else None,
     )
     rec = LlmCallRecord(
         span_id=llm_span.id,
         agent_name=state.agent_name,
-        # A turn that asks for tools is planning; a pure-text turn is responding.
-        call_role=CallRole.PLANNER if tool_uses else CallRole.RESPONDER,
+        call_role=CallRole.RESPONDER,
         provider="anthropic",
         model_name=str(model) if model else None,
         rendered_input=rendered_input or None,
-        output={"role": "assistant", "content": text_joined} if text_joined else None,
-        finish_reason=FinishReason.TOOL_CALLS if tool_uses else FinishReason.STOP,
+        finish_reason=FinishReason.STOP,
         # Verbatim from the provider — `input_tokens` is Anthropic's UNCACHED
         # remainder and the two cache counts sit alongside it, never folded in.
         input_tokens=turn_usage.input_tokens,
@@ -589,11 +621,38 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
         started_at=started,
         ended_at=started,
     )
-    if text_joined:
-        # Last assistant text seen so far; ResultMessage.result overrides at finalize.
-        state.final_output_preview = text_joined[:500]
+    turn_entry: Dict[str, Any] = {"role": "assistant", "content": ""}
+    state.transcript.append(turn_entry)
+    state.spans.append(llm_span)
+    state.llm_calls.append(rec)
+    state.generated[rec.id] = generated
+    if isinstance(mid, str) and mid:
+        state.turns[mid] = (rec, llm_span, turn_entry)
+    _add_to_turn(state, rec, llm_span, turn_entry, text_parts, tool_uses)
 
-    turn_entry: Dict[str, Any] = {"role": "assistant", "content": text_joined}
+
+def _add_to_turn(
+    state: _RunState,
+    rec: LlmCallRecord,
+    llm_span: TraceSpan,
+    turn_entry: Dict[str, Any],
+    text_parts: List[str],
+    tool_uses: List[Tuple[Optional[str], Optional[str], Any]],
+) -> None:
+    """Fold one frame's text and tool uses into the request's call, span and
+    transcript entry."""
+    if text_parts:
+        text = "\n".join(p for p in [turn_entry.get("content") or "", *text_parts] if p).strip()
+        turn_entry["content"] = text
+        if text:
+            rec.output = {"role": "assistant", "content": text}
+            llm_span.output_preview = _preview(text)
+            # Last assistant text seen so far; ResultMessage.result overrides at finalize.
+            state.final_output_preview = text[:500]
+    if tool_uses:
+        # A request that asks for tools is planning; a pure-text request is responding.
+        rec.call_role = CallRole.PLANNER
+        rec.finish_reason = FinishReason.TOOL_CALLS
     for tid, tname, tinput in tool_uses:
         name = str(tname) if tname else "tool"
         if name == _SKILL_TOOL and isinstance(tinput, dict):
@@ -621,10 +680,6 @@ def _ingest_assistant(state: _RunState, message: Any) -> None:
             # No id to match a result against — close the span now.
             span.ended_at = _now()
             state.spans.append(span)
-
-    state.transcript.append(turn_entry)
-    state.spans.append(llm_span)
-    state.llm_calls.append(rec)
 
 
 def _ingest_user(state: _RunState, message: Any) -> None:
@@ -683,6 +738,26 @@ def _ingest_user(state: _RunState, message: Any) -> None:
         state.spans.append(span)
 
 
+def _share_out(state: _RunState, remainder: int) -> None:
+    """Add ``remainder`` output tokens across the calls, weighted by what each
+    request generated (evenly when nothing was measured), in whole tokens that sum
+    to exactly ``remainder``."""
+    calls = state.llm_calls
+    weights = [state.generated.get(c.id, 0) for c in calls]
+    if sum(weights) <= 0:
+        weights = [1] * len(calls)
+    total = sum(weights)
+    shares = [remainder * w // total for w in weights]
+    # Largest fractional parts first get the tokens integer division left over.
+    leftover = remainder - sum(shares)
+    order = sorted(range(len(calls)), key=lambda i: (remainder * weights[i]) % total, reverse=True)
+    for i in order[:leftover]:
+        shares[i] += 1
+    for call, share in zip(calls, shares):
+        if share:
+            call.output_tokens = (call.output_tokens or 0) + share
+
+
 def _ingest_result(state: _RunState, message: Any) -> None:
     state.ended_at = _now()
     if state.session_id is None:
@@ -734,14 +809,20 @@ def _ingest_result(state: _RunState, message: Any) -> None:
     # per-turn numbers, and only fill a turn the CLI left blank with whatever
     # the totals have not already accounted for.
     known_in = sum(c.input_tokens or 0 for c in state.llm_calls)
-    known_out = sum(c.output_tokens or 0 for c in state.llm_calls)
     for call in state.llm_calls:
         if call.input_tokens is None and inp is not None and inp > known_in:
             call.input_tokens = inp - known_in
             known_in = inp
-        if call.output_tokens is None and out is not None and out > known_out:
-            call.output_tokens = out - known_out
-            known_out = out
+
+    # Output is different: a frame's `output_tokens` is the count when the request's
+    # stream STARTED (1 to 5), not what it produced, while input and the cache counts
+    # are final from the first frame. The run total is the only real output number, so
+    # the part of it the frames do not account for is shared across the requests by how
+    # much each one generated. The split between requests is an estimate; the sum is
+    # the provider's.
+    known_out = sum(c.output_tokens or 0 for c in state.llm_calls)
+    if out is not None and out > known_out:
+        _share_out(state, out - known_out)
 
     # The cache counts are deliberately NOT redistributed the same way. They
     # arrive on the SAME usage object as input_tokens on every assistant frame,

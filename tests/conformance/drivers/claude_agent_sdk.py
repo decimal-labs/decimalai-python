@@ -148,23 +148,25 @@ def _frames(ctx: Ctx, *, use_tool: bool = True, declare: bool = True) -> List[Di
             blocks.append({"type": "tool_use", "id": tool_use_id, "name": name, "input": args})
         if turn.content:
             blocks.append({"type": "text", "text": turn.content})
-        frames.append({
-            "type": "assistant",
-            "session_id": session,
-            "message": {
-                "id": f"msg_conformance_{index}",
-                "type": "message",
-                "role": "assistant",
-                "model": STUB_MODEL_NAME,
-                "stop_reason": "tool_use" if turn.tool_call else "end_turn",
-                "content": blocks,
-                # The real CLI reports per-turn usage on every assistant frame.
-                "usage": {
-                    "input_tokens": turn.input_tokens,
-                    "output_tokens": turn.output_tokens,
+        # The real CLI streams ONE request as one assistant frame PER CONTENT BLOCK,
+        # every frame carrying the request's id and the same usage, whose output
+        # count is where the stream started, not what it produced; the result frame
+        # carries the run's real totals (measured: claude-agent-sdk 0.2.166, CLI
+        # 2.1.299). Replay that shape, not one tidy frame per turn.
+        for block in blocks:
+            frames.append({
+                "type": "assistant",
+                "session_id": session,
+                "message": {
+                    "id": f"msg_conformance_{index}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": STUB_MODEL_NAME,
+                    "stop_reason": None,
+                    "content": [block],
+                    "usage": {"input_tokens": turn.input_tokens, "output_tokens": 1},
                 },
-            },
-        })
+            })
         if turn.tool_call:
             _, args = turn.tool_call
             frames.append({

@@ -4,6 +4,22 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **Claude Agent SDK: one LLM call per model request.** The Claude Code CLI streams one API
+  request as several `AssistantMessage`s, one per content block (thinking, text, each tool use),
+  all carrying the request's `message_id` and the same `usage`. Each was recorded as its own LLM
+  call, so a two-request tool-using run showed five calls, input and cache tokens repeated per
+  message (46 input recorded against 18 used in the measured run), and output tokens
+  under-reported (17 against 194: the stream reports a request's output count only as it starts). Messages sharing an id are now one
+  call: input and cache counts are taken once, exactly as the request reported them; output is
+  the run total from the `ResultMessage`, shared across the requests by how much each one
+  generated, so the calls add up to the run. The platform estimates cost from these token
+  counts, so Claude Agent SDK costs were understated too. When this ships, drop the "Known
+  issue in SDK 0.20.0 and earlier" caveat from the docs' Claude Agent SDK page.
+
 ## [0.20.0] — 2026-10-20
 
 ### Changed (breaking): Google ADK agents get their prompt and skills from `load_agent()`

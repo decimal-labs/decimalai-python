@@ -33,9 +33,11 @@ class SystemMessage:
 
 
 class AssistantMessage:
-    def __init__(self, content, model="claude-haiku-4-5"):
+    def __init__(self, content, model="claude-haiku-4-5", message_id=None, usage=None):
         self.content = content
         self.model = model
+        self.message_id = message_id
+        self.usage = usage
 
 
 class UserMessage:
@@ -665,3 +667,104 @@ class TestCacheTokensReachTheRecord:
         payload = LlmCallRecord(model_name="gpt-5.4-mini").model_dump(mode="json")
         assert payload["cache_read_tokens"] is None
         assert payload["cache_creation_tokens"] is None
+
+
+# ── One API request streams as several AssistantMessages ──────────────
+
+def _frame_usage(inp, out, cache_read, cache_creation):
+    return {"input_tokens": inp, "output_tokens": out,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation}
+
+
+def _cli_shaped_run():
+    """A two-request run in the CLI's real wire shape, numbers from a measured run
+    (claude-agent-sdk 0.2.166, CLI 2.1.299, claude-haiku-4-5, 2026-10-20).
+
+    Request 1 is streamed as three frames (thinking, text, tool use) and request 2
+    as two (thinking, text). Every frame of a request carries the request's id and
+    the SAME usage, and that usage's output count is the stream's starting count
+    (5, then 1), not what the request produced: the run used 194 output tokens.
+    """
+    u1 = _frame_usage(10, 5, 16154, 0)
+    u2 = _frame_usage(8, 1, 16154, 196)
+    return [
+        SystemMessage(data={"session_id": "s"}),
+        AssistantMessage([ThinkingBlock("I should look for txt files first.")],
+                         message_id="msg_1", usage=u1),
+        AssistantMessage([TextBlock("Let me check.")], message_id="msg_1", usage=u1),
+        AssistantMessage([ToolUseBlock(id="tu_1", name="Glob", input={"pattern": "*.txt"})],
+                         message_id="msg_1", usage=u1),
+        UserMessage(content=[ToolResultBlock(tool_use_id="tu_1", content="notes.txt")]),
+        AssistantMessage([ThinkingBlock("One file.")], message_id="msg_2", usage=u2),
+        AssistantMessage([TextBlock("There is one: notes.txt.")], message_id="msg_2", usage=u2),
+        ResultMessage(
+            result="There is one: notes.txt.",
+            usage=_frame_usage(18, 194, 32308, 196),
+            total_cost_usd=0.0045891, session_id="s",
+        ),
+    ]
+
+
+class TestOneCallPerRequest:
+    def test_frames_sharing_a_message_id_are_one_llm_call(self):
+        _drive(_cli_shaped_run(), agent_name="cas")
+        trace = _flush_and_get_trace()
+
+        assert len(trace.llm_calls) == 2, "five frames, two API requests"
+        plan, answer = trace.llm_calls
+        assert plan.output["content"] == "Let me check."
+        assert [t.tool_name for t in plan.tool_calls] == ["Glob"]
+        assert plan.tool_calls[0].result == "notes.txt"
+        assert plan.call_role.value == "planner" and plan.finish_reason.value == "tool_calls"
+        assert answer.output["content"] == "There is one: notes.txt."
+        assert answer.call_role.value == "responder" and answer.finish_reason.value == "stop"
+        assert len([s for s in trace.spans if s.span_type.value == "llm"]) == 2
+        assert len([s for s in trace.spans if s.span_type.value == "tool"]) == 1
+
+    def test_usage_is_counted_once_per_request_and_sums_to_the_run(self):
+        _drive(_cli_shaped_run(), agent_name="cas")
+        plan, answer = _flush_and_get_trace().llm_calls
+
+        # Input and cache counts are final on the first frame: exact per request.
+        assert (plan.input_tokens, answer.input_tokens) == (10, 8)
+        assert (plan.cache_read_tokens, answer.cache_read_tokens) == (16154, 16154)
+        assert (plan.cache_creation_tokens, answer.cache_creation_tokens) == (0, 196)
+        # Output: the run total, shared by what each request generated.
+        assert plan.output_tokens + answer.output_tokens == 194
+        assert plan.output_tokens > 5 and answer.output_tokens > 1
+        assert plan.input_tokens + answer.input_tokens == 18
+        assert plan.cache_read_tokens + answer.cache_read_tokens == 32308
+        assert abs(plan.cost_usd + answer.cost_usd - 0.0045891) < 1e-12
+
+    def test_the_next_request_sees_the_whole_previous_request_once(self):
+        _drive(_cli_shaped_run(), agent_name="cas")
+        _, answer = _flush_and_get_trace().llm_calls
+        assistant_turns = [m for m in answer.rendered_input if m["role"] == "assistant"]
+        assert len(assistant_turns) == 1
+        assert assistant_turns[0]["content"] == "Let me check."
+        assert [c["name"] for c in assistant_turns[0]["tool_calls"]] == ["Glob"]
+
+    def test_frames_without_an_id_stay_one_call_each(self):
+        """A stream that names no request (older CLI, hand-built stream) keeps the
+        old one-frame-one-call shape."""
+        msgs = [
+            SystemMessage(data={"session_id": "s"}),
+            AssistantMessage([TextBlock("a")]),
+            AssistantMessage([TextBlock("b")]),
+            ResultMessage(result="b", session_id="s"),
+        ]
+        _drive(msgs, agent_name="cas")
+        assert len(_flush_and_get_trace().llm_calls) == 2
+
+    def test_output_already_accounted_for_is_left_alone(self):
+        """Per-request output that already adds up to the run total is not inflated."""
+        msgs = [
+            SystemMessage(data={"session_id": "s"}),
+            AssistantMessage([TextBlock("one")], message_id="m1", usage=_frame_usage(5, 7, 0, 0)),
+            AssistantMessage([TextBlock("two")], message_id="m2", usage=_frame_usage(6, 3, 0, 0)),
+            ResultMessage(result="two", usage=_frame_usage(11, 10, 0, 0), session_id="s"),
+        ]
+        _drive(msgs, agent_name="cas")
+        first, second = _flush_and_get_trace().llm_calls
+        assert (first.output_tokens, second.output_tokens) == (7, 3)

@@ -179,3 +179,67 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model):
     assert output_tokens is not None and output_tokens > 0, (
         f"output_tokens missing or zero in llm_call: {resp}"
     )
+
+
+@pytest.mark.live_llm
+@pytest.mark.claude_agent_sdk
+@pytest.mark.parametrize("provider, model", h.matrix("claude_agent_sdk"))
+def test_claude_agent_sdk_one_llm_call_per_request(provider, model, tmp_path):
+    """A tool-using run: the CLI streams each API request as one AssistantMessage
+    per content block, all sharing the request's ``message_id``. The trace must hold
+    ONE llm_call per request, and its token counts must add up to the run totals the
+    ResultMessage reports (input and cache counts exactly per request; output is the
+    run total shared across the requests)."""
+    h.require_key_for(provider)
+    pytest.importorskip("claude_agent_sdk")
+    if shutil.which("claude") is None:
+        pytest.skip("Claude Code CLI ('claude') not found on PATH")
+
+    from claude_agent_sdk import ClaudeAgentOptions
+    from decimalai.claude_agent_sdk import traced_query
+
+    agent_name = h.unique_agent(f"claude-agent-sdk-requests-{provider}")
+    (tmp_path / "notes.txt").write_text("hello\n")
+    options = ClaudeAgentOptions(
+        model=model,
+        cwd=str(tmp_path),
+        setting_sources=[],
+        system_prompt=(
+            "Say one short sentence first, then call the Glob tool exactly once with the "
+            "pattern '*.txt', then answer with the file names."
+        ),
+        allowed_tools=["Glob"],
+        max_turns=4,
+    )
+    seen = {"ids": set(), "frames": 0, "usage": None}
+
+    async def _run():
+        async for message in traced_query(
+            prompt="Which .txt files are here?", options=options, agent_name=agent_name,
+        ):
+            kind = type(message).__name__
+            if kind == "AssistantMessage" and getattr(message, "message_id", None):
+                seen["ids"].add(message.message_id)
+                seen["frames"] += 1
+            elif kind == "ResultMessage":
+                seen["usage"] = getattr(message, "usage", None) or {}
+
+    asyncio.run(_run())
+    assert seen["ids"], "the stream carried no message ids; nothing to group by"
+    h.flush_sdk_sender()
+    traces = h.poll_for_trace(agent_name)
+    detail = h.get_trace_detail(traces[0]["id"])
+    llm_calls = detail.get("llm_calls", [])
+
+    assert len(llm_calls) == len(seen["ids"]), (
+        f"{len(llm_calls)} llm_calls for {len(seen['ids'])} API requests "
+        f"({seen['frames']} assistant frames)"
+    )
+    usage = seen["usage"]
+    for field, key in (("input_tokens", "input_tokens"),
+                       ("output_tokens", "output_tokens"),
+                       ("cache_read_tokens", "cache_read_input_tokens")):
+        reported = usage.get(key)
+        if isinstance(reported, int):
+            recorded = sum(c.get(field) or 0 for c in llm_calls)
+            assert recorded == reported, f"{field}: trace sums to {recorded}, the run reported {reported}"
