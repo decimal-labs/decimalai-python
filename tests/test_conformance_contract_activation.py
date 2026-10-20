@@ -526,7 +526,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
     2026-10-08 the same way, on the commit that shipped its rail (a
     before_llm_call hook): graded on C8/C13/C14, and no load_skill tool.
     `adk` left with 0.20, when `agent_config()` gave it a load_skill tool, and
-    `anthropic` with 0.22 the same way.
+    `anthropic` with 0.23 the same way.
     """
     from tests.conformance.drivers import all_drivers
 

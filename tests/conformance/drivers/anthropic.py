@@ -665,7 +665,7 @@ def _async_shape(ctxs: Sequence[Ctx]) -> Any:
 DRIVER = Driver(
     name="anthropic",
     # The capability table's "Anthropic Messages API (with `agent_config(...)`)" row
-    # (decimalai/_frameworks.py), which agent_config() earned in 0.22. The tracing
+    # (decimalai/_frameworks.py), which agent_config() earned in 0.23. The tracing
     # half, init(anthropic=True), is advertised in prose and recorded in
     # test_coverage.PROVIDER_FLAG_DRIVERS.
     covers=frozenset({"anthropic-messages-api"}),

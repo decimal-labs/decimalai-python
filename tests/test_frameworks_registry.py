@@ -36,7 +36,7 @@ DOCS_FRAMEWORKS = REPO_ROOT.parent / "decimalai-docs" / "sdk" / "python" / "fram
 #: the registry. Equal by value, on purpose: a registry edit made for the docs or the
 #: dashboard must not change what `decimalai init` does. When a change IS meant (a
 #: framework gains a template), change this snapshot in the same commit. Anthropic
-#: gained one in 0.22.
+#: gained one in 0.23.
 SCAFFOLD_BEFORE = {
     "DEFAULT_MODEL": "gpt-4o-mini",
     "_FRAMEWORK_DEFAULT_MODELS": {
@@ -260,8 +260,8 @@ def test_replace_block_round_trips_on_a_page():
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "0.22 adds the Anthropic Messages API row (agent_config(...)) to the registry tables; the "
-    "docs describe what PyPI serves, so decimalai-docs regenerates its tables with the 0.22 "
+    "0.23 adds the Anthropic Messages API row (agent_config(...)) to the registry tables; the "
+    "docs describe what PyPI serves, so decimalai-docs regenerates its tables with the 0.23 "
     "release. Remove this mark then: strict, so the regenerated page turns it red."))
 def test_docs_generated_blocks_are_the_registrys():
     """The docs page carries exactly what the renderers produce. Skips without the docs

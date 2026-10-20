@@ -115,7 +115,7 @@ class TestWarningGuards:
             oa.agent_config("support")
 
     def test_anthropic_load_agent_names_the_extra_before_any_call(self, monkeypatch):
-        """Since 0.22 the Messages API's skills come from agent_config(), which needs the
+        """Since 0.23 the Messages API's skills come from agent_config(), which needs the
         Anthropic SDK outright: it raises, naming the extra, before init() or any
         request. The module itself imports without the SDK (see below)."""
         import decimalai._agent as agent_mod

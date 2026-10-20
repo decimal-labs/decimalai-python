@@ -16,7 +16,7 @@ The four things that must never regress:
      openai-agents (0.18+) the equivalent is `agent_config()`'s two pieces in
      `Agent(...)`, on pydantic-ai (0.19+) `agent_config()`'s capability in
      `Agent(capabilities=[...])`, on adk (0.20+) `agent_config()`'s instruction
-     and tools in `LlmAgent(...)`, and on anthropic (0.22+) a run's `system` and
+     and tools in `LlmAgent(...)`, and on anthropic (0.23+) a run's `system` and
      `tools` in the Tool Runner: nothing else gives those agents their skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
@@ -295,7 +295,7 @@ class TestTemplateIsCode:
 
 #: The templates with no instrument() at all: `agent_config()` hands the pieces to the
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
-#: anthropic's Tool Runner since 0.22).
+#: anthropic's Tool Runner since 0.23).
 LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk", "anthropic")
 
 #: The templates whose skills arrive through instrument()'s loader.

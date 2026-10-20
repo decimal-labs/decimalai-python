@@ -1090,7 +1090,7 @@ def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
 
 
 def instrument(*args: Any, **kwargs: Any) -> None:
-    """Removed in decimalai 0.22: use :func:`agent_config`.
+    """Removed in decimalai 0.23: use :func:`agent_config`.
 
     ``instrument(enable_skill_loader=True)`` patched every Anthropic client in the
     process. Skills now come per agent from ``agent_config()``; tracing is
@@ -1098,7 +1098,7 @@ def instrument(*args: Any, **kwargs: Any) -> None:
     its own runs.
     """
     raise TypeError(
-        "decimalai.anthropic.instrument() was removed in decimalai 0.22. For an agent's "
+        "decimalai.anthropic.instrument() was removed in decimalai 0.23. For an agent's "
         "prompt and skills use decimalai.anthropic.agent_config(name) and open a run per "
         "message (with support.run(question) as run: system=run.system, "
         "tools=[*your_tools, *run.tools]). For tracing alone: decimalai.init(anthropic=True)."

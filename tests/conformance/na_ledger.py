@@ -53,7 +53,7 @@ DECLARED_NA: Dict[str, str] = {
     "langchain:C13b": "model_can_load_skill_bodies",
     # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.agent_config()`
     # gives the agent a real load_skill tool, so C13b is graded on its pulls.
-    # Anthropic left the same day (decimalai 0.22), for the same reason:
+    # Anthropic left the same day (decimalai 0.23), for the same reason:
     # `decimalai.anthropic.agent_config()` gives each run a load_skill tool.
     # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
     # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
@@ -99,7 +99,7 @@ DECLARED_NA: Dict[str, str] = {
     # here and both items are graded. Two are rail adapters, and for them the
     # missing link is a live gap the reasons name: a run wrapped in
     # decimalai.start_trace() ships unlinked and a delivery is credited twice.
-    # Anthropic's two came off on 2026-10-20 (decimalai 0.22): agent_config()
+    # Anthropic's two came off on 2026-10-20 (decimalai 0.23): agent_config()
     # takes on_trace, so the observer and the parent link are graded.
     "openai-agents:C15": "has_invocation_observer",
     "openai-agents:C16": "has_invocation_observer",
@@ -148,7 +148,7 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # An invoke-layer callback patch observes one model call; it does not own the
     # turn, so a load_skill result has nowhere to be routed back to.
     "langchain:tool_loaded": "decimalai/langchain.py",
-    # Anthropic left here on 2026-10-20 (decimalai 0.22). The patched
+    # Anthropic left here on 2026-10-20 (decimalai 0.23). The patched
     # `messages.create()` saw one provider request and never the caller's tool
     # loop; `decimalai.anthropic.agent_config()` hands the loop a load_skill tool
     # (`run.tools` for the Tool Runner, `run.tool_result(block)` for a hand-written one).
@@ -195,7 +195,7 @@ DELIVERY_NA_BUDGET = 2
 #: framework therefore turns a skip into a graded cell on the same commit, and
 #: leaves a line here that must be deleted.
 DECLARED_JOURNEY_NA: Dict[str, str] = {
-    # anthropic left this ledger on 2026-10-20 (decimalai 0.22): `decimalai init
+    # anthropic left this ledger on 2026-10-20 (decimalai 0.23): `decimalai init
     # --framework anthropic` writes a Tool Runner file (scaffold.py
     # `_render_anthropic`), and the journey stub speaks `POST /v1/messages`.
     "llamaindex:J1": "NO_PROMPT_SEAM",

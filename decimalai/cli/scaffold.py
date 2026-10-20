@@ -43,7 +43,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    skill titles it cannot read. Every generated file whose adapter has a
    loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
    one stops. The openai-agents (0.18+), pydantic-ai (0.19+), adk (0.20+) and
-   anthropic (0.22+) files have no loader to turn on: their skills reach the
+   anthropic (0.23+) files have no loader to turn on: their skills reach the
    model only through the `agent_config()` pieces they pass to their agent, which
    the same tests check.
    (`init(langchain=True)` and `init(crewai=True)` turn the loader on
@@ -181,7 +181,7 @@ skill they picked. `--framework` names the reason rather than printing a bare
 
 Of the six, five are scaffolded. `crewai` is the holdout, and that one IS
 "nobody got to it yet": its loader shipped on 2026-10-08, ahead of a template.
-`anthropic` was one until 0.22, for a different reason: its adapter patched one
+`anthropic` was one until 0.23, for a different reason: its adapter patched one
 `messages.create()` call and owned no tool loop, so a generated file would have
 been a hand-rolled while-loop this template had to invent. `agent_config()` now
 gives each run a `load_skill` tool, and the SDK's own Tool Runner is the loop.

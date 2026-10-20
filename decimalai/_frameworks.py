@@ -355,7 +355,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         init_flag=None,
         init_flag_note="— (no flag; `agent_config()` traces its runs, `anthropic=True` every call)",
         extra="anthropic",
-        # a template since 0.22: agent_config() gives each run a load_skill tool, and the
+        # a template since 0.23: agent_config() gives each run a load_skill tool, and the
         # SDK's own Tool Runner is the loop. Was SEAM_NO_TEMPLATE while the adapter patched
         # one `messages.create()` call and owned no loop.
         scaffold=TEMPLATE,
@@ -376,7 +376,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         use_for="Anthropic Messages API — `agent_config(name)`; each `support.run(question)` gives "
                 "`run.system` (the prompt, then the skill list) and `load_skill` in `run.tools` "
                 "for the Tool Runner (`run.tool_params` and `run.tool_result()` for your own "
-                "`messages.create()` loop), one trace per run, nothing patched (0.22+)",
+                "`messages.create()` loop), one trace per run, nothing patched (0.23+)",
     ),
     Framework(
         key="llamaindex",

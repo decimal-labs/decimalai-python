@@ -638,7 +638,7 @@ ADVERTISED_SNAPSHOT: frozenset = frozenset({
     "pydantic-ai",
     "google-adk",
     # The capability table's Anthropic Messages API row, new with
-    # decimalai.anthropic.agent_config() (0.22).
+    # decimalai.anthropic.agent_config() (0.23).
     "anthropic-messages-api",
     "llamaindex",
     "crewai",

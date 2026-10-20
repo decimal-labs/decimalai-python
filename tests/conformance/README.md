@@ -426,7 +426,7 @@ fixes and green after them, run with the same task environments:
 | `adk:S1[app_runner]` | `Runner(app=App(...))`, the `adk web` shape, raised `ValueError` after the global install |
 | `openai-agents:S1[sandbox_agent]` | a `SandboxAgent` run made zero router calls |
 | `openai-agents:S1[init_flag_then_instrument]` (`init_flag_then_load_agent` since 0.18) | `init(openai_agents=True)` then `instrument()` shipped every run three times |
-| `anthropic:S1[messages_stream]` (a hand-written `agent_config()` loop since 0.22) | `messages.stream()` got no skills |
+| `anthropic:S1[messages_stream]` (a hand-written `agent_config()` loop since 0.23) | `messages.stream()` got no skills |
 
 **C17** reads every `llm_calls[].tool_calls[]` entry in every phase. A record
 that says the call **finished** must carry what the tool returned; a record the
@@ -565,7 +565,7 @@ artifact in the one cell that exists to be channel-agnostic.
 
 **Which frameworks get a cell** is read off `decimalai/cli/scaffold.py`
 directly — `SUPPORTED_FRAMEWORKS` today is langchain, openai-agents, pydantic-ai, adk
-and anthropic (it was two until 2026-09-03, and anthropic joined with its 0.22
+and anthropic (it was two until 2026-09-03, and anthropic joined with its 0.23
 template; a doc test keeps this sentence honest). The other four drivers are a
 declared N/A whose reason is the SDK's own
 `UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM` classification, recomputed and
