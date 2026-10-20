@@ -354,13 +354,66 @@ def _hot_path_read_budget() -> float:
     return max(_HOT_PATH_READ_FLOOR_S, min(_HOT_PATH_READ_CEILING_S, value))
 
 
-def _hot_path_timeout() -> httpx.Timeout:
+def _hot_path_timeout(read_s: Optional[float] = None) -> httpx.Timeout:
     """connect/read/write/pool. Read is the one that matters: a hung backend
     must not hold a turn open. The caller degrades to an empty menu, which is
-    correct — the agent answers without skills rather than not answering."""
+    correct — the agent answers without skills rather than not answering.
+    ``read_s`` overrides the read budget for one call (the menu fallback's)."""
     return httpx.Timeout(
-        connect=1.0, read=_hot_path_read_budget(), write=2.0, pool=1.0,
+        connect=1.0, read=_hot_path_read_budget() if read_s is None else read_s,
+        write=2.0, pool=1.0,
     )
+
+
+# ── The menu fallback (2026-10-20) ────────────────────────────────────────
+#
+# A route that times out or errors used to leave the turn with NO skills: on
+# 2026-10-18 the OpenAI tutorial's agent answered without its procedures after
+# a route timeout, and nothing but the trace said so. The agent's own menu
+# (`GET /skills/menu`) is the cheap endpoint — 0.08 s on prod while routes took
+# 1.4-7.8 s — so after such a failure one request for it serves the agent's
+# skills, unranked, which beats none.
+#
+#: Route failures after which that one request is worth making: the route was
+#: slow (`timeout`, `http_504`) or failed in the handler (`http_500`). Not a 429
+#: or 503 (the platform is shedding load), a transport error (it is unreachable)
+#: or an open breaker: a second request then only adds to the load that made the
+#: first one fail.
+_MENU_FALLBACK_REASONS = frozenset({"timeout", "http_500", "http_504"})
+#: The fallback's own read budget. It takes no admission retries either, so a
+#: failed route costs a turn at most this much more.
+_MENU_FALLBACK_READ_S = 2.0
+#: After a fallback served a menu, routes from the same host and key are skipped
+#: for this long and turns go straight to the menu. Otherwise every turn would
+#: pay the route's timeout again: the menu's answer proves the host reachable,
+#: so the breaker never opens on a route that alone is slow.
+_ROUTE_PAUSE_S = 30.0
+_route_pauses: Dict[Tuple[str, str], float] = {}
+_route_pauses_lock = Lock()
+
+
+def _route_pause_key(base_url: str, api_key: Optional[str]) -> Tuple[str, str]:
+    return (_without_userinfo(base_url), _key_digest(api_key))
+
+
+def _route_paused(base_url: str, api_key: Optional[str]) -> bool:
+    with _route_pauses_lock:
+        until = _route_pauses.get(_route_pause_key(base_url, api_key))
+    return until is not None and time.monotonic() < until
+
+
+def _pause_route(base_url: str, api_key: Optional[str]) -> None:
+    now = time.monotonic()
+    with _route_pauses_lock:
+        for key in [k for k, until in _route_pauses.items() if until <= now]:
+            del _route_pauses[key]
+        _route_pauses[_route_pause_key(base_url, api_key)] = now + _ROUTE_PAUSE_S
+
+
+def _clear_route_pauses() -> None:
+    """Forget every pause. For tests, and for a process that wants routes back now."""
+    with _route_pauses_lock:
+        _route_pauses.clear()
 
 
 def _empty_menu_reason(e: "SkillRouterError") -> str:
@@ -577,7 +630,8 @@ class _RoutingTotals:
 
     ``timeouts`` counts transport failures (a read timeout, a refused
     connection); ``http_errors`` counts responses that arrived but mean no
-    skills (see ``_is_health_failure``).
+    skills (see ``_is_health_failure``); ``menu_fallbacks`` counts turns that
+    got the agent's menu, unranked, in place of a failed or paused route.
     """
 
     def __init__(self) -> None:
@@ -586,6 +640,7 @@ class _RoutingTotals:
         self.http_errors = 0
         self.opens = 0
         self.suppressed = 0
+        self.menu_fallbacks = 0
         self.last_error: Optional[str] = None
         self.last_error_at: Optional[float] = None
         self.last_status_code: Optional[int] = None
@@ -609,6 +664,10 @@ class _RoutingTotals:
     def skipped(self) -> None:
         with self._lock:
             self.suppressed += 1
+
+    def menu_fallback(self) -> None:
+        with self._lock:
+            self.menu_fallbacks += 1
 
     def success(self) -> None:
         with self._lock:
@@ -898,6 +957,7 @@ class _HotPathBreakers:
                 http_errors=t.http_errors,
                 opens=t.opens,
                 suppressed=t.suppressed,
+                menu_fallbacks=t.menu_fallbacks,
                 read_budget_s=_hot_path_read_budget(),
                 last_error=t.last_error,
                 last_error_at=t.last_error_at,
@@ -917,6 +977,11 @@ class RoutingStatus:
     returns 200. On 2026-09-01 that state ran for 21 hours across 93 agents
     with every other health signal green.
 
+    ``menu_fallbacks`` counts turns that got the agent's menu, unranked, because
+    the route failed or was paused after failing (see ``_MENU_FALLBACK_REASONS``).
+    Those turns had skills, so they do not make ``healthy`` False; a count that
+    keeps rising says routing itself is not working.
+
     Example::
 
         st = decimalai.routing_status()
@@ -927,7 +992,7 @@ class RoutingStatus:
     __slots__ = (
         "healthy", "breaker_open", "consecutive_failures", "timeouts",
         "http_errors", "opens", "suppressed", "read_budget_s", "last_error",
-        "last_error_at", "last_status_code", "last_success_at",
+        "last_error_at", "last_status_code", "last_success_at", "menu_fallbacks",
     )
 
     def __init__(self, **kw):
@@ -1631,6 +1696,8 @@ class SkillRouter:
         params: Optional[Dict[str, Any]] = None,
         *,
         hot: Optional[bool] = None,
+        read_budget_s: Optional[float] = None,
+        admission_wait_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Make an HTTP request to the platform API.
 
@@ -1638,6 +1705,9 @@ class SkillRouter:
             hot: whether this call sits inside a user's turn (5 s read budget,
                 circuit breaker, counted by ``routing_status()``). Decided by the
                 path when omitted; disk export passes ``False`` for ``/body``.
+            read_budget_s: a hot call's read budget in place of the default.
+            admission_wait_s: the most this call may wait out ``Retry-After``
+                on a 429 (default ``_ADMISSION_MAX_WAIT_S``); 0 never waits.
 
         Raises:
             SkillRouterError: on transport failure, non-2xx response, or
@@ -1686,13 +1756,14 @@ class SkillRouter:
         request_params = deepcopy(clean_params)
         started = time.monotonic()
         waited = 0.0
+        max_wait = _ADMISSION_MAX_WAIT_S if admission_wait_s is None else admission_wait_s
         try:
             for attempt in range(_ADMISSION_MAX_RETRIES + 1):
                 resp = httpx.request(
                     method, url, params=request_params, json=request_json, headers=headers,
                     # Retain the existing per-request latency budgets. Admission
                     # recovery never retries transport errors or generic 5xx.
-                    timeout=_hot_path_timeout() if hot else _COLD_PATH_TIMEOUT,
+                    timeout=_hot_path_timeout(read_budget_s) if hot else _COLD_PATH_TIMEOUT,
                 )
                 if not admission_safe or resp.status_code != 429 or attempt >= _ADMISSION_MAX_RETRIES:
                     break
@@ -1700,8 +1771,8 @@ class SkillRouter:
                     break
                 from ._client import _parse_retry_after
                 delay = _parse_retry_after(resp.headers.get("Retry-After"))
-                if (delay <= 0 or waited + delay > _ADMISSION_MAX_WAIT_S
-                        or time.monotonic() - started + delay > _ADMISSION_MAX_WAIT_S):
+                if (delay <= 0 or waited + delay > max_wait
+                        or time.monotonic() - started + delay > max_wait):
                     break
                 logger.warning(
                     "SkillRouter admission limited on %s %s; retrying in %.1fs (%d/%d)",
@@ -1880,6 +1951,38 @@ class SkillRouter:
             logger.warning("smart_route failed, returning empty: %s", e)
             return {"skills": [], "prompt_fragment": "", "strategy": "none",
                     "degraded_reason": _empty_menu_reason(e)}
+
+    def _fallback_menu(
+        self, route_failure: str, *, category: Optional[str], agent_name: Optional[str],
+    ) -> Dict[str, Any]:
+        """This agent's menu, unranked, in place of a route that cannot be used.
+
+        One fresh ``GET /skills/menu`` (a fresh decision, so the run's
+        ``routing_id`` is its own), on a ``_MENU_FALLBACK_READ_S`` read budget
+        and with no admission retries. It goes through the same breakers as any
+        hot call, so an open one skips it. Returns the menu marked ``degraded``,
+        or the SDK's empty stand-in when the menu failed too.
+        """
+        params: Dict[str, Any] = {}
+        if category:
+            params["category"] = category
+        if agent_name:
+            params["agent_name"] = agent_name
+        try:
+            menu = self._request(
+                "GET", "/api/v1/skills/menu", params=params,
+                read_budget_s=min(_MENU_FALLBACK_READ_S, _hot_path_read_budget()),
+                admission_wait_s=0.0,
+            )
+        except SkillRouterError as e:
+            logger.warning("skill routing failed (%s) and so did the menu fallback: %s", route_failure, e)
+            return {"skills": [], "prompt_fragment": "", "strategy": "none",
+                    "degraded_reason": _empty_menu_reason(e)}
+        if not isinstance(menu, dict) or not menu:
+            return {"skills": [], "prompt_fragment": "", "strategy": "none",
+                    "degraded_reason": route_failure}
+        _hot_path_breakers.totals.menu_fallback()
+        return {**menu, "degraded": True, "degraded_reason": f"menu_fallback:{route_failure}"}
 
     def get_skill_body(
         self,
@@ -2851,7 +2954,11 @@ class SkillRouter:
         # How long the routing call took: a failure is cached only when
         # retrying it would cost the turn that time again (see below).
         route_started = time.monotonic()
-        if query and self.strategy in ("auto", "semantic"):
+        if query and self.strategy in ("auto", "semantic") and _route_paused(self.base_url, self.api_key):
+            # A route failed moments ago and the menu answered: go straight to
+            # the menu until the pause ends (see `_ROUTE_PAUSE_S`).
+            result = self._fallback_menu("route_paused", category=category, agent_name=effective_agent)
+        elif query and self.strategy in ("auto", "semantic"):
             try:
                 result = self.smart_route(
                     query,
@@ -2868,6 +2975,16 @@ class SkillRouter:
                 logger.warning("build_prompt_fragment smart_route failed: %s", e)
                 result = {"skills": [], "prompt_fragment": "", "strategy": "none",
                           "degraded_reason": _empty_menu_reason(e)}
+            failure = result.get("degraded_reason") if _routing_call_failed(result) else None
+            if failure in _MENU_FALLBACK_REASONS:
+                fallback = self._fallback_menu(failure, category=category, agent_name=effective_agent)
+                if not _routing_call_failed(fallback):
+                    logger.warning(
+                        "Skill routing failed (%s); this turn gets the agent's skills unranked, "
+                        "and routes from this key are skipped for %.0f s.", failure, _ROUTE_PAUSE_S,
+                    )
+                    _pause_route(self.base_url, self.api_key)
+                    result = fallback
         else:
             try:
                 result = self.get_menu(category=category, agent_name=effective_agent, scope=scope)

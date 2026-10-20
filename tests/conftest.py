@@ -536,3 +536,15 @@ def _clear_prompt_cache():
     _reset_prompt_cache()
     yield
     _reset_prompt_cache()
+
+
+@pytest.fixture(autouse=True)
+def _clear_route_pauses():
+    """A route failure answered by the menu pauses routes for that host and key
+    for 30 s, process-wide (`skill_router._ROUTE_PAUSE_S`). Reset it between tests
+    or one case's failure turns the next case's route into a menu."""
+    from decimalai.skill_router import _clear_route_pauses as _clear
+
+    _clear()
+    yield
+    _clear()

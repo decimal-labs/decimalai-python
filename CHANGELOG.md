@@ -16,6 +16,21 @@ and patch releases are fixes.
   and `openai-agents` writes 0 there when the provider reported nothing; those record a positive
   count only, and leave 0 as not reported.
 
+### Changed: a failed skill route serves the agent's menu instead of no skills
+
+- When `POST /api/v1/skills/route` times out or fails with a 500 or 504, the SDK asks once for the
+  agent's own menu (`GET /api/v1/skills/menu`) and the turn gets the agent's skills, unranked,
+  instead of none. Before, the agent answered without skills and only the trace showed it. This
+  covers every adapter that routes through `SkillRouter.build_prompt_fragment`, including
+  `load_agent()`.
+- The extra request has its own 2 s read budget and does not wait out a `Retry-After`, so a failed
+  route costs a turn at most 2 s more. It is not made after a 429 or 503 (the platform is shedding
+  load), a connection failure, or while the circuit breaker is open.
+- After a fallback, routes from the same host and API key are skipped for 30 s and turns go
+  straight to the menu, so they do not each wait out the route's timeout again.
+- `routing_status().menu_fallbacks` counts the turns served this way. They had their skills, so
+  they do not make `healthy` False; a rising count says routing itself is failing.
+
 ## [0.19.0] — 2026-10-20
 
 ### Changed (breaking): Pydantic AI agents get their prompt and skills from `load_agent()`

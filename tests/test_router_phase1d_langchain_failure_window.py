@@ -32,6 +32,15 @@ from decimalai import skill_router as sr
 from decimalai.skill_router import SkillRouter, _ambient_scope
 from tests.test_langchain_phase1 import loader, sdk  # noqa: F401  (fixtures)
 
+
+@pytest.fixture(autouse=True)
+def _no_menu_fallback(monkeypatch):
+    """These tests pin how long a FAILED route is held. Since 2026-10-20 a slow
+    route is first answered by the agent's menu (test_route_menu_fallback.py),
+    which this fake platform does not serve; off here, so the rule is tested alone."""
+    monkeypatch.setattr(sr, "_MENU_FALLBACK_REASONS", frozenset())
+
+
 QUERY = "I want a refund for my order"
 ROUTE = {
     "strategy": "smart_routing",

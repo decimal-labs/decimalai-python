@@ -362,6 +362,10 @@ class TestAFailedRouteIsCachedForTheTurn:
         clock = _Clock()
         monkeypatch.setattr(sr, "time", clock)
         if failure == "timeout":
+            # A route timeout now asks once for the agent's menu instead
+            # (test_route_menu_fallback.py); here the menu fails too, which
+            # leaves the turn's slow failure to be cached as before.
+            platform.status["/menu"] = 503
             transport = _Scripted(platform, ["timeout"] * 4)
         else:
             # Three 429s with Retry-After: 2 → 2 s + 2 s of waiting, then give up.
@@ -378,6 +382,9 @@ class TestAFailedRouteIsCachedForTheTurn:
 
     def test_a_new_run_retries(self, monkeypatch):
         platform = FakePlatform()
+        # With the menu up, the timeout would be answered by the menu and pause
+        # routes for 30 s (test_route_menu_fallback.py); this is the cache rule.
+        platform.status["/menu"] = 503
         monkeypatch.setattr(httpx, "request", _Scripted(platform, ["timeout"]))
         router = _router()
         router.build_prompt_fragment("q", scope="run-1")
@@ -420,6 +427,9 @@ class TestAFastFailureIsNotCached:
     @pytest.mark.parametrize("status", [429, 503, 500, 401])
     def test_the_next_llm_call_retries_and_gets_skills(self, monkeypatch, status):
         platform = FakePlatform()
+        # A 500 is also answered by the agent's menu when the menu is up
+        # (test_route_menu_fallback.py); with it down, this is the cache rule.
+        platform.status["/menu"] = 503
         monkeypatch.setattr(httpx, "request", _Scripted(platform, [status]))
         router = _router()
 
