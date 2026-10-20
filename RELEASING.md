@@ -157,7 +157,7 @@ The package is pre-1.0 (`0.x`) while the API settles.
 
 ## Cutting a release
 
-Steps 1–6 are identical in both regimes. Only the last step differs. **Today the precondition is
+Only step 7, the publish, differs between the regimes. **Today the precondition is
 met**, so: run the gate, then cut the GitHub Release and let `publish.yml` do the upload. The local
 `scripts/release.sh` upload path is the fallback for when Actions is down, not the default.
 
@@ -192,6 +192,22 @@ met**, so: run the gate, then cut the GitHub Release and let `publish.yml` do th
      ```bash
      gh release create "v$VERSION" --generate-notes   # CI uploads via OIDC and attests
      ```
+8. **Sync the platform** once PyPI serves the version (`pypi.org/pypi/decimalai/$VERSION/json`
+   answers 200). The platform repo follows this package's latest `vX.Y.Z` tag in two places: the
+   dashboard's framework snippets (`frontend/src/lib/generated/frameworks.json`) and the SDK its
+   backend tests drive (the `decimalai==X.Y.Z` pin in `backend/pyproject.toml`'s dev extra). Its
+   `scripts/lint_doc_invariants.py` fails every platform land and deploy until both match the new
+   tag. One script updates both. From the root of a platform checkout, with this repo checked
+   out beside it as `../decimalai-python`:
+   ```bash
+   git -C ../decimalai-python fetch --tags                        # the new tag, if it was cut elsewhere
+   python3 scripts/sync_framework_registry.py                     # writes frameworks.json, bumps the pin
+   uv pip install --python backend/.venv/bin/python "decimalai==$VERSION"
+   make test                                                      # the backend against the new SDK
+   ```
+   Commit both files and land them. That `make test` is the first run of the backend's SDK tests
+   against this release: a removed or renamed public API breaks them here (0.20.0's removal of
+   `project=` broke seven). Fix those callers in the same change.
 
 ### What the script does
 
