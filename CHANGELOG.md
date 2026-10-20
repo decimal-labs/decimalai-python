@@ -13,8 +13,10 @@ and patch releases are fixes.
   agent's saved prompt (`{{placeholders}}` filled from the run's `deps`), then the skill list
   routed on the run's prompt; its toolset is `load_skill`, limited to the agent's skills; and its
   `wrap_run` opens one DecimalAI run span per run, so a run's model calls are one trace filed under
-  the DecimalAI agent, whatever the `Agent` is called. Every run is routed on its own prompt, the
-  way OpenAI Agents runs are. Built only on Pydantic AI's capability API.
+  the DecimalAI agent, whatever the `Agent` or `init(agent_name=...)` is called: under
+  `Agent.instrument_all()`, Pydantic AI's own run span is the trace's root, and it is named for the
+  DecimalAI agent too. Every run is routed on its own prompt, the way OpenAI Agents runs are.
+  Built only on Pydantic AI's capability API.
 - **Removed:** `decimalai.pydantic_ai.instrument()` and the three patches behind it
   (`Agent.__init__` twice, `Agent.iter`): the skills instructions function and `load_skill` it
   added to every Agent in the process, the `decimalai_load_skill` rename, the run span it opened

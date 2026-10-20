@@ -176,6 +176,46 @@ def test_a_run_is_one_trace_named_for_the_decimalai_agent_with_its_record(platfo
     assert otel._decimal_record_attributes(span)["decimal.prompt.version"] == 4
 
 
+def test_under_pydantic_ais_own_instrumentation_the_trace_is_still_the_decimalai_agents(
+        platform, monkeypatch):
+    """`Agent.instrument_all()` is the documented tracing. Its `invoke_agent` span opens before
+    any capability's wrap_run, so it is the trace's root, and the exporter files a trace under
+    its root's `decimal.agent_name` — which that span took from the context when it started:
+    `init(agent_name=...)`'s name. The run is still filed under the DecimalAI agent."""
+    pytest.importorskip("opentelemetry.sdk.trace")
+    from opentelemetry import trace as trace_api
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from pydantic_ai import InstrumentationSettings
+
+    import decimalai.otel as otel
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(otel._AgentNameStamper())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace_api, "get_tracer_provider", lambda: provider)
+    support = pai.load_agent("support")
+    agent = Agent(FunctionModel(Model("answer")), name="pydantic-agent", capabilities=[support],
+                  deps_type=dict)
+    # The per-agent form of Agent.instrument_all(), which would leave a global switch on.
+    agent.instrument = InstrumentationSettings(tracer_provider=provider)
+    token = otel._active_agent_name.set("init-agent")  # what init(agent_name="init-agent") sets
+    try:
+        agent.run_sync("Hi", deps=SAM)
+    finally:
+        otel._active_agent_name.reset(token)
+    spans = list(exporter.get_finished_spans())
+    (root,) = [span for span in spans if span.parent is None]
+    assert root.attributes.get("gen_ai.operation.name") == "invoke_agent"
+    assert root.attributes["decimal.agent_name"] == "support"
+    assert root.attributes["gen_ai.agent.name"] == "pydantic-agent", "Pydantic AI's own name stays"
+    # And the exporter, built with init()'s name as its default, files the trace there.
+    run_trace = otel.DecimalSpanExporter(agent_name="init-agent")._assemble_trace(spans)[0]
+    assert run_trace.agent_name == "support"
+
+
 def test_two_configs_never_compare_equal(platform):
     first, second = pai.load_agent("support"), pai.load_agent("support")
     assert first != second and first == first

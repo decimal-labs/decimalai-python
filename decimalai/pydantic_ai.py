@@ -18,7 +18,8 @@ extension points:
   sentence naming the tool;
 - its toolset is ``load_skill``, which the model calls for a listed skill's text;
 - ``wrap_run`` opens a DecimalAI run span around each run, so the run's model calls
-  land in one trace, filed under the DecimalAI agent.
+  land in one trace, filed under the DecimalAI agent (Pydantic AI's own run span, the
+  trace's root under ``Agent.instrument_all()``, is named for it too).
 
 Nothing in Pydantic AI is patched, and agents without the capability are untouched.
 Every run is routed on its own prompt: the first run before its first model request,
@@ -197,6 +198,31 @@ def _native_skills(agent: Any) -> Optional[bool]:
         return None
 
 
+def _name_framework_run_span(run_id: Optional[str], agent_name: str) -> None:
+    """Name Pydantic AI's own run span for the DecimalAI agent, when it is open here.
+
+    With Pydantic AI's instrumentation on (``Agent.instrument_all()``), its ``invoke_agent``
+    span opens before any capability's ``wrap_run``, so it is the trace's root and the
+    DecimalAI run span is its child. The exporter files a trace under its root's
+    ``decimal.agent_name``, which that span took from the context when it started:
+    ``init(agent_name=...)``'s name, or none. Matched on the run id Pydantic AI puts on the
+    span (``gen_ai.agent.call.id``), so any other span keeps its name. Never raises.
+    """
+    if not run_id:
+        return
+    try:
+        from opentelemetry import trace as trace_api
+
+        from .otel import _DECIMAL_AGENT_NAME
+
+        span = trace_api.get_current_span()
+        attributes = getattr(span, "attributes", None) or {}
+        if span.is_recording() and attributes.get("gen_ai.agent.call.id") == run_id:
+            span.set_attribute(_DECIMAL_AGENT_NAME, agent_name)
+    except Exception:  # noqa: BLE001 — naming must never cost the run
+        logger.debug("could not name Pydantic AI's run span", exc_info=True)
+
+
 # ── the capability ───────────────────────────────────────────
 
 
@@ -262,7 +288,9 @@ class _PydanticAIBinding(AgentBinding):
         """One DecimalAI run span around the run, named for the DecimalAI agent."""
         from .otel import agent_run
 
-        token = _RUN.set(getattr(ctx, "run_id", None))
+        run_id = getattr(ctx, "run_id", None)
+        _name_framework_run_span(run_id, self.name)
+        token = _RUN.set(run_id)
         try:
             with agent_run(self.name):
                 return await handler()
