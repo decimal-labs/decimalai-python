@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import functools
 import logging
 import re
 import threading
@@ -63,6 +64,40 @@ _CONVERSATION_STATE_VERSION = 1
 
 _config_pool: Optional[ThreadPoolExecutor] = None
 _config_pool_lock = threading.Lock()
+
+
+def _running_asyncio_loop() -> Optional[asyncio.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+async def _in_thread(func: Any, *args: Any) -> Any:
+    """``func(*args)`` in a worker thread, with this context's variables.
+
+    asyncio's thread when an asyncio loop is running; otherwise anyio's, which
+    is how an async client runs under trio (the Anthropic SDK is built on anyio).
+    """
+    if _running_asyncio_loop() is not None:
+        return await asyncio.to_thread(func, *args)
+    import anyio.to_thread
+
+    call = functools.partial(contextvars.copy_context().run, func, *args)
+    try:
+        # A cancelled run returns at once, as under asyncio; the thread finishes alone.
+        return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+    except TypeError:  # anyio < 4.1
+        return await anyio.to_thread.run_sync(call, cancellable=True)
+
+
+async def _wait_without_cancelling(pending: Any, timeout: float) -> None:
+    """Wait up to ``timeout`` for a background future: never cancelling it, holding no thread."""
+    import anyio
+
+    deadline = time.monotonic() + timeout
+    while not pending.done() and time.monotonic() < deadline:
+        await anyio.sleep(0.02)
 
 
 def is_claude(model_name: Any) -> bool:
@@ -495,7 +530,7 @@ class AgentBinding:
             # The first run, or an agent whose menu depends on the message: this
             # run's own decision, ranked on its message, before the model call.
             try:
-                routed_result = await asyncio.to_thread(
+                routed_result = await _in_thread(
                     self._route, run_key, plan["query"], plan["inject"],
                 )
             except Exception:
@@ -780,7 +815,7 @@ class AgentBinding:
         if repeat is not None:
             return repeat
         await self._name_this_runs_decision(run_key, state)
-        result = await asyncio.to_thread(self._serve_load, name)
+        result = await _in_thread(self._serve_load, name)
         self._mark_loaded(name, state, result)
         return result
 
@@ -815,8 +850,10 @@ class AgentBinding:
             return
         pending = state.get("pending") if state is not None else None
         if pending is not None and not pending.done():
+            # Not `asyncio.wait_for(wrap_future(pending))`: that cancels a decision
+            # still queued when the wait times out.
             try:
-                await asyncio.wait_for(asyncio.wrap_future(pending), _LOAD_WAITS_FOR_ROUTING_S)
+                await _wait_without_cancelling(pending, _LOAD_WAITS_FOR_ROUTING_S)
             except Exception:
                 self._log.debug("this run's routing decision is not in yet", exc_info=True)
         self._name_latest_decision(run_key)

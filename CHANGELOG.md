@@ -17,6 +17,16 @@ and patch releases are fixes.
   and outside one it was sent as two traces, one of them empty. Where DecimalAI turned
   OpenInference's Anthropic instrumentor on, the SDK's own call spans are now dropped, which is
   the record anthropic 1.13 gave. Elsewhere they are kept, since they may be the only record.
+- **An async `load_skill` no longer cancels its run's routing decision.** A load waits up to 2 s for
+  its run's decision, which is recorded in the background. In an async run that wait was
+  `asyncio.wait_for()` around the decision itself. When it timed out with the decision still
+  queued (the pool busy with other runs), the decision was cancelled, and that run's trace never
+  got it. Now the load stops waiting and leaves the decision running, and the wait holds no
+  thread. This affected async runs of the OpenAI Agents, Pydantic AI and Google ADK
+  `agent_config()` bindings.
+- **Async runs work without an asyncio event loop.** Under trio, the routing and the skill loads
+  now go to anyio's worker thread, and a cancelled run returns at once rather than after its
+  thread. Before, the routing failed quietly, and the run had no skills.
 
 ## [0.22.0] — 2026-10-21
 

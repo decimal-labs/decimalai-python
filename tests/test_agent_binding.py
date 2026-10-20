@@ -9,6 +9,7 @@ test environment.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 from types import SimpleNamespace
@@ -330,3 +331,128 @@ def test_a_record_survives_json_and_refuses_another_agents_state(platform):
 ])
 def test_is_claude_reads_every_providers_spelling(name, claude):
     assert binding.is_claude(name) is claude
+
+
+def _start_async_run(support, message):
+    """An async run of the neutral binding: (run key, its state), on the caller's event loop."""
+    key = f"run-{uuid4().hex}"
+    _RUN.set(key)
+    context = {"message": message, "values": None}
+
+    async def prepare():
+        state = await support._prepare_run(context, None, key)
+        support._compose(context, None, key, state)
+        return state
+
+    return key, prepare
+
+
+def test_an_async_load_that_stops_waiting_leaves_the_runs_decision_running(platform, monkeypatch):
+    """`asyncio.wait_for(wrap_future(...))` cancelled a decision still queued in the pool when the
+    load stopped waiting for it, and the run's record never got it. Every binding's async load
+    (OpenAI Agents, Pydantic AI, Google ADK) waits this way."""
+    import concurrent.futures
+    import threading
+
+    support = Binding(prompt(), platform.router)
+    support.run("My keyboard arrived cracked.")  # the first run routes; later ones in the background
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    gate = threading.Event()
+    pool.submit(gate.wait, 5)  # the pool's one worker is busy: the decision queues
+    monkeypatch.setattr(binding, "_in_background",
+                        lambda fn, *args: pool.submit(contextvars.copy_context().run, fn, *args))
+    monkeypatch.setattr(binding, "_LOAD_WAITS_FOR_ROUTING_S", 0.2)
+
+    async def go():
+        _key, prepare = _start_async_run(support, "Where is my order?")
+        state = await prepare()
+        await support._load("order-support")
+        return state["pending"]
+
+    pending = asyncio.run(go())
+    assert not pending.cancelled(), "the decision is still on its way"
+    gate.set()
+    pending.result(timeout=5)
+    pool.shutdown()
+
+
+def test_without_an_asyncio_loop_anyio_carries_an_async_run(platform, monkeypatch):
+    """An async client also runs under trio, where there is no asyncio loop to hand the routing
+    to; anyio's worker thread takes it there. Exercised on anyio's asyncio backend with the
+    asyncio branch switched off and asyncio's thread hop failing as it does under trio."""
+    monkeypatch.setattr(binding, "_running_asyncio_loop", lambda: None)
+
+    async def no_asyncio_loop(*args, **kwargs):
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(asyncio, "to_thread", no_asyncio_loop)
+    support = Binding(prompt(), platform.router)
+
+    async def go():
+        _key, prepare = _start_async_run(support, "My keyboard arrived cracked.")
+        await prepare()
+        return await support._load("damaged-item")
+
+    body = asyncio.run(go())
+    assert body.startswith("## Skill: damaged-item"), "the run was routed and its skill served"
+    assert platform.queries[support.records[0]["routing_id"]] == "My keyboard arrived cracked."
+
+
+def test_an_async_load_waiting_for_its_decision_holds_no_thread(platform, monkeypatch):
+    """The wait is on the event loop: the loop's default executor stays free for the app's own
+    work (DNS lookups, other loads) while a load waits up to 2 s for its decision."""
+    import concurrent.futures
+    import threading
+    import time
+
+    support = Binding(prompt(), platform.router)
+    support.run("My keyboard arrived cracked.")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    gate = threading.Event()
+    pool.submit(gate.wait, 5)
+    monkeypatch.setattr(binding, "_in_background",
+                        lambda fn, *args: pool.submit(contextvars.copy_context().run, fn, *args))
+    monkeypatch.setattr(binding, "_LOAD_WAITS_FOR_ROUTING_S", 0.6)
+
+    async def go():
+        asyncio.get_running_loop().set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        _key, prepare = _start_async_run(support, "Where is my order?")
+        await prepare()
+        load = asyncio.ensure_future(support._load("order-support"))
+        await asyncio.sleep(0.1)  # the load is waiting now
+        started = time.monotonic()
+        await asyncio.to_thread(lambda: None)  # the app's own thread work
+        took = time.monotonic() - started
+        await load
+        return took
+
+    took = asyncio.run(go())
+    gate.set()
+    pool.shutdown()
+    assert took < 0.3, f"the app's thread work waited {took:.2f}s behind the load"
+
+
+def test_without_an_asyncio_loop_a_cancelled_run_does_not_wait_for_its_thread(platform, monkeypatch):
+    """Under trio, anyio's thread hop shields the call from cancellation unless told otherwise:
+    a cancelled run (a client that hung up) then waits for its routing thread. It is abandoned
+    on cancel, as asyncio's is. (On anyio's asyncio backend, which this suite runs, a native
+    cancel interrupts either way, so the hop's arguments are what can be checked here.)"""
+    import anyio.to_thread
+
+    monkeypatch.setattr(binding, "_running_asyncio_loop", lambda: None)
+    seen = []
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def run_sync(func, *args, **kwargs):
+        seen.append(kwargs)
+        return await real_run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", run_sync)
+    support = Binding(prompt(), platform.router)
+
+    async def go():
+        _key, prepare = _start_async_run(support, "My keyboard arrived cracked.")
+        await prepare()
+
+    asyncio.run(go())
+    assert seen and all(kw.get("abandon_on_cancel") or kw.get("cancellable") for kw in seen)
