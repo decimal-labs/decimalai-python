@@ -21,10 +21,13 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 
    EXPLICITLY, and that is the design, not an implementation detail: the
    prompt lands in a variable in THEIR file and is passed to the model by a
-   line they can see. Skills go the other way (instrument() injects them),
-   because a skill menu is additive and a system prompt is not — silently
-   replacing one means their repo says "Never issue refunds over $500" while
-   the model receives something else, which is unfixable from their side.
+   line they can see. On langchain and adk skills go the other way
+   (instrument() injects them), because a skill menu is additive and a system
+   prompt is not — silently replacing one means their repo says "Never issue
+   refunds over $500" while the model receives something else, which is
+   unfixable from their side. On openai-agents and pydantic-ai nothing is
+   injected: `load_agent()` returns the prompt and the skills together, and
+   the file hands both to its own `Agent(...)`.
 
    `load_agent()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
@@ -36,8 +39,11 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    that calls `instrument()` without it traces beautifully and delivers NONE of
    the agent's skills. The failure is silent and it is the whole reason the
    scaffold is worth shipping: without the flag the model is handed a list of
-   skill titles it cannot read. Every generated file carries it, and
-   `tests/test_cli_init_scaffold.py` fails the build if one stops.
+   skill titles it cannot read. Every generated file whose adapter has a
+   loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
+   one stops. The openai-agents (0.18+) and pydantic-ai (0.19+) files have no
+   loader to turn on: their skills reach the model only through the
+   `load_agent()` pieces they pass to `Agent(...)`, which the same tests check.
    (`init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
    `init(crewai=True)` turn the loader on themselves since 2026-10-14; the
    templates keep the explicit `instrument()` line because it is where the
@@ -86,9 +92,9 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    /agents/<name>", which is a promise about the file it just wrote. The
    langchain and openai-agents adapters keep it themselves — their `instrument()`
    installs a callback handler / a trace processor. `decimalai.pydantic_ai`
-   deliberately does not: Pydantic AI emits no spans of its own, so that adapter
-   ships the skills rail and the run BOUNDARY and leaves the span content to
-   whatever tracing you paired with it. `init()` with no flags installs no
+   deliberately does not: its `load_agent()` capability ships the prompt, the
+   skills and the run BOUNDARY (one DecimalAI run span per run) and leaves the
+   span content to Pydantic AI's own instrumentation or a provider instrumentor. `init()` with no flags installs no
    exporter at all (see `decimalai/__init__.py` — the exporter is built inside
    the `if otel or crewai or autogen:` branch), so a pydantic-ai file that called
    a bare `init()` would run, deliver its skills, and leave the user staring at
@@ -117,7 +123,7 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
        span and a Pydantic AI span on the same model call.
 
    `Agent.instrument_all()` lives in the generated file rather than inside
-   `decimalai.pydantic_ai.instrument()` on purpose: turning it on inside the
+   `decimalai.pydantic_ai.load_agent()` on purpose: turning it on inside the
    adapter would silently double up for every existing user who already pairs a
    provider instrumentor, which is the failure this point is about.
 
@@ -134,36 +140,33 @@ share is identical, deliberately:
     `instrument(enable_skill_loader=True)`. `init(langchain=True)` is the same
     install, so passing it as well installs twice: the first one wins, and the
     explicit call's other arguments are dropped with a warning.
-  * openai-agents: same shape. `init(openai_agents=True)` is the same install
-    as the explicit `instrument()` line, so it is one or the other — never
-    both.
-  * pydantic-ai: the same `instrument(enable_skill_loader=True)` — but
-    `init(..., otel=True)`. That is not a contradiction of the rule above, it
-    is the same rule: exactly one span source per file. On the other two the
-    adapter IS the span source; here it is not (point 4).
+  * openai-agents: no `instrument()` at all. `load_agent(AGENT_NAME)`'s
+    instructions and tools go into the file's own `Agent(...)`, and init()
+    carries no framework flag.
+  * pydantic-ai: `load_agent(AGENT_NAME)` passed as `Agent(capabilities=[support])`,
+    with `init(..., otel=True)` and `Agent.instrument_all()` for the spans.
+    That is the same rule: exactly one span source per file. On the other two
+    the adapter IS the span source; here it is not (point 4).
 
-Three differences are intentional. The snippets name the agent on
+Two differences are intentional. The snippets name the agent on
 `instrument(agent_name=...)`; the templates name it on `init(agent_name=...)`
 (point 2). It is the same binding — `init()`'s name is the one every
 `instrument()` falls back to — moved to the one call that reaches every
 adapter, so a whole file can name its agent once. The openai-agents snippet awaits
 `Runner.run(...)` because it is being pasted into an async app, while the
-generated file is a standalone script and uses `Runner.run_sync(...)`. And the
-pydantic-ai snippet stops at `Agent(...)` without a `name=`, because it is being
-pasted into an agent that already has one — the template passes a name, because
-an unnamed Pydantic AI Agent is named after the local variable it is assigned to
-and would file its traces under `agent`.
+generated file is a standalone script and uses `Runner.run_sync(...)`.
 
 WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. `enable_skill_loader` exists on six adapters (langchain,
-openai_agents, anthropic, pydantic_ai, adk, crewai); the rest — llamaindex,
-claude_agent_sdk, autogen/otel — trace and version but have no loader, and
-generating a file for them would hand someone a program that looks correct and
-quietly ignores every skill they picked. `--framework` names the reason rather
-than printing a bare "invalid choice".
+loader can use. Six adapters have one: `enable_skill_loader` on four
+(langchain, anthropic, adk, crewai) and a `load_agent()` binding on two
+(openai_agents, pydantic_ai). The rest — llamaindex, claude_agent_sdk,
+autogen/otel — trace and version but have no loader, and generating a file for
+them would hand someone a program that looks correct and quietly ignores every
+skill they picked. `--framework` names the reason rather than printing a bare
+"invalid choice".
 
 Of the six, four are scaffolded. `anthropic` is a holdout and the reason is
 not "nobody got to it": that adapter patches one `messages.create()` call, so it
@@ -432,7 +435,8 @@ def _agent_name_lines(agent_name: str, *, load_agent_routes: bool = False) -> Li
     """The one place a generated file writes the agent's name (point 2).
 
     ``load_agent_routes``: the template's ``load_agent()`` call brings the
-    skills as well as the prompt (OpenAI Agents), so init() only traces.
+    skills as well as the prompt (OpenAI Agents, Pydantic AI), so init() only
+    traces.
     """
     second = (
         "# to everything that traces, and load_agent() reads its prompt and skills."
@@ -667,7 +671,7 @@ def _render_pydantic_ai(
         "import os",
         "",
         "import decimalai",
-        "from decimalai.pydantic_ai import instrument, retry_model_requests",
+        "from decimalai.pydantic_ai import load_agent, retry_model_requests",
         "from pydantic_ai import Agent",
         "from pydantic_ai.exceptions import UsageLimitExceeded",
         "from pydantic_ai.usage import UsageLimits",
@@ -679,7 +683,7 @@ def _render_pydantic_ai(
         "# all three ship with the pydantic-ai install; the key each one reads is",
         "# named in the `Set:` list `decimalai init` printed for your model.",
         f"MODEL = {_py(model)}",
-        *_agent_name_lines(agent_name),
+        *_agent_name_lines(agent_name, load_agent_routes=True),
         "# Pydantic AI's own default is 50 model requests. Lower, because a",
         "# runaway loop here costs real tokens; raise it if your agent legitimately",
         "# chains many tool calls.",
@@ -690,12 +694,9 @@ def _render_pydantic_ai(
         "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
         "# file you are going to commit.",
         "#",
-        "# otel=True is what makes this agent's traces exist. Unlike the LangChain",
-        "# and OpenAI-Agents adapters, decimalai.pydantic_ai installs no exporter:",
-        "# Pydantic AI emits no spans of its own, so that adapter ships the skills",
-        "# rail and the run boundary and leaves the tracing to whatever you pair.",
-        "# A bare init() here would run fine, deliver every skill, and leave your",
-        "# traces page empty forever.",
+        "# otel=True installs DecimalAI's OpenTelemetry exporter, which turns this",
+        "# agent's spans into traces. A bare init() here would run fine and deliver",
+        "# every skill, and your traces page would stay empty.",
         _init_call(base_url, "otel"),
         "",
         "# Pydantic AI's own OpenTelemetry instrumentation, which is where the",
@@ -707,60 +708,40 @@ def _render_pydantic_ai(
         "# to go until it has.",
         "Agent.instrument_all()",
         "",
-        "# enable_skill_loader=True is what actually delivers this agent's skills.",
-        "# instrument() defaults it to False, and tracing alone does not deliver",
-        "# them. This adapter registers a real load_skill tool on every Agent,",
-        "# and Pydantic AI owns its tool loop — so the model reads the menu, asks",
-        "# for the one it needs, and the body comes back mid-turn.",
+        "# Your agent's prompt and skills, as they stand in the dashboard, as one",
+        "# Pydantic AI capability: its instructions are the saved prompt, then the",
+        "# skill list picked for each run's prompt, and its toolset is load_skill,",
+        "# which the model calls for a listed skill's text. It also wraps each run",
+        "# in one DecimalAI run span, so a run is one trace filed under this agent.",
+        "# Nothing in Pydantic AI is patched.",
         "#",
-        "# No agent_name here: this call takes init()'s, as the fallback for an",
-        "# Agent built without a name=. Pydantic AI infers one from the VARIABLE it",
-        "# was assigned to in that case, so without it an agent you renamed files",
-        "# its traces under 'agent'.",
-        "#",
-        "# This call must stay ABOVE the Agent(...) below: the loader works by",
-        "# wrapping Agent.__init__, so an Agent constructed earlier gets neither",
-        "# the skills prompt nor the load_skill tool.",
-        "instrument(enable_skill_loader=True)",
-        "",
-        "# Your agent's system prompt, as it stands in the dashboard right now.",
-        "# It is handed to you as data and passed to the Agent by the line YOU can",
-        "# see below — nothing injects it behind your back, so what this file sends",
-        "# is what this file says. (Skills are the other way round: instrument()",
-        "# delivers those for you, because a menu is additive and a prompt is not.)",
-        "#",
-        "# Read at run time, so editing the prompt in the dashboard changes the",
-        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "support = decimalai.load_agent(AGENT_NAME)",
+        "# The prompt is re-read in the background at most once a minute, so",
+        "# editing it in the dashboard changes the next runs of this process.",
+        "# {{placeholders}} in it are filled from the run's deps=. With no prompt",
+        "# saved, the agent gets only the skill list: nothing this file made up.",
+        "# Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
+        "support = load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
-        "# loop runs, the skills rail delivers, and adding a tool later needs no",
-        "# other change to this file.",
+        "# loop runs, load_skill sits beside your tools, and adding a tool later",
+        "# needs no other change to this file.",
         "TOOLS: list = []",
         "",
         "agent = Agent(",
         "    # Retry temporary provider failures inside a model request. Completed",
         "    # tools are not repeated. Each request has a 30-second total budget.",
         "    retry_model_requests(MODEL, max_attempts=3, timeout_s=30),",
-        "    # Bound, not inferred. Pydantic AI reads the name off the variable",
-        "    # this Agent is assigned to when you leave it out, and the DecimalAI",
-        "    # run scope stamps whatever it finds onto the trace — so an unnamed",
-        "    # Agent files under 'agent' and your dashboard page stays empty.",
-        "    name=AGENT_NAME,",
-        "    # `or ()` because None is a REAL state (this agent has no prompt set;",
-        "    # a failed read raises instead) and Pydantic AI's system_prompt takes a",
-        "    # string or a sequence, never None. An empty tuple sends no system",
-        "    # prompt at all, rather than one this file invented.",
-        "    system_prompt=support.prompt or (),",
+        "    name=support.name,",
         "    tools=TOOLS,",
+        "    capabilities=[support],",
         ")",
         "",
         "",
         "def run(question: str) -> str:",
         '    """One turn: the loop runs until the model answers.',
         "",
-        "    Add tools to TOOLS above — the skills rail rides on the Agent's own",
-        "    system prompt and its load_skill tool, so it survives them.",
+        "    Add tools to TOOLS above; load_agent()'s capability adds load_skill",
+        "    beside them.",
         '    """',
         "    async def bounded_turn():",
         "        return await asyncio.wait_for(",

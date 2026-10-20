@@ -129,7 +129,7 @@ openai-agents = ["openai-agents>=0.23.1"]
 # Runtime extra for the native Claude Agent SDK integration
 # (decimalai.init(claude_agent_sdk=True)).
 claude-agent-sdk = ["claude-agent-sdk>=0.2.166"]
-# Runtime extra for the Pydantic AI skill loader (decimalai.pydantic_ai.instrument).
+# Runtime extra for the Pydantic AI integration (decimalai.pydantic_ai.load_agent).
 # pydantic-ai-SLIM, not the `pydantic-ai` meta package: the meta package always
 # pulls slim's `logfire` extra, which needs opentelemetry-instrumentation-httpx
 # >=0.65b0 and so opentelemetry-api>=1.44, while google-adk 2.12 caps

@@ -1,145 +1,90 @@
-"""Pydantic AI integration.
+"""Pydantic AI: an agent's DecimalAI prompt and skills, as one capability.
 
-One-line install path::
-
-    import decimalai
-    decimalai.init()
-
-    from decimalai.pydantic_ai import instrument
-    instrument(enable_skill_loader=True)
+::
 
     from pydantic_ai import Agent
-    agent = Agent("openai:gpt-4o", system_prompt="You are helpful")
-    # Skills are now auto-loaded into every agent.run() call.
+    from decimalai.pydantic_ai import load_agent
 
-Supports pydantic-ai-slim 2.56 and later only.
+    support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+    agent = Agent("openai:gpt-5.4-mini", name=support.name,
+                  tools=[lookup_order], capabilities=[support])
+    result = await agent.run(question, deps=customer)
 
-The install monkey-patches `pydantic_ai.Agent.__init__` so each newly
-constructed Agent gets an `@agent.instructions` function that calls
-`SkillRouter.build_prompt_fragment()` once per RUN and returns the routed menu.
+``support`` is a Pydantic AI capability, built only from Pydantic AI's documented
+extension points:
 
-Instructions, not a system prompt, because of what Pydantic AI does with each:
+- its instructions are the agent's saved prompt (``{{placeholders}}`` filled from
+  the run's ``deps``), then the skill list routed on the run's prompt, then one
+  sentence naming the tool;
+- its toolset is ``load_skill``, which the model calls for a listed skill's text;
+- ``wrap_run`` opens a DecimalAI run span around each run, so the run's model calls
+  land in one trace, filed under the DecimalAI agent.
 
-- A plain `@agent.system_prompt` is built only when there is no
-  `message_history`. Turn 2 of a conversation reused turn 1's menu, was never
-  routed, and its trace carried no routing_id.
-- `@agent.system_prompt(dynamic=True)` is re-evaluated only where its part is
-  still in the history. A history processor that trims the first request takes
-  routing with it. The menu also gets stored in the history, and the OpenAI
-  model skips its `openai_cache_instructions` breakpoint whenever a dynamic
-  system prompt is present.
-- Instructions are rebuilt for every request, and the model is sent only the
-  current request's instructions, never older ones from the history. Pydantic
-  AI puts them after the system-prompt messages and marks a function's output
-  as dynamic. The caller's `system_prompt=` and static `instructions=` stay a
-  byte-identical leading prefix, and provider cache breakpoints go in front of
-  the routed menu. The menu still sits ahead of the conversation history, so a
-  turn that routes to a DIFFERENT menu re-reads the history after it uncached.
-  That is the price of routing every turn; a turn whose menu comes out the
-  same keeps the whole prefix.
+Nothing in Pydantic AI is patched, and agents without the capability are untouched.
+Every run is routed on its own prompt: the first run before its first model request,
+later runs from a local copy while their own decision is recorded in the background,
+and every run of an agent with more skills than fit the list.
 
-"Every request" includes each tool-loop step of a run, so the fragment is
-remembered per run (`ctx.run_id`): one routing decision per run, the same menu
-on every step of it. One consequence of being an instruction: inside
-`agent.override(instructions=...)`, Pydantic AI replaces every instruction,
-this one included, so runs in that block get no menu.
+Tracing is DecimalAI's OpenTelemetry exporter, ``decimalai.init(otel=True)``, carrying
+Pydantic AI's own spans (``Agent.instrument_all()``; any provider) or a provider
+instrumentor's (``decimalai.init(openai=True)``). Pick one, or a model call is reported
+twice.
 
-Tracing for Pydantic AI is observed via the underlying provider SDK
-(OpenAI/Anthropic) — install the matching tracing adapter alongside::
-
-    decimalai.init(openai=True)               # carries the spans
-    decimalai.pydantic_ai.instrument()        # carries the run boundary
-
-Both halves are needed. The provider instrumentor sees provider calls and
-nothing else, so on its own it emits one unparented root span — and therefore
-one DecimalAI trace — per call: a single `agent.run_sync()` that asks for a
-tool and then answers arrives as two unrelated one-span traces, both filed
-under whichever agent happened to run first in the process. `instrument()`
-patches `Agent.iter` (the one place `run`/`run_sync`/`run_stream` all funnel
-through) to open an `agent.run` span around each run, which gives those calls a
-real parent to nest under and puts the Agent's own name on the trace.
-
-The provider pairing is not the only route, and `decimalai init --framework
-pydantic-ai` takes the other one::
-
-    decimalai.init(otel=True)                 # the DecimalAI OTel exporter
-    Agent.instrument_all()                    # Pydantic AI's OWN OTel spans
-    decimalai.pydantic_ai.instrument(...)     # skills + the run boundary
-
-Pydantic AI has native OpenTelemetry instrumentation, off by default, and it
-covers every provider — so this route needs no per-provider instrumentor
-package and works unchanged for `google:…` models. Pick ONE: with both, an
-OpenInference span and a Pydantic AI span describe the same model call. Neither
-is installed from in here, deliberately — turning `instrument_all()` on inside
-this adapter would double up for every caller who already pairs a provider
-instrumentor.
+The harness's ``Skills`` capability is the other way to give an agent skills: files the
+harness loads (``decimalai.pydantic_ai_harness.skills``). An agent that has it gets no
+DecimalAI skills from ``load_agent()``, and a warning says so once.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional
 
 from decimalai._provider_recovery import retry_model_requests as retry_model_requests
 
+from ._agent_binding import AgentBinding
+
 logger = logging.getLogger("decimalai.pydantic_ai")
 
+#: The run whose ``wrap_run`` is active in this context. Pydantic AI hands the
+#: instructions function and the tool their ``RunContext``; everything else that
+#: needs the run (the background routing, the load's scope) reads it here.
+_RUN: "ContextVar[Optional[str]]" = ContextVar("decimalai_pydantic_ai_run", default=None)
 
-# ── SkillRouter routing-id context ──────────────────────────
-# Pydantic AI doesn't have its own DecimalAI trace processor (yet);
-# downstream provider adapters (openai_agents / anthropic) read from
-# their own contextvars. We surface our routing_id via a getter so
-# the provider adapter can pull it in if both are installed.
-_routing_id_ctx: ContextVar[Optional[str]] = ContextVar(
-    "decimalai_skill_router_routing_id_pydantic_ai", default=None,
-)
+#: The runs a DecimalAI config showed a skill list to, newest last. Read by the
+#: harness's two-catalog warning (`decimalai.pydantic_ai_harness`).
+_RUNS_WITH_MENU: "OrderedDict[str, None]" = OrderedDict()
+_RUNS_WITH_MENU_MAX = 256
+_runs_lock = threading.Lock()
 
-
-def _set_routing_id(routing_id: Optional[str]) -> None:
-    _routing_id_ctx.set(routing_id)
-
-
-def get_current_routing_id() -> Optional[str]:
-    """Read (without clearing) the current routing_id.
-
-    Exposed so downstream framework adapters can read the routing_id
-    set by the Pydantic AI skill loader and stamp it onto a trace.
-    """
-    return _routing_id_ctx.get()
-
-
-def _scope() -> Optional[str]:
-    """This run's routing scope — the live OTel trace id, or None.
-
-    ``instrument()`` opens an ``agent.run`` span around every run, so inside a
-    run this is stable and unique per run: both the prompt build and the
-    ``load_skill`` tool call land on the same key. Without it, eight concurrent
-    runs of one agent share one fragment-cache slot (they all route with
-    ``query=None`` and the same agent name) and would be handed one routing
-    decision between them.
-    """
-    try:
-        from .otel import current_run_key
-        key = current_run_key()
-    except Exception:
-        return None
-    return None if key is None else f"{key:032x}"
-
-
-# ── SkillRouter dynamic loader ──────────────────────────────
-_skill_loader_installed = False
+#: The SkillRouter behind every config. `init()` drops it when a re-init changes
+#: the key or workspace (`decimalai._drop_adapter_skill_routers`).
 _skill_router_singleton: Any = None
 
 
+def _menu_shown(ctx: Any) -> bool:
+    """Whether a DecimalAI config put its skill list into this run."""
+    run_id = getattr(ctx, "run_id", None)
+    with _runs_lock:
+        return run_id in _RUNS_WITH_MENU
+
+
+def _note_menu_shown(run_id: Optional[str]) -> None:
+    if not run_id:
+        return
+    with _runs_lock:
+        _RUNS_WITH_MENU[run_id] = None
+        _RUNS_WITH_MENU.move_to_end(run_id)
+        while len(_RUNS_WITH_MENU) > _RUNS_WITH_MENU_MAX:
+            _RUNS_WITH_MENU.popitem(last=False)
+
+
 def _get_skill_router() -> Any:
-    """Lazily construct a SkillRouter using the SDK's global config."""
+    """The SkillRouter for these configs, built on first use; None when switched off."""
     global _skill_router_singleton
-    # The kill switch: a later init(enabled=False) withholds the router (kept
-    # for a re-enable) from a loader an earlier init installed.
     from ._config import _disabled_by_init
 
     if _disabled_by_init():
@@ -149,186 +94,43 @@ def _get_skill_router() -> Any:
     try:
         from ._config import _get_config
         from .skill_router import SkillRouter
+
         config = _get_config()
         _skill_router_singleton = SkillRouter(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            # Every routing call names its agent; no router default (see
-            # `skill_router._AGENT_FROM_INIT`).
+            api_key=config.api_key, base_url=config.base_url,
+            # Every routing call names its agent; no router default.
             agent_name=None,
-            inject_body=config.resolve_inject_body(has_tool_loop=_load_skill_tool_enabled()),
+            # Skill text reaches the model through load_skill, not the prompt.
+            inject_body=False,
         )
         return _skill_router_singleton
     except Exception:
-        logger.debug("SkillRouter singleton init failed", exc_info=True)
+        logger.debug("SkillRouter init failed", exc_info=True)
         return None
 
 
-# True once at least one Agent got the load_skill tool — gates the prompt
-# hint in _skills_system_prompt (per-agent introspection of registered tools
-# is private API in pydantic_ai; a module flag is the stable alternative).
-_load_skill_tool_active = False
-
-#: The name DecimalAI's tool falls back to when something else in the run
-#: already exposes ``load_skill``, and the key it is always registered under in
-#: the Agent's function toolset.
-#:
-#: Registered under this key, never under ``load_skill``, so that a caller's own
-#: ``@agent.tool_plain def load_skill`` still registers. Under one key, two tools
-#: raise ``UserError`` at the caller's decorator line. The model is shown the
-#: tool as ``load_skill`` unless that name is taken; see _exposed_tool_name.
-_NAMESPACED_TOOL_NAME = "decimalai_load_skill"
-_tool_clash_warned = False
-
-
-def _exposed_tool_name(ctx: Any) -> str:
-    """The name the model sees DecimalAI's tool under in this run.
-
-    ``load_skill`` (the name in the docs, the menu hint and every other adapter)
-    unless another tool in the run already uses it. Pydantic AI does not let two
-    toolsets share a tool name: every run raised ``UserError``. Namespacing
-    keeps both catalogs callable, so the caller's skill loader keeps working
-    and DecimalAI's skills still reach the model. Skipping DecimalAI's tool
-    would have dropped DecimalAI's bodies without a word.
-
-    What is checked: every function toolset in the run. That covers the Agent's
-    own (``tools=`` and ``@agent.tool_plain``), its ``toolsets=``, and the run's
-    ``toolsets=``. What is not: a toolset whose tools are known only once it is
-    asked for them, such as an MCP server. That clash still raises Pydantic AI's
-    own ``UserError``, which tells the caller to rename it or wrap it in
-    ``PrefixedToolset``.
-
-    Pure in ``ctx``, so the tool's ``prepare`` and the menu hint, which call it
-    separately, give the same answer for the same run. If it cannot tell, it
-    answers the namespaced name, which can never clash.
-    """
-    from .skill_router import LOAD_SKILL_TOOL_NAME
-
+def _require_pydantic_ai() -> None:
+    """Fail before any setup or network call when Pydantic AI is missing."""
     try:
-        roots = []
-        tool_manager = getattr(ctx, "tool_manager", None)
-        if tool_manager is not None:
-            # The run's whole toolset tree, run-time `toolsets=` included.
-            roots.append(tool_manager.toolset)
-        roots.extend(getattr(getattr(ctx, "agent", None), "toolsets", None) or ())
-        if not roots:
-            # Nothing to clash with: a context that carries no toolsets at all.
-            return LOAD_SKILL_TOOL_NAME
-
-        from pydantic_ai.toolsets import FunctionToolset
-
-        taken = False
-
-        def visit(toolset: Any) -> None:
-            nonlocal taken
-            if isinstance(toolset, FunctionToolset) and LOAD_SKILL_TOOL_NAME in toolset.tools:
-                taken = True
-
-        for root in roots:
-            root.apply(visit)
-    except Exception:  # noqa: BLE001 - a tool name must never break the run
-        logger.debug("could not inspect the run's toolsets", exc_info=True)
-        return _NAMESPACED_TOOL_NAME
-    if not taken:
-        return LOAD_SKILL_TOOL_NAME
-    global _tool_clash_warned
-    if not _tool_clash_warned:
-        _tool_clash_warned = True
-        logger.warning(
-            "another toolset on this Pydantic AI agent already has a tool named "
-            "%r, so DecimalAI's skill loader is exposed to the model as %r "
-            "instead. Both stay callable; the DecimalAI skills menu names %r.",
-            LOAD_SKILL_TOOL_NAME, _NAMESPACED_TOOL_NAME, _NAMESPACED_TOOL_NAME,
-        )
-    return _NAMESPACED_TOOL_NAME
+        import pydantic_ai  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "load_agent() needs Pydantic AI: pip install \"decimalai[pydantic-ai]\""
+        ) from None
 
 
-def _prepare_load_skill(ctx: Any, tool_def: Any) -> Any:
-    """Per-step ``prepare`` for DecimalAI's tool: pick its exposed name."""
-    import dataclasses
-
-    name = _exposed_tool_name(ctx)
-    return tool_def if tool_def.name == name else dataclasses.replace(tool_def, name=name)
-
-
-def _load_skill_hint(ctx: Any) -> str:
-    """The menu's how-to line, naming the tool the model can actually call."""
-    from .skill_router import LOAD_SKILL_PROMPT_HINT, LOAD_SKILL_TOOL_NAME
-
-    name = _exposed_tool_name(ctx)
-    if name == LOAD_SKILL_TOOL_NAME:
-        return LOAD_SKILL_PROMPT_HINT
-    return LOAD_SKILL_PROMPT_HINT.replace(LOAD_SKILL_TOOL_NAME, name)
-
-
-def _load_skill_tool_enabled() -> bool:
-    """Config gate for the load_skill tool (kill switch:
-    DECIMALAI_LOAD_SKILL_TOOL=0 / init(load_skill_tool=False))."""
-    try:
-        from ._config import _get_config
-        return bool(getattr(_get_config(), "load_skill_tool", True))
-    except Exception:
-        return True
-
-
-def _handle_load_skill(name: str, agent_name: Optional[str] = None) -> str:
-    """Tool callback — always returns a string the model can act on.
-
-    ``agent_name`` is the name this run was ROUTED under (``_run_agent_name``).
-    Without it the platform resolves the body for no agent: it misses the
-    agent's own Use rows, so it serves the registry's latest version instead of
-    the agent's pin, or nothing at all for a Use target the registry hides.
-    """
-    router = _get_skill_router()
-    if router is None:
-        return "load_skill error: skill router unavailable."
-    try:
-        scope = _scope()
-        body = router.load_skill(name, scope=scope, agent_name=agent_name)
-        if scope is not None:
-            # Only names the router actually served a body for reach this rail
-            # — a budget refusal or a not-found never records, so
-            # `skills_loaded_by_agent` means "a body reached the model", not
-            # "the model asked for one".
-            served = router.consume_loaded_names(scope=scope)
-            if served:
-                try:
-                    from .otel import record_skill_rail
-                    # Drained in the same breath as the names and from the same
-                    # scope, so the hash describes the body THIS run just read.
-                    # `{}` on a router that predates the hash rail, which is the
-                    # pre-existing behaviour: the name, with a null hash.
-                    try:
-                        digests = router.consume_loaded_hashes(scope=scope) or {}
-                    except (AttributeError, TypeError):
-                        digests = {}
-                    try:
-                        versions = router.consume_delivered_versions(scope=scope)
-                    except (AttributeError, TypeError):
-                        versions = []
-                    record_skill_rail(loaded=served, loaded_hashes=digests, delivered_versions=versions)
-                except Exception:
-                    logger.debug(
-                        "skill rail recording failed (non-fatal)", exc_info=True
-                    )
-        return body
-    except Exception:
-        logger.debug("load_skill handler failed (non-fatal)", exc_info=True)
-        return f"load_skill error: could not load {name!r} (transient error)."
+# ── the run's message ────────────────────────────────────────
 
 
 def _run_query(ctx: Any) -> Optional[str]:
-    """The turn's user text from a RunContext, or None.
+    """The run's user text from a RunContext, or None.
 
-    Best-effort and never raises: this runs inside a system-prompt hook, and an
-    adapter that crashes a user's agent to improve its own routing has made
-    things worse. `prompt` is the current turn; `messages` is the fallback for
-    shapes that put the text there instead. A None result is a real answer —
-    the caller degrades to full-menu mode.
+    ``prompt`` is the run's own prompt; the last user part in ``messages`` is the
+    fallback for shapes that put the text there instead. Never raises: a run
+    whose text cannot be read gets the skills in the platform's fixed order.
     """
     try:
-        prompt = getattr(ctx, "prompt", None)
-        text = _content_text(prompt)
+        text = _content_text(getattr(ctx, "prompt", None))
         if text:
             return text
         messages = list(getattr(ctx, "messages", None) or [])
@@ -343,7 +145,7 @@ def _run_query(ctx: Any) -> Optional[str]:
                     if text:
                         return text
     except Exception:  # noqa: BLE001 — routing must never break the run
-        logger.debug("could not read the turn's query from RunContext", exc_info=True)
+        logger.debug("could not read the run's prompt from RunContext", exc_info=True)
     return None
 
 
@@ -364,287 +166,22 @@ def _content_text(content: Any) -> Optional[str]:
     return None
 
 
-# ── one routing decision per run ────────────────────────────
-#: The fragment each live run was given, by ``RunContext.run_id``.
-#:
-#: Pydantic AI resolves instructions for every model request, and a run that
-#: calls a tool makes several. Routing each of them would ask the router again
-#: on every tool-loop step, hand the model a different menu halfway through the
-#: run, and file several routing decisions against one trace. So the first
-#: request of a run routes and the rest of the run reuses that answer.
-#:
-#: An entry is reused only for the same run_id AND the same live RunUsage and
-#: Agent objects. Pydantic AI requires a run_id to be distinct only within one
-#: history. A caller who passes the same explicit ``run_id=`` to two separate
-#: conversations is not served the first conversation's menu, because each run
-#: gets a fresh RunUsage. Bounded, oldest evicted first: a run that outlives
-#: 256 newer runs routes again, which costs one router call and nothing else.
-_RUN_FRAGMENTS_MAX = 256
-_run_fragments: "OrderedDict[str, Tuple[Any, Any, str]]" = OrderedDict()
-_run_fragments_lock = threading.Lock()
+# ── the harness's own skills ─────────────────────────────────
 
 
-def _run_memo_key(ctx: Any) -> Optional[str]:
-    run_id = getattr(ctx, "run_id", None)
-    return run_id if isinstance(run_id, str) and run_id else None
+def _native_skills(agent: Any) -> Optional[bool]:
+    """Whether the Agent was built with the harness's ``Skills`` capability.
 
-
-def _remembered_fragment(ctx: Any) -> Optional[str]:
-    key = _run_memo_key(ctx)
-    if key is None:
-        return None
-    with _run_fragments_lock:
-        entry = _run_fragments.get(key)
-    if entry is None:
-        return None
-    usage_ref, agent_ref, fragment = entry
-    if usage_ref() is getattr(ctx, "usage", None) and agent_ref() is getattr(ctx, "agent", None):
-        return fragment
-    return None
-
-
-def _remember_fragment(ctx: Any, fragment: str) -> None:
-    import weakref
-
-    key = _run_memo_key(ctx)
-    if key is None:
-        return
-    try:
-        entry = (
-            weakref.ref(getattr(ctx, "usage", None)),
-            weakref.ref(getattr(ctx, "agent", None)),
-            fragment,
-        )
-    except TypeError:  # not weak-referenceable (None, or a stand-in): no memo
-        return
-    with _run_fragments_lock:
-        _run_fragments[key] = entry
-        _run_fragments.move_to_end(key)
-        while len(_run_fragments) > _RUN_FRAGMENTS_MAX:
-            _run_fragments.popitem(last=False)
-
-
-_Routed = Tuple[str, Optional[str], list, list, list]
-
-
-def _route_turn(ctx: Any) -> Optional[_Routed]:
-    """The blocking half of the skills prompt: the router call and its rails.
-
-    Runs in a worker thread (see _skills_system_prompt) and must not touch the
-    event loop. Everything that reads what the router wrote into contextvars
-    runs here, in the same thread and the same copied context as the call that
-    wrote it. The worker's context is a copy, so nothing written here reaches
-    the awaiting coroutine. Returns None when there is no router or it failed.
-    """
-    router = _get_skill_router()
-    if router is None:
-        return None
-    try:
-        agent_obj = getattr(ctx, "agent", None)
-        # The name the TRACE uses for this run (see _run_agent_name), not
-        # `agent.name`: for an unnamed Agent that is the variable name Pydantic
-        # AI inferred, so routing asked for agent "agent" while the trace was
-        # filed under instrument(agent_name=...), and skills assigned to the
-        # real agent were silently never offered.
-        agent_name = _run_agent_name(agent_obj) if agent_obj is not None else None
-        from .skill_router import (
-            _release_scoped_routing_rail,
-            consume_last_delivered_names,
-            consume_last_delivered_versions,
-            consume_last_offered_names,
-        )
-        scope = _scope()
-        consume_last_delivered_versions()
-        try:
-            fragment, routing_id = router.build_prompt_fragment(
-                query=_run_query(ctx), agent_name=agent_name, scope=scope,
-            )
-        except Exception:
-            consume_last_delivered_versions()
-            raise
-        finally:
-            # The router keeps its own copy of this decision under the run's
-            # scope, for adapters that read it back from there. This one reads
-            # the per-call rails below, so the copy is released here or never.
-            # Only the decision: the body budget filed under the same scope is
-            # still needed by this run's load_skill calls.
-            _release_scoped_routing_rail(router, scope)
-        # Drain the per-call contextvar rails NOW, one statement after the
-        # router wrote them and on the same thread, so these are this call's
-        # names. The router's instance rails are not used here on purpose: they
-        # are process-global and clear-on-read, so under concurrent runs the
-        # first drainer takes every lane's names.
-        return (
-            fragment or "",
-            routing_id,
-            consume_last_offered_names(),
-            consume_last_delivered_names(),
-            consume_last_delivered_versions(),
-        )
-    except Exception:
-        logger.debug("Pydantic AI skill loader failed (non-fatal)", exc_info=True)
-        return None
-
-
-async def _skills_system_prompt(ctx: Any) -> str:
-    """The instructions function registered on every Agent: the routed menu.
-
-    Routes on the turn's user message (``RunContext.prompt``, else the last
-    user part in ``messages``), once per run; later requests in the same run
-    get the same fragment back (see _run_fragments). Falls back to full-menu
-    mode when no text can be read, which is the honest answer for a turn that
-    genuinely has none. With no query, ``SkillRouter`` also skips body
-    injection, so reading the query is what keeps the injected channel alive
-    when ``DECIMALAI_LOAD_SKILL_TOOL=0``.
-
-    The router call is blocking HTTP, so it runs in a worker thread. Called on
-    the loop, it stalled every other coroutine there for up to the router's
-    5 s hot-path budget, including the other runs of a concurrent agent.
-
-    Never raises: any failure is an empty string, i.e. an un-routed turn.
-    """
-    remembered = _remembered_fragment(ctx)
-    if remembered is not None:
-        return remembered
-    try:
-        import anyio.to_thread
-
-        from .skill_router import consume_last_delivered_versions
-
-        # A version witness some earlier, failed build left in THIS context
-        # must not outlive the build that replaces it. The worker starts from a
-        # copy of this context and clears its copy too, but only this call can
-        # clear the caller's.
-        consume_last_delivered_versions()
-        routed = await anyio.to_thread.run_sync(_route_turn, ctx)
-    except Exception:
-        logger.debug("Pydantic AI skill loader failed (non-fatal)", exc_info=True)
-        routed = None
-    fragment = ""
-    if routed is not None:
-        fragment, routing_id, offered, delivered, delivered_versions = routed
-        if routing_id:
-            # Here, not in the worker: the worker's context is a copy, and a
-            # routing id set there would never reach this coroutine's caller.
-            _set_routing_id(routing_id)
-        # Tell the model how bodies arrive when the tool exists.
-        # The server fragment keeps the activation-statement instruction
-        # unchanged (Stage-M parity).
-        if fragment and _load_skill_tool_active:
-            fragment = f"{fragment}\n{_load_skill_hint(ctx)}"
-        if fragment:
-            # Only for a prompt we actually returned. An empty fragment is an
-            # un-routed turn and must claim neither a routing_id nor a name.
-            try:
-                from .otel import record_skill_rail
-                record_skill_rail(
-                    routing_id=routing_id,
-                    offered=offered,
-                    delivered=delivered,
-                    delivered_versions=delivered_versions,
-                    prompt_text=fragment,
-                )
-            except Exception:
-                logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
-    # Remembered even when empty: a router that failed on this run's first
-    # request is not asked again on every tool step of the same run.
-    _remember_fragment(ctx, fragment)
-    return fragment
-
-
-def _install_skill_loader() -> None:
-    """Monkey-patch `pydantic_ai.Agent.__init__` to auto-register skills.
-
-    Also registers the load_skill tool on every new Agent (the progressive-disclosure path):
-    Pydantic AI owns its tool loop, so the tool result routes back mid-turn
-    for free — this adapter ships the tool live."""
-    global _skill_loader_installed
-    if _skill_loader_installed:
-        return
-    try:
-        from pydantic_ai import Agent
-    except ImportError:
-        logger.warning(
-            "enable_skill_loader=True but pydantic-ai not installed; "
-            "skipping skill loader install. "
-            "Install it with: pip install \"decimalai[pydantic-ai]\""
-        )
-        return
-
-    original_init = Agent.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        if _has_native_skills(self):
-            return
-        try:
-            # An instructions function, not a system prompt: see the module
-            # docstring for why. Do NOT move the fragment into the caller's
-            # `system_prompt=` / `instructions=` either. Pydantic AI sends
-            # those first and our dynamic part after them, which is what keeps
-            # the caller's text a byte-identical, cacheable prefix.
-            self.instructions(_skills_system_prompt)
-        except Exception:
-            logger.debug(
-                "Failed to register the skills instructions on Agent (non-fatal)",
-                exc_info=True,
-            )
-        # Register load_skill so surfaced descriptions are
-        # executable — an agent that can see a skill can pull its body.
-        if _load_skill_tool_enabled():
-            try:
-                from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION
-
-                # Weak: the tool lives on the agent, and a strong reference
-                # would make every Agent a reference cycle.
-                agent_ref = weakref.ref(self)
-
-                def load_skill(name: str) -> str:
-                    # Resolved per call, the same way routing resolves it, so
-                    # the body is loaded for the agent the menu was built for.
-                    agent = agent_ref()
-                    return _handle_load_skill(
-                        name,
-                        agent_name=(
-                            _run_agent_name(agent) if agent is not None
-                            else _default_agent_name
-                        ),
-                    )
-
-                # Keyed `decimalai_load_skill`, shown to the model as
-                # `load_skill` unless that name is taken (see _exposed_tool_name).
-                self.tool_plain(
-                    load_skill,
-                    name=_NAMESPACED_TOOL_NAME,
-                    description=LOAD_SKILL_TOOL_DESCRIPTION,
-                    prepare=_prepare_load_skill,
-                )
-                global _load_skill_tool_active
-                _load_skill_tool_active = True
-            except Exception:
-                logger.debug(
-                    "load_skill tool registration failed (non-fatal)", exc_info=True
-                )
-
-    Agent.__init__ = patched_init  # type: ignore[method-assign]
-    _skill_loader_installed = True
-    logger.info("DecimalAI SkillRouter loader installed (Pydantic AI)")
-
-
-#: Which of the two INFO lines below were logged: an observed ``Skills``, a plain one.
-_native_skills_logged: set = set()
-
-
-def _has_native_skills(agent: Any) -> bool:
-    """True when the Agent was built with the harness's ``Skills`` capability.
+    None: it was not. True: it was, and every one reports its loads (built with
+    ``decimalai.pydantic_ai_harness.skills``). False: a plain ``Skills``, whose loads
+    nobody reports.
 
     That capability is a skill loader of its own: a catalog in the instructions and
-    ``load_capability`` for the bodies. The router's menu and ``load_skill`` beside it
-    would be a second catalog of the same skills, so the skill loader leaves such an
-    Agent alone. Read off the Agent's capability tree, where the harness's own
-    ``Skills`` lives; a ``Skills`` a capability FUNCTION returns per run is not visible
-    here (`decimalai.pydantic_ai_harness` warns once if that run is also routed).
-    Never raises: when the answer is unknown, the router stays on.
+    ``load_capability`` for the bodies. DecimalAI's list and ``load_skill`` beside it
+    would be a second catalog of the same skills. Read off the Agent's capability
+    tree; a ``Skills`` a capability FUNCTION returns per run is not visible here
+    (`decimalai.pydantic_ai_harness` warns once if that run also got DecimalAI's
+    list). Never raises: when the answer is unknown, DecimalAI's skills stay on.
     """
     try:
         from . import pydantic_ai_harness as harness
@@ -653,217 +190,235 @@ def _has_native_skills(agent: Any) -> bool:
         agent.root_capability.apply(
             lambda capability: found.append(capability) if harness.is_skills(capability) else None)
         if not found:
-            return False
-        observed = all(harness.is_observed(c) for c in found)
-        if observed not in _native_skills_logged:
-            _native_skills_logged.add(observed)
-            logger.info(
-                "decimalai: the Pydantic AI agent %r loads skills with the harness's Skills "
-                "capability, so the DecimalAI skill router adds neither its skills menu nor "
-                "its load_skill tool to it. %s Logged once.",
-                getattr(agent, "name", None) or "(unnamed)",
-                "Each skill the model loads is reported as an activation." if observed else
-                "Its loads are not reported: build the capability with "
-                "decimalai.pydantic_ai_harness.skills(...) to report them.")
-        return True
+            return None
+        return all(harness.is_observed(capability) for capability in found)
     except Exception:  # noqa: BLE001
         logger.debug("native-skills check failed (non-fatal)", exc_info=True)
-        return False
+        return None
 
 
-# ── agent name ──────────────────────────────────────────────
-#: The name `instrument(agent_name=...)` was called with, used for runs of an
-#: Agent that carries no explicit one. None means "never set", which is the
-#: pre-2026-08-29 behaviour exactly.
-_default_agent_name: Optional[str] = None
-
-#: Where the patched ``Agent.__init__`` stashes the name the CALLER passed.
-#:
-#: Read rather than ``Agent.name`` because those stop being the same thing the
-#: moment a run starts: Pydantic AI's ``_infer_name`` fills a missing ``name``
-#: from the local VARIABLE the Agent was assigned to (``agent = Agent(...)`` runs
-#: as agent name ``"agent"``, measured on 2.56). By the time ``iter`` opens,
-#: ``self.name`` is that invented name and nothing distinguishes it from one the
-#: user chose — so the distinction has to be captured at construction.
-_CONSTRUCTED_NAME_ATTR = "_decimalai_constructed_name"
-
-_name_capture_installed = False
+# ── the capability ───────────────────────────────────────────
 
 
-def _install_name_capture() -> None:
-    """Patch ``Agent.__init__`` to remember whether the caller named the Agent."""
-    global _name_capture_installed
-    if _name_capture_installed:
-        return
-    try:
-        from pydantic_ai import Agent
-    except ImportError:
-        return
+class _PydanticAIBinding(AgentBinding):
+    """Everything of `PydanticAIAgentConfig` except Pydantic AI's base class.
 
-    original_init = Agent.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        try:
-            # `name` is keyword-only on Agent.__init__, so kwargs is the whole
-            # story — there is no positional spelling to miss.
-            setattr(self, _CONSTRUCTED_NAME_ATTR, kwargs.get("name"))
-        except Exception:  # noqa: BLE001 — naming must never break construction
-            logger.debug("could not record the constructed agent name",
-                         exc_info=True)
-
-    Agent.__init__ = patched_init  # type: ignore[method-assign]
-    _name_capture_installed = True
-
-
-def _run_agent_name(agent: Any) -> Optional[str]:
-    """Whose run this is, most specific answer first.
-
-    1. the name the caller passed to ``Agent(name=...)`` — per-agent, and the
-       only one that stays right in a process running two agents;
-    2. ``instrument(agent_name=...)`` — the process-wide binding, which is what
-       `decimalai init` writes so that dropping ``name=`` from the generated
-       Agent does not silently move the traces;
-    3. ``agent.name`` as Pydantic AI left it, which after ``_infer_name`` is the
-       variable name. Last, because it is a guess about a local variable, but
-       still ahead of nothing: it is what this adapter used before there was
-       anything else to prefer.
+    Kept apart so this module imports without Pydantic AI installed: the class
+    `load_agent()` returns mixes in ``AbstractCapability`` when it is first needed.
     """
-    constructed = getattr(agent, _CONSTRUCTED_NAME_ATTR, None)
-    return constructed or _default_agent_name or getattr(agent, "name", None)
 
+    _log = logger
+    _VALUES_HINT = "Pass them as the run's deps=..., as attributes or dict keys."
 
-# ── run scope ───────────────────────────────────────────────
-_run_scope_installed = False
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+        super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        # Unique per agent in a run; Pydantic AI reserves ":" in capability ids.
+        self.id = "decimalai-" + self.name.replace(":", "-")
+        self._tool_names: List[str] = []
+        self._toolset = self._build_toolset()
 
-
-def _install_run_scope() -> None:
-    """Monkey-patch ``Agent.iter`` so one agent run is one span, one trace.
-
-    Pydantic AI emits no spans of its own — the docs say so, and it is the
-    reason this integration's documented setup is *two* calls, the second being
-    a provider pairing like ``decimalai.init(openai=True)``. But a provider
-    instrumentor only sees provider calls. Each one becomes an unparented root
-    span in its own OTel trace, so a single ``agent.run_sync()`` that asks for a
-    tool and then answers arrived as two unrelated one-span DecimalAI traces —
-    no waterfall, no way to tell which calls belonged to the same run, and
-    (because the exporter's agent name is fixed when it is built) every one of
-    them filed under whichever agent ran first.
-
-    ``iter`` is the patch point because it is the one place every entry point
-    funnels through: ``run_sync`` awaits ``run``, ``run``/``run_stream``/
-    ``run_stream_events`` all open ``self.iter(...)``, and an ``AgentRun`` is
-    exactly one run. Patching ``run_sync`` instead would have covered less and
-    cost more — it calls ``self._infer_name(inspect.currentframe())``, so a
-    wrapper frame between it and the caller breaks the name inference this fix
-    depends on.
-
-    The span this opens is the parent that genuinely wraps the run. It does not
-    synthesize the steps Pydantic AI never reported: the tool call it executes
-    in-process emits no span here, and none is invented for it.
-    """
-    global _run_scope_installed
-    if _run_scope_installed:
-        return
-    try:
-        from pydantic_ai import Agent
-    except ImportError:
-        logger.warning(
-            "pydantic-ai is not installed; skipping the DecimalAI run scope. "
-            "Install it with: pip install \"decimalai[pydantic-ai]\""
+    def __repr__(self) -> str:
+        return (
+            f"PydanticAIAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"skills={self.skill_names!r})"
         )
-        return
 
-    original_iter = Agent.iter
+    # ── what Pydantic AI asks a capability for ───────────────
+    def get_instructions(self) -> Any:
+        async def decimalai_instructions(ctx: Any) -> str:
+            """The agent's prompt, filled, then its skill list. Pydantic AI calls it."""
+            agent = getattr(ctx, "agent", None)
+            run_key = getattr(ctx, "run_id", None)
+            state = await self._prepare_run(ctx, agent, run_key)
+            if state["text"] is None:
+                state["text"] = self._compose(ctx, agent, run_key, state)
+            return state["text"]
 
-    from contextlib import asynccontextmanager
+        return decimalai_instructions
 
-    @asynccontextmanager
-    async def patched_iter(self, *args, **kwargs):
-        from .providers import agent_run
+    def get_toolset(self) -> Any:
+        return self._toolset
 
-        # The Agent's own name, per run — resolved rather than read, because
-        # by now `self.name` may be one Pydantic AI invented from a local
-        # variable. See _run_agent_name.
-        with agent_run(_run_agent_name(self)):
-            async with original_iter(self, *args, **kwargs) as run:
-                yield run
+    async def prepare_tools(self, ctx: Any, tool_defs: List[Any]) -> List[Any]:
+        """Show ``load_skill`` only beside a list, naming the listed skills."""
+        import dataclasses
 
-    Agent.iter = patched_iter  # type: ignore[method-assign]
-    _run_scope_installed = True
-    logger.info("DecimalAI run scope installed (Pydantic AI)")
+        from .skill_router import LOAD_SKILL_TOOL_NAME
+
+        state = await self._prepare_run(ctx, getattr(ctx, "agent", None), getattr(ctx, "run_id", None))
+        show = bool(state["names"]) and state["tool"]
+        with self._lock:
+            names = list(self._tool_names)
+        prepared = []
+        for tool_def in tool_defs:
+            if getattr(tool_def, "name", None) == LOAD_SKILL_TOOL_NAME:
+                if not show:
+                    continue
+                tool_def = dataclasses.replace(tool_def, parameters_json_schema=self._tool_schema(names))
+            prepared.append(tool_def)
+        return prepared
+
+    async def wrap_run(self, ctx: Any, *, handler: Any) -> Any:
+        """One DecimalAI run span around the run, named for the DecimalAI agent."""
+        from .otel import agent_run
+
+        token = _RUN.set(getattr(ctx, "run_id", None))
+        try:
+            with agent_run(self.name):
+                return await handler()
+        finally:
+            _RUN.reset(token)
+
+    # ── the seams AgentBinding asks for ─────────────────────
+    def _router(self) -> Any:
+        return _get_skill_router()
+
+    def _run_key(self) -> Optional[str]:
+        return _RUN.get()
+
+    def _message(self, context: Any, agent: Any) -> Optional[str]:
+        return _run_query(context)
+
+    def _values(self, context: Any) -> Any:
+        return getattr(context, "deps", None)
+
+    def _skills_blocked(self, agent: Any, *, tool: bool = True, inject: bool = False) -> Optional[str]:
+        base = super()._skills_blocked(agent, tool=tool, inject=inject)
+        if base:
+            return base
+        native = _native_skills(agent) if agent is not None else None
+        if native is None:
+            return None
+        reported = ("Each skill the model loads through it is reported as an activation."
+                    if native else
+                    "Its loads are not reported: build it with "
+                    "decimalai.pydantic_ai_harness.skills(...) to report them.")
+        return ("it loads skills with the Pydantic AI harness's Skills capability, a catalog "
+                f"of its own, so DecimalAI adds neither its skill list nor load_skill. {reported}")
+
+    def _on_menu(self, names: List[str]) -> None:
+        with self._lock:
+            self._tool_names = list(names)
+
+    def _record(self, **fields: Any) -> bool:
+        from ._agent import _record_turn
+
+        if fields.get("offered"):
+            _note_menu_shown(_RUN.get())
+        return _record_turn(fields)
+
+    def _serve_load(self, name: str) -> str:
+        from ._agent import _serve_and_record
+
+        return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name)
+
+    def _build_toolset(self) -> Any:
+        from pydantic_ai.toolsets import FunctionToolset
+
+        from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
+
+        # No RunContext parameter: the run is `_RUN`, which `wrap_run` sets for the
+        # whole run, tool calls included.
+        async def load_skill(name: str) -> str:
+            return await self._load(str(name or "").strip())
+
+        toolset = FunctionToolset()
+        toolset.add_function(
+            load_skill, takes_ctx=False, name=LOAD_SKILL_TOOL_NAME,
+            description=LOAD_SKILL_TOOL_DESCRIPTION,
+        )
+        return toolset
 
 
-def instrument(
+_config_class_cache: Any = None
+_config_class_lock = threading.Lock()
+
+
+def _config_class() -> Any:
+    """`PydanticAIAgentConfig`, built once: the binding with Pydantic AI's capability base."""
+    global _config_class_cache
+    with _config_class_lock:
+        if _config_class_cache is None:
+            from pydantic_ai.capabilities import AbstractCapability
+
+            class PydanticAIAgentConfig(_PydanticAIBinding, AbstractCapability):
+                """One agent's prompt and skills in DecimalAI, as a Pydantic AI capability.
+
+                Made by :func:`load_agent`. Pass it in ``Agent(capabilities=[...])``::
+
+                    support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+                    agent = Agent(model, name=support.name, tools=[lookup_order],
+                                  capabilities=[support])
+
+                Attributes:
+                    name: The agent's canonical DecimalAI name.
+                """
+
+                # One config is one object: Pydantic AI's base is a dataclass, whose
+                # generated equality would make two agents' configs compare equal.
+                __eq__ = object.__eq__
+                __hash__ = object.__hash__
+
+            PydanticAIAgentConfig.__module__ = __name__
+            _config_class_cache = PydanticAIAgentConfig
+        return _config_class_cache
+
+
+def __getattr__(name: str) -> Any:
+    if name == "PydanticAIAgentConfig":
+        return _config_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def load_agent(
+    agent_name: str,
     *,
-    agent_name: Optional[str] = None,
-    enable_skill_loader: bool = False,
-    trace_runs: bool = True,
-) -> None:
-    """Install DecimalAI integration for Pydantic AI.
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+) -> Any:
+    """Pull an agent's prompt and skills from DecimalAI, as a Pydantic AI capability.
 
-    Pydantic AI does no tracing of its own, so the *content* of a trace still
-    comes from the provider pairing you install alongside
-    (``decimalai.init(openai=True)`` / ``init(anthropic=True)``). What this adds
-    is the run boundary that pairing cannot see: an ``agent.run`` span around
-    each agent run, so the run's provider calls land in ONE trace, nested, under
-    the name of the agent that made them.
+    ::
 
-    Note: this adapter never reads from or writes to disk, so there is
-    no ``disk_sync`` parameter. If you're running inside a disk-loading
-    runtime (Claude Code, Cursor), ``_warn_if_disk_runtime_detected``
-    will log a one-shot warning on enable to flag the duplicate-injection
-    risk.
+        from pydantic_ai import Agent
+        from decimalai.pydantic_ai import load_agent
+
+        support = load_agent("support", fallback=BASE_INSTRUCTIONS)
+        agent = Agent("openai:gpt-5.4-mini", name=support.name,
+                      tools=[lookup_order], capabilities=[support])
+        result = await agent.run(question, deps=customer)
+
+    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps
+    a local copy, re-read in the background at most once a minute. Each run is
+    routed on its own prompt: the first run before its first model request, later
+    runs from a local copy while their decision is recorded in the background, and
+    every run of an agent with more skills than fit the list. ``{{placeholders}}``
+    are filled from the run's ``deps`` (attributes or dict keys). Initializes the SDK
+    from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
+
+    With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
+    ``init(load_skill_tool=False)``), every run is routed and the text of the skills
+    picked for it goes into the instructions instead (``inject_skill_body``).
 
     Args:
-        agent_name: The DecimalAI agent runs of an UNNAMED Agent are filed
-            under. An ``Agent(name=...)`` always wins — this is the fallback,
-            and it exists because Pydantic AI's own fallback is worse:
-            ``_infer_name`` fills a missing name from the local variable, so
-            ``agent = Agent(...)`` traces as the agent ``"agent"`` and the
-            dashboard page for the agent you configured stays empty. Defaults
-            to the name an earlier call set, else the agent
-            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``); with none of
-            those, the pre-existing behaviour exactly.
-        enable_skill_loader: When True, monkey-patch Agent so new
-            instances get the routed skills menu as an instructions function
-            (routed once per run, on every turn of a conversation) and the
-            ``load_skill`` tool. The tool is exposed as
-            ``decimalai_load_skill`` instead when another toolset in the run
-            already has a ``load_skill``.
-        trace_runs: When True (the default), wrap every agent run in a parent
-            span. Turn it off only if something else already opens a span around
-            the run — a second one would be a redundant layer in the waterfall,
-            not a wrong one.
+        agent_name: The agent's name in DecimalAI.
+        fallback: Instructions to use when the agent has no saved prompt, or when
+            DecimalAI cannot be reached at startup. Without one, an unreachable
+            DecimalAI raises here rather than starting an agent with no instructions.
+        on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
+            never returned them, and the run's record says so; ``"fail"`` raises
+            before the model request instead.
+
+    Raises:
+        ImportError: Pydantic AI is not installed.
+        AgentNotFoundError: DecimalAI has no agent by this name.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
-    global _default_agent_name
-    if enable_skill_loader:
-        from .skill_router import _warn_if_disk_runtime_detected
-        _warn_if_disk_runtime_detected("pydantic_ai")
-        _install_skill_loader()
-    if agent_name is None and _default_agent_name is None:
-        # Named by neither this call nor an earlier one: the agent init()
-        # named (or DECIMAL_AGENT_NAME). Still only the fallback below an
-        # explicit ``Agent(name=...)``.
-        from ._config import default_agent_name
-        agent_name = default_agent_name()
-    if agent_name is not None:
-        _default_agent_name = agent_name
-    if trace_runs or enable_skill_loader:
-        # Installed whenever the run scope or the skill loader is, not only when
-        # a name was given: the capture is what tells an explicit
-        # ``Agent(name=…)`` apart from an inferred one, and both name a run with
-        # it. Routing without it, under ``trace_runs=False``, would let the
-        # process-wide ``agent_name=`` fallback take a name the caller chose. A
-        # LATER instrument(agent_name=…) call must not find that Agents built
-        # in between were never recorded, either.
-        _install_name_capture()
-    if trace_runs:
-        _install_run_scope()
-    logger.info(
-        "DecimalAI Pydantic AI integration installed "
-        "(agent_name=%s, skill_loader=%s, trace_runs=%s)",
-        agent_name,
-        enable_skill_loader,
-        trace_runs,
-    )
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
+    _require_pydantic_ai()
+    from ._agent import _ensure_initialized, read_prompt
+
+    _ensure_initialized()
+    prompt = read_prompt(agent_name, fallback=fallback)
+    return _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)

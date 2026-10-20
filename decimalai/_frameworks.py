@@ -257,12 +257,12 @@ FRAMEWORKS: Tuple[Framework, ...] = (
     ),
     Framework(
         key="pydantic-ai",
-        title="Pydantic AI",
+        title="Pydantic AI (with `load_agent(...)`)",
         cli_label="Pydantic AI",
         module="decimalai.pydantic_ai",
-        entry_point="`instrument(enable_skill_loader=True)`",
+        entry_point="`load_agent(name)`",
         init_flag=None,
-        init_flag_note="— (no flag; `instrument()` only)",
+        init_flag_note="— (no flag; tracing is `otel=True` + `Agent.instrument_all()`)",
         extra="pydantic-ai",
         scaffold=TEMPLATE,
         # One line, whatever the model. `decimalai[pydantic-ai]` resolves to
@@ -287,8 +287,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 helpers=("decimalai.pydantic_ai_harness.skills",),
                 label="Pydantic AI harness",
                 requires="pydantic-ai-harness",
-                traced_by="`otel=True` + `decimalai.pydantic_ai.instrument()` + "
-                          "`Agent.instrument_all()`",
+                traced_by="`otel=True` + `Agent.instrument_all()`",
                 use_for="The Pydantic AI harness's `Skills` capability, pointed at installed "
                         "skills; each load recorded as an activation (0.16+)",
             ),
@@ -300,7 +299,8 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             handoffs="—",
             skills_rail="`load_skill` tool",
         ),
-        use_for="Pydantic AI skill loader + `load_skill` tool",
+        use_for="Pydantic AI — `load_agent(name)` returns the agent's prompt and skills "
+                "as one capability for `Agent(capabilities=[...])`, nothing patched (0.19+)",
     ),
     Framework(
         key="adk",

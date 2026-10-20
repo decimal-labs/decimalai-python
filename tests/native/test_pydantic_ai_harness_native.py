@@ -111,10 +111,10 @@ def test_the_router_leaves_an_agent_with_skills_alone(native_project):
     assert "load_skill" in result["no_skills"]["tools"]
     assert "conformance-skill-alpha" in result["no_skills"]["instructions"]
     assert no_skills.get("routing_id")
-    said = [line for line in result["logs"] if "adds neither its skills menu" in line]
+    said = [line for line in result["logs"] if "adds neither its skill list" in line]
     # Once for a Skills whose loads are reported, once for a plain one, which says how.
-    assert len(said) == 2 and all(line.startswith("INFO") for line in said), result["logs"]
-    assert "Each skill the model loads is reported" in said[0]
+    assert len(said) == 2 and all(line.startswith("WARNING") for line in said), result["logs"]
+    assert "Each skill the model loads through it is reported" in said[0]
     assert "decimalai.pydantic_ai_harness.skills(" in said[1]
 
 

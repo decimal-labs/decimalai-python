@@ -380,28 +380,43 @@ class TestPydanticAI:
     def test_runs_past_the_cap_hold_no_slot(
         self, monkeypatch, router, pipeline, client, overflow_warnings,
     ):
+        pytest.importorskip("pydantic_ai")
+        import decimalai._agent as agent_mod
+        import decimalai._agent_binding as binding
         import decimalai.pydantic_ai as pa
+        from decimalai._agent import SavedPrompt
         from decimalai.providers import agent_run
 
         monkeypatch.setattr(pa, "_skill_router_singleton", router)
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(agent_mod, "read_prompt",
+                            lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=None))
+        support = pa.load_agent("support")
+        instructions = support.get_instructions()
         tracer = pipeline.get_tracer("fake-model")
-        ctx = SimpleNamespace(prompt=QUESTION, messages=[], agent=SimpleNamespace(name="support"))
         prompts: List[str] = []
+        loads: List[str] = []
 
         async def _runs() -> None:
-            for _ in range(RUNS):
-                # `instrument()` opens this span around every agent run.
-                with agent_run("support", tracer_provider=pipeline):
-                    prompts[:] = [await pa._skills_system_prompt(ctx)]
-                    pa._handle_load_skill("refund-policy")
-                    with tracer.start_as_current_span("chat", attributes={
-                        "gen_ai.system": "openai", "gen_ai.request.model": "stub-model-1",
-                    }):
-                        pass
+            for n in range(RUNS):
+                ctx = SimpleNamespace(prompt=QUESTION, messages=[], deps=None, run_id=f"run-{n}",
+                                      agent=SimpleNamespace(name="support"))
+                token = pa._RUN.set(ctx.run_id)
+                try:
+                    # `wrap_run` opens this span around every agent run.
+                    with agent_run("support", tracer_provider=pipeline):
+                        prompts[:] = [await instructions(ctx)]
+                        loads[:] = [await support._load("refund-policy")]
+                        with tracer.start_as_current_span("chat", attributes={
+                            "gen_ai.system": "openai", "gen_ai.request.model": "stub-model-1",
+                        }):
+                            pass
+                finally:
+                    pa._RUN.reset(token)
 
         asyncio.run(_runs())
 
-        assert SENTINEL in prompts[0]
+        assert "refund-policy" in prompts[0] and SENTINEL in loads[0], "the text arrives by load_skill"
         assert client.traces == RUNS
         assert client.last.routing_id == ROUTING_ID
         assert client.last.skills_loaded_by_agent == ["refund-policy"]

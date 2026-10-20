@@ -1,15 +1,15 @@
 """DecimalAI Provider-Specific Skill Loading Example
 
-Demonstrates the ``instrument(enable_skill_loader=True)`` option across
-different LLM provider integrations, and how the ``load_skill`` tool is
-controlled: it is NOT an ``instrument()`` flag on the tool-loop adapters —
-it registers automatically with the loader and is config-driven via
+Demonstrates how each provider integration gives an agent its DecimalAI
+skills: ``instrument(enable_skill_loader=True)`` on the Anthropic SDK, and
+``load_agent()`` on the OpenAI Agents SDK and Pydantic AI. Their ``load_skill``
+tool is not a ``load_agent()`` argument: it is config-driven via
 ``decimalai.init(load_skill_tool=...)`` / ``DECIMALAI_LOAD_SKILL_TOOL``.
 
 This example shows:
 - Anthropic SDK with skill injection into system prompts (no tool loop)
 - OpenAI Agents SDK with the live load_skill tool
-- Pydantic AI with automatic skill injection + load_skill tool
+- Pydantic AI with load_agent()'s capability (skill list + load_skill tool)
 
 Prerequisites:
     pip install "decimalai[openai-agents,pydantic-ai]" anthropic
@@ -114,18 +114,19 @@ def example_openai_agents_skill_loading():
 
 
 async def example_pydantic_ai_skill_loading():
-    """Pydantic AI example with automatic skill injection and load_skill tool.
+    """Pydantic AI example with load_agent()'s capability.
 
-    The enable_skill_loader=True option:
-    1. Registers a system prompt function that injects skills
-    2. Registers a load_skill tool on each Agent (automatic — controlled by
-       init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL, not an instrument() flag)
+    ``decimalai.pydantic_ai.load_agent(name)`` returns a Pydantic AI capability
+    you pass in your own ``Agent(capabilities=[...])``:
+    1. its instructions — the agent's saved prompt, then the skill list picked
+       for each run's prompt
+    2. its toolset — the load_skill tool the model fetches a skill's body with
 
-    Skills are injected before every agent.run() call, and the model can
-    call load_skill to fetch full skill bodies.
+    Pydantic AI owns the tool loop, so a load_skill result goes back to the
+    model mid-run. Nothing in Pydantic AI is patched.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 3: Pydantic AI with Automatic Skill Injection")
+    print("EXAMPLE 3: Pydantic AI with load_agent()")
     print("="*70)
 
     import decimalai
@@ -134,26 +135,31 @@ async def example_pydantic_ai_skill_loading():
     try:
         from pydantic_ai import Agent
 
-        from decimalai.pydantic_ai import instrument
+        from decimalai.pydantic_ai import load_agent
 
-        # Turn on the skill loader — this patches Agent.__init__
-        instrument(enable_skill_loader=True)
+        def check_account_status(customer_id: str) -> str:
+            """Check the status of a customer account."""
+            return f"Account {customer_id}: Active, good standing"
 
-        # Every new Agent will have:
-        # 1. A system_prompt function that injects skills
-        # 2. A load_skill tool for fetching skill bodies
-
+        support = load_agent(
+            "support-agent",
+            fallback="You are a helpful customer support agent. Use tools to help.",
+        )
         agent = Agent(
-            model="anthropic:claude-opus-4-7",
-            system_prompt="You are a helpful assistant.",
+            "anthropic:claude-opus-4-7",
+            name=support.name,
+            tools=[check_account_status],
+            capabilities=[support],
         )
 
-        print("✅ Pydantic AI skill loader installed")
-        print("Every new Agent will have:")
-        print("  - Skills auto-injected into system_prompt")
-        print("  - load_skill tool for fetching skill bodies\n")
+        print("✅ Pydantic AI agent configured from DecimalAI")
+        print(f"Agent '{agent.name}' is ready with:")
+        print(f"  - prompt version {support.prompt_version} and skills {support.skill_names}")
+        print("  - load_skill tool available for fetching skill bodies\n")
 
     except ImportError as e:
+        print(f"⚠️  Pydantic AI example skipped: {e}")
+    except Exception as e:  # e.g. no such agent in this workspace
         print(f"⚠️  Pydantic AI example skipped: {e}")
 
 
@@ -201,9 +207,10 @@ def main():
     print("="*70)
     print("\nThis script demonstrates the provider skill-loading options:")
     print("  - instrument(enable_skill_loader=True): Auto-inject skills into prompts")
-    print("  - load_skill tool: auto-registered with the loader on pydantic_ai;")
-    print("    config-driven via init(load_skill_tool=) / DECIMALAI_LOAD_SKILL_TOOL")
     print("  - OpenAI Agents SDK: decimalai.openai_agents.load_agent(name)")
+    print("  - Pydantic AI: decimalai.pydantic_ai.load_agent(name), a capability")
+    print("  - load_skill tool on both: config-driven via init(load_skill_tool=) /")
+    print("    DECIMALAI_LOAD_SKILL_TOOL")
 
     # Example 1: Anthropic
     try:
@@ -250,9 +257,9 @@ Provider-specific options summary:
      Nothing is installed or patched for this framework.
 
 3. PYDANTIC AI (decimalai.pydantic_ai)
-   - instrument(enable_skill_loader=True) → skills injected into system_prompt
-     AND the load_skill tool registers automatically (same config switch,
-     also not an instrument() parameter).
+   - load_agent(name) → pass it in your own Agent(capabilities=[...]): its
+     instructions carry the prompt and skill list, its toolset load_skill.
+     Nothing is installed or patched for this framework.
 
 For more information:
   📖 DecimalAI Skills: https://docs.decimal.ai/guides/skills

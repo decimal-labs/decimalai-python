@@ -3,10 +3,8 @@
 Setup::
 
     import decimalai
-    import decimalai.pydantic_ai
     decimalai.init(otel=True)
-    decimalai.pydantic_ai.instrument()          # one trace per agent run
-    Agent.instrument_all()                      # Pydantic AI's own spans
+    Agent.instrument_all()                      # Pydantic AI's own spans: one trace per run
 
     from pydantic_ai_harness import FileSystem, Shell
     import decimalai.pydantic_ai_harness
@@ -35,9 +33,9 @@ the lock. The harness reads its skill libraries at the start of every run, so a 
 ``decimalai skills update`` delivers the new version, and the activation says so.
 
 The observer records onto the run that is live when the run starts: a
-``decimalai.start_trace()`` trace, or the OpenTelemetry run (``instrument()``'s
-``agent.run`` span) whose trace the exporter assembles. With neither, a load is dropped and
-a warning says so once.
+``decimalai.start_trace()`` trace, or the OpenTelemetry run (Pydantic AI's own run span,
+with ``Agent.instrument_all()``) whose trace the exporter assembles. With neither, a load
+is dropped and a warning says so once.
 """
 
 from __future__ import annotations
@@ -47,7 +45,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Collection, List, Optional, Union
+from typing import Any, List, Optional, Union
 
 logger = logging.getLogger("decimalai.pydantic_ai_harness")
 
@@ -113,11 +111,23 @@ def _observed_skills_class() -> type:
     from pydantic_ai_harness import Skills
 
     class _LoadObserver(AbstractCapability):
-        """One run's observer: knows the run's skill catalog and the run's collector."""
+        """One run's observer: knows the run's skill catalog and, once the run starts,
+        the run's collector."""
 
-        def __init__(self, ids: Collection[str], loads: Any) -> None:
+        def __init__(self, ids: List[str]) -> None:
+            self.catalog = list(ids)
             self.ids = frozenset(ids)
-            self.loads = loads
+            self.loads: Any = None
+
+        async def before_run(self, ctx: Any) -> None:
+            # Inside every wrap_run, so Pydantic AI's own run span is open here. It is
+            # not yet open in Skills.for_run, which runs while the run is being set up.
+            try:
+                self.loads = _run_carrier()
+                if self.loads is not None:
+                    self.loads.listed(_wire_names(self.catalog))
+            except Exception:  # noqa: BLE001 - observing must never cost the run
+                logger.debug("could not record the skill catalog (non-fatal)", exc_info=True)
 
         async def after_tool_execute(self, ctx: Any, *, call: Any, tool_def: Any,
                                      args: Any, result: Any) -> Any:
@@ -137,10 +147,7 @@ def _observed_skills_class() -> type:
                        if isinstance(getattr(c, "id", None), str)]
                 if not ids:
                     return run_capability  # no skills this run: nothing to observe
-                loads = _run_carrier()
-                if loads is not None:
-                    loads.listed(_wire_names(ids))
-                return CombinedCapability([run_capability, _LoadObserver(ids, loads)])
+                return CombinedCapability([run_capability, _LoadObserver(ids)])
             except Exception:  # noqa: BLE001
                 logger.debug("could not attach the skills observer (non-fatal)", exc_info=True)
                 return run_capability
@@ -196,8 +203,8 @@ def _body(skill: str, text: str) -> tuple:
 
 def _run_carrier() -> Any:
     """The collector of the run starting now: the open ``start_trace()`` trace's, else the
-    OpenTelemetry run's. Taken here, at the run's start, so a tool that runs in another
-    task still records onto its own run."""
+    OpenTelemetry run's. Taken at the run's start (``before_run``), so a tool that runs in
+    another task still records onto its own run."""
     from .generic import _get_current_trace
 
     trace = _get_current_trace()
@@ -232,7 +239,7 @@ def _warn_if_router_injected(ctx: Any, name: str) -> None:
     adapter = sys.modules.get("decimalai.pydantic_ai")
     if adapter is None or _double_catalog_warned:
         return
-    if not adapter._remembered_fragment(ctx):
+    if not adapter._menu_shown(ctx):
         return
     with _warn_lock:
         if _double_catalog_warned:
@@ -240,7 +247,7 @@ def _warn_if_router_injected(ctx: Any, name: str) -> None:
         _double_catalog_warned = True
     logger.warning(
         "decimalai: the model loaded the skill %s through the harness's Skills, on a run "
-        "the DecimalAI skill router also put its skill menu into, so it saw two catalogs "
-        "of skills. decimalai.pydantic_ai.instrument(enable_skill_loader=True) leaves an "
-        "Agent built with Skills alone; this one got its Skills some other way (a "
-        "capability function, or capabilities passed to the run). Logged once.", name)
+        "decimalai.pydantic_ai.load_agent() also put its skill list into, so it saw two "
+        "catalogs of skills. load_agent() leaves an Agent built with Skills alone; this "
+        "one got its Skills some other way (a capability function, or capabilities passed "
+        "to the run). Logged once.", name)

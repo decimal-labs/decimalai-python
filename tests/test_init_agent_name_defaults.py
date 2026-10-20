@@ -329,25 +329,6 @@ class TestInstrumentDefaults:
         da.instrument(agent_name="other")
         assert da._install_agent_name == "other"
 
-    def test_pydantic_ai_fills_the_fallback_only(self, configured, monkeypatch):
-        """Pydantic AI keeps its documented rule: ``Agent(name=...)`` wins, and
-        the DecimalAI name is the fallback for an Agent built without one."""
-        import decimalai.pydantic_ai as pa
-
-        monkeypatch.setattr(pa, "_default_agent_name", None)
-        configured(NAME)
-        pa.instrument(trace_runs=False)
-        assert pa._default_agent_name == NAME
-
-        class _Agent:
-            name = "agent"  # what `_infer_name` leaves on an unnamed Agent
-
-        unnamed, named = _Agent(), _Agent()
-        setattr(unnamed, pa._CONSTRUCTED_NAME_ATTR, None)
-        setattr(named, pa._CONSTRUCTED_NAME_ATTR, "billing")
-        assert pa._run_agent_name(unnamed) == NAME
-        assert pa._run_agent_name(named) == "billing"
-
     def test_llamaindex(self, configured, monkeypatch):
         pytest.importorskip("llama_index.core")
         import llama_index.core.instrumentation as li_inst

@@ -442,6 +442,49 @@ def _annotate_current_span(attributes: Dict[str, Any]) -> None:
         logger.debug("could not annotate the current span", exc_info=True)
 
 
+def _record_turn(fields: Dict[str, Any]) -> bool:
+    """A composed turn's record onto the OpenTelemetry run live now (False: none is).
+
+    The routing decision and the names offered and delivered go on the run's skill
+    rail; the prompt record (version, hash, placeholder names) on the current span.
+    """
+    from .otel import record_skill_rail
+
+    if isinstance(fields.get("prompt"), dict):
+        _annotate_current_span(_prompt_attributes(fields["prompt"]))
+    return record_skill_rail(
+        routing_id=fields.get("routing_id"),
+        offered=fields.get("offered"),
+        delivered=fields.get("delivered"),
+        delivered_versions=fields.get("delivered_versions"),
+        prompt_text=fields.get("system_prompt"),
+    )
+
+
+def _serve_and_record(router: Any, name: str, *, scope: Optional[str], agent_name: str) -> str:
+    """One skill's text for the model; a served body is recorded on the live run."""
+    if router is None:
+        return "load_skill error: skill router unavailable."
+    try:
+        body = router.load_skill(name, scope=scope, agent_name=agent_name)
+    except Exception:
+        logger.debug("load_skill failed (non-fatal)", exc_info=True)
+        return f"load_skill error: could not load {name!r} (transient error)."
+    if scope is not None:
+        # Only names whose body was actually served reach the record.
+        try:
+            served = router.consume_loaded_names(scope=scope)
+            hashes = router.consume_loaded_hashes(scope=scope) or {}
+            versions = router.consume_delivered_versions(scope=scope)
+            if served:
+                from .otel import record_skill_rail
+
+                record_skill_rail(loaded=served, loaded_hashes=hashes, delivered_versions=versions)
+        except Exception:
+            logger.debug("load_skill record failed (non-fatal)", exc_info=True)
+    return body
+
+
 class AgentConfig(AgentBinding):
     """One agent's prompt and skills from DecimalAI, for code that calls a model itself.
 
@@ -554,41 +597,10 @@ class AgentConfig(AgentBinding):
             self._tool_names = list(names)
 
     def _record(self, **fields: Any) -> bool:
-        from .otel import record_skill_rail
-
-        if isinstance(fields.get("prompt"), dict):
-            _annotate_current_span(_prompt_attributes(fields["prompt"]))
-        return record_skill_rail(
-            routing_id=fields.get("routing_id"),
-            offered=fields.get("offered"),
-            delivered=fields.get("delivered"),
-            delivered_versions=fields.get("delivered_versions"),
-            prompt_text=fields.get("system_prompt"),
-        )
+        return _record_turn(fields)
 
     def _serve_load(self, name: str) -> str:
-        router = self._router()
-        if router is None:
-            return "load_skill error: skill router unavailable."
-        scope = self._run_key()
-        try:
-            body = router.load_skill(name, scope=scope, agent_name=self.name)
-        except Exception:
-            logger.debug("load_skill failed (non-fatal)", exc_info=True)
-            return f"load_skill error: could not load {name!r} (transient error)."
-        if scope is not None:
-            # Only names whose body was actually served reach the record.
-            try:
-                served = router.consume_loaded_names(scope=scope)
-                hashes = router.consume_loaded_hashes(scope=scope) or {}
-                versions = router.consume_delivered_versions(scope=scope)
-                if served:
-                    from .otel import record_skill_rail
-
-                    record_skill_rail(loaded=served, loaded_hashes=hashes, delivered_versions=versions)
-            except Exception:
-                logger.debug("load_skill record failed (non-fatal)", exc_info=True)
-        return body
+        return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name)
 
 
 def load_agent(

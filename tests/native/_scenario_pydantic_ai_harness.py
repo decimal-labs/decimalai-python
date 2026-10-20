@@ -1,15 +1,14 @@
 """Pydantic AI harness native-mode scenarios (child side; no assertions).
 
-The documented native mode: ``decimalai.init(otel=True)``, ``Agent.instrument_all()``
-(Pydantic AI's own spans, which cover any model, the scripted one included) and
-``decimalai.pydantic_ai.instrument()`` (one trace per agent run), with
-``decimalai.pydantic_ai_harness.skills(project)`` in a ``LocalWorkspace(project)`` beside
-the harness's ``FileSystem`` and ``Shell``. The model is a ``FunctionModel`` whose steps
+The documented native mode: ``decimalai.init(otel=True)`` and ``Agent.instrument_all()``
+(Pydantic AI's own spans, which cover any model, the scripted one included: one trace per
+agent run), with ``decimalai.pydantic_ai_harness.skills(project)`` in a
+``LocalWorkspace(project)`` beside the harness's ``FileSystem`` and ``Shell``. The model is a ``FunctionModel`` whose steps
 use only what the harness told it (the ``Skill directory`` line of a loaded skill).
 
 ``column`` is the native column's scenario (``column.py`` describes the shape).
-``checks`` builds agents with the skill router's loader installed and a skill to
-route, and returns what each model request was shown.
+``checks`` gives each agent ``decimalai.pydantic_ai.load_agent()``'s capability, with a
+skill to route, and returns what each model request was shown.
 """
 
 from __future__ import annotations
@@ -24,14 +23,11 @@ DISTRIBUTIONS = ["pydantic-ai-slim", "pydantic-ai-harness"]
 USER = "refund for $100 after 45 days?"
 
 
-def _session(*, skill_loader: bool = False) -> Session:
+def _session() -> Session:
     from pydantic_ai import Agent
-
-    import decimalai.pydantic_ai
 
     s = Session("pydantic-ai-harness", distributions=DISTRIBUTIONS, otel=True)
     Agent.instrument_all()
-    decimalai.pydantic_ai.instrument(enable_skill_loader=skill_loader)
     return s
 
 
@@ -109,7 +105,7 @@ class _Script:
         return None
 
 
-def _agent(script: _Script, project: str, *, observed: bool = True):
+def _agent(script: _Script, project: str, *, observed: bool = True, extra: tuple = ()):
     from pydantic_ai import Agent
     from pydantic_ai.capabilities import LocalWorkspace
     from pydantic_ai.models.function import FunctionModel
@@ -121,7 +117,7 @@ def _agent(script: _Script, project: str, *, observed: bool = True):
     skills = (decimalai.pydantic_ai_harness.skills(project) if observed
               else Skills(str(decimalai.skills_dir(relative_to=project))))
     return Agent(FunctionModel(script, model_name="scripted-harness"), name="harness-agent",
-                 capabilities=[LocalWorkspace(project), skills, FileSystem(), Shell()])
+                 capabilities=[LocalWorkspace(project), skills, FileSystem(), Shell(), *extra])
 
 
 def column(ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -153,8 +149,8 @@ def column(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """The router's loader installed, with a skill to route: an Agent with the harness's
-    Skills (made by the pointer helper), one with a plain ``Skills``, and one without."""
+    """``load_agent()``'s capability on each Agent, with a skill to route: one with the
+    harness's Skills (made by the pointer helper), one with a plain ``Skills``, one without."""
     import logging
     import warnings
 
@@ -172,8 +168,12 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
     logging.getLogger("decimalai").addHandler(_Capture(level=logging.INFO))
     logging.getLogger("decimalai").setLevel(logging.INFO)
 
-    s = _session(skill_loader=True)
+    import decimalai.pydantic_ai
+
+    s = _session()
     s.probe.skills = [dict(sk) for sk in CONFORMANCE_SKILLS]
+    for name in ("harness-agent", "plain-agent"):
+        s.probe.register_agent(name)
     project = str(col.project().root)
     out: Dict[str, Any] = {}
 
@@ -193,10 +193,12 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
         out[label] = {"instructions": script.instructions[0] if script.instructions else "",
                       "tools": script.tools[0] if script.tools else []}
 
-    one("observed", lambda script: _agent(script, project))
-    one("plain_skills", lambda script: _agent(script, project, observed=False))
+    harness = decimalai.pydantic_ai.load_agent("harness-agent")
+    plain = decimalai.pydantic_ai.load_agent("plain-agent")
+    one("observed", lambda script: _agent(script, project, extra=(harness,)))
+    one("plain_skills", lambda script: _agent(script, project, observed=False, extra=(harness,)))
     one("no_skills", lambda script: Agent(FunctionModel(script, model_name="scripted-harness"),
-                                          name="plain-agent"))
+                                          name="plain-agent", capabilities=[plain]))
     result = s.result()
     out["traces"] = [r["traces"] for r in result["runs"]]
     out["errors"] = [r["error"] for r in result["runs"]]

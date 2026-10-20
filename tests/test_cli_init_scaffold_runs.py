@@ -130,7 +130,7 @@ print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
         "requires": "pydantic_ai",
         # `infer_model` is where the MODEL string becomes a model object, so
         # patching it swaps the provider and leaves everything else — the real
-        # Agent, the real tool loop, the real adapter patches — on the path.
+        # Agent, the real tool loop, load_agent()'s capability — on the path.
         # Patching `Agent.run_sync` instead (the openai-agents shape) would skip
         # the loop, and the loop is the body channel on this framework.
         "stub": """
@@ -160,16 +160,32 @@ def _reply(messages, info):
 _stack.enter_context(patch(
     "pydantic_ai.models.infer_model", return_value=FunctionModel(_reply),
 ))
+
+# The name each DecimalAI run span is opened with. load_agent()'s capability
+# passes it to decimalai.otel.agent_run in wrap_run, and the exporter files the
+# run's trace under it.
+import decimalai.otel as _otel
+_runs = []
+_agent_run = _otel.agent_run
+
+
+def _named_run(agent_name=None, **kwargs):
+    _runs.append(agent_name)
+    return _agent_run(agent_name, **kwargs)
+
+
+_stack.enter_context(patch.object(_otel, "agent_run", _named_run))
 """,
         "probe": """
-import decimalai.pydantic_ai as adapter
-print("LOADER:", adapter._skill_loader_installed)
-# The name the RUN SCOPE will stamp, computed by the adapter's own resolver
-# against the Agent the template built — not the literal from the template and
-# not the module global either. Pydantic AI fills a missing name from the local
-# variable (`agent = Agent(...)` runs as the agent "agent"), so this is the one
-# reading that can tell a bound name from an invented one.
-print("BOUND:", adapter._run_agent_name(_mod["agent"]))
+# What the model was handed, request by request. load_agent()'s capability puts
+# the agent's prompt, then its skill list, into the instructions, and load_skill
+# into the tools: the two places its skills reach this agent.
+_first = (_sent[0][1].instructions or "") if _sent else ""
+print("LOADER:", bool(_sent) and "load_skill" in {
+    t.name for t in (_sent[0][1].function_tools or [])})
+# The name the run's span was opened with, which is the name its trace is filed
+# under: what the capability passed, not the literal from the template.
+print("BOUND:", _runs[0] if _runs else "<no run span>")
 
 # Every part the model was handed, across every request, flattened. Parts carry
 # their text under `content` whatever their kind (system prompt, user turn, tool
@@ -184,16 +200,9 @@ def _texts():
 
 _parts = list(_texts())
 
-# The agent's own prompt, told apart from the rail's system parts by their
-# headings — same filter the langchain probe uses, and for the same reason: the
-# rail registers a system_prompt function, so "the first system part" stopped
-# being "the agent's prompt" the moment the loader was on.
-_system = [
-    c for kind, c in _parts
-    if kind == "SystemPromptPart"
-    and not c.lstrip().startswith(("## Available Skills", "## Skill:"))
-]
-print("PROMPT_SEEN:", _system[0] if _system else "<none>")
+# The agent's own prompt: the instructions up to the skill list.
+_prompt = _first.split("## Available Skills")[0].strip()
+print("PROMPT_SEEN:", _prompt or "<none>")
 
 # The load_skill tool was really registered — the body channel on this
 # framework IS the tool, so a run without it can only ever offer a menu.
@@ -203,8 +212,9 @@ print("TOOL_REGISTERED:", any(
 ))
 print("TURNS:", len(_sent))
 
-_all = "\\n".join(c for _kind, c in _parts)
-print("SKILL_OFFERED:", "restocking-policy" in _all)
+_all = "\\n".join([info.instructions or "" for _m, info in _sent]
+                  + [c for _kind, c in _parts])
+print("SKILL_OFFERED:", "restocking-policy" in _first)
 print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
 """,
     },
@@ -296,8 +306,9 @@ BODY_CHANNEL_OBSERVABLE = {
         "channel."
     ),
     "pydantic-ai": (
-        "This adapter registers a real load_skill tool and Pydantic AI owns the "
-        "loop, so the body should have come back as a tool result mid-turn."
+        "load_agent()'s capability hands the Agent a real load_skill tool and "
+        "Pydantic AI owns the loop, so the body should have come back as a tool "
+        "result mid-turn."
     ),
 }
 
@@ -430,10 +441,13 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     assert "stubbed answer" in out, out
     assert "INIT: True" in out and "FLUSH: True" in out, out
 
-    # The load-bearing one: `instrument(enable_skill_loader=True)` did not
-    # merely parse — the adapter accepted it and the loader is INSTALLED.
-    # A template that passes an argument the adapter silently ignores would
-    # satisfy every AST assertion in the sibling module and fail here.
+    # The load-bearing one: the skills rail did not merely parse, it is ON.
+    # Through `instrument(enable_skill_loader=True)` (langchain, adk) the
+    # adapter accepted it and the loader is INSTALLED; through load_agent()
+    # (openai-agents, pydantic-ai) load_skill was in the model's first request.
+    # A template that passes an argument the adapter silently ignores, or
+    # builds an Agent without load_agent()'s pieces, would satisfy every AST
+    # assertion in the sibling module and fail here.
     assert "LOADER: True" in out, out
 
     # And the name reached the adapter, so traces file against the agent the

@@ -14,7 +14,8 @@ The four things that must never regress:
      without it traces perfectly and delivers none of the agent's skills —
      silently. That is the single most important line in the template. On
      openai-agents (0.18+) the equivalent is `load_agent()`'s two pieces in
-     `Agent(...)`: nothing else gives that agent its skills.
+     `Agent(...)`, and on pydantic-ai (0.19+) `load_agent()`'s capability in
+     `Agent(capabilities=[...])`: nothing else gives those agents their skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
      files traces against a different agent than the one the user configured;
@@ -275,9 +276,12 @@ class TestTemplateIsCode:
 # ── 2. the flag that makes the whole thing worth shipping ────────────
 
 
-#: The templates whose skills arrive through instrument()'s loader. openai-agents
-#: has none since 0.18: `load_agent()` hands the pieces to the file's own Agent.
-LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f != "openai-agents"]
+#: The templates with no instrument() at all: `load_agent()` hands the pieces to the
+#: file's own Agent (openai-agents since 0.18, pydantic-ai since 0.19).
+LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai")
+
+#: The templates whose skills arrive through instrument()'s loader.
+LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAMEWORKS]
 
 
 def _support_attr(node: ast.AST, attr: str) -> bool:
@@ -304,11 +308,12 @@ class TestSkillLoaderIsOn:
     #: and openai-agents `instrument()` installs the span source itself, so any
     #: flag here is a SECOND install of the same adapter: on langchain the first
     #: one wins and the explicit call's other options are dropped with a warning,
-    #: and on openai-agents the adapter is installed twice. On pydantic-ai
-    #: `instrument()` installs NO span source (that adapter ships the skills rail
-    #: and the run boundary; Pydantic AI emits no spans of its own), so `otel=True`
-    #: is the first one rather than the second — and without it the generated file
-    #: runs, delivers every skill, and traces nothing at all.
+    #: and on openai-agents the adapter is installed twice. On pydantic-ai nothing
+    #: else installs one: `load_agent()`'s capability opens the run span and
+    #: Pydantic AI's own instrumentation emits the rest, through the exporter
+    #: `otel=True` installs. So it is the first span source rather than the second
+    #: — and without it the generated file runs, delivers every skill, and traces
+    #: nothing at all.
     #:
     #: What both halves forbid is the same thing: two span sources on one file.
     TRACING_FLAGS = (
@@ -354,6 +359,22 @@ class TestSkillLoaderIsOn:
         assert isinstance(keywords["tools"], ast.List)
         assert any(isinstance(e, ast.Starred) and _support_attr(e.value, "tools")
                    for e in keywords["tools"].elts)
+
+    def test_pydantic_ai_passes_load_agent_to_the_agent_as_a_capability(self):
+        """Nothing patches Pydantic AI since 0.19: the prompt, the skill list and
+        load_skill reach the model only because the file passes `load_agent()`'s
+        capability into its own `Agent(capabilities=[...])`. Without it, it
+        traces and delivers no skills."""
+        tree = parse(render_agent_file(AGENT, "pydantic-ai", SKILLS))
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "load_agent")
+        assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (agent,) = calls(tree, "Agent")
+        keywords = {kw.arg: kw.value for kw in agent.keywords}
+        assert isinstance(keywords["capabilities"], ast.List)
+        assert any(reads(e, "support") for e in keywords["capabilities"].elts)
 
 
 # ── 2b. the agent's own system prompt is what it runs on ─────────────
@@ -476,17 +497,14 @@ class TestAgentNameBinding:
                               for t in n.targets))
         assert holder.value is carriers[0]
 
-    @pytest.mark.parametrize("framework", ["openai-agents", "pydantic-ai"])
+    @pytest.mark.parametrize("framework", LOAD_AGENT_FRAMEWORKS)
     def test_the_framework_agent_is_named_from_the_constant(self, framework):
-        """A framework-native name that must exist reads AGENT_NAME — a literal
-        there was the copy a rename used to miss. On openai-agents it is
-        ``support.name``: the canonical name DecimalAI gave back for AGENT_NAME."""
+        """The framework's own Agent name comes from AGENT_NAME — a literal there
+        was the copy a rename used to miss. It is ``support.name``: the canonical
+        name DecimalAI gave back for AGENT_NAME."""
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         name = next(kw.value for kw in calls(tree, "Agent")[0].keywords if kw.arg == "name")
-        if framework == "openai-agents":
-            assert _support_attr(name, "name")
-        else:
-            assert reads(name, "AGENT_NAME")
+        assert _support_attr(name, "name")
 
     @staticmethod
     def _adk_node_name(name: str) -> str:
@@ -1303,9 +1321,10 @@ class TestConsistencyWithFrontendSnippets:
         assert len(init_calls) == 1
         assert kwarg_reads(init_calls[0], "agent_name", "AGENT_NAME")
         inst = calls(tree, "instrument")
-        if framework == "openai-agents":
-            # 0.18's shape, which the dashboard snippet adopts with the release:
-            # no instrument() at all, one load_agent(AGENT_NAME).
+        if framework in LOAD_AGENT_FRAMEWORKS:
+            # The load_agent() shape (openai-agents 0.18, pydantic-ai 0.19), which
+            # the dashboard snippet adopts with each release: no instrument() at
+            # all, one load_agent(AGENT_NAME).
             assert inst == []
             (load,) = calls(tree, "load_agent")
             assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")

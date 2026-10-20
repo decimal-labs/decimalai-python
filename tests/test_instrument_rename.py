@@ -1,8 +1,10 @@
-"""Every framework integration's entry point is `instrument()`.
+"""Every tracing integration's entry point is `instrument()`.
 
 `install()` was its old name on these modules, a deprecated alias through 0.17,
 removed in 0.18: "install" also named adding a skill to a workspace (now
 `decimalai skills add`), and one word for two unrelated actions was the problem.
+Pydantic AI has neither since 0.19: `load_agent()` returns a capability, and
+tracing is Pydantic AI's own OpenTelemetry.
 """
 import importlib
 
@@ -10,7 +12,7 @@ import pytest
 
 MODULES = [
     "adk", "anthropic", "autogen", "claude_agent_sdk", "langchain",
-    "llamaindex", "openai_agents", "otel", "pydantic_ai",
+    "llamaindex", "openai_agents", "otel",
 ]
 
 
@@ -19,3 +21,9 @@ def test_instrument_is_the_one_entry_point(name):
     mod = importlib.import_module(f"decimalai.{name}")
     assert callable(getattr(mod, "instrument", None)), f"{name}.instrument() missing"
     assert not hasattr(mod, "install"), f"{name}.install() is back; the name is instrument()"
+
+
+def test_pydantic_ai_has_load_agent_and_nothing_to_install():
+    mod = importlib.import_module("decimalai.pydantic_ai")
+    assert callable(mod.load_agent)
+    assert not hasattr(mod, "instrument") and not hasattr(mod, "install")

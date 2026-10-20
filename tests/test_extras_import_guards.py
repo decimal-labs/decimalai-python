@@ -75,14 +75,17 @@ class TestWarningGuards:
             adk.instrument()
         assert 'decimalai[adk]' in caplog.text
 
-    def test_pydantic_ai_loader_warns_with_extra(self, monkeypatch, caplog):
+    def test_pydantic_ai_load_agent_names_the_extra_before_any_call(self, monkeypatch):
+        """Pydantic AI's skills come from load_agent(), which needs the framework
+        outright: it raises, naming the extra, before init() or any request."""
+        import decimalai._agent as agent_mod
         import decimalai.pydantic_ai as pai
 
         _block(monkeypatch, "pydantic_ai")
-        monkeypatch.setattr(pai, "_skill_loader_installed", False)
-        with caplog.at_level("WARNING"):
-            pai._install_skill_loader()
-        assert 'decimalai[pydantic-ai]' in caplog.text
+        monkeypatch.setattr(agent_mod, "_ensure_initialized",
+                            lambda: pytest.fail("set up before the import check"))
+        with pytest.raises(ImportError, match=r'decimalai\[pydantic-ai\]'):
+            pai.load_agent("support")
 
     def test_langchain_loader_warns_with_extra(self, monkeypatch, caplog):
         import decimalai.langchain as lc

@@ -6,7 +6,6 @@ The concurrent lanes deliberately fetch different versions of the SAME name.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import importlib
 import json
@@ -144,7 +143,7 @@ def assert_versions(traces, parents, *, observed=None, loaded=False):
             assert callback.skills_delivered_versions == witness
 
 
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "pydantic_ai"])
+@pytest.mark.parametrize("adapter", ["anthropic", "crewai"])
 def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(monkeypatch, sdk, adapter):
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry.sdk.trace import TracerProvider
@@ -171,8 +170,6 @@ def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(mo
                 record_run_link(root.get_span_context().trace_id, parent_trace_id=parent.get_trace_id(), on_trace=observe)
                 if adapter == "anthropic":
                     prompt = module.skill_system("caller", query=f"request-{index}")
-                elif adapter == "pydantic_ai":
-                    prompt = asyncio.run(module._skills_system_prompt(SimpleNamespace(prompt=f"request-{index}")))
                 else:
                     messages = [{"role": "user", "content": f"request-{index}"}]
                     module._skill_hook(SimpleNamespace(
@@ -192,16 +189,18 @@ def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(mo
         provider.shutdown()
 
 
-def test_pydantic_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
+def test_load_agent_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
+    """The load every OpenTelemetry-rail load_agent() shares (decimalai's and
+    Pydantic AI's): two runs at once each record their own body's version."""
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-    import decimalai.pydantic_ai as pa
+    from decimalai._agent import _serve_and_record
     from decimalai.generic import start_trace
     from decimalai.otel import DecimalSpanExporter, agent_run, record_run_link
 
-    monkeypatch.setattr(pa, "_skill_router_singleton", router(monkeypatch))
+    shared = router(monkeypatch)
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(DecimalSpanExporter()))
 
@@ -210,7 +209,8 @@ def test_pydantic_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
         with start_trace(agent_name=f"parent-{index}", auto_send=False) as parent:
             with agent_run(f"child-{index}", tracer_provider=provider) as root:
                 record_run_link(root.get_span_context().trace_id, parent_trace_id=parent.get_trace_id())
-                body = contextvars.copy_context().run(pa._handle_load_skill, NAME)
+                body = contextvars.copy_context().run(
+                    _serve_and_record, shared, NAME, scope=f"run-{index}", agent_name=f"child-{index}")
                 assert BODIES[index] in body and BODIES[1 - index] not in body
             return parent.get_trace_id()
 
@@ -322,7 +322,7 @@ def test_partial_or_noncanonical_pair_preserves_legacy_hash_only(pair):
 
 
 # Not openai_agents: since 0.18 it never builds a body into a prompt (load_skill only).
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "pydantic_ai", "langchain", "adk"])
+@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "langchain", "adk"])
 @pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
 def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapter, failure):
     import decimalai.otel as otel
@@ -392,21 +392,12 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
         finally:
             module._close_call_rails(tokens)
 
-    if adapter == "pydantic_ai":
-        async def run():
-            await module._skills_system_prompt(SimpleNamespace(prompt="synthetic request"))
-            assert sr._last_delivered_versions_ctx.get() is None
-            current[0] = 42
-            return await module._skills_system_prompt(SimpleNamespace(prompt="synthetic request"))
-
-        prompt = asyncio.run(run())
-    else:
-        build()
-        assert sr._last_delivered_versions_ctx.get() is None
-        current[0] = 42
-        prompt = build()
+    build()
+    assert sr._last_delivered_versions_ctx.get() is None
+    current[0] = 42
+    prompt = build()
     assert BODIES[1] in prompt
-    if adapter in {"anthropic", "crewai", "pydantic_ai"}:
+    if adapter in {"anthropic", "crewai"}:
         rail = otel._pop_skill_rail(42)
         assert rail["delivered"] == [NAME]
         assert rail["delivered_versions"] == []

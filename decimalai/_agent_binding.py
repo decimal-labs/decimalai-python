@@ -435,10 +435,16 @@ class AgentBinding:
             consume_last_menu_truncated,
             consume_last_offered_names,
         )
+        # A version witness an earlier, failed build left in this context must not
+        # be read as this build's (on the synchronous path the context is the caller's).
+        consume_last_delivered_versions()
         try:
             prefix, _tail, routing_id = router.build_prompt_parts(
                 query, agent_name=self.name, inject_body=inject, scope=scope,
             )
+        except Exception:
+            consume_last_delivered_versions()
+            raise
         finally:
             _release_scoped_routing_rail(router, scope)
         offered = _clean_names(consume_last_offered_names())

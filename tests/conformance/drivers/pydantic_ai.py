@@ -1,46 +1,40 @@
 """Pydantic AI driver.
 
-Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/pydantic-ai``.
-That page is explicit about the shape of this integration, and the shape decides
-what this driver has to do:
+Runs the snippet documented at ``https://docs.decimal.ai/sdk/python/frameworks/pydantic-ai``:
+the agent's prompt and skills pulled from DecimalAI as one capability and handed to
+the developer's own ``Agent``::
 
-    "It does not have its own tracing — Pydantic AI calls the provider SDK
-    underneath, so tracing flows through a provider integration you install
-    alongside."
+    support = load_agent(name)
+    agent = Agent(model, name=support.name, tools=[...], capabilities=[support])
 
-So the documented setup is **two calls**, and the driver makes both:
-``decimalai.init(openai=True)`` for the traces (OpenInference's instrumentor for
-the ``openai`` SDK, routed through DecimalAI's OTel exporter) and
-``decimalai.pydantic_ai.instrument(enable_skill_loader=True)`` for the skills
-rail. Grading only the second half would grade a framework that, by design,
-puts nothing on the wire — and the contract is a statement about the wire.
+The capability is the whole integration: its instructions (the saved prompt, then
+the skill list routed on the run's prompt), its ``load_skill`` toolset, and the
+DecimalAI run span its ``wrap_run`` opens around each run, which puts a run's
+model calls in one trace filed under the DecimalAI agent. Nothing is patched, so
+every phase builds its agent that way (``Driver.loads_agent_from_platform``: the
+harness puts each phase's agent in the workspace first, as the dashboard would).
+
+Tracing is the provider pairing, ``decimalai.init(openai=True)`` (OpenInference's
+instrumentor for the ``openai`` SDK, through DecimalAI's OTel exporter). The other
+documented route, ``Agent.instrument_all()``, is a process-wide switch, so this
+in-process driver keeps to the pairing.
 
 The model is a stub and the model path is real: Pydantic AI's own
 ``OpenAIChatModel`` talking to :mod:`._openai_wire` over a socket. That is
-load-bearing here beyond the usual reason — the *only* spans this integration
-produces are the ones OpenInference derives from real ``openai`` client calls,
-so a monkeypatched client would leave nothing to grade at all.
-
-Two consequences worth stating up front, because they are properties of the
-integration rather than of this driver:
-
-* The agent name is fixed process-wide, at the moment the exporter is built.
-  This driver passes ``agent_name=ctx.agent_name`` on every run anyway — asking
-  correctly and recording what comes back is the point.
-* One trace per *provider call*, not per agent run, because each instrumented
-  ``openai`` call is its own OTel root span.
+load-bearing here beyond the usual reason: the model-call spans this pairing
+produces are the ones OpenInference derives from real ``openai`` client calls, so
+a monkeypatched client would leave nothing to grade at all.
 
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..delivery import INJECTED
 from . import (
     STUB_MODEL_NAME,
-    SYSTEM_PROMPT,
     Capabilities,
     Ctx,
     Driver,
@@ -86,14 +80,23 @@ def _tool(ctx: Ctx) -> Any:
     return lookup
 
 
-def _agent(ctx: Ctx) -> Any:
+def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None, named: bool = True) -> Any:
+    """The documented snippet: this agent's ``load_agent()`` capability on the
+    developer's own ``Agent``. ``configs`` shares one config per agent name, as a
+    module-level one would be."""
     from pydantic_ai import Agent
 
+    from decimalai.pydantic_ai import load_agent
+
+    configs = {} if configs is None else configs
+    if ctx.agent_name not in configs:
+        configs[ctx.agent_name] = load_agent(ctx.agent_name)
+    support = configs[ctx.agent_name]
     return Agent(
         _model(),
-        name=ctx.agent_name,
-        system_prompt=SYSTEM_PROMPT,
+        **({"name": support.name} if named else {}),
         tools=[_tool(ctx)],
+        capabilities=[support],
     )
 
 
@@ -127,14 +130,13 @@ def _skill_script(ctx: Ctx) -> List[StubTurn]:
 
 
 def _setup(ctx: Ctx, *, fail: bool = False, skills_rail: bool = False) -> None:
-    """The documented two-call setup, plus this lane's script.
+    """The documented setup, plus this lane's script.
 
     Kept out of the threaded body: ``init()`` rebuilds process-global config,
     and eight threads racing to rebuild it would be a driver artifact dressed
     up as an isolation defect.
     """
     import decimalai
-    from decimalai.pydantic_ai import instrument
 
     _wire().register(
         ctx, script=_skill_script(ctx) if skills_rail else None, fail=fail
@@ -146,13 +148,11 @@ def _setup(ctx: Ctx, *, fail: bool = False, skills_rail: bool = False) -> None:
         openai=True,               # the provider pairing that carries the traces
         agent_name=ctx.agent_name,
     )
-    instrument(enable_skill_loader=skills_rail)
 
 
-def _go(ctx: Ctx) -> Any:
-    """One run. The Agent is built here so the skills phase's patched
-    ``Agent.__init__`` is the one that constructs it."""
-    return _agent(ctx).run_sync(user_message(ctx))
+def _go(pair: Any) -> Any:
+    ctx, agent = pair
+    return agent.run_sync(user_message(ctx))
 
 
 # ── phases ───────────────────────────────────────────────────────────────────
@@ -160,58 +160,57 @@ def _go(ctx: Ctx) -> Any:
 
 def run(ctx: Ctx) -> Any:
     _setup(ctx)
-    return _go(ctx)
+    return _go((ctx, _agent(ctx)))
 
 
 def run_error(ctx: Ctx) -> Any:
     """The same snippet, with the provider failing the request."""
     _setup(ctx, fail=True)
-    return _go(ctx)
+    return _go((ctx, _agent(ctx)))
 
 
 def run_concurrent(ctxs: Sequence[Ctx]) -> Any:
+    configs: Dict[str, Any] = {}
+    pairs = []
     for ctx in ctxs:
         _setup(ctx)
-    return fanout_threads(_go)(list(ctxs))
+        pairs.append((ctx, _agent(ctx, configs=configs)))
+    return fanout_threads(_go)(pairs)
 
 
 def run_skills(ctxs: Sequence[Ctx]) -> Any:
     """The skills rail, N lanes at once.
 
-    ``instrument(enable_skill_loader=True)`` monkey-patches
-    ``pydantic_ai.Agent.__init__``, so it runs LAST and the agents are built
-    after it — the adapter only ever reaches Agents constructed afterwards,
-    which its own caveats say out loud.
+    The lanes share one agent name and so one config, the way every run of a
+    module-level agent does. Each lane asks a different question, so the router
+    mints a routing decision per lane and a leaked one is visible.
     """
+    configs: Dict[str, Any] = {}
+    pairs = []
     for ctx in ctxs:
         _setup(ctx, skills_rail=True)
-    return fanout_threads(_go)(list(ctxs))
+        pairs.append((ctx, _agent(ctx, configs=configs)))
+    return fanout_threads(_go)(pairs)
 
 
 def run_unnamed(ctx: Ctx) -> Any:
-    """The rail on an UNNAMED Agent, named by ``instrument(agent_name=...)``.
+    """The rail on an UNNAMED Agent.
 
-    ``Agent(model, ...)`` with no ``name=`` — Pydantic AI then infers one from
-    the variable the Agent is assigned to (``agent`` here), which is nothing
-    anybody chose. The adapter documents ``instrument(agent_name=...)`` as the
-    name such a run is filed under, so that is the one DecimalAI name given.
+    ``Agent(model, ...)`` with no ``name=``: Pydantic AI then infers one from the
+    variable the Agent is assigned to, which is nothing anybody chose. The run
+    is still the DecimalAI agent's, named once in ``load_agent()``: the trace and
+    the routing call must both carry that name.
     """
-    from pydantic_ai import Agent
-
-    from decimalai.pydantic_ai import instrument
-
     _setup(ctx, skills_rail=True)
-    instrument(agent_name=ctx.agent_name, enable_skill_loader=True)
-    agent = Agent(_model(), system_prompt=SYSTEM_PROMPT, tools=[_tool(ctx)])
-    return agent.run_sync(user_message(ctx))
+    return _go((ctx, _agent(ctx, named=False)))
 
 
 def run_conversation(ctxs: Sequence[Ctx]) -> Any:
     """Two turns of one conversation: ``run_sync(..., message_history=...)``.
 
     The second run is handed the first run's ``all_messages()``, Pydantic AI's
-    documented way to continue a conversation — and the case its
-    ``@agent.system_prompt`` functions are NOT re-run for.
+    documented way to continue a conversation. The capability's instructions are
+    rebuilt for every request, so the second run is routed on its own prompt.
     """
     first, second = ctxs
     _setup(first, skills_rail=True)
@@ -230,7 +229,7 @@ DRIVER = Driver(
     # tracing path the environment never turned on.
     requires=("pydantic_ai", "openai", "openinference"),
     frameworks=("pydantic-ai-slim",),
-    entrypoint="decimalai.pydantic_ai.instrument() + decimalai.init(openai=True)",
+    entrypoint="decimalai.pydantic_ai.load_agent(name) + decimalai.init(openai=True)",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
@@ -238,6 +237,7 @@ DRIVER = Driver(
     run_skills=run_skills,
     run_unnamed=run_unnamed,
     run_conversation=run_conversation,
+    loads_agent_from_platform=True,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,
@@ -247,24 +247,19 @@ DRIVER = Driver(
         has_invocation_observer=False,
         reasons={
             "has_invocation_observer": (
-                "decimalai/pydantic_ai.py hands its caller no run: instrument() takes "
-                "no on_trace, so C15 has no observer to grade. Its traces come from "
-                "the provider instrumentor on the OTel rail, which links a run to an "
-                "enclosing decimalai.start_trace() only where an adapter recorded that "
-                "link when the run started (decimalai/crewai.py does; this adapter "
-                "does not), so C16 is N/A with C15. A known gap: a run wrapped in "
-                "start_trace() ships unlinked, and a routed delivery is credited on "
-                "both traces. Not a framework limit and not this suite's opinion: "
-                "test_coverage reads this flag off instrument()'s own signature, so "
-                "the commit that gives it on_trace turns both items on."
+                "decimalai/pydantic_ai.py hands its caller no run: load_agent() takes "
+                "no on_trace, so C15 has no observer to grade. Its traces are built on "
+                "the OTel rail, which links a run to an enclosing decimalai.start_trace() "
+                "only where an adapter recorded that link when the run started "
+                "(decimalai/crewai.py does; this adapter does not), so C16 is N/A with "
+                "C15. A known gap: a run wrapped in start_trace() ships unlinked, and a "
+                "routed delivery is credited on both traces."
             ),
             "supports_degenerate": (
-                "this adapter does no tracing of its own — every trace it "
-                "produces is derived from a real provider-SDK call underneath. "
-                "A Pydantic AI run with no model call therefore emits no span "
-                "and no trace at all, so there is no degenerate run for a "
-                "manifest to be fabricated from. C7b has nothing to grade here; "
-                "C7 (the same agent twice) still applies and is graded."
+                "a Pydantic AI run always makes a model request, so there is no "
+                "degenerate run (one with no model call) for a manifest to be "
+                "fabricated from. C7b has nothing to grade here; C7 (the same agent "
+                "twice) still applies and is graded."
             ),
         },
     ),

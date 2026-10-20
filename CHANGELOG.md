@@ -6,6 +6,43 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed (breaking): Pydantic AI agents get their prompt and skills from `load_agent()`
+
+- **New:** `decimalai.pydantic_ai.load_agent(name, fallback=..., on_unavailable="continue")`
+  returns a Pydantic AI capability for `Agent(capabilities=[...])`. Its instructions are the
+  agent's saved prompt (`{{placeholders}}` filled from the run's `deps`), then the skill list
+  routed on the run's prompt; its toolset is `load_skill`, limited to the agent's skills; and its
+  `wrap_run` opens one DecimalAI run span per run, so a run's model calls are one trace filed under
+  the DecimalAI agent, whatever the `Agent` is called. Every run is routed on its own prompt, the
+  way OpenAI Agents runs are. Built only on Pydantic AI's capability API.
+- **Removed:** `decimalai.pydantic_ai.instrument()` and the three patches behind it
+  (`Agent.__init__` twice, `Agent.iter`): the skills instructions function and `load_skill` it
+  added to every Agent in the process, the `decimalai_load_skill` rename, the run span it opened
+  around every run, and `get_current_routing_id()`. Tracing is DecimalAI's OpenTelemetry exporter:
+  `decimalai.init(otel=True)` with `Agent.instrument_all()`, or a provider instrumentor
+  (`decimalai.init(openai=True)`).
+- An agent that also has the Pydantic AI harness's `Skills` gets no DecimalAI skills from the
+  capability, with one warning. An agent with another tool named `load_skill` fails its run with
+  Pydantic AI's own error.
+- The harness's observed `Skills` (`decimalai.pydantic_ai_harness.skills()`) needs no
+  `instrument()` either: with `init(otel=True)` and `Agent.instrument_all()`, each run's skill
+  catalog and every load go on that run's trace.
+- `decimalai init --framework pydantic-ai` writes the new shape.
+
+Migration:
+
+```python
+# before
+from decimalai.pydantic_ai import instrument
+instrument(enable_skill_loader=True)
+agent = Agent(model, name="support", system_prompt=BASE, tools=[lookup_order])
+
+# after
+from decimalai.pydantic_ai import load_agent
+support = load_agent("support", fallback=BASE)
+agent = Agent(model, name=support.name, tools=[lookup_order], capabilities=[support])
+```
+
 ### Changed (breaking): `decimalai.load_agent()` returns the agent's prompt and skills
 
 - `decimalai.load_agent(name, fallback=..., on_unavailable="continue")` returns an `AgentConfig`

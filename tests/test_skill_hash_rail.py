@@ -449,16 +449,14 @@ class TestOtelRailCarriesTheVersion:
         assert stored["loaded_hashes"] == {"a": HASH}
 
 
-class TestPydanticAIPassesTheHashes:
-    def test_the_handler_forwards_what_it_drained(self, monkeypatch):
-        """`pydantic_ai` drains names and hashes from the same scope in one
-        breath and hands both to the otel rail."""
-        import decimalai.pydantic_ai as pa
+class TestLoadAgentPassesTheHashes:
+    def test_the_load_forwards_what_it_drained(self, monkeypatch):
+        """Every OpenTelemetry-rail load_agent() (decimalai's, Pydantic AI's)
+        drains names and hashes from the same scope in one breath and hands both
+        to the otel rail."""
+        from decimalai._agent import _serve_and_record
 
         router = _router()
-        monkeypatch.setattr(pa, "_get_skill_router", lambda: router)
-        monkeypatch.setattr(pa, "_scope", lambda: "run-a")
-
         seen: List[Dict[str, Any]] = []
         import decimalai.otel as otel_mod
         monkeypatch.setattr(
@@ -467,7 +465,7 @@ class TestPydanticAIPassesTheHashes:
         )
 
         with patch.object(router, "get_skill_body_record", return_value=_record()):
-            out = pa._handle_load_skill("restocking-policy")
+            out = _serve_and_record(router, "restocking-policy", scope="run-a", agent_name="support")
 
         assert out.startswith("## Skill: restocking-policy")
         assert seen and seen[-1]["loaded"] == ["restocking-policy"]
