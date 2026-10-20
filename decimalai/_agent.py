@@ -286,7 +286,17 @@ def read_prompt(
             'decimalai.agent_config("refund-bot").'
         )
 
-    from ._config import _get_client
+    from ._config import _disabled_by_init, _get_client
+
+    if _disabled_by_init():
+        # The kill switch: DecimalAI is not asked, and the agent runs on its
+        # fallback text (or says it cannot run without one).
+        if fallback is None:
+            raise RuntimeError(
+                f"DecimalAI is switched off (decimalai.init(enabled=False)), so the prompt of "
+                f"{agent_name!r} cannot be read; pass agent_config(..., fallback=...) to run without it."
+            )
+        return SavedPrompt(agent_name=agent_name, system_prompt=fallback, is_fallback=True)
 
     key = f"{agent_name}\x00{version if version is not None else ''}"
 
@@ -398,7 +408,9 @@ def _ensure_initialized() -> None:
     """`decimalai.init()` from the environment when nothing initialized the SDK yet."""
     from . import _config
 
-    if _config._client is None:
+    # Not `_client is None`: `init(enabled=False)` leaves no client too, and
+    # initializing again from the environment would turn the kill switch back off.
+    if _config._config is None and _config._client is None:
         import decimalai
 
         decimalai.init()

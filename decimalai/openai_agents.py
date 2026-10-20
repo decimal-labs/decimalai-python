@@ -1365,13 +1365,14 @@ def _require_agents_sdk() -> None:
 
 
 def _ensure_initialized() -> None:
-    """`decimalai.init()` from the environment when nothing initialized the SDK yet."""
-    from . import _config
+    """`decimalai.init()` from the environment when nothing initialized the SDK yet.
 
-    if _config._client is None:
-        import decimalai
+    The shared rule (`decimalai._agent._ensure_initialized`): `init(enabled=False)`
+    leaves no client, and initializing again would turn the kill switch back off.
+    """
+    from ._agent import _ensure_initialized as ensure
 
-        decimalai.init()
+    ensure()
 
 
 def _ensure_tracing() -> None:

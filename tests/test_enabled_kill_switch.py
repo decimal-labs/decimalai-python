@@ -339,3 +339,55 @@ def test_openai_agents_load_agent_skills_stop_after_a_disabled_reinit(monkeypatc
     shown = prompt("can I return an opened box?")
     assert "Recommended Skills" not in shown and shown.startswith("You help.")
     assert fake.skill_calls() == before
+
+
+@pytest.mark.parametrize("module", ["decimalai", "decimalai.openai_agents", "decimalai.pydantic_ai",
+                                    "decimalai.adk", "decimalai.anthropic"])
+def test_no_agent_config_turns_the_kill_switch_back_off(monkeypatch, module):
+    """`init(enabled=False)` leaves no client; an `agent_config()` that re-initialized from the
+    environment on seeing none turned DecimalAI back on for the whole process."""
+    import importlib
+
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    try:
+        binding_module = importlib.import_module(module)
+        binding_module.agent_config  # noqa: B018
+    except (ImportError, AttributeError):
+        pytest.skip(f"{module} has no agent_config() here")
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(api_key="dai_sk_test", base_url="http://127.0.0.1:9",
+                                                      enabled=False))
+    monkeypatch.setattr(cfg, "_client", None)
+    if hasattr(binding_module, "_ensure_tracing"):
+        # It registers a process-wide trace processor (OpenAI Agents): not this test's subject,
+        # and left behind it makes later tests' runs export twice.
+        monkeypatch.setattr(binding_module, "_ensure_tracing", lambda: None)
+    called = []
+    monkeypatch.setattr("decimalai.init", lambda *a, **k: called.append(k))
+    try:
+        binding_module.agent_config("support", fallback="You help.")
+    except ImportError:
+        pytest.skip(f"{module}'s framework is not installed here")
+    assert called == [], f"{module}.agent_config() switched DecimalAI back on"
+    assert cfg._config.enabled is False and cfg._client is None
+
+
+def test_under_the_kill_switch_agent_config_runs_on_its_fallback_without_asking(monkeypatch):
+    import decimalai
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    monkeypatch.setattr(cfg, "_config", DecimalConfig(api_key="dai_sk_test", base_url="http://127.0.0.1:9",
+                                                      enabled=False))
+    monkeypatch.setattr(cfg, "_client", None)
+
+    def no_client():
+        raise AssertionError("DecimalAI was asked")
+
+    monkeypatch.setattr(cfg, "_get_client", no_client)
+    support = decimalai.agent_config("support", fallback="You help.")
+    assert support.prompt_source == "fallback (unreachable)"
+    assert support.run("Hi").system == "You help."
+    with pytest.raises(RuntimeError, match="switched off"):
+        decimalai.agent_config("support")

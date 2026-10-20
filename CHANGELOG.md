@@ -27,6 +27,13 @@ and patch releases are fixes.
 - **Async runs work without an asyncio event loop.** Under trio, the routing and the skill loads
   now go to anyio's worker thread, and a cancelled run returns at once rather than after its
   thread. Before, the routing failed quietly, and the run had no skills.
+- **`agent_config()` no longer switches DecimalAI back on after `init(enabled=False)`.** The kill
+  switch leaves no client, and `decimalai.agent_config()` and the OpenAI Agents, Pydantic AI and
+  Google ADK ones took that to mean the SDK was never initialized. They then called
+  `decimalai.init()` again from the environment, which turned DecimalAI back on for the whole
+  process. They now initialize only a process that never called `init()`. Under the kill switch,
+  `agent_config()` asks DecimalAI nothing: the agent runs on its `fallback=` text, and with no
+  fallback `agent_config()` raises `RuntimeError` saying to pass one.
 
 ## [0.22.0] — 2026-10-21
 
