@@ -867,3 +867,37 @@ def test_the_provider_pipeline_reuses_an_otel_exporter_already_on_the_provider(m
     monkeypatch.setattr(provider, "add_span_processor", lambda p: added.append(p))
     assert providers._ensure_pipeline("support") is provider
     assert added == [], "a second DecimalAI exporter would send every trace twice"
+
+
+def test_the_conversation_state_is_the_shared_record_every_binding_keeps(platform):
+    """One mechanism for every binding: the state is ConversationRecord's, with the skill-list
+    part kept apart (so the system blocks come back exactly) and which decision showed each
+    skill, plus this module's conversation id."""
+    from decimalai._agent_binding import ConversationRecord
+
+    chat = da.agent_config("support").conversation(variables=SAM)
+    with chat.run("Where is my order?") as run:
+        system = run.system
+    state = chat.state
+    record = ConversationRecord.from_state(state, "support")
+    assert record is not None and state["id"] == chat.id
+    assert state["system"] == "".join(block["text"] for block in system)
+    assert state["skills_menu"] and state["system"].endswith(state["skills_menu"])
+    assert set(state["skills_shown"]) == {"damaged-item", "order-support"}
+
+
+def test_a_state_without_the_newer_fields_still_resumes(platform):
+    """A record saved before `skills_menu` and `skills_shown` existed loads: the list then
+    stays inside one system block, and each listed skill is shown by the record's decision."""
+    from decimalai._agent_binding import ConversationRecord
+
+    support = da.agent_config("support")
+    chat = support.conversation(variables=SAM)
+    with chat.run("Where is my order?"):
+        pass
+    old = {key: value for key, value in chat.state.items() if key not in ("skills_menu", "skills_shown")}
+    record = ConversationRecord.from_state(old, "support")
+    assert record.menu == "" and set(record.shown) == set(record.names)
+    with support.conversation(state=old).run("It arrived cracked.") as run:
+        (block,) = run.system
+        assert block["text"] == old["system"]

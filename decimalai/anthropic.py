@@ -63,12 +63,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 from uuid import uuid4
 
-from ._agent_binding import (
-    _MAX_CONFIG_RUNS,
-    AgentBinding,
-    _in_background,
-    template_variables,
-)
+from ._agent_binding import AgentBinding, ConversationRecord
 
 logger = logging.getLogger("decimalai.anthropic")
 
@@ -82,9 +77,6 @@ _EXIT_WAITS_FOR_ROUTING_S = 3.0
 
 #: ``agent_config(cache_control=...)``'s default: one breakpoint on the system text.
 _DEFAULT_CACHE_CONTROL: Dict[str, Any] = {"type": "ephemeral"}
-
-#: The version of `Conversation.state`'s shape.
-_STATE_VERSION = 1
 
 _UNSET: Any = object()
 
@@ -238,55 +230,7 @@ def _register_drain_at_exit() -> None:
         atexit.register(_drain_finishing)
 
 
-# ── what a conversation fixes ────────────────────────────────
-
-
-class _Fixed:
-    """A conversation's system text and tool, as its first run composed them."""
-
-    __slots__ = ("text", "blocks", "names", "tool_def", "prompt_record", "delivered",
-                 "unavailable", "inject", "cut", "routing_id", "shown")
-
-    def __init__(self, *, text: str, blocks: List[Dict[str, Any]], names: List[str],
-                 tool_def: Optional[Dict[str, Any]], prompt_record: Optional[Dict[str, Any]],
-                 delivered: List[str], unavailable: Optional[str], inject: bool, cut: bool,
-                 routing_id: Optional[str], shown: Optional[Dict[str, Optional[str]]] = None) -> None:
-        self.text = text
-        self.blocks = blocks
-        self.names = names
-        self.tool_def = tool_def
-        self.prompt_record = prompt_record
-        self.delivered = delivered
-        self.unavailable = unavailable
-        self.inject = inject
-        self.cut = cut
-        self.routing_id = routing_id
-        #: Every skill this conversation has shown the model (in ``system``, or in a
-        #: later user message), and the routing decision that showed it.
-        self.shown: Dict[str, Optional[str]] = dict(shown) if shown else {n: routing_id for n in names}
-
-    def to_state(self, agent: str, conversation_id: str) -> Dict[str, Any]:
-        return copy.deepcopy({
-            "version": _STATE_VERSION, "agent": agent, "id": conversation_id,
-            "system": self.blocks, "tool": self.tool_def, "skills": self.names,
-            "skills_cut": self.cut, "routing_id": self.routing_id,
-            "prompt": self.prompt_record, "delivered": self.delivered,
-            "skills_unavailable": self.unavailable, "pasted": self.inject,
-            "skills_shown": self.shown,
-        })
-
-    @classmethod
-    def from_state(cls, state: Dict[str, Any]) -> "_Fixed":
-        blocks = copy.deepcopy(list(state["system"]))
-        return cls(
-            text="".join(str(block.get("text", "")) for block in blocks), blocks=blocks,
-            names=list(state.get("skills") or []), tool_def=copy.deepcopy(state.get("tool")),
-            prompt_record=copy.deepcopy(state.get("prompt")),
-            delivered=list(state.get("delivered") or []),
-            unavailable=state.get("skills_unavailable"), inject=bool(state.get("pasted")),
-            cut=bool(state.get("skills_cut")), routing_id=state.get("routing_id"),
-            shown=state.get("skills_shown"),
-        )
+# ── a conversation ───────────────────────────────────────────
 
 
 class Conversation:
@@ -299,6 +243,10 @@ class Conversation:
     that keeps no chat in memory stores :attr:`state` with the history and
     resumes with ``support.conversation(state=...)``.
 
+    What it keeps is the ``ConversationRecord`` every DecimalAI binding shares for
+    a chat (``decimalai._agent_binding``); this module renders it as Anthropic
+    system blocks and a ``load_skill`` definition.
+
     Everything in ``system`` and ``tools`` has to stay the same for the whole
     conversation, your own parts included: per-message facts belong in the user
     message.
@@ -307,13 +255,14 @@ class Conversation:
         id: This conversation's id; its runs' traces carry it as ``session_id``.
     """
 
-    def __init__(self, config: "AnthropicAgentConfig", context: Any,
-                 state: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, config: "AnthropicAgentConfig", variables: Any,
+                 record: Optional[ConversationRecord] = None,
+                 conversation_id: Optional[str] = None) -> None:
         self._config = config
-        self._values = context
+        self._values = variables
         self._lock = threading.Lock()
-        self._fixed: Optional[_Fixed] = _Fixed.from_state(state) if state else None
-        self.id: str = str(state["id"]) if state else uuid4().hex
+        self._record: Optional[ConversationRecord] = record
+        self.id: str = conversation_id or uuid4().hex
         self._runs = 0
 
     def __repr__(self) -> str:
@@ -330,24 +279,28 @@ class Conversation:
     def state(self) -> Optional[Dict[str, Any]]:
         """What the conversation keeps, as JSON-ready data; None before its first run.
 
-        The system blocks (variables already filled), the ``load_skill``
-        definition, the prompt version and the routing decision the list came
-        from. Pass it to ``support.conversation(state=...)`` to continue the
-        conversation in another process.
+        The system text (variables already filled) with its skill list, the
+        ``load_skill`` definition, the prompt version, the routing decision the
+        list came from and the one that first showed each skill. Pass it to
+        ``support.conversation(state=...)`` to continue the conversation in
+        another process.
         """
-        fixed = self._current()
-        return fixed.to_state(self._config.name, self.id) if fixed is not None else None
-
-    def _fix(self, fixed: _Fixed) -> _Fixed:
-        """Keep ``fixed`` unless another run fixed the conversation first."""
+        record = self._current()
+        if record is None:
+            return None
         with self._lock:
-            if self._fixed is None:
-                self._fixed = fixed
-            return self._fixed
+            return {**record.to_state(self._config.name), "id": self.id}
 
-    def _current(self) -> Optional[_Fixed]:
+    def _fix(self, record: ConversationRecord) -> ConversationRecord:
+        """Keep ``record`` unless another run fixed the conversation first."""
         with self._lock:
-            return self._fixed
+            if self._record is None:
+                self._record = record
+            return self._record
+
+    def _current(self) -> Optional[ConversationRecord]:
+        with self._lock:
+            return self._record
 
 
 class Run:
@@ -379,8 +332,10 @@ class Run:
         self._exited = False
         self._ended = False
         self._exit_ns: Optional[int] = None
-        self._fixed: Optional[_Fixed] = None
-        self._fixed_by_me = False
+        self._record: Optional[ConversationRecord] = None
+        self._recorded_by_me = False
+        self._blocks: List[Dict[str, Any]] = []
+        self._tool_def: Optional[Dict[str, Any]] = None
         self._state: Optional[Dict[str, Any]] = None
         self._span: Any = None
         self._otel_ctx: Any = None
@@ -504,9 +459,9 @@ class Run:
     def _record_this_messages_decision(self) -> None:
         """A later message of a cut-list conversation: its own decision goes on its trace
         when every skill it offered has been shown to the model."""
-        state, fixed = self._state or {}, self._fixed
+        state, record = self._state or {}, self._record
         routing_id = state.get("routing_now")
-        if fixed is None or routing_id is None:
+        if record is None or routing_id is None:
             return
         new = state.get("new_names") or []
         if new and "message" not in self._read:
@@ -522,7 +477,7 @@ class Run:
             self._config._log.debug("could not record the message's decision", exc_info=True)
         with self._conversation._lock:
             for name in new:
-                fixed.shown.setdefault(name, routing_id)
+                record.shown.setdefault(name, routing_id)
 
     def _end(self, end_ns: int) -> None:
         with self._lock:
@@ -537,8 +492,8 @@ class Run:
         self._config._close(self)
 
     def _warn_at_exit(self) -> None:
-        config, fixed = self._config, self._fixed
-        if fixed is not None and fixed.tool_def is not None and "system" in self._read \
+        config = self._config
+        if self._tool_def is not None and "system" in self._read \
                 and not self._read & {"tools", "tool_params", "tool_result"}:
             config._warn_once(None, (
                 "run.system names the load_skill tool, but this run's tools never included it. "
@@ -561,60 +516,60 @@ class Run:
 
     # ── preparing ───────────────────────────────────────────
     def _context(self) -> Dict[str, Any]:
-        return {"message": self._message, "values": self._conversation._values}
+        return {"message": self._message, "values": self._conversation._values,
+                "conversation": self._conversation}
 
     def _prepare_sync(self) -> None:
         config, ctx = self._config, self._context()
-        fixed = self._conversation._current()
-        if fixed is None:
-            state = config._prepare_run_sync(ctx, None, self.key)
-            text = config._compose(ctx, None, self.key, state)
-            mine = config._fixed_from(self.key, state, text)
-            fixed = self._conversation._fix(mine)
-            self._fixed_by_me = fixed is mine
-        else:
-            routed = config._route_later_run(self.key, ctx, fixed) if config._routes_later(fixed) else None
-            state = config._later_run(ctx, self.key, fixed, routed)
-        self._done_preparing(fixed, state)
+        record = self._conversation._current()
+        if record is not None and config._routes_later(record):
+            ctx["routed"] = config._route_later_run(self.key, ctx)
+        state = config._prepare_run_sync(ctx, None, self.key)
+        if state.get("conversation") is None:
+            config._compose(ctx, None, self.key, state)
+        self._done_preparing(state)
 
     async def _prepare_async(self) -> None:
         config, ctx = self._config, self._context()
-        fixed = self._conversation._current()
-        if fixed is None:
-            state = await config._prepare_run(ctx, None, self.key)
-            text = config._compose(ctx, None, self.key, state)
-            mine = config._fixed_from(self.key, state, text)
-            fixed = self._conversation._fix(mine)
-            self._fixed_by_me = fixed is mine
-        else:
-            routed = (await asyncio.to_thread(config._route_later_run, self.key, ctx, fixed)
-                      if config._routes_later(fixed) else None)
-            state = config._later_run(ctx, self.key, fixed, routed)
-        self._done_preparing(fixed, state)
+        record = self._conversation._current()
+        if record is not None and config._routes_later(record):
+            ctx["routed"] = await asyncio.to_thread(config._route_later_run, self.key, ctx)
+        state = await config._prepare_run(ctx, None, self.key)
+        if state.get("conversation") is None:
+            config._compose(ctx, None, self.key, state)
+        self._done_preparing(state)
 
-    def _done_preparing(self, fixed: _Fixed, state: Dict[str, Any]) -> None:
-        self._fixed, self._state = fixed, state
+    def _done_preparing(self, state: Dict[str, Any]) -> None:
+        mine = state["conversation"]
+        record = self._conversation._current() or mine
         with self._conversation._lock:
+            first = self._conversation._runs == 0
             self._conversation._runs += 1
-            later = self._conversation._runs > 1
-        if later and fixed.inject:
-            self._config._warn_once(None, (
-                "the load_skill tool is off, so skill text is pasted into the system prompt; in a "
-                "conversation that text stays the first message's (Anthropic rejects a changed "
-                "system prompt), so later messages get no new skill text."))
+        self._recorded_by_me = first and record is mine
+        self._record, self._state = record, state
+        self._blocks, self._tool_def = self._config._shape(record)
+        routed = state.get("routed")
+        if routed is not None and routed[2]:
+            # A later message of a cut-list conversation, routed on its own text: the
+            # skills it picked that the conversation has not shown go in its user turn.
+            offered, routing_id = list(routed[1]), routed[2]
+            with self._conversation._lock:
+                new = [name for name in offered if name not in record.shown]
+            state["offered_now"], state["routing_now"], state["new_names"] = offered, routing_id, new
+            state["new_block"] = _new_skills_block(routed[0], new) if new else None
 
     # ── what the developer reads ────────────────────────────
-    def _require_open(self, what: str) -> _Fixed:
-        if self._fixed is None:
+    def _require_open(self, what: str) -> ConversationRecord:
+        if self._record is None:
             raise RuntimeError(
                 f"run.{what} is ready once the run is open: use it inside `with support.run(...) as run:`")
-        return self._fixed
+        return self._record
 
     @property
     def system(self) -> List[Dict[str, Any]]:
-        fixed = self._require_open("system")
+        self._require_open("system")
         self._read.add("system")
-        return copy.deepcopy(fixed.blocks)
+        return copy.deepcopy(self._blocks)
 
     @property
     def message(self) -> Dict[str, Any]:
@@ -636,15 +591,15 @@ class Run:
 
     @property
     def tool_params(self) -> List[Dict[str, Any]]:
-        fixed = self._require_open("tool_params")
+        self._require_open("tool_params")
         self._read.add("tool_params")
-        return [copy.deepcopy(fixed.tool_def)] if fixed.tool_def is not None else []
+        return [copy.deepcopy(self._tool_def)] if self._tool_def is not None else []
 
     @property
     def tools(self) -> List[Any]:
-        fixed = self._require_open("tools")
+        self._require_open("tools")
         self._read.add("tools")
-        if fixed.tool_def is None:
+        if self._tool_def is None:
             return []
         if self._tools is None:
             sync_cls, async_cls = _tool_classes()
@@ -657,10 +612,10 @@ class Run:
         In an ``async with`` run, ``await run.atool_result(block)`` keeps the load
         off the event loop.
         """
-        fixed = self._require_open("tool_result")
+        self._require_open("tool_result")
         self._read.add("tool_result")
         name, tool_input, tool_use_id = _tool_use_parts(block)
-        if fixed.tool_def is None or name != fixed.tool_def["name"]:
+        if self._tool_def is None or name != self._tool_def["name"]:
             return None
         if self._mode == "async" and _event_loop_running():
             self._config._warn_once(None, (
@@ -671,10 +626,10 @@ class Run:
 
     async def atool_result(self, block: Any) -> Optional[Dict[str, Any]]:
         """`tool_result` for an async loop: the load runs off the event loop."""
-        fixed = self._require_open("atool_result")
+        self._require_open("atool_result")
         self._read.add("tool_result")
         name, tool_input, tool_use_id = _tool_use_parts(block)
-        if fixed.tool_def is None or name != fixed.tool_def["name"]:
+        if self._tool_def is None or name != self._tool_def["name"]:
             return None
         text, error = await self._aserve(tool_input)
         return _result_block(tool_use_id, text, error)
@@ -694,14 +649,14 @@ class Run:
         name = str(raw or "").strip()
         if not name:
             return None, "load_skill needs the name of one skill from the list."
-        fixed = self._fixed
-        if fixed is not None and not fixed.cut:
+        record = self._record
+        if record is not None and not record.cut:
             # The SDK does not hold a tool's input to its schema, so the name is
             # checked here. A cut list names only some skills; the platform checks those.
-            match = next((n for n in fixed.names if n.lower() == name.lower()), None)
+            match = next((n for n in record.names if n.lower() == name.lower()), None)
             if match is None:
                 return None, (f"{name!r} is not one of this agent's skills. Load one of: "
-                              f"{', '.join(fixed.names)}; or answer without one.")
+                              f"{', '.join(record.names)}; or answer without one.")
             name = match
         return name, None
 
@@ -716,10 +671,11 @@ class Run:
 
     def _name_the_showing_decision(self, name: str) -> None:
         """A skill shown by an earlier message of the conversation is loaded under that decision."""
-        state, fixed = self._state or {}, self._fixed
-        if fixed is None or state.get("offered_now") is None or name in state["offered_now"]:
+        state, record = self._state or {}, self._record
+        if record is None or state.get("offered_now") is None or name in state["offered_now"]:
             return
-        origin = fixed.shown.get(name)
+        with self._conversation._lock:
+            origin = record.shown.get(name)
         router = self._config._router()
         remember = getattr(router, "_remember_run_routing", None)
         if origin and callable(remember):
@@ -804,7 +760,7 @@ def _tool_classes() -> tuple:
                     self._run = run
 
                 def to_dict(self) -> Any:
-                    return copy.deepcopy(self._run._fixed.tool_def)
+                    return copy.deepcopy(self._run._tool_def)
 
                 def call(self, input: object) -> str:
                     text, error = self._run._serve(input)
@@ -822,7 +778,7 @@ def _tool_classes() -> tuple:
                     self._run = run
 
                 def to_dict(self) -> Any:
-                    return copy.deepcopy(self._run._fixed.tool_def)
+                    return copy.deepcopy(self._run._tool_def)
 
                 async def call(self, input: object) -> str:
                     text, error = await self._run._aserve(input)
@@ -864,7 +820,6 @@ class AnthropicAgentConfig(AgentBinding):
         self._cache_control = copy.deepcopy(cache_control) if cache_control else None
         self._on_trace = on_trace
         self._open_runs: Dict[str, Run] = {}
-        self._prompt_records: Dict[str, Dict[str, Any]] = {}
 
     def __repr__(self) -> str:
         return (
@@ -917,12 +872,14 @@ class AnthropicAgentConfig(AgentBinding):
             if variables is not None:
                 raise ValueError("a resumed conversation keeps the values it started with; "
                                  "pass state= or variables=, not both")
-            if not isinstance(state, dict) or state.get("version") != _STATE_VERSION:
-                raise ValueError("state= takes a Conversation.state from this version of decimalai")
-            if state.get("agent") != self.name:
+            if isinstance(state, dict) and state.get("agent") != self.name:
                 raise ValueError(f"this conversation state is agent {state.get('agent')!r}'s, "
                                  f"not {self.name!r}'s")
-        return Conversation(self, variables, state=state)
+            record = ConversationRecord.from_state(state, self.name)
+            if record is None:
+                raise ValueError("state= takes a Conversation.state from this version of decimalai")
+            return Conversation(self, None, record, str(state.get("id") or "") or None)
+        return Conversation(self, variables)
 
     # ── open runs ───────────────────────────────────────────
     def _open(self, run: Run) -> None:
@@ -932,27 +889,18 @@ class AnthropicAgentConfig(AgentBinding):
     def _close(self, run: Run) -> None:
         with self._lock:
             self._open_runs.pop(run.key, None)
-            self._prompt_records.pop(run.key, None)
 
-    def _fixed_from(self, run_key: str, state: Dict[str, Any], text: str) -> _Fixed:
-        """What a conversation keeps, from its first run's composed text."""
-        from .skill_router import (
-            LOAD_SKILL_PROMPT_HINT,
-            LOAD_SKILL_TOOL_DESCRIPTION,
-            LOAD_SKILL_TOOL_NAME,
-        )
+    def _shape(self, record: ConversationRecord) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """A conversation's record as Anthropic sees it: system blocks and the tool.
 
-        prefix = state.get("prefix") or ""
-        tool = bool(state.get("tool")) and bool(state.get("names"))
-        menu = f"{prefix}\n{LOAD_SKILL_PROMPT_HINT}" if (prefix and state.get("tool")) else prefix
-        if menu and text.endswith(menu):
-            head = text[: len(text) - len(menu)].rstrip("\n")
-        else:
-            head, menu = text, ""
-        _tool_on, inject = self._channels()
-        with self._lock:
-            cut = bool(self._menu_truncated)
-            record = self._prompt_records.get(run_key)
+        The same record always gives the same blocks and the same definition, so a
+        conversation resumed from its state in another process sends what its first
+        run sent.
+        """
+        from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
+
+        text, menu = record.text, record.menu
+        head = text[: len(text) - len(menu)].rstrip("\n") if menu else text
         blocks = self._blocks(head, menu)
         if blocks and self._cache_control:
             # At the end of the system text: a run's model calls, and a conversation's
@@ -962,16 +910,13 @@ class AnthropicAgentConfig(AgentBinding):
             # And on the prompt when later runs share it but not the list after it (a cut
             # list, or pasted skill text): the next run reads the prompt from the cache. A
             # prompt with {{variables}} differs per customer, so it gets none.
-            if len(blocks) == 2 and (cut or inject) and not template_variables(self._template()):
+            if len(blocks) == 2 and (record.cut or record.pasted) and not (record.prompt or {}).get("variables"):
                 blocks[0]["cache_control"] = copy.deepcopy(self._cache_control)
         tool_def = None
-        if tool:
+        if record.tool:
             tool_def = {"name": LOAD_SKILL_TOOL_NAME, "description": LOAD_SKILL_TOOL_DESCRIPTION,
-                        "input_schema": self._tool_schema([] if cut else list(state["names"]))}
-        return _Fixed(text="".join(block["text"] for block in blocks), blocks=blocks,
-                      names=list(state.get("names") or []), tool_def=tool_def, prompt_record=record,
-                      delivered=list(state.get("delivered") or []), unavailable=state.get("unavailable"),
-                      inject=bool(inject), cut=cut, routing_id=state.get("routing_id"))
+                        "input_schema": self._tool_schema(list(record.tool_names))}
+        return blocks, tool_def
 
     @staticmethod
     def _blocks(head: str, menu: str) -> List[Dict[str, Any]]:
@@ -983,14 +928,14 @@ class AnthropicAgentConfig(AgentBinding):
             blocks.append({"type": "text", "text": f"\n\n{menu}" if blocks else menu})
         return blocks
 
-    def _routes_later(self, fixed: _Fixed) -> bool:
+    def _routes_later(self, record: ConversationRecord) -> bool:
         """Whether a later message of this conversation is routed before its model call."""
         from ._config import _disabled_by_init
 
         tool, _inject = self._channels()
-        return fixed.cut and bool(fixed.tool_def) and tool and not _disabled_by_init()
+        return record.cut and record.tool and tool and not _disabled_by_init()
 
-    def _route_later_run(self, run_key: str, ctx: Dict[str, Any], fixed: _Fixed) -> Any:
+    def _route_later_run(self, run_key: str, ctx: Dict[str, Any]) -> Any:
         """This message's own decision, for a conversation whose list is cut (or None)."""
         try:
             routed = self._route(run_key, self._message(ctx, None))
@@ -1000,61 +945,6 @@ class AnthropicAgentConfig(AgentBinding):
         prefix, offered, routing_id, truncated, _delivered, _versions = routed
         self._store_menu(prefix, offered, routing_id, truncated)
         return routed
-
-    def _later_run(self, ctx: Dict[str, Any], run_key: str, fixed: _Fixed,
-                   routed: Any = None) -> Dict[str, Any]:
-        """A later run of a conversation: its system and tool are the conversation's.
-
-        A whole list: the message is routed in the background and recorded on its
-        own trace (the decision offers exactly the list shown). A cut list: the
-        message was routed before its call (``routed``); skills it offers that the
-        conversation has not shown go in ``run.message``, and its decision goes on
-        its trace when the run closes (`Run._record_this_messages_decision`). A
-        load names the decision that showed its skill.
-        """
-        from ._config import _disabled_by_init
-
-        self._refresh_prompt_if_stale()  # for the next conversation
-        query = self._message(ctx, None)
-        switched_off = _disabled_by_init()
-        tool, _inject = self._channels()
-        routing_id = None
-        state: Dict[str, Any] = {
-            "query": query, "route_now": False, "routing_id": routing_id, "prefix": "",
-            "names": list(fixed.names), "unavailable": fixed.unavailable, "text": fixed.text,
-            "tool": bool(fixed.tool_def) and tool and not switched_off,
-            # Skill text already in the system prompt is not sent again.
-            "loaded": set(fixed.delivered), "delivered": [], "delivered_versions": [],
-        }
-        with self._lock:
-            self._runs[(run_key, None)] = state
-            while len(self._runs) > _MAX_CONFIG_RUNS:
-                self._runs.popitem(last=False)
-        self._record(
-            agent=None, system_prompt=fixed.text, offered=fixed.names, routing_id=routing_id,
-            user_input=query, prompt=fixed.prompt_record, delivered=[], delivered_versions=[],
-        )
-        if switched_off or not fixed.names:
-            return state
-        if fixed.cut:
-            if routed is not None and routed[2]:
-                prefix, offered, routing_id_now = routed[0], list(routed[1]), routed[2]
-                with self._lock:
-                    shown = set(fixed.shown)
-                new = [name for name in offered if name not in shown]
-                state["offered_now"], state["routing_now"], state["new_names"] = offered, routing_id_now, new
-                state["new_block"] = _new_skills_block(prefix, new) if new else None
-            else:
-                # No decision of its own: loads name the conversation's.
-                router = self._router()
-                remember = getattr(router, "_remember_run_routing", None)
-                if fixed.routing_id and callable(remember):
-                    remember(run_key, fixed.routing_id)
-        else:
-            pending = _in_background(self._route_run, run_key, list(fixed.names), query)
-            self._note_pending(run_key, pending)
-            state["pending"] = pending
-        return state
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
@@ -1076,11 +966,21 @@ class AnthropicAgentConfig(AgentBinding):
     def _record(self, **fields: Any) -> bool:
         from ._agent import _record_turn
 
-        run_key = _RUN.get()
-        if isinstance(fields.get("prompt"), dict) and run_key is not None:
-            with self._lock:
-                self._prompt_records[run_key] = fields["prompt"]
         return _record_turn(fields)
+
+    def _conversation(self, context: Any, agent: Any) -> Optional[ConversationRecord]:
+        conversation = context.get("conversation") if isinstance(context, dict) else None
+        return conversation._current() if conversation is not None else None
+
+    def _keep_conversation(self, context: Any, agent: Any, run_key: Optional[str],
+                           record: ConversationRecord) -> None:
+        conversation = context.get("conversation") if isinstance(context, dict) else None
+        if conversation is not None:
+            conversation._fix(record)
+
+    def _routed_continuation(self, context: Any, agent: Any) -> Any:
+        routed = context.get("routed") if isinstance(context, dict) else None
+        return routed if routed is not None and routed[2] else None
 
     def _stamp_routing(self, run_key: Optional[str], routing_id: str) -> None:
         """A background decision lands on its run's trace only while that trace is open."""
@@ -1094,12 +994,13 @@ class AnthropicAgentConfig(AgentBinding):
             if run._ended:
                 return
             record_skill_rail(routing_id=routing_id)
-            fixed = run._fixed
-            if run._fixed_by_me and fixed is not None and not fixed.routing_id:
-                fixed.routing_id = routing_id
-                for name, origin in list(fixed.shown.items()):
-                    if origin is None:
-                        fixed.shown[name] = routing_id
+            record = run._record
+            if run._recorded_by_me and record is not None and not record.routing_id:
+                with run._conversation._lock:
+                    record.routing_id = routing_id
+                    for name, origin in list(record.shown.items()):
+                        if origin is None:
+                            record.shown[name] = routing_id
 
     def _serve_load(self, name: str) -> str:
         from ._agent import _serve_and_record

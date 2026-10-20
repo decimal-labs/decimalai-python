@@ -132,14 +132,22 @@ class ConversationRecord:
         delivered: Skills whose text was pasted into ``text``.
         unavailable: Why the list is missing, when it is.
         pasted: Skill text was pasted in (``load_skill`` switched off).
+        menu: The skill-list part at the end of ``text`` ("" without one), so a
+            framework that sends the prompt and the list as separate pieces (the
+            Anthropic module's system blocks) rebuilds them exactly.
+        shown: Every skill the conversation has shown the model, and the routing
+            decision that first showed it. A load names that decision: the
+            platform serves a public-registry skill only to a load whose decision
+            offered it.
     """
 
     __slots__ = ("text", "names", "tool", "tool_names", "cut", "routing_id", "prompt",
-                 "delivered", "unavailable", "pasted")
+                 "delivered", "unavailable", "pasted", "menu", "shown")
 
     def __init__(self, *, text: str, names: List[str], tool: bool, tool_names: List[str],
                  cut: bool, routing_id: Optional[str], prompt: Optional[Dict[str, Any]],
-                 delivered: List[str], unavailable: Optional[str], pasted: bool) -> None:
+                 delivered: List[str], unavailable: Optional[str], pasted: bool,
+                 menu: str = "", shown: Optional[Dict[str, Optional[str]]] = None) -> None:
         self.text = text
         self.names = names
         self.tool = tool
@@ -150,6 +158,9 @@ class ConversationRecord:
         self.delivered = delivered
         self.unavailable = unavailable
         self.pasted = pasted
+        self.menu = menu if text.endswith(menu) else ""
+        self.shown: Dict[str, Optional[str]] = (
+            dict(shown) if shown is not None else {name: routing_id for name in names})
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, ConversationRecord) and all(
@@ -162,7 +173,7 @@ class ConversationRecord:
             "skills": self.names, "load_skill": self.tool, "load_skill_names": self.tool_names,
             "skills_cut": self.cut, "routing_id": self.routing_id, "prompt": self.prompt,
             "delivered": self.delivered, "skills_unavailable": self.unavailable,
-            "pasted": self.pasted,
+            "pasted": self.pasted, "skills_menu": self.menu, "skills_shown": self.shown,
         })
 
     @classmethod
@@ -177,6 +188,9 @@ class ConversationRecord:
             cut=bool(state.get("skills_cut")), routing_id=state.get("routing_id"),
             prompt=copy.deepcopy(state.get("prompt")), delivered=_clean_names(state.get("delivered")),
             unavailable=state.get("skills_unavailable"), pasted=bool(state.get("pasted")),
+            menu=state.get("skills_menu") if isinstance(state.get("skills_menu"), str) else "",
+            shown=({str(k): (v if isinstance(v, str) else None) for k, v in state["skills_shown"].items()}
+                   if isinstance(state.get("skills_shown"), Mapping) else None),
         )
 
 
@@ -384,6 +398,18 @@ class AgentBinding:
                            record: ConversationRecord) -> None:
         """A run composed afresh: keep its record where its conversation's later runs look."""
 
+    def _routed_continuation(self, context: Any, agent: Any) -> Any:
+        """A later run's own routing result, when the framework routed its message already.
+
+        Only for a conversation whose list is cut. None (the default): the run is
+        not routed again and names the conversation's decision. A framework that
+        can show the model this message's new skills without touching the system
+        text (the Anthropic module's ``run.message``) routes before the run and
+        returns `_route`'s result; the run's state then carries it as ``routed``,
+        and recording the decision is that framework's.
+        """
+        return None
+
     # ── what the agent currently gets ────────────────────────
     @property
     def prompt_version(self) -> Optional[int]:
@@ -569,6 +595,7 @@ class AgentBinding:
             prompt = self._prompt
         template = self._template()
         text = template
+        menu = ""
         if template_variables(template):
             version = getattr(prompt, "version_number", None)
             where = f"Prompt version {version} of {self.name!r}" if version else f"The fallback prompt of {self.name!r}"
@@ -592,7 +619,7 @@ class AgentBinding:
             tool_names=list(state.get("tool_names") or []), cut=bool(state.get("cut")),
             routing_id=state["routing_id"], prompt=copy.deepcopy(prompt_record),
             delivered=list(state["delivered"]), unavailable=state["unavailable"],
-            pasted=bool(state.get("pasted")),
+            pasted=bool(state.get("pasted")), menu=menu,
         )
         state["conversation"] = record
         try:
@@ -623,7 +650,8 @@ class AgentBinding:
 
         self._refresh_prompt_if_stale()  # for the next conversation
         query = self._message(context, agent)
-        routing_id = record.routing_id if record.cut else None
+        routed = self._routed_continuation(context, agent) if record.cut else None
+        routing_id = record.routing_id if (record.cut and routed is None) else None
         state: Dict[str, Any] = {
             "query": query, "route_now": False, "routing_id": routing_id, "prefix": "",
             "names": list(record.names), "unavailable": record.unavailable, "text": record.text,
@@ -650,7 +678,11 @@ class AgentBinding:
         )
         if _disabled_by_init() or not record.names:
             return state
-        if record.cut:
+        if record.cut and routed is not None:
+            # Routed on its own message already; the router named that decision for
+            # this run's loads, and the framework records it.
+            state["routed"] = routed
+        elif record.cut:
             router = self._router()
             remember = getattr(router, "_remember_run_routing", None)
             if run_key is not None and routing_id and callable(remember):
