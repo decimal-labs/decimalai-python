@@ -315,12 +315,11 @@ def post_regression_check(agent_name: str, candidate_manifest_id: str) -> dict:
         return json.loads(r.read())
 
 
-def create_agent(agent_name: str, system_prompt: str) -> dict:
-    """Create an agent with a saved prompt, which is what ``load_agent()`` reads."""
+def _send(method: str, path: str, body: dict) -> dict:
     req = urllib.request.Request(
-        f"{BACKEND_URL}/api/v1/agents",
-        data=json.dumps({"agent_name": agent_name, "system_prompt": system_prompt}).encode("utf-8"),
-        method="POST",
+        f"{BACKEND_URL}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        method=method,
         headers={
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
@@ -328,6 +327,25 @@ def create_agent(agent_name: str, system_prompt: str) -> dict:
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read())
+
+
+def create_agent(agent_name: str, system_prompt: str) -> dict:
+    """Make ``agent_name`` exist with a saved prompt, which is what ``load_agent()`` reads.
+
+    Not ``POST /api/v1/agents``: it refuses the ``live-`` prefix every live test's
+    agent carries (a fixture prefix, hidden from the agents list). A manifest makes
+    the agent exist, as trace ingest would, and the prompt is saved on it.
+    """
+    _send("POST", "/api/v1/manifests", {
+        "agent_name": agent_name,
+        "manifest_hash": f"live_{uuid4().hex}",
+        "version_label": "v1",
+        "components": [
+            {"component_type": "prompt", "component_name": "system",
+             "content_hash": f"live_prompt_{uuid4().hex[:12]}"},
+        ],
+    })
+    return _send("PUT", f"/api/v1/agents/{agent_name}/prompt", {"system_prompt": system_prompt})
 
 
 def get_trace_detail(trace_id: str) -> dict:
