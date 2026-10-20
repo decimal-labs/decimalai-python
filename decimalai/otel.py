@@ -741,6 +741,7 @@ def instrument(
     # reads the same ContextVar, so it picks the new name up too.
     if agent_name:
         _active_agent_name.set(agent_name)
+    exporter._provider = provider
     provider.add_span_processor(_AgentNameStamper())
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace_api.set_tracer_provider(provider)
@@ -989,6 +990,9 @@ class DecimalSpanExporter:
         # buffer them by trace_id and finalize once the root span shows up.
         self._pending: Dict[int, List[Any]] = defaultdict(list)
         self._pending_lock = threading.Lock()
+        # The tracer provider this exporter was attached to, when DecimalAI attached
+        # it (`otel.instrument()`, `decimalai.providers`). See _without_sdk_duplicates.
+        self._provider: Any = None
 
     def export(self, spans: Sequence[Any]) -> Any:
         """Export a batch of OTEL spans, grouped into DecimalAI traces.
@@ -1225,6 +1229,32 @@ class DecimalSpanExporter:
 
     # ── Trace assembly ─────────────────────────────────────
 
+    def _without_sdk_duplicates(self, otel_spans: List[Any]) -> List[Any]:
+        """The Anthropic SDK's own call spans, dropped where OpenInference records the same calls.
+
+        anthropic >= 1.14 traces each API call itself, by default without the
+        messages. On a provider where DecimalAI turned OpenInference's Anthropic
+        instrumentor on, every call is then recorded twice: inside OpenInference's
+        span for a plain request (which `content_from_wrapper` below would cover),
+        but beside it for `messages.stream()` (the request goes out after
+        OpenInference's span stops being current), and as a trace of its own when
+        no run wraps the stream. OpenInference's span has the content and the
+        tokens, so the SDK's call span is dropped there: the record anthropic 1.13
+        gave. On any other provider it is kept, as it may be the only record.
+        """
+        try:
+            from .providers import _openinference_bound_to
+
+            if not _openinference_bound_to("anthropic", self._provider):
+                return otel_spans
+        except Exception:
+            return otel_spans
+        return [
+            span for span in otel_spans
+            if not (_scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE)
+                    and (getattr(span, "attributes", None) or {}).get("gen_ai.operation.name") == "chat")
+        ]
+
     def _assemble_trace(self, otel_spans: List[Any]) -> Optional[tuple]:
         """Convert a group of OTEL spans (same trace_id) to a RunTrace.
 
@@ -1235,6 +1265,7 @@ class DecimalSpanExporter:
 
         if not _config._is_enabled():
             return None
+        otel_spans = self._without_sdk_duplicates(otel_spans)
 
         trace_spans: List[TraceSpan] = []
         llm_calls: List[LlmCallRecord] = []
@@ -2253,6 +2284,14 @@ def _messages_from_attrs(
         }
         for idx in sorted(found)
     ]
+
+
+#: The instrumentation scope of the Anthropic SDK's own spans (anthropic >= 1.14).
+_ANTHROPIC_SDK_SCOPE = "com.anthropic.sdk"
+
+
+def _scope_name(span: Any) -> str:
+    return getattr(getattr(span, "instrumentation_scope", None), "name", None) or ""
 
 
 def _carries_content(attrs: Dict[str, Any]) -> bool:

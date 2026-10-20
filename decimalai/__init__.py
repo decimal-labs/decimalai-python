@@ -689,6 +689,7 @@ def _activate_crewai_instrumentation(
         # Mark it globally instrumented so a later init(openai=True) doesn't
         # build a second exporter pipeline for a provider already captured.
         _providers._instrumented.add(pname)
+        _providers._openinference_provider[pname] = tracer_provider
         logger.info("DecimalAI tracing enabled for %s SDK calls (via CrewAI)", pname)
 
 

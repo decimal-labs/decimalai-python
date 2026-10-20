@@ -4,6 +4,20 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **A streamed Anthropic call is one call again, not two with doubled tokens** (anthropic 1.14
+  and later, under `init(anthropic=True)`). The SDK traces each request itself, without the
+  messages, beside OpenInference's span of the same call. 0.22.0 merged the two when the SDK's
+  span sits inside OpenInference's, as it does for `messages.create()`. For
+  `client.messages.stream()` they are siblings instead: the request goes out after
+  OpenInference's span stops being current. So a streamed call was counted twice inside a run,
+  and outside one it was sent as two traces, one of them empty. Where DecimalAI turned
+  OpenInference's Anthropic instrumentor on, the SDK's own call spans are now dropped, which is
+  the record anthropic 1.13 gave. Elsewhere they are kept, since they may be the only record.
+
 ## [0.22.0] — 2026-10-21
 
 ### Fixed

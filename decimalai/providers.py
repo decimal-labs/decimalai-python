@@ -121,6 +121,16 @@ _pipeline_provider: Any = None
 # ``tracer_provider=`` explicitly.
 _last_provider: Any = None
 
+# The tracer provider DecimalAI last bound each provider's OpenInference
+# instrumentor to. The instrumentor is a process-wide singleton, bound when it is
+# turned on; one another tool turned on first is not recorded.
+_openinference_provider: Dict[str, Any] = {}
+
+
+def _openinference_bound_to(name: str, provider: Any) -> bool:
+    """Whether DecimalAI bound ``name``'s instrumentor to ``provider`` (see otel)."""
+    return provider is not None and _openinference_provider.get(name) is provider
+
 
 def _sdk_present(sdk_module: str) -> bool:
     """True if the provider's SDK is importable (without importing it)."""
@@ -196,25 +206,26 @@ def _ensure_pipeline(agent_name: Optional[str], tracer_provider: Any = None) -> 
     from .otel import DecimalSpanExporter, _AgentNameStamper
 
     if tracer_provider is not None:
+        exporter = DecimalSpanExporter(agent_name=agent_name)
+        exporter._provider = tracer_provider
         tracer_provider.add_span_processor(_AgentNameStamper())
-        tracer_provider.add_span_processor(
-            SimpleSpanProcessor(DecimalSpanExporter(agent_name=agent_name))
-        )
+        tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
         _last_provider = tracer_provider
         return tracer_provider
 
     if _pipeline_provider is not None:
         return _pipeline_provider
 
-    processor = SimpleSpanProcessor(DecimalSpanExporter(agent_name=agent_name))
+    exporter = DecimalSpanExporter(agent_name=agent_name)
     current = trace_api.get_tracer_provider()
     if hasattr(current, "add_span_processor"):
         provider = current
     else:
         provider = TracerProvider()
         trace_api.set_tracer_provider(provider)
+    exporter._provider = provider
     provider.add_span_processor(_AgentNameStamper())
-    provider.add_span_processor(processor)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     _pipeline_provider = provider
     _last_provider = provider
@@ -310,6 +321,9 @@ def instrument(
             logger.warning(msg, name, spec.pip) if forced else logger.info(msg, name, spec.pip)
             continue
         instrumentor = instrumentor_cls()
+        # Already on (bound by an earlier call, or by another tool): instrument()
+        # leaves it bound where it was.
+        already_on = getattr(instrumentor, "is_instrumented_by_opentelemetry", None) is True
         try:
             instrumentor.instrument(tracer_provider=provider)
         except Exception:
@@ -330,6 +344,8 @@ def instrument(
             continue
         if not explicit_provider:
             _instrumented.add(name)
+        if not already_on:
+            _openinference_provider[name] = provider
         logger.info("DecimalAI tracing enabled for direct %s SDK calls", name)
 
     return provider

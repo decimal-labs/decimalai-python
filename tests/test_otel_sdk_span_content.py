@@ -176,3 +176,83 @@ def test_a_wrapper_around_several_calls_lends_its_content_to_none():
     trace, *_ = _assemble(spans)
     assert len(trace.llm_calls) == 2
     assert all(c.rendered_input is None and c.output is None for c in trace.llm_calls)
+
+
+# ── the SDK's call span beside OpenInference's: messages.stream() ─────────────
+
+
+class _Scope:
+    def __init__(self, name):
+        self.name = name
+
+
+SDK_SCOPE, OPENINFERENCE_SCOPE = "com.anthropic.sdk.python", "openinference.instrumentation.anthropic"
+
+
+def _scoped(span, scope):
+    span.instrumentation_scope = _Scope(scope)
+    return span
+
+
+def _stream_spans(oi_id=OPENINFERENCE, sdk_id=SDK, parent=ROOT, reply="pong-COMPLETION-SENTINEL"):
+    """``messages.stream()``: OpenInference's span is current only while ``stream()`` builds the
+    stream manager, and the SDK sends the request (opening its own span) on entering it, so the
+    two spans of one call are siblings, not nested."""
+    oi_attrs = dict(OPENINFERENCE_ATTRS, **{
+        "llm.output_messages.0.message.contents.0.message_content.text": reply})
+    return [_scoped(_Span("anthropic.messages.create", sdk_id, parent, SDK_ATTRS), SDK_SCOPE),
+            _scoped(_Span("messages.stream", oi_id, parent, oi_attrs), OPENINFERENCE_SCOPE)]
+
+
+@pytest.fixture
+def bound(monkeypatch):
+    """An exporter on the provider DecimalAI bound OpenInference's Anthropic instrumentor to."""
+    import decimalai.providers as providers
+    from decimalai.otel import DecimalSpanExporter
+
+    provider = object()
+    monkeypatch.setattr(providers, "_openinference_provider", {"anthropic": provider})
+    exporter = DecimalSpanExporter(agent_name="test-agent")
+    exporter._provider = provider
+    return exporter
+
+
+def test_a_streamed_call_is_one_call_with_the_instrumentors_content(bound):
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    trace, *_ = bound._assemble_trace([*_stream_spans(), run])
+    (call,) = trace.llm_calls  # one request, not two with doubled tokens
+    assert call.output == {"role": "assistant", "content": "pong-COMPLETION-SENTINEL"}
+    assert (call.input_tokens, call.output_tokens) == (12, 3)
+
+
+def test_two_streams_at_once_are_two_calls_each_with_its_own_content(bound):
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    first = _stream_spans(reply="FIRST")
+    second = _stream_spans(oi_id=0xAAA1, sdk_id=0xAAA2, reply="SECOND")
+    trace, *_ = bound._assemble_trace([*first, *second, run])
+    assert sorted(c.output["content"] for c in trace.llm_calls) == ["FIRST", "SECOND"]
+
+
+def test_a_stream_outside_a_run_is_not_a_second_trace(bound):
+    # No run around it: each span is a root, so each would be a trace of its own.
+    (sdk, _oi) = _stream_spans(parent=None)
+    assert bound._assemble_trace([sdk]) is None
+
+
+def test_where_decimalai_did_not_bind_the_instrumentor_the_sdks_span_is_kept():
+    # init(otel=True) beside another tool's OpenInference: the SDK's span may be the only record.
+    from decimalai.otel import DecimalSpanExporter
+
+    (sdk, _oi) = _stream_spans(parent=None)
+    trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace([sdk])
+    (call,) = trace.llm_calls
+    assert (call.input_tokens, call.output_tokens) == (12, 3)
+
+
+def test_the_tool_runners_own_span_is_kept(bound):
+    runner = _scoped(_Span("anthropic.messages.tool_runner", 0xBBB1, None,
+                           {"gen_ai.operation.name": "invoke_agent", "gen_ai.request.model": "claude-haiku-4-5"}),
+                     SDK_SCOPE)
+    trace, *_ = bound._assemble_trace([*_stream_spans(parent=0xBBB1), runner])
+    assert [s.name for s in trace.spans if s.name == "anthropic.messages.tool_runner"]
+    assert len(trace.llm_calls) == 1

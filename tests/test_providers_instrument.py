@@ -38,9 +38,11 @@ def _reset_providers_state():
     """Clear the process-global instrument/pipeline caches around each test."""
     providers._instrumented.clear()
     providers._pipeline_provider = None
+    providers._openinference_provider.clear()
     yield
     providers._instrumented.clear()
     providers._pipeline_provider = None
+    providers._openinference_provider.clear()
 
 
 @pytest.fixture
@@ -392,3 +394,32 @@ class TestAutoTraceEnv:
         kwargs = spy.call_args.kwargs
         assert kwargs["openai_agents"] is True
         assert kwargs["openai"] is False
+
+
+# ── which provider DecimalAI bound an instrumentor to (otel drops SDK duplicates there) ──
+
+class TestOpenInferenceBinding:
+    @staticmethod
+    def _turns_on(instrumentor, already_on=False):
+        instrumentor.is_instrumented_by_opentelemetry = already_on
+        instrumentor.instrument.side_effect = lambda **kwargs: setattr(
+            instrumentor, "is_instrumented_by_opentelemetry", True)
+
+    def test_the_provider_decimalai_binds_the_instrumentor_to_is_recorded(self, fake_pipeline, loaded):
+        self._turns_on(loaded["anthropic"].return_value)
+        instrument(anthropic=True)
+        assert providers._openinference_bound_to("anthropic", SENTINEL_PROVIDER)
+
+    def test_an_instrumentor_another_tool_turned_on_is_not_recorded(self, fake_pipeline, loaded):
+        self._turns_on(loaded["anthropic"].return_value, already_on=True)
+        instrument(anthropic=True)
+        assert not providers._openinference_bound_to("anthropic", SENTINEL_PROVIDER)
+
+    def test_each_exporter_decimalai_attaches_knows_its_provider(self):
+        from opentelemetry.sdk.trace import TracerProvider
+
+        provider = TracerProvider()
+        providers._ensure_pipeline("agent", provider)
+        exporters = [getattr(p, "span_exporter", None)
+                     for p in provider._active_span_processor._span_processors]
+        assert [e._provider for e in exporters if e is not None] == [provider]
