@@ -287,21 +287,6 @@ class TestInstrumentDefaults:
         finally:
             lc._decimal_callback_var.reset(token)
 
-    def test_adk_and_its_repeat_call(self, configured, monkeypatch):
-        """Each ``adk.instrument()`` replaces the name, so a bare repeat used to
-        put the install back on ADK's node name."""
-        import decimalai.adk as adk
-
-        for attr in ("_install_agent_name", "_skill_loader_enabled", "_instrument_config"):
-            monkeypatch.setattr(adk, attr, getattr(adk, attr))
-        monkeypatch.setattr(adk, "_runner_patched", True)  # configure only; patch nothing
-        configured(NAME)
-        adk.instrument()
-        assert adk._install_agent_name == NAME
-        assert adk._instrument_config.agent_name == NAME
-        adk.instrument(agent_name="other")
-        assert adk._install_agent_name == "other"
-
     def test_crewai(self, configured, monkeypatch):
         import decimalai.crewai as dc
 

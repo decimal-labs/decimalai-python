@@ -806,7 +806,6 @@ def init(
     enabled: bool = True,
     langchain: bool = False,
     openai_agents: bool = False,
-    adk: bool = False,
     llamaindex: bool = False,
     claude_agent_sdk: bool = False,
     crewai: bool = False,
@@ -834,14 +833,13 @@ def init(
 
         decimalai.init(langchain=True)       # LangChain / LangGraph
         decimalai.init(openai_agents=True)   # OpenAI Agents SDK
-        decimalai.init(adk=True)             # Google ADK (Agent Development Kit)
         decimalai.init(llamaindex=True)      # LlamaIndex
         decimalai.init(claude_agent_sdk=True)  # Anthropic Claude Agent SDK
         decimalai.init(crewai=True)          # CrewAI
         decimalai.init(otel=True)            # Any OpenTelemetry framework
 
-    On the three frameworks with a skill loader — ``langchain``, ``adk`` and
-    ``crewai`` — the flag both traces and delivers the agent's skills, so
+    On the two frameworks with a skill loader — ``langchain`` and ``crewai`` —
+    the flag both traces and delivers the agent's skills, so
     ``init(langchain=True, agent_name="support")`` is the whole setup. It is the
     same install as calling that adapter's
     ``instrument(agent_name=..., enable_skill_loader=True)`` after a bare
@@ -871,7 +869,7 @@ def init(
             ``https://api.decimal.ai``.
         enabled: Set ``False`` to disable all tracing. This is a real kill
             switch: no client is created, and the framework flags below
-            (``langchain``/``openai_agents``/``adk``/``llamaindex``/
+            (``langchain``/``openai_agents``/``llamaindex``/
             ``claude_agent_sdk``/``otel``/``crewai``/``autogen``) are ignored —
             no adapter is installed, no call is made to the DecimalAI API, and
             no skill files are written to disk. It also stops a skill loader an
@@ -884,9 +882,6 @@ def init(
             an agent gets its DecimalAI prompt and skills from
             ``decimalai.openai_agents.load_agent(name)``, which you pass into
             your own ``Agent(...)``. ``skills`` does not apply to it.
-        adk: If ``True``, instrument Google ADK (Agent Development Kit) via a
-            native ADK plugin, and deliver skills into each model request's
-            system instruction (see ``skills``). ADK is Gemini-native.
         llamaindex: If ``True``, instrument LlamaIndex. Tracing only: this
             adapter has no skill loader.
         claude_agent_sdk: If ``True``, instrument Anthropic's Claude Agent SDK
@@ -942,7 +937,7 @@ def init(
         verify_timeout: Seconds before the verify probe gives up.
             On timeout, init() logs a warning and continues (does not
             raise) so a transiently slow backend doesn't break startup.
-        skills: Whether the ``langchain``, ``adk`` or ``crewai`` flag also turns
+        skills: Whether the ``langchain`` or ``crewai`` flag also turns
             on that adapter's skill loader. ``True`` makes the flag form deliver
             the agent's skills; ``False`` installs tracing only, exactly as
             ``instrument()`` does without ``enable_skill_loader``. Left unset,
@@ -1149,7 +1144,7 @@ def init(
     # is exactly the behaviour the flag exists to prevent, so the whole block is
     # skipped: no adapter installed, no HTTP call, nothing written to disk.
     if not enabled:
-        if langchain or openai_agents or adk or llamaindex or claude_agent_sdk \
+        if langchain or openai_agents or llamaindex or claude_agent_sdk \
                 or otel or crewai or autogen:
             logger.info(
                 "DecimalAI SDK disabled (enabled=False) — skipping framework "
@@ -1164,7 +1159,7 @@ def init(
         if skills_from_env:
             skills = (
                 _skills_from_env()
-                if (langchain or adk or crewai)
+                if (langchain or crewai)
                 else True
             )
             if not skills:
@@ -1180,10 +1175,6 @@ def init(
         if openai_agents:
             from .openai_agents import instrument as _oai_install
             _oai_install(agent_name=agent_name)
-
-        if adk:
-            from .adk import instrument as _adk_install
-            _adk_install(agent_name=agent_name, enable_skill_loader=skills)
 
         # Auto-install LlamaIndex span handler if requested
         if llamaindex:
@@ -2279,8 +2270,8 @@ def _auto_init_from_env() -> None:
 
     Two paths:
     1. `DECIMAL_AUTO_TRACE=<framework>` — full framework auto-install, the same
-       as passing that framework's flag to `init()`: on langchain,
-       openai-agents, adk and crewai that includes the skill loader.
+       as passing that framework's flag to `init()`: on langchain and
+       crewai that includes the skill loader.
        `DECIMALAI_SKILLS=0` keeps it to tracing only (`init()` reads it as its
        `skills=` default, and this path passes none).
     2. `DECIMAL_API_KEY` present AND `DECIMAL_AUTOINIT != "false"` — bare
@@ -2295,6 +2286,14 @@ def _auto_init_from_env() -> None:
     auto_trace = os.environ.get("DECIMAL_AUTO_TRACE", "").strip().lower()
     api_key = _api_key_from_env()
 
+    if auto_trace == "adk":
+        # ADK has no process-wide install since 0.20: say so, or this value would
+        # quietly trace nothing.
+        logger.warning(
+            "DecimalAI: DECIMAL_AUTO_TRACE=adk traces nothing since decimalai 0.20. Add "
+            "decimalai.adk.DecimalaiPlugin() to your App(plugins=[...]); an agent gets its "
+            "prompt and skills from decimalai.adk.load_agent(name)."
+        )
     if auto_trace:
         if not api_key:
             logger.warning(
@@ -2307,7 +2306,6 @@ def _auto_init_from_env() -> None:
             init(
                 langchain=(auto_trace == "langchain"),
                 openai_agents=(auto_trace == "openai-agents"),
-                adk=(auto_trace == "adk"),
                 llamaindex=(auto_trace == "llamaindex"),
                 # `crewai` is its own flag, not `otel`: the exporter alone
                 # receives nothing, because CrewAI emits no spans until its

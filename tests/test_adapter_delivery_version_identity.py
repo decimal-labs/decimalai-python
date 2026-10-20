@@ -11,7 +11,6 @@ import importlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -321,8 +320,9 @@ def test_partial_or_noncanonical_pair_preserves_legacy_hash_only(pair):
     assert copy_delivered_versions([witness]) == [{"name": NAME, "hash": HASHES[0]}]
 
 
-# Not openai_agents: since 0.18 it never builds a body into a prompt (load_skill only).
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "langchain", "adk"])
+# Not openai_agents or adk: since 0.18 and 0.20 they never build a body into a prompt
+# (load_skill only).
+@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "langchain"])
 @pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
 def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapter, failure):
     import decimalai.otel as otel
@@ -365,23 +365,6 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
                 executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
             ))
             return "\n".join(message["content"] for message in messages)
-        if adapter == "adk":
-            class Request:
-                def __init__(self):
-                    self.config = SimpleNamespace(system_instruction="caller")
-                    self.contents = []
-
-                def append_instructions(self, instructions):
-                    self.config.system_instruction += "\n" + "\n".join(instructions)
-
-            state = module._RunState(agent_name="child", started_at=datetime.now(timezone.utc))
-            state.enable_skill_loader = True
-            request = Request()
-            module._inject_skills_into_request(state, request)
-            if current[0] == 42:
-                assert state.skills_delivered == {NAME}
-                assert state.skills_delivered_versions == set()
-            return request.config.system_instruction
         tokens = module._open_call_rails()
         try:
             messages = module._inject_skills_into_input("synthetic request")

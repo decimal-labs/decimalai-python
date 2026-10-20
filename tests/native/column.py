@@ -103,7 +103,7 @@ class Session:
     """A probe, DecimalAI pointed at it, and the traces each run sent.
 
     ``init`` takes the ``decimalai.init`` flags the framework's documented native-mode
-    setup uses (``langchain=True``, ``adk=True``, ...).
+    setup uses (``langchain=True``, ``otel=True``, ...).
     """
 
     def __init__(self, framework: str, *, distributions: Iterable[str] = (),

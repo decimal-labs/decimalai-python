@@ -1,56 +1,34 @@
-"""Google ADK (Agent Development Kit) integration.
+"""Google ADK (Agent Development Kit): an agent's DecimalAI prompt and skills, and its traces.
 
-First-class tracing for ``google-adk`` via a native ADK ``BasePlugin``. One
-DecimalAI :class:`RunTrace` is captured per ADK *invocation* (one
-``Runner.run`` / ``run_async``), with LLM generations, tool calls, and
-multi-agent (sub-agent) activity recorded against it. The root agent's
-model / instruction / tools / sub-agents are auto-registered as a manifest.
+::
 
-Simple path (global — every ``Runner`` is traced)::
-
-    import decimalai
-    decimalai.init(adk=True)          # or: from decimalai.adk import instrument; instrument()
-
-    from google.adk.runners import Runner
-    runner = Runner(agent=my_agent, app_name="support", session_service=svc)
-    # all runner.run_async(...) invocations are now traced
-
-The global install covers every way ADK 2.12 builds a runner:
-``Runner(agent=...)``, ``Runner(app=App(...))``, ``InMemoryRunner(app=...)``,
-and the ``Runner(app=...)`` that ``adk web`` / ``adk run`` / ``api_server``
-construct. For an ``app=`` runner the plugin goes into the runner's copy of
-``App.plugins``; the caller's ``App`` is not modified.
-
-Explicit path (attach the plugin yourself — ADK's ``App`` is where plugins go)::
-
+    from google.adk.agents import LlmAgent
     from google.adk.apps import App
-    from decimalai.adk import DecimalaiPlugin
-    app = App(name="support", root_agent=my_agent,
-              plugins=[DecimalaiPlugin(agent_name="support")])
-    runner = Runner(app=app, session_service=svc)
+    from google.adk.runners import Runner
+    from decimalai.adk import DecimalaiPlugin, load_agent
 
-An explicit DecimalAI plugin answers for its runner: with the global install
-also on, the shared plugin is not added beside it, so an invocation is traced
-once.
+    support = load_agent("support", fallback=BASE_INSTRUCTION)
+    agent = LlmAgent(name="support", model="gemini-3.5-flash",
+                     instruction=support.instruction, tools=[lookup_order, *support.tools])
+    app = App(name="support", root_agent=agent, plugins=[DecimalaiPlugin()])
+    runner = Runner(app=app, session_service=session_service)
 
-Skills (opt-in)::
+``support.instruction`` is an ADK instruction provider. Before each model request it
+returns the agent's saved prompt (``{{placeholders}}`` filled from the session's state),
+then the skill list routed on the invocation's user message, then one sentence naming the
+tool. ``support.tools`` is ``load_skill``, which the model calls for a listed skill's text.
+Each invocation is routed on its own message: the first one before its first model
+request, later ones from a local copy while their own decision is recorded in the
+background, and every one of an agent with more skills than fit the list. ADK fills no
+``{var}`` of its own into an instruction provider's text, so ``{{name}}`` is the only
+template syntax in play.
 
-    decimalai.init(api_key=..., agent_name="support")
-    from decimalai.adk import instrument
-    instrument(agent_name="support", enable_skill_loader=True)
-
-With the loader on, every model turn is routed through ``SkillRouter`` and the
-result is appended to ``llm_request.config.system_instruction`` from the
-plugin's ``before_model_callback`` — the same hook, and the same field, ADK's
-own ``GlobalInstructionPlugin`` uses (``google/adk/plugins/
-global_instruction_plugin.py:86-121``). ``flows/llm_flows/core/_model_call.py``
-runs that hook (line 194) and hands the same request object to
-``llm.generate_content_async`` (line 261), so what is appended here is what the
-model is sent. The router call is a blocking HTTP round-trip, so it runs on a
-worker thread and never on ADK's event loop. Model turns of one invocation
-that ask the same question while that call is in flight — the branches of a
-``ParallelAgent`` — wait for it and share its answer, so one user turn is one
-routing decision and the trace names it.
+``DecimalaiPlugin`` traces: one DecimalAI trace per ADK invocation, with its model calls,
+tool calls and sub-agents, and the root agent's manifest (model, instruction, tools,
+sub-agents). An invocation whose agent was given ``load_agent()``'s instruction is filed
+under that DecimalAI agent and carries the prompt version, its placeholder names and the
+skills offered and loaded. Nothing in ADK is patched: the plugin goes where ADK puts
+plugins, ``App(plugins=[...])``, so only the runners built from that app are traced.
 
 Native mode: ADK's own skill loader
 -----------------------------------
@@ -75,10 +53,9 @@ in one invocation is one activation. The names ``list_skills`` returns (or the
 catalog an ``EAGER`` toolset writes into the system instruction) are recorded
 as offered.
 
-The router's injection stays off for an agent that carries a ``SkillToolset``:
-the toolset already offers the skills, and a second catalog in the same prompt
-would give the model two sets of instructions for one job. That is said once
-per agent at INFO. Every other agent of the same runner is routed as before.
+An agent that carries a ``SkillToolset`` gets no DecimalAI skills from ``load_agent()``,
+and one warning says so: the toolset already offers the skills, and a second catalog in
+the same prompt would give the model two sets of instructions for one job.
 
 The toolset's calls are traced like every other tool call, results included:
 each result lands on the ``ToolCallRecord`` of the model turn that asked for it
@@ -101,11 +78,14 @@ import logging
 import os
 import re
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import UUID, uuid4
 
+from ._agent_binding import AgentBinding, attach_prompt_records
 from ._native import Load, NativeLoads, record
 from ._skill_witness import copy_delivered_versions
 from .schema.common import CallRole, FinishReason, SpanType, Status
@@ -169,44 +149,13 @@ def _reregister_refused(agent: str) -> Optional[str]:
         _pending_manifests.pop(agent, None)
     return manifest_id
 
-# Set by instrument(); used as the fallback agent_name when a trace can't
-# resolve one from the ADK agent itself.
-_install_agent_name: Optional[str] = None
-_runner_patched = False
-
 # Cached plugin class (built lazily so importing this module never requires
 # google-adk to be installed).
 _PluginClass: Any = None
 
-
-# Set by instrument(enable_skill_loader=True). Module-level (not per-plugin)
-# for the same reason langchain keeps `_skill_loader_installed` module-level:
-# the global install path shares ONE plugin across every Runner, so there is no
-# per-Runner object to hang the flag on. `DecimalaiPlugin(enable_skill_loader=)`
-# overrides it for one explicitly-constructed plugin.
-_skill_loader_enabled = False
+#: The SkillRouter behind every load_agent() config. `init()` drops it when a re-init
+#: changes the key or workspace (`decimalai._drop_adapter_skill_routers`).
 _skill_router_singleton: Any = None
-
-#: Logged when a caller asks for ``enable_load_skill_tool``. The leading clause
-#: is the refusal marker the conformance suite matches on the run, so it stays
-#: word for word.
-_LOAD_SKILL_TOOL_REFUSAL = (
-    "enable_load_skill_tool is not supported on the adk adapter (this adapter "
-    "registers no load_skill tool and does not bridge ADK's SkillToolset, so "
-    "the model cannot ask for a DecimalAI skill body); staying on prompt "
-    "injection. Use openai_agents or pydantic_ai for the native load_skill tool."
-)
-
-
-@dataclass(frozen=True)
-class _InstrumentationConfig:
-    agent_name: Optional[str] = None
-    on_trace: Optional[Callable[[RunTrace], None]] = None
-    enable_skill_loader: bool = False
-
-
-_instrument_lock = threading.Lock()
-_instrument_config = _InstrumentationConfig()
 
 
 def _now() -> datetime:
@@ -226,6 +175,24 @@ def _content_to_text(content: Any) -> str:
         if text:
             chunks.append(text)
     return "\n".join(chunks).strip()
+
+
+def _function_responses(content: Any) -> List[str]:
+    """The tool results in a genai ``Content``, as the text the model reads.
+
+    ADK wraps a tool's plain return value as ``{"result": value}``; that value is
+    the text. Any other response is its JSON form.
+    """
+    out: List[str] = []
+    for p in getattr(content, "parts", None) or []:
+        response = getattr(getattr(p, "function_response", None), "response", None)
+        if response is None:
+            continue
+        if isinstance(response, dict) and set(response) == {"result"} and isinstance(response["result"], str):
+            out.append(response["result"])
+        else:
+            out.append(_json_text(response))
+    return [text for text in out if text]
 
 
 def _provider_for_model(model: Optional[str]) -> Optional[str]:
@@ -488,25 +455,9 @@ def _wire_names(names: List[str]) -> List[str]:
     return out
 
 
-#: Agents the router's injection was turned off for, named once each at INFO.
-_router_off_logged: set = set()
-#: Said once per process: a native load in a run the router also delivered into.
+#: Said once per process: a native load in a run a load_agent() config also listed skills in.
 _both_catalogs_warned = False
 _native_log_lock = threading.Lock()
-
-
-def _say_router_off(agent_name: Optional[str]) -> None:
-    key = agent_name or ""
-    with _native_log_lock:
-        if key in _router_off_logged:
-            return
-        _router_off_logged.add(key)
-    logger.info(
-        "DecimalAI ADK: agent %r carries ADK's own SkillToolset, so DecimalAI's skill "
-        "router does not inject its menu or bodies into that agent's requests: the "
-        "toolset already offers the installed skills, and its load_skill calls are "
-        "recorded as activations. Other agents are routed as before.", agent_name,
-    )
 
 
 def _warn_both_catalogs(skill_name: Optional[str]) -> None:
@@ -516,11 +467,11 @@ def _warn_both_catalogs(skill_name: Optional[str]) -> None:
             return
         _both_catalogs_warned = True
     logger.warning(
-        "DecimalAI ADK: ADK's SkillToolset loaded %r in an invocation whose requests "
-        "also carried DecimalAI's routed skills, so two skill catalogs reached the "
-        "model. The router is turned off only for an agent whose own tools include "
-        "the SkillToolset; give the toolset to the agent that uses it, or turn the "
-        "skill loader off. Logged once per process.", skill_name,
+        "DecimalAI ADK: ADK's SkillToolset loaded %r in an invocation that also "
+        "listed DecimalAI skills from load_agent(), so two skill catalogs reached the "
+        "model. load_agent() leaves an agent alone only when its own tools include the "
+        "SkillToolset; give the toolset to the agent that uses it, or that agent no "
+        "load_agent() instruction. Logged once per process.", skill_name,
     )
 
 
@@ -551,7 +502,7 @@ def _observe_native_tool(state: "_RunState", tool: Any, result: Any) -> None:
                 body=instructions,
                 metadata=metadata if isinstance(metadata, dict) else None),
            loads=state.native)
-    if state.skills_delivered:
+    if state.skills_offered or state.skills_delivered:
         _warn_both_catalogs(name if isinstance(name, str) else None)
 
 
@@ -636,6 +587,11 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
             info["model"] = {"name": str(model), "provider": _provider_for_model(str(model))}
 
         instruction = getattr(agent, "instruction", None)
+        if callable(instruction):
+            # A load_agent() config's instruction is its bound method: declare the saved
+            # prompt TEMPLATE (placeholders unfilled), which is what the dashboard versions.
+            owner = getattr(instruction, "__self__", None)
+            instruction = owner._template() if isinstance(owner, ADKAgentConfig) else None
         if isinstance(instruction, str) and instruction.strip():
             info["prompts"] = {"system": instruction.strip()}
 
@@ -664,44 +620,13 @@ def _introspect_agent(agent: Any) -> Dict[str, Any]:
     return info
 
 
-# ── SkillRouter delivery ────────────────────────────────────
-#
-# ADK's prompt seam, established from the installed package rather than from
-# memory (google-adk 2.12.0):
-#
-#   * ``BasePlugin.before_model_callback(*, callback_context, llm_request)``
-#     receives the live ``LlmRequest`` BY REFERENCE.
-#     ``flows/llm_flows/core/_model_call.py::call_llm_async`` runs it (line 194)
-#     and then passes that same object to
-#     ``llm.generate_content_async(llm_request, ...)`` (line 261). Nothing
-#     copies it in between.
-#   * ``LlmRequest.append_instructions(list[str])`` is PUBLIC API and appends to
-#     ``config.system_instruction`` with a ``"\n\n"`` join
-#     (``models/llm_request.py:266-283``).
-#   * ADK's own ``GlobalInstructionPlugin`` writes
-#     ``llm_request.config.system_instruction`` from this hook, which is the
-#     first-party proof that the seam is a supported extension point rather
-#     than something we discovered by poking at internals.
-#   * The agent's own ``instruction`` is already in ``system_instruction`` by
-#     then — ``_preprocess_async`` runs the instructions processor before
-#     ``_call_llm_async`` — so appending puts the caller's stable prompt FIRST
-#     and the routed fragment behind it, which is the ordering the prefix/tail
-#     split exists for.
-#
-# The cache caveat, stated rather than hidden: ADK serializes the whole
-# instruction as ONE ``system_instruction`` string, so the per-query tail
-# changes those bytes every turn and a provider's implicit prefix cache stops
-# matching at the start of that field. This is the same tradeoff LangChain
-# makes against Gemini (``langchain_google_genai`` also joins system messages
-# into one ``system_instruction``); the stable half still leads, so the split is
-# not wasted, but ADK has no second cacheable slot to put the tail in.
-
+# ── where a load_agent() config's record goes ──────────────
 
 def _get_skill_router() -> Any:
-    """Lazily construct a SkillRouter using the SDK's global config."""
+    """The SkillRouter behind every load_agent() config, built on first use; None when off."""
     global _skill_router_singleton
-    # The kill switch: a later init(enabled=False) withholds the router (kept
-    # for a re-enable) from a loader an earlier init installed.
+    # The kill switch: a later init(enabled=False) withholds the router (kept for a
+    # re-enable) from configs built before it.
     from ._config import _disabled_by_init
 
     if _disabled_by_init():
@@ -718,11 +643,8 @@ def _get_skill_router() -> Any:
             # Every routing call names its agent; no router default (see
             # `skill_router._AGENT_FROM_INIT`).
             agent_name=None,
-            # This adapter registers no `load_skill` tool (and does not bridge
-            # ADK's own SkillToolset), so there is no on-demand fetch to defer
-            # to: injection is the only body channel. That is exactly the case
-            # `resolve_inject_body` answers True for.
-            inject_body=config.resolve_inject_body(has_tool_loop=False),
+            # Skill text reaches the model through load_skill, not the prompt.
+            inject_body=False,
         )
         return _skill_router_singleton
     except Exception:
@@ -730,34 +652,8 @@ def _get_skill_router() -> Any:
         return None
 
 
-def _query_from_request(llm_request: Any, fallback: Optional[str]) -> Optional[str]:
-    """The user text this turn should be routed on.
-
-    Walks ``llm_request.contents`` backward for the most recent user content
-    that carries TEXT. The text filter is load-bearing on ADK specifically:
-    ADK files tool results as ``role="user"`` contents whose only part is a
-    ``function_response``, so a naive "last user content" picks the tool result
-    on step 2 of a turn — a different query, a different cache key, and
-    therefore a second routing decision for one user turn.
-
-    Falls back to the invocation's own ``user_content`` (captured in
-    ``before_run_callback``) when the request carries no text at all.
-    """
-    for content in reversed(list(getattr(llm_request, "contents", None) or [])):
-        if getattr(content, "role", None) != "user":
-            continue
-        text = _content_to_text(content)
-        if text:
-            return text
-    return (fallback or "").strip() or None
-
-
 def _system_instruction_text(llm_request: Any) -> str:
-    """Flatten whatever is in ``config.system_instruction`` to text.
-
-    Used to VERIFY that an append actually landed before anything is claimed
-    as delivered — see ``_deliver_routed_turn``.
-    """
+    """Flatten whatever is in ``config.system_instruction`` to text, for the trace."""
     config = getattr(llm_request, "config", None)
     si = getattr(config, "system_instruction", None)
     if si is None:
@@ -774,246 +670,83 @@ def _system_instruction_text(llm_request: Any) -> str:
     return _content_to_text(si) or str(getattr(si, "text", "") or "")
 
 
-def _append_system_text(llm_request: Any, texts: List[str]) -> bool:
-    """Append ``texts`` to the request's system instruction. True if it landed.
+#: The invocations a DecimalaiPlugin is tracing right now, by invocation id: where a
+#: load_agent() config's record goes. Bound in `before_run_callback`, unbound once the
+#: trace is built, so a record that arrives after that is dropped, not misfiled.
+_live_runs: Dict[str, "_RunState"] = {}
+_live_runs_lock = threading.Lock()
 
-    The str case is ``LlmRequest.append_instructions``, ADK's public API.
-
-    The non-str case is here because ``append_instructions`` DROPS the text and
-    only logs a warning when ``system_instruction`` is a ``types.Content`` or a
-    part list (google-adk 2.12.0, ``models/llm_request.py:276-282``) — a caller who set
-    ``generate_content_config=GenerateContentConfig(system_instruction=Content(...))``
-    would otherwise get a beautifully traced run with none of their skills in
-    it, silently, which is the exact failure this rail exists to prevent.
-    """
-    config = getattr(llm_request, "config", None)
-    if config is None:
-        return False
-    si = getattr(config, "system_instruction", None)
-    if si is None or isinstance(si, str):
-        llm_request.append_instructions(list(texts))
-        return True
-    try:
-        from google.genai import types
-    except ImportError:  # pragma: no cover - google-adk always brings genai
-        return False
-    if isinstance(si, types.Content):
-        config.system_instruction = types.Content(
-            role=getattr(si, "role", None),
-            parts=[*(si.parts or []), *(types.Part(text=t) for t in texts)],
-        )
-        return True
-    if isinstance(si, (list, tuple)):
-        # A ``list[PartUnion]``; a bare ``str`` is a valid PartUnion.
-        config.system_instruction = [*si, *texts]
-        return True
-    return False
+#: How long building a trace waits for its invocation's background routing request.
+#: An invocation normally outlasts that request by seconds; this covers one faster
+#: than one HTTP round trip, which would otherwise ship with no routing id.
+_PENDING_ROUTING_WAIT_S = 3.0
 
 
-@dataclass(frozen=True)
-class _RoutedTurn:
-    """One routing decision: what the router returned, and its drained rails.
-
-    Built on the worker thread that made the router call, because the rails
-    are ContextVars of that call (see ``_route_turn``). Applied on the loop by
-    ``_deliver_routed_turn`` to every model request that shares the decision,
-    so it is read-only once built.
-    """
-
-    prefix: Any
-    tail: Any
-    routing_id: Optional[str]
-    offered: Tuple[str, ...]
-    delivered: Tuple[str, ...]
-    delivered_versions: Tuple[Dict[str, str], ...]
-
-
-def _inject_skills_into_request(state: "_RunState", llm_request: Any) -> None:
-    """Route this turn's skills and append them to the system instruction.
-
-    Blocking, for a caller that is not on ADK's event loop. The plugin itself
-    goes through ``_route_turn_shared`` instead, which runs ``_route_turn`` on
-    a worker thread and shares one call between the model turns of an
-    invocation that ask the same question at the same moment.
-    """
-    routed = _route_turn(state, _query_from_request(llm_request, state.user_input_preview))
-    if routed is not None:
-        _deliver_routed_turn(state, llm_request, routed)
-
-
-async def _route_turn_shared(state: "_RunState", query: Optional[str]) -> Optional[_RoutedTurn]:
-    """This invocation's routing decision for ``query``, made once while in flight.
-
-    The branches of an ADK ``ParallelAgent`` are model turns of ONE invocation:
-    one ``_RunState``, so one scope (the trace id), one agent label, and the
-    same user text. They ask the router the same question at the same moment,
-    and would get the same answer: those are the inputs the router's cache is
-    keyed by. While the router call ran on the loop, the first branch blocked the
-    loop and filled that cache, and the others hit it. Off the loop they all
-    missed it at once, and each made its own platform call: N routing
-    decisions for one user turn, of which the trace (it has ONE
-    ``routing_id``) could name only one. The rest were orphans, deflating
-    acceptance and inflating the decision count.
-
-    So a call in flight is shared: a model turn that asks the question an
-    in-flight call is already asking waits for that call and gets its answer,
-    failure included. N branches retrying a failing platform at the same
-    instant would only multiply its load, and three of them are the three
-    consecutive failures that open the router's circuit breaker, which then
-    skips routing for every turn of its cooldown. Sharing ends when the call
-    lands. A later model turn (a tool step) goes to the router as it always
-    did, and the router's cache answers it with the same decision for the rest
-    of the turn.
-
-    Keyed by the question alone, since the scope and the label are this
-    invocation's (the router's other cache inputs are fixed for this adapter):
-    two different questions are two calls, never one answer.
-
-    The call runs as its own task, and every model turn — the one that started
-    it too — awaits it through ``asyncio.shield``: ADK cancels the other
-    branches when one escalates, and a cancelled branch must not take the
-    answer from a branch still waiting on it. The task is created here, so
-    ``asyncio.to_thread`` still runs the router in a copy of the context of the
-    turn that started it (OpenTelemetry's span, the enclosing generic trace).
-    Only ADK's event loop touches ``routing_flights``, so it needs no lock.
-    """
-    key = query or ""
-    flight = state.routing_flights.get(key)
-    if flight is None:
-        flight = asyncio.ensure_future(asyncio.to_thread(_route_turn, state, query))
-        state.routing_flights[key] = flight
-
-        def _landed(done: "asyncio.Future[Optional[_RoutedTurn]]") -> None:
-            if state.routing_flights.get(key) is done:
-                del state.routing_flights[key]
-            if not done.cancelled():
-                # Retrieved, so a failure no surviving turn awaited is not
-                # reported by asyncio as an exception nobody handled.
-                done.exception()
-
-        flight.add_done_callback(_landed)
-    return await asyncio.shield(flight)
-
-
-def _route_turn(state: "_RunState", query: Optional[str]) -> Optional[_RoutedTurn]:
-    """Ask the router for ``query``'s skills, and drain the call's rails.
-
-    Blocking: the router call is a synchronous HTTP round-trip. The plugin
-    therefore never calls this on ADK's event loop — ``_route_turn_shared``
-    runs it through ``asyncio.to_thread``, which runs it on a worker thread in
-    a COPY of the caller's context (OpenTelemetry's current span and the
-    generic tracer's enclosing trace come with it). The router call and the
-    drain of its per-call rails below MUST stay in this one function for that
-    reason: the rails are ContextVars, and a value the router sets in the
-    worker's copy is gone once the worker returns.
-
-    None when there is no router, or the router raised: an unskilled turn.
-    """
-    router = _get_skill_router()
-    if router is None:
+def _live_run(run_key: Optional[str]) -> Optional["_RunState"]:
+    if not run_key:
         return None
-
-    scope = str(state.trace_id)
-    from .skill_router import (
-        _release_scoped_routing_rail,
-        consume_last_delivered_names,
-        consume_last_delivered_versions,
-        consume_last_offered_names,
-    )
-    # Custom and older routers need not initialize the newly added rail.
-    # Only this prompt build may supply this turn's immutable body witness.
-    consume_last_delivered_versions()
-    try:
-        parts_fn = getattr(router, "build_prompt_parts", None)
-        if callable(parts_fn):
-            # The prefix/tail split: `prefix` is byte-identical turn to turn
-            # (and carries the skill BODIES), `tail` is the one sentence that
-            # depends on this query.
-            prefix, tail, routing_id = parts_fn(
-                query=query, agent_name=state.agent_name, scope=scope,
-            )
-        else:
-            # A router object that predates the split still has to deliver.
-            # Without this branch the AttributeError is swallowed below and the
-            # adapter traces perfectly while injecting nothing — the silent
-            # no-op that cost LangChain 21 tests before its fallback existed.
-            prefix, routing_id = router.build_prompt_fragment(
-                query=query, agent_name=state.agent_name, scope=scope,
-            )
-            tail = ""
-    except Exception:
-        # A partially built prompt must not hand off its body witness to a
-        # later invocation, even when a custom router fails after setting it.
-        consume_last_delivered_versions()
-        logger.debug("build_prompt_parts failed (non-fatal)", exc_info=True)
-        return None
-    finally:
-        # The router keeps its own copy of this decision under the run's scope,
-        # for adapters that read it back from there. This one reads the
-        # per-call rails below, so the copy is released here or never.
-        _release_scoped_routing_rail(router, scope)
-
-    # Drain the router's per-call rails FIRST, whatever happens next: they are
-    # contextvars scoped to the call that just ran, and leaving them full would
-    # attribute this turn's skills to the next one.
-    offered = consume_last_offered_names()
-    delivered = consume_last_delivered_names()
-    delivered_versions = consume_last_delivered_versions()
-    return _RoutedTurn(
-        prefix=prefix, tail=tail, routing_id=routing_id,
-        offered=tuple(offered), delivered=tuple(delivered),
-        delivered_versions=tuple(delivered_versions),
-    )
+    with _live_runs_lock:
+        return _live_runs.get(run_key)
 
 
-def _deliver_routed_turn(state: "_RunState", llm_request: Any, routed: _RoutedTurn) -> None:
-    """Append a routing decision to one model request, and stamp what landed.
+def _clean_names(names: Any) -> List[str]:
+    return [n for n in (names or ()) if isinstance(n, str) and n]
 
-    Called once for each model turn that shares the decision, each with its
-    own request. Stamping the run again for a second branch changes nothing:
-    the rails are sets, and the decision is the same one.
 
-    Nothing is claimed that was not verified: the offered / delivered / routing
-    rails are stamped onto the run only after the appended prefix has been read
-    back out of ``llm_request``. A router call that produced no text, or an
-    append the request refused, leaves the trace saying nothing happened —
-    because nothing did.
+def _record_adk(run_key: Optional[str], fields: Dict[str, Any]) -> bool:
+    """Put one piece of a load_agent() config's record on its invocation's trace.
+
+    False when no DecimalaiPlugin is tracing that invocation: the record is dropped.
+    Names offered or delivered in a composed instruction count only when they are in
+    its text, the way the OpenTelemetry rail checks them.
     """
-    prefix, tail, routing_id = routed.prefix, routed.tail, routed.routing_id
-    offered, delivered = routed.offered, routed.delivered
+    state = _live_run(run_key)
+    if state is None:
+        return False
+    text = fields.get("system_prompt")
 
-    texts = [t for t in (prefix, tail) if t]
-    if not texts:
-        return
-    if not _append_system_text(llm_request, texts):
-        logger.debug(
-            "ADK system_instruction is a shape append_instructions cannot extend; "
-            "skills not delivered for this turn"
-        )
-        return
-    if prefix and prefix not in _system_instruction_text(llm_request):
-        # Belt and braces. Reaching here means the append silently no-opped,
-        # and the one thing we must not do is report the skills as delivered.
-        logger.warning(
-            "DecimalAI ADK: skill prefix did not survive the append; reporting "
-            "nothing offered or delivered for this turn"
-        )
-        return
+    def shown(names: Any) -> List[str]:
+        kept = _clean_names(names)
+        return kept if not isinstance(text, str) else [n for n in kept if n in text]
 
-    if routing_id:
-        state.routing_id = routing_id
-    state.skills_offered.update(n for n in offered if n)
-    state.skills_delivered.update(n for n in delivered if n)
-    for version in copy_delivered_versions(routed.delivered_versions, names=delivered):
-        name, digest = version.get("name"), version.get("hash")
-        if name not in delivered or not digest:
-            continue
-        # A long invocation may receive more than one immutable version.
-        # Preserve each actual delivery rather than replacing it with latest.
-        state.skills_delivered_versions.add((
-            name, digest, version.get("routing_id") or "",
-            version.get("skill_id") or "", version.get("version_id") or "",
-        ))
+    with _live_runs_lock:
+        routing_id = fields.get("routing_id")
+        if routing_id and not state.routing_id:
+            state.routing_id = routing_id
+        state.skills_offered.update(shown(fields.get("offered")))
+        delivered = shown(fields.get("delivered"))
+        state.skills_delivered.update(delivered)
+        loaded = _clean_names(fields.get("loaded"))
+        state.skills_loaded.update(loaded)
+        for name in loaded:
+            digest = (fields.get("loaded_hashes") or {}).get(name)
+            if digest and state.loaded_hashes.get(name, digest) != digest:
+                digest = None  # one name, two versions: a gap beats a wrong version
+            if name not in state.loaded_hashes or not digest:
+                state.loaded_hashes[name] = digest
+        for version in copy_delivered_versions(fields.get("delivered_versions"), names=delivered + loaded):
+            name, digest = version.get("name"), version.get("hash")
+            if name and digest:
+                state.skills_delivered_versions.add((
+                    name, digest, version.get("routing_id") or "",
+                    version.get("skill_id") or "", version.get("version_id") or "",
+                ))
+        prompt = fields.get("prompt")
+        if isinstance(prompt, dict) and prompt.get("agent"):
+            # First record per agent wins: an invocation reads its prompt once.
+            state.decimal_prompts.setdefault(prompt["agent"], dict(prompt))
+            if not state.decimal_agent and prompt.get("decimal_agent"):
+                # The first config in the invocation names its trace: the root agent's,
+                # whose instruction is resolved first.
+                state.decimal_agent = prompt["decimal_agent"]
+    return True
+
+
+def _note_adk_pending(run_key: Optional[str], pending: Any) -> None:
+    state = _live_run(run_key)
+    if state is not None and pending is not None:
+        with _live_runs_lock:
+            state.pending_routing.append(pending)
 
 
 class _RunState:
@@ -1026,9 +759,9 @@ class _RunState:
         "open_tool_calls", "failed_tool_calls",
         "status", "error_code", "error_message", "manifest",
         "routing_id", "skills_offered", "skills_delivered",
-        "skills_delivered_versions", "routing_flights",
-        "parent_trace_id", "on_trace", "enable_skill_loader",
-        "native", "native_agents",
+        "skills_delivered_versions", "skills_loaded", "loaded_hashes",
+        "decimal_prompts", "decimal_agent", "pending_routing",
+        "parent_trace_id", "on_trace", "native", "native_agents",
     )
 
     def __init__(self, *, agent_name: Optional[str], started_at: datetime):
@@ -1036,7 +769,6 @@ class _RunState:
         self.agent_name = agent_name
         self.parent_trace_id: Optional[str] = None
         self.on_trace: Optional[Callable[[RunTrace], None]] = None
-        self.enable_skill_loader = False
         # The ADK root agent's own ``.name`` (a Python identifier). Distinct
         # from ``agent_name`` (the DecimalAI label, which an explicit plugin
         # name can override). Used only to detect when the *root* agent
@@ -1073,23 +805,26 @@ class _RunState:
         self.error_message: Optional[str] = None
         # Manifest config introspected from the root agent in before_run.
         self.manifest: Dict[str, Any] = {}
-        # Skill-delivery rails for this invocation. Accumulated per model turn
-        # (a turn that calls a tool routes more than once) and stamped onto the
-        # RunTrace in `_finalize`. Sets, so a multi-step turn reports each
-        # skill once.
+        # The skills rails of this invocation, from the load_agent() configs of its
+        # agents (`_record_adk`), stamped onto the RunTrace in `_finalize`. Sets, so
+        # a model turn that calls a tool reports each skill once.
         self.routing_id: Optional[str] = None
         self.skills_offered: set = set()
         self.skills_delivered: set = set()
         self.skills_delivered_versions: set[Tuple[str, str, str, str, str]] = set()
-        # Routing calls in flight, by question: the model turns of this
-        # invocation that ask one at the same moment (a ParallelAgent's
-        # branches) share it. See `_route_turn_shared`.
-        self.routing_flights: Dict[str, "asyncio.Future[Optional[_RoutedTurn]]"] = {}
+        self.skills_loaded: set = set()
+        self.loaded_hashes: Dict[str, Optional[str]] = {}
+        # Each config's prompt record, by ADK agent name, for that agent's span; and
+        # the DecimalAI agent the trace is filed under, from the first config.
+        self.decimal_prompts: Dict[str, Dict[str, Any]] = {}
+        self.decimal_agent: Optional[str] = None
+        # Background routing requests of this invocation, which `_finalize` waits for.
+        self.pending_routing: List[Any] = []
         # Skills ADK's own SkillToolset listed and loaded in this invocation, as
         # decimalai._native resolved them; applied onto the RunTrace in `_finalize`.
         self.native = NativeLoads()
-        # Names of the agents of this invocation that carry a SkillToolset: the
-        # router does not inject into their requests (see `_say_router_off`).
+        # Names of the agents of this invocation that carry a SkillToolset, whose
+        # system instruction may hold an EAGER toolset's catalog.
         self.native_agents: set = set()
 
 
@@ -1103,7 +838,12 @@ def _plugin_class() -> Any:
     if _PluginClass is not None:
         return _PluginClass
 
-    from google.adk.plugins.base_plugin import BasePlugin
+    try:
+        from google.adk.plugins.base_plugin import BasePlugin
+    except ImportError:
+        raise ImportError(
+            'DecimalaiPlugin needs Google ADK: pip install "decimalai[adk]"'
+        ) from None
 
     class _DecimalaiPlugin(BasePlugin):
         """ADK BasePlugin that emits one DecimalAI RunTrace per invocation."""
@@ -1114,37 +854,16 @@ def _plugin_class() -> Any:
             *,
             name: str = "decimalai",
             parent_trace_id: Optional[str] = None,
-            enable_skill_loader: Optional[bool] = None,
-            enable_load_skill_tool: bool = False,
             on_trace: Optional[Callable[[RunTrace], None]] = None,
         ):
             super().__init__(name=name)
-            # Accepted and DORMANT — see `instrument()`'s docstring. Refused
-            # here too, not only there, because the documented
-            # `plugins=[DecimalaiPlugin(...)]` form never calls instrument(),
-            # and a flag that is silently dropped on one of two documented
-            # paths is the same silent no-op this adapter's own comments keep
-            # warning about.
-            if enable_load_skill_tool:
-                logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
             self.agent_name = agent_name
             self.parent_trace_id = parent_trace_id
             self.on_trace = on_trace
-            self._follow_instrument_config = False
-            # None = follow the module flag `instrument()` set. An explicit
-            # bool is this plugin's own answer, for the documented
-            # `plugins=[DecimalaiPlugin(...)]` path where no instrument() call
-            # exists to carry it.
-            self.enable_skill_loader = enable_skill_loader
             self._runs: Dict[str, _RunState] = {}
             self._lock = threading.Lock()
 
         # ── helpers ────────────────────────────────────────
-        def _skill_loader_on(self) -> bool:
-            if self.enable_skill_loader is not None:
-                return bool(self.enable_skill_loader)
-            return _skill_loader_enabled
-
         def _get_run(self, invocation_id: Optional[str]) -> Optional[_RunState]:
             if not invocation_id:
                 return None
@@ -1210,19 +929,14 @@ def _plugin_class() -> Any:
             if not _config._is_enabled():
                 return None
             agent = getattr(invocation_context, "agent", None)
-            # An explicit label wins over ADK's internal node name (a
+            # The DecimalAI agent the trace is filed under, unless a load_agent()
+            # config names it during the run: this plugin's label, else the agent
+            # init() named (or DECIMAL_AGENT_NAME), else ADK's own agent name (a
             # constrained Python identifier).
-            # Capture configuration and context at invocation START. Finalization
-            # runs on an executor thread, where the generic ContextVar is absent;
-            # reinstrumenting meanwhile must not move an in-flight observer.
-            with _instrument_lock:
-                settings = _instrument_config if self._follow_instrument_config else _InstrumentationConfig(
-                    self.agent_name, self.on_trace, self._skill_loader_on(),
-                )
-            agent_name = settings.agent_name or getattr(agent, "name", None) or _install_agent_name
+            from ._config import default_agent_name
+            agent_name = self.agent_name or default_agent_name(None) or getattr(agent, "name", None)
             state = _RunState(agent_name=agent_name, started_at=_now())
-            state.on_trace = settings.on_trace
-            state.enable_skill_loader = settings.enable_skill_loader
+            state.on_trace = self.on_trace
             state.parent_trace_id = self.parent_trace_id
             if not state.parent_trace_id:
                 # The caller's enclosing generic trace, read from the context
@@ -1244,6 +958,8 @@ def _plugin_class() -> Any:
             if inv_id:
                 with self._lock:
                     self._runs[inv_id] = state
+                with _live_runs_lock:
+                    _live_runs[inv_id] = state
             return None
 
         async def _complete(self, inv_id: Optional[str]) -> None:
@@ -1258,9 +974,9 @@ def _plugin_class() -> Any:
             # network round-trip, and the trace ingest is queued there too.
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._finalize, state)
+                await loop.run_in_executor(None, self._finalize_and_unbind, inv_id, state)
             except RuntimeError:
-                self._finalize(state)
+                self._finalize_and_unbind(inv_id, state)
 
         # ── agent boundary ─────────────────────────────────
         async def before_agent_callback(self, *, agent: Any, callback_context: Any):  # noqa: ANN001
@@ -1273,8 +989,8 @@ def _plugin_class() -> Any:
             if state is None:
                 return None
             # The agent object is only handed to this callback; the model
-            # callback knows the agent by name. Noted here so the router can
-            # stay out of an agent whose own SkillToolset offers the skills.
+            # callback knows the agent by name. Noted here so an EAGER toolset's
+            # catalog in that agent's system instruction is recorded as offered.
             if _has_skill_toolset(agent):
                 state.native_agents.add(getattr(agent, "name", None))
             span = TraceSpan(
@@ -1376,56 +1092,23 @@ def _plugin_class() -> Any:
             state = self._get_run(getattr(callback_context, "invocation_id", None))
             if state is None:
                 return None
-            # Delivery FIRST, tracing after. The order matters: everything
-            # below is bookkeeping, and a bookkeeping change must never be able
-            # to push the one line that actually reaches the model off the end
-            # of the callback. Never raises out — a Router failure degrades to
-            # an unskilled turn, it does not break the caller's model call.
-            # Off the loop: the router call blocks on HTTP, and a slow
-            # platform must stall this turn only — not every other coroutine
-            # on ADK's event loop. Shared: a sibling branch asking the same
-            # question meanwhile waits for this call instead of making its own,
-            # so the turn is one routing decision. The decision is appended to
-            # THIS request here, on the loop, by the turn that owns it.
-            # An agent whose own SkillToolset offers the skills is not routed at
-            # all (D7 of the Phase 3 design): its toolset is the catalog.
             native = getattr(callback_context, "agent_name", None) in state.native_agents
-            if state.enable_skill_loader and native:
-                _say_router_off(getattr(callback_context, "agent_name", None))
-            elif state.enable_skill_loader:
-                try:
-                    routed = await _route_turn_shared(
-                        state, _query_from_request(llm_request, state.user_input_preview),
-                    )
-                    if routed is not None:
-                        _deliver_routed_turn(state, llm_request, routed)
-                except Exception:
-                    logger.debug("Skill injection failed (non-fatal)", exc_info=True)
             model = getattr(llm_request, "model", None)
             rendered_input: List[Dict[str, Any]] = []
             # The system instruction FIRST, and it is not optional bookkeeping.
             #
             # `llm_request.contents` holds the conversation turns only. ADK puts
-            # the agent's own `instruction` — and, three lines above, every
-            # routed skill body — in `config.system_instruction`, which is a
+            # the agent's own `instruction` — a load_agent() config's prompt and
+            # skill list included — in `config.system_instruction`, which is a
             # separate field. Recording only `contents` meant the trace omitted
             # the entire system prompt the model was actually shown.
             #
-            # That is not a cosmetic gap. Every delivery signal downstream reads
-            # the rendered input: the SDK's own `infer_prompt_rungs`, the
-            # platform's skill-activation detection, and the conformance
-            # contract's C8/C14. So this adapter could route a skill, append its
-            # BODY to the system instruction, verify the append survived, stamp
-            # `skills_delivered` on the run — and then emit a trace in which no
-            # skill text appears anywhere. Delivery was real and unwitnessable,
-            # which is the one combination that cannot be distinguished from
-            # delivery never happening. It is why ADK was carried as a
-            # non-witnessable framework, and why C8/C14 read "claims to have
-            # offered [...] but those names are not in the prompt the model was
-            # shown" the first time the rail was graded (2026-09-03).
-            #
-            # Must stay AFTER `_deliver_routed_turn` above, or it records
-            # the instruction as it was before the skills were appended.
+            # That is not a cosmetic gap. Every skill signal downstream reads the
+            # rendered input: the SDK's own `infer_prompt_rungs`, the platform's
+            # skill-activation detection, and the conformance contract's C8/C14.
+            # Without it a trace claims a skill list it does not itself show,
+            # which cannot be told apart from a list that was never shown (C8/C14
+            # read exactly that the first time ADK's rail was graded, 2026-09-03).
             sys_text = _system_instruction_text(llm_request)
             if sys_text:
                 rendered_input.append({"role": "system", "content": sys_text})
@@ -1440,6 +1123,10 @@ def _plugin_class() -> Any:
                 txt = _content_to_text(c)
                 if txt:
                     rendered_input.append({"role": getattr(c, "role", "user"), "content": txt})
+                # A tool's result is what the model reads next: load_skill's body
+                # reaches it here, so the trace shows the body the model was handed.
+                for result in _function_responses(c):
+                    rendered_input.append({"role": "tool", "content": result})
             started = _now()
             # One span per generation, parented to the agent that asked for it.
             # `LlmCallRecord.span_id` used to be a fresh uuid4 that named no
@@ -1678,10 +1365,41 @@ def _plugin_class() -> Any:
             return None
 
         # ── finalize (runs in executor thread) ─────────────
+        def _finalize_and_unbind(self, inv_id: Optional[str], state: _RunState) -> None:
+            """Build and send the trace, then stop taking load_agent() records for it."""
+            try:
+                self._finalize(state)
+            finally:
+                if inv_id:
+                    with _live_runs_lock:
+                        if _live_runs.get(inv_id) is state:
+                            del _live_runs[inv_id]
+
         def _finalize(self, state: _RunState) -> None:
             from . import _config
             if not _config._is_enabled():
                 return
+            # The invocation's background routing requests, so its trace names its
+            # own decision (bounded: a slow platform must not hold the trace back).
+            deadline = _now().timestamp() + _PENDING_ROUTING_WAIT_S
+            with _live_runs_lock:
+                pending = list(state.pending_routing)
+            for future in pending:
+                try:
+                    future.result(timeout=max(0.0, deadline - _now().timestamp()))
+                except Exception:
+                    logger.debug("background routing did not finish before the trace was built", exc_info=True)
+            with _live_runs_lock:
+                if state.decimal_agent:
+                    state.agent_name = state.decimal_agent
+                # A body the model pulled with load_skill was delivered; a body in
+                # the prompt was offered there too.
+                loaded = set(state.skills_loaded)
+                delivered = set(state.skills_delivered) | loaded
+                offered = set(state.skills_offered) | set(state.skills_delivered)
+                loaded_hashes = dict(state.loaded_hashes)
+                prompts = {k: dict(v) for k, v in state.decimal_prompts.items()}
+                versions = sorted(state.skills_delivered_versions)
             manifest_prepared = True
             try:
                 manifest_id = self._maybe_register_manifest(state)
@@ -1714,19 +1432,28 @@ def _plugin_class() -> Any:
                     session_metadata={'framework': 'adk'},
                     # Skill-delivery rails. `routing_id` closes the
                     # routing_decision × trace_skill_activation join;
-                    # `skills_delivered` is the subset whose BODY reached the
-                    # model, and on ADK it is only ever populated after the
-                    # injected prefix was read back out of the request.
+                    # `skills_delivered` is the subset whose text reached the
+                    # model, `skills_loaded_by_agent` the part it asked for.
                     routing_id=state.routing_id,
-                    skills_offered_in_prompt=sorted(state.skills_offered),
-                    skills_delivered=sorted(state.skills_delivered),
+                    skills_offered_in_prompt=sorted(offered),
+                    skills_delivered=sorted(delivered),
+                    skills_loaded_by_agent=sorted(loaded),
                     skills_delivered_versions=[
                         {"name": name, "hash": digest,
                          **({"routing_id": route_id} if route_id else {}),
                          **({"skill_id": skill_id, "version_id": version_id} if skill_id and version_id else {})}
-                        for name, digest, route_id, skill_id, version_id in sorted(state.skills_delivered_versions)
+                        for name, digest, route_id, skill_id, version_id in versions
+                    ],
+                    # The version of each body the model loaded, where the load
+                    # carried one: what joins a measured lift to its version.
+                    active_skills=[
+                        {"name": name, "hash": loaded_hashes[name]}
+                        for name in sorted(loaded) if loaded_hashes.get(name)
                     ],
                 )
+                # Each config's prompt version and placeholder names (never values)
+                # on its agent's span.
+                attach_prompt_records(trace.spans, prompts)
                 try:
                     # Before the observer, so it sees the trace that is exported.
                     state.native.apply(trace)
@@ -1821,210 +1548,298 @@ def DecimalaiPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     *,
     name: str = "decimalai",
     parent_trace_id: Optional[str] = None,
-    enable_skill_loader: Optional[bool] = None,
-    enable_load_skill_tool: bool = False,
     on_trace: Optional[Callable[[RunTrace], None]] = None,
 ) -> Any:
-    """Construct a DecimalAI ADK plugin to add to a ``Runner``.
+    """Construct a DecimalAI ADK plugin, for ``App(..., plugins=[DecimalaiPlugin()])``.
+
+    Every invocation of a runner built from that app becomes one DecimalAI trace.
 
     Args:
-        agent_name: Fallback agent name when the ADK agent doesn't supply one.
+        agent_name: The DecimalAI agent the traces are filed under. Default: the
+            agent ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``), else the
+            ADK root agent's name. An invocation whose agent was given
+            ``load_agent()``'s instruction is filed under that DecimalAI agent.
         name: ADK plugin name (must be unique among a Runner's plugins).
         parent_trace_id: When this Runner runs as a sub-agent of another,
             the parent's trace id — links the child traces in the backend.
         on_trace: Optional observer called once on the exporter worker thread
             with a detached completed trace, before export. Exceptions are
             isolated from tracing and execution.
-        enable_skill_loader: Route this Runner's turns through SkillRouter and
-            append the result to the system instruction. ``None`` (default)
-            follows whatever ``instrument()`` was told; pass ``True``/``False``
-            to answer for this plugin alone, which is what the explicit
-            ``plugins=[DecimalaiPlugin(...)]`` path needs — it never calls
-            ``instrument()``, so there is no module flag to inherit. An agent
-            carrying ADK's own ``SkillToolset`` is never routed: the toolset
-            is its catalog, and its loads are recorded as activations.
-        enable_load_skill_tool: Accepted and DORMANT — this adapter
-            registers no ``load_skill`` tool (ADK's own ``SkillToolset`` is not
-            wired to DecimalAI skills), so the model cannot ask for a body.
-            True logs a warning naming the adapters that do have the tool loop
-            and stays on prompt injection. See ``instrument()`` for why it is
-            accepted rather than rejected.
 
-    Attach it through ADK's ``App`` — ``App(..., plugins=[DecimalaiPlugin()])``
-    — which is ADK's supported place for plugins; ``Runner(plugins=...)`` still
-    works but ADK deprecates it.
+    ADK's ``App`` is its supported place for plugins; ``Runner(plugins=...)`` still
+    works, but ADK deprecates it.
 
     ⚠ This factory's signature is a SECOND place every parameter must be
     listed. It forwards by explicit keyword, so a parameter added to
     ``_DecimalaiPlugin.__init__`` and not to this signature does not merely
     get ignored — the call raises TypeError and the plugin is never built, so
-    the Runner traces NOTHING. That is not hypothetical: adding
-    ``enable_load_skill_tool`` to the class alone took every ADK conformance
-    item from green to "the documented snippet ran and NOTHING was POSTed".
+    the Runner traces NOTHING. That is not hypothetical: adding a parameter to
+    the class alone once took every ADK conformance item from green to "the
+    documented snippet ran and NOTHING was POSTed".
     """
     return _plugin_class()(
         agent_name=agent_name, name=name,
-        parent_trace_id=parent_trace_id, enable_skill_loader=enable_skill_loader,
-        enable_load_skill_tool=enable_load_skill_tool, on_trace=on_trace,
+        parent_trace_id=parent_trace_id, on_trace=on_trace,
     )
 
 
-def instrument(
-    agent_name: Optional[str] = None, *, enable_skill_loader: bool = False,
-    enable_load_skill_tool: bool = False,
-    on_trace: Optional[Callable[[RunTrace], None]] = None,
-) -> None:
-    """Install DecimalAI tracing globally for google-adk.
 
-    Monkeypatches ``Runner.__init__`` so a single shared DecimalAI plugin is
-    auto-injected into every ``Runner`` created afterwards — ``InMemoryRunner``
-    and the runners ADK's own CLI and server build included. Idempotent.
+# ── load_agent(): an agent's prompt and skills, as ADK objects ─────────
 
-    How it is injected depends on the shape ADK was given, because ADK refuses
-    ``app=`` together with ``plugins=``:
+#: The ADK invocation whose instruction or load_skill call is running in this context.
+#: Set around each call ADK makes into a config, so its record and its loads reach that
+#: invocation's trace (`_record_adk`).
+_RUN: "ContextVar[Optional[str]]" = ContextVar("decimalai_adk_run", default=None)
 
-    * ``Runner(app=...)``: the runner is built from a copy of the ``App`` whose
-      ``plugins`` list carries the shared plugin first. The caller's ``App`` is
-      not modified (the same move ADK's own evaluator makes).
-    * ``Runner(agent=...)`` / ``Runner(node=...)``: the runner is built from
-      the ``App`` ADK itself would wrap that agent in, with the shared plugin
-      in it — not from ``plugins=``, which ADK deprecates and warns about on
-      every construction.
-    * ``Runner(..., plugins=[...])`` (the caller's own, deprecated): the shared
-      plugin is put first in that list.
 
-    Either way, a runner that already carries a DecimalAI plugin — by type, or
-    by the shared plugin's name — is left alone, so an explicit
-    ``DecimalaiPlugin`` answers for its runner and nothing is traced twice.
+def _invocation_agent(ctx: Any) -> Any:
+    """The ADK agent a context belongs to.
+
+    ADK's context names the agent (``agent_name``) and hands the object over only
+    through its invocation context; without that, a stand-in carrying the name.
+    """
+    agent = getattr(getattr(ctx, "_invocation_context", None), "agent", None)
+    return agent if agent is not None else SimpleNamespace(name=getattr(ctx, "agent_name", None))
+
+
+def _other_load_skill(agent: Any, config: Any) -> bool:
+    """Whether ``agent`` has a tool named load_skill that is not ``config``'s own.
+
+    A function tool by its ``__name__``, any other tool by its ``name``. Toolsets
+    resolve their tools per request and are not looked into.
+    """
+    from .skill_router import LOAD_SKILL_TOOL_NAME
+
+    ours = _load_skill_tool_cls
+    for tool in getattr(agent, "tools", None) or ():
+        if ours is not None and isinstance(tool, ours) and tool.config is config:
+            continue
+        name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+        if name == LOAD_SKILL_TOOL_NAME:
+            return True
+    return False
+
+
+_load_skill_tool_cls: Any = None
+_load_skill_tool_lock = threading.Lock()
+
+
+def _load_skill_tool_class() -> Any:
+    """The ADK tool class behind ``support.tools``, built once (google-adk is optional)."""
+    global _load_skill_tool_cls
+    with _load_skill_tool_lock:
+        if _load_skill_tool_cls is not None:
+            return _load_skill_tool_cls
+        from google.adk.tools.base_tool import BaseTool
+        from google.genai import types
+
+        from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
+
+        class DecimalaiLoadSkillTool(BaseTool):
+            """``load_skill`` for one ``load_agent()`` config: a listed skill's text."""
+
+            def __init__(self, config: Any) -> None:
+                super().__init__(name=LOAD_SKILL_TOOL_NAME, description=LOAD_SKILL_TOOL_DESCRIPTION)
+                self.config = config
+
+            def _get_declaration(self) -> Any:
+                with self.config._lock:
+                    names = list(self.config._tool_names)
+                return types.FunctionDeclaration(
+                    name=self.name, description=self.description,
+                    parameters_json_schema=self.config._tool_schema(names),
+                )
+
+            async def process_llm_request(self, *, tool_context: Any, llm_request: Any) -> None:
+                """Offer load_skill only beside a skill list (ADK asks before each request)."""
+                run_key = getattr(tool_context, "invocation_id", None)
+                token = _RUN.set(run_key)
+                try:
+                    state = await self.config._prepare_run(
+                        tool_context, _invocation_agent(tool_context), run_key)
+                finally:
+                    _RUN.reset(token)
+                if state["names"] and state["tool"]:
+                    llm_request.append_tools([self])
+
+            async def run_async(self, *, args: Dict[str, Any], tool_context: Any) -> Any:
+                token = _RUN.set(getattr(tool_context, "invocation_id", None))
+                try:
+                    return await self.config._load(str((args or {}).get("name") or "").strip())
+                finally:
+                    _RUN.reset(token)
+
+        DecimalaiLoadSkillTool.__module__ = __name__
+        _load_skill_tool_cls = DecimalaiLoadSkillTool
+        return _load_skill_tool_cls
+
+
+class ADKAgentConfig(AgentBinding):
+    """One agent's prompt and skills in DecimalAI, as ADK objects.
+
+    Made by :func:`load_agent`. Put its two pieces in your own ``LlmAgent``::
+
+        support = load_agent("support", fallback=BASE_INSTRUCTION)
+        agent = LlmAgent(name="support", model="gemini-3.5-flash",
+                         instruction=support.instruction, tools=[lookup_order, *support.tools])
+
+    Attributes:
+        name: The agent's canonical DecimalAI name.
+    """
+
+    _log = logger
+    _VALUES_HINT = "Put them in the session's state, as attributes or dict keys."
+
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+        super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        self._tool_names: List[str] = []
+        self._tool: Any = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ADKAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"skills={self.skill_names!r})"
+        )
+
+    # A config is one agent's live binding (its prompt copy, its runs, its locks):
+    # a copied LlmAgent shares it rather than splitting it in two.
+    def __copy__(self) -> "ADKAgentConfig":
+        return self
+
+    def __deepcopy__(self, memo: Any) -> "ADKAgentConfig":
+        return self
+
+    # ── what the developer hands to ADK ─────────────────────
+    async def instruction(self, ctx: Any) -> str:
+        """The agent's prompt, filled, then its skill list: an ADK instruction provider.
+
+        Pass it as ``LlmAgent(instruction=support.instruction)``; ADK calls it before
+        each model request. ``{{placeholders}}`` are filled from the session's state.
+        """
+        run_key = getattr(ctx, "invocation_id", None)
+        agent = _invocation_agent(ctx)
+        token = _RUN.set(run_key)
+        try:
+            state = await self._prepare_run(ctx, agent, run_key)
+            if state["text"] is None:
+                state["text"] = self._compose(ctx, agent, run_key, state)
+            return state["text"]
+        finally:
+            _RUN.reset(token)
+
+    @property
+    def tools(self) -> List[Any]:
+        """``[load_skill]``, for ``LlmAgent(tools=[..., *support.tools])``."""
+        with self._lock:
+            if self._tool is None:
+                self._tool = _load_skill_tool_class()(self)
+            return [self._tool]
+
+    # ── the seams AgentBinding asks for ─────────────────────
+    def _router(self) -> Any:
+        return _get_skill_router()
+
+    def _run_key(self) -> Optional[str]:
+        return _RUN.get()
+
+    def _message(self, context: Any, agent: Any) -> Optional[str]:
+        return _content_to_text(getattr(context, "user_content", None)) or None
+
+    def _values(self, context: Any) -> Any:
+        try:
+            return dict(getattr(context, "state", None) or {})
+        except Exception:  # noqa: BLE001 — a state we cannot read fills nothing
+            return {}
+
+    def _skills_blocked(self, agent: Any, *, tool: bool = True, inject: bool = False) -> Optional[str]:
+        base = super()._skills_blocked(agent, tool=tool, inject=inject)
+        if base:
+            return base
+        if _has_skill_toolset(agent):
+            return ("it carries ADK's own SkillToolset, a catalog of its own, so DecimalAI adds "
+                    "neither its skill list nor load_skill. Each skill the toolset loads is "
+                    "recorded as an activation.")
+        if tool and _other_load_skill(agent, self):
+            return ("it has another tool named load_skill, so DecimalAI adds neither its skill "
+                    "list nor its load_skill. Rename that tool to give the agent its skills.")
+        return None
+
+    def _record(self, **fields: Any) -> bool:
+        return _record_adk(_RUN.get(), fields)
+
+    def _note_pending(self, run_key: Optional[str], pending: Any) -> None:
+        _note_adk_pending(run_key, pending)
+
+    def _stamp_routing(self, run_key: Optional[str], routing_id: str) -> None:
+        _record_adk(run_key, {"routing_id": routing_id})
+
+    def _on_menu(self, names: List[str]) -> None:
+        with self._lock:
+            self._tool_names = list(names)
+
+    def _serve_load(self, name: str) -> str:
+        from ._agent import _serve_and_record
+
+        run_key = self._run_key()
+        return _serve_and_record(
+            self._router(), name, scope=run_key, agent_name=self.name,
+            record=lambda **fields: _record_adk(run_key, fields),
+        )
+
+
+def load_agent(
+    agent_name: str,
+    *,
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+) -> ADKAgentConfig:
+    """Pull an agent's prompt and skills from DecimalAI, for your own ``LlmAgent``.
+
+    ::
+
+        from google.adk.agents import LlmAgent
+        from decimalai.adk import load_agent
+
+        support = load_agent("support", fallback=BASE_INSTRUCTION)
+        agent = LlmAgent(name="support", model="gemini-3.5-flash",
+                         instruction=support.instruction, tools=[lookup_order, *support.tools])
+
+    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps a
+    local copy, re-read in the background at most once a minute. Each invocation is
+    routed on its own user message: the first before its first model request, later
+    ones from the local copy while their decision is recorded in the background, and
+    every one of an agent with more skills than fit the list. ``{{placeholders}}`` are
+    filled from the session's state (attributes or dict keys). Traces come from
+    :func:`DecimalaiPlugin` in ``App(plugins=[...])``: an invocation of this agent is
+    filed under ``support.name`` with its prompt version and its skills. Initializes
+    the SDK from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
+
+    With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
+    ``init(load_skill_tool=False)``), every invocation is routed and the text of the
+    skills picked for it goes into the instruction instead (``inject_skill_body``).
 
     Args:
-        agent_name: Optional DecimalAI trace label. When omitted, the agent
-            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``), else the
-            ADK agent's own name.
-        on_trace: Optional observer called once per real invocation, including
-            failed invocations. Receives a detached trace with witnessed delivery
-            rails on the exporter worker thread. Exceptions are isolated from
-            tracing and execution. Updating instrument() affects new invocations only.
-        enable_skill_loader: When True, every model turn is routed through
-            ``SkillRouter`` and the routed skills — bodies included, since this
-            adapter registers no ``load_skill`` tool to fetch them on demand —
-            are appended to ``llm_request.config.system_instruction`` before
-            the request goes out. Off by default, like every other adapter's
-            loader. An agent carrying ADK's own ``SkillToolset`` is never
-            routed (said once per agent at INFO): the toolset is its catalog,
-            and its ``load_skill`` calls are recorded as activations whether
-            or not this is on.
-        enable_load_skill_tool: Accepted and DORMANT, exactly as on the
-            langchain adapter. This adapter registers no ``load_skill`` tool
-            and does not connect DecimalAI skills to ADK's own
-            ``SkillToolset``, so the model has no way to ASK for a DecimalAI
-            body and the strongest rung this rail can reach is DELIVERED.
-            Passing True logs a warning naming the adapters that do have the
-            tool loop, and stays on prompt injection.
+        agent_name: The agent's name in DecimalAI.
+        fallback: The instruction to use when the agent has no saved prompt, or when
+            DecimalAI cannot be reached at startup. Without one, an unreachable
+            DecimalAI raises here rather than starting an agent with no instruction.
+        on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
+            never returned them, and the trace says so; ``"fail"`` raises before the
+            model request instead.
 
-            It is accepted rather than rejected on purpose: silently ignoring
-            the flag is how an adapter ends up graded as if it had a channel it
-            does not have. The conformance suite ASKS for the tool loop in the
-            ``tool_loaded`` cell precisely so the refusal has to happen out
-            loud, on that run, instead of being excused by a sentence in a
-            table.
+    Raises:
+        ImportError: Google ADK is not installed.
+        AgentNotFoundError: DecimalAI has no agent by this name.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
-    global _install_agent_name, _runner_patched, _skill_loader_enabled, _instrument_config
-    if enable_load_skill_tool:
-        logger.warning(_LOAD_SKILL_TOOL_REFUSAL)
-    # Not named here: the agent init() named (or DECIMAL_AGENT_NAME). Each call
-    # replaces the name, so a bare `instrument(enable_skill_loader=True)` after
-    # `init(adk=True, agent_name=...)` used to drop it back to ADK's node name.
-    from ._config import default_agent_name
-    agent_name = default_agent_name(agent_name)
-    with _instrument_lock:
-        _install_agent_name = agent_name
-        # Preserve the loader's existing sticky opt-in, and atomically publish
-        # the observer/name configuration for subsequent invocations.
-        if enable_skill_loader:
-            _skill_loader_enabled = True
-        _instrument_config = _InstrumentationConfig(agent_name, on_trace, _skill_loader_enabled)
-        if _runner_patched:
-            return
-
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
     try:
-        from google.adk.runners import Runner
+        import google.adk  # noqa: F401 — before any setup or network call
     except ImportError:
-        logger.warning(
-            "decimalai.adk.instrument() called but google-adk is not installed; "
-            "ADK tracing not active. "
-            "Install it with: pip install \"decimalai[adk]\""
-        )
-        return
+        raise ImportError('load_agent() needs Google ADK: pip install "decimalai[adk]"') from None
+    from ._agent import _ensure_initialized, read_prompt
 
-    with _instrument_lock:
-        if _runner_patched:
-            return
-        shared_plugin = DecimalaiPlugin()
-        shared_plugin._follow_instrument_config = True
-        original_init = Runner.__init__
-
-        def carries_decimalai(plugins: Any) -> bool:
-            # By type, so a renamed explicit DecimalaiPlugin counts; by name,
-            # because ADK refuses two plugins with one name.
-            return any(
-                isinstance(p, type(shared_plugin))
-                or getattr(p, "name", None) == shared_plugin.name
-                for p in plugins or ()
-            )
-
-        def _wraps_cleanly(kwargs: dict) -> bool:
-            # Exactly one of agent / node (ADK refuses the rest itself), and an
-            # app_name when it is an agent (ADK requires one; for a node it
-            # defaults to the node's name).
-            agent, node = kwargs.get("agent"), kwargs.get("node")
-            if (agent is None) == (node is None):
-                return False
-            return node is not None or bool(kwargs.get("app_name"))
-
-        def patched_init(self, **kwargs):  # Runner.__init__ is keyword-only
-            app = kwargs.get("app")
-            if app is not None:
-                # ADK refuses app= with plugins= (`Runner._resolve_app`), so the
-                # plugin goes INTO the app. A `plugins=` the caller passed
-                # alongside it is left as given, and ADK refuses it with its
-                # own message. A copy, so the caller's App is not mutated.
-                if not carries_decimalai(app.plugins):
-                    kwargs["app"] = app.model_copy(
-                        update={"plugins": [shared_plugin, *app.plugins]},
-                    )
-            elif kwargs.get("plugins") is None and _wraps_cleanly(kwargs):
-                # A bare agent or node, and no `plugins=`: build the App ADK
-                # would build from it (`Runner._resolve_app`), with the plugin
-                # in it. Passing `plugins=` instead made ADK warn that the
-                # argument is deprecated on every runner, to a user who never
-                # passed one.
-                from google.adk.apps.app import App
-
-                root = kwargs.pop("agent", None)
-                if root is None:
-                    root = kwargs.pop("node")
-                    kwargs.pop("agent", None)
-                    name = kwargs.get("app_name") or getattr(root, "name", "default")
-                else:
-                    kwargs.pop("node", None)
-                    name = kwargs["app_name"]
-                kwargs.pop("plugins", None)
-                kwargs["app"] = App.model_construct(
-                    name=name, root_agent=root, plugins=[shared_plugin],
-                )
-            elif kwargs.get("plugins") is not None:
-                # The caller passed `plugins=`: ADK's deprecated path, and its
-                # warning, are theirs. Add the plugin where they put theirs.
-                plugins = list(kwargs.pop("plugins"))
-                if not carries_decimalai(plugins):
-                    plugins.insert(0, shared_plugin)
-                kwargs["plugins"] = plugins
-            # Anything else is a combination ADK refuses (both agent and node,
-            # neither, an agent with no app_name): handed over untouched, so the
-            # caller gets ADK's own error and no warning ADK would not give.
-            original_init(self, **kwargs)
-
-        Runner.__init__ = patched_init  # type: ignore[method-assign]
-        _runner_patched = True
-    logger.info("DecimalAI ADK tracing installed globally (agent_name=%s)", agent_name)
+    _ensure_initialized()
+    prompt = read_prompt(agent_name, fallback=fallback)
+    return ADKAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)

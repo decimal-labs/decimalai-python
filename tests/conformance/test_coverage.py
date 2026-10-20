@@ -46,7 +46,7 @@ import ast
 import inspect
 import re
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import pytest
 
@@ -134,7 +134,6 @@ def advertised_from_docs(text: str) -> Set[str]:
 FLAG_SLUGS: Dict[str, Set[str]] = {
     "langchain": {"langchain", "langgraph"},
     "openai_agents": {"openai-agents"},
-    "adk": {"google-adk"},
     "llamaindex": {"llamaindex"},
     "claude_agent_sdk": {"claude-agent-sdk", "claude-code"},
     "crewai": {"crewai"},
@@ -1011,13 +1010,15 @@ def test_rail_declarations_match_the_scaffold_seam_ledger() -> None:
 
 
 #: Driver name -> the module whose ``instrument()`` is that driver's adapter
-#: surface: where an ``on_trace`` observer is, or would be. Every driver must be
-#: mapped — an unmapped one would slip past the cross-check below unread.
+#: surface: where an ``on_trace`` observer is, or would be. ``module:name`` names a
+#: different callable. Every driver must be mapped — an unmapped one would slip
+#: past the cross-check below unread.
 OBSERVER_SURFACES: Dict[str, str] = {
     "langchain": "decimalai.langchain",
     "openai-agents": "decimalai.openai_agents",
     "llamaindex": "decimalai.llamaindex",
-    "adk": "decimalai.adk",
+    # ADK has no instrument() since 0.20: its runs come from the plugin in the App.
+    "adk": "decimalai.adk:DecimalaiPlugin",
     "crewai": "decimalai.crewai",
     "generic-otel": "decimalai.otel",
     "claude-agent-sdk": "decimalai.claude_agent_sdk",
@@ -1026,8 +1027,15 @@ OBSERVER_SURFACES: Dict[str, str] = {
 }
 
 
-def _takes_on_trace(module: str) -> bool:
-    """Whether ``<module>.instrument`` takes a NAMED ``on_trace`` keyword.
+def _surface(entry: str) -> Tuple[str, str]:
+    """``(module, callable)`` for an OBSERVER_SURFACES entry; ``instrument`` by default."""
+    module, _, name = entry.partition(":")
+    return module, name or "instrument"
+
+
+def _takes_on_trace(entry: str) -> bool:
+    """Whether the adapter's surface (``<module>.instrument``, or the callable the
+    entry names) takes a NAMED ``on_trace`` keyword.
 
     ``**kwargs`` does not count: it would accept the observer and never call it,
     so a caller checking for one has to read the named parameter too. Every
@@ -1035,7 +1043,8 @@ def _takes_on_trace(module: str) -> bool:
     """
     import importlib
 
-    fn = getattr(importlib.import_module(module), "instrument", None)
+    module, name = _surface(entry)
+    fn = getattr(importlib.import_module(module), name, None)
     if not callable(fn):
         return False
     param = inspect.signature(fn).parameters.get("on_trace")
@@ -1061,12 +1070,12 @@ def test_observer_declarations_match_the_adapter_signatures() -> None:
     )
     disagreements: List[str] = []
     for driver in all_drivers():
-        module = OBSERVER_SURFACES[driver.name]
-        has = _takes_on_trace(module)
+        has = _takes_on_trace(OBSERVER_SURFACES[driver.name])
+        module, name = _surface(OBSERVER_SURFACES[driver.name])
         declared = driver.capabilities.has_invocation_observer
         if has and not declared:
             disagreements.append(
-                f"  {driver.name}: {module}.instrument() takes on_trace, but the "
+                f"  {driver.name}: {module}.{name}() takes on_trace, but the "
                 f"driver declares has_invocation_observer=False — C15/C16 would be "
                 f"N/A on an adapter that hands its caller every run. Give the driver "
                 f"a run_nested hook and delete its two DECLARED_NA lines."
@@ -1074,7 +1083,7 @@ def test_observer_declarations_match_the_adapter_signatures() -> None:
         if declared and not has:
             disagreements.append(
                 f"  {driver.name}: the driver declares has_invocation_observer=True, "
-                f"but {module}.instrument() takes no on_trace — the observer it "
+                f"but {module}.{name}() takes no on_trace — the observer it "
                 f"grades is not the adapter's public surface."
             )
     assert not disagreements, (

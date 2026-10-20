@@ -165,25 +165,6 @@ class TestFlagFormDeliversSkills:
         _init(openai_agents=True, agent_name="support", **kwargs)
         assert bool(seen) is reads_local_skills
 
-    @pytest.mark.parametrize("skills, expected", [(True, True), (False, False)])
-    def test_adk_flag_follows_skills(self, monkeypatch, skills, expected):
-        import decimalai.adk as adk
-
-        _keep(
-            monkeypatch, adk,
-            "_install_agent_name", "_skill_loader_enabled", "_instrument_config",
-        )
-        # Pretend Runner is already patched: the patch is process-wide and
-        # irreversible, and the loader decision is made before that point.
-        monkeypatch.setattr(adk, "_runner_patched", True)
-        monkeypatch.setattr(adk, "_skill_loader_enabled", False)
-        monkeypatch.setattr(adk, "_instrument_config", adk._InstrumentationConfig())
-
-        _init(adk=True, agent_name="support", skills=skills)
-
-        assert adk._instrument_config.enable_skill_loader is expected
-        assert adk._instrument_config.agent_name == "support"
-
     @pytest.mark.parametrize("skills, expected", [(True, [1]), (False, [])])
     def test_crewai_flag_follows_skills(self, monkeypatch, skills, expected):
         import decimalai.crewai as dc

@@ -3,11 +3,13 @@ trace DecimalAI sends names the version the model received.
 
 The scenario (``_scenario_adk.native``) runs once, in a child process: the real ADK
 runner, ``SkillToolset(skills=decimalai.adk.skills())``, a scripted model, and
-``decimalai.init(adk=True)`` pointed at a probe. Run 1 lists, loads the target twice,
-reads its resource and runs its script; then the target is updated to version 2 on
-disk; run 2 loads it again with the same agent object. A third run, an agent with no
-toolset, is the control that shows the router is on at all. Everything below grades
-what the probe received and what the scripted model was handed.
+``decimalai.adk.DecimalaiPlugin`` in the App, pointed at a probe. The toolset agent also
+carries ``decimalai.adk.load_agent()``'s instruction and tools. Run 1 lists, loads the
+target twice, reads its resource and runs its script; then the target is updated to
+version 2 on disk; run 2 loads it again with the same agent object. A third run, an
+agent with ``load_agent()``'s pieces and no toolset, is the control that shows
+``load_agent()`` lists skills at all. Everything below grades what the probe received
+and what the scripted model was handed.
 
 The pointer helper's tests run in this process: they only read files.
 """
@@ -96,30 +98,31 @@ def test_after_an_update_the_activation_names_the_version_the_model_received(
     assert scenario["notes"]["v2_expected"]["version_id"] != v1["version_id"]
 
 
-def test_the_router_stays_out_of_the_agent_with_a_skill_toolset(scenario):
+def test_load_agent_gives_the_agent_with_a_skill_toolset_no_decimal_skills(scenario):
     native = _calls(scenario, "support")
     assert native, "the native agent made no model call"
     for call in native:
         for text in (ROUTER_SENTINEL, MENU_INSTRUCTION, ROUTER_SKILL["name"]):
-            assert text not in call["system"], f"the router injected {text!r}"
+            assert text not in call["system"], f"load_agent() put {text!r} in the request"
     for i in (0, 1):
         trace = _trace(scenario, i)
         assert trace.get("routing_id") is None
         assert ROUTER_SKILL["name"] not in (trace.get("skills_delivered") or [])
-    said = [l for l in scenario["logs"] if l["level"] == "INFO"
-            and "does not inject" in l["message"]]
-    assert len(said) == 1 and "'support'" in said[0]["message"], said
+    said = [l for l in scenario["logs"] if l["level"] == "WARNING"
+            and "SkillToolset" in l["message"]]
+    assert len(said) == 1 and "(support)" in said[0]["message"], said
 
 
-def test_the_router_still_serves_an_agent_without_a_toolset(scenario):
-    """The control: without it, the test above would pass on a router that is off."""
+def test_load_agent_still_lists_skills_for_an_agent_without_a_toolset(scenario):
+    """The control: without it, the test above would pass on a load_agent() that lists nothing."""
     (call,) = _calls(scenario, "plain")
-    assert ROUTER_SENTINEL in call["system"] and MENU_INSTRUCTION in call["system"]
+    assert ROUTER_SKILL["name"] in call["system"] and MENU_INSTRUCTION in call["system"]
+    assert ROUTER_SENTINEL not in call["system"], "a body arrives by load_skill, not in the prompt"
     assert _trace(scenario, 2)["routing_id"]
 
 
 def test_no_two_catalogs_warning_when_only_the_toolset_served(scenario):
-    assert not [l for l in scenario["logs"] if l["level"] == "WARNING"]
+    assert not [l for l in scenario["logs"] if "two skill catalogs" in l["message"]]
 
 
 # ── the pointer helper ──────────────────────────────────────

@@ -304,12 +304,12 @@ FRAMEWORKS: Tuple[Framework, ...] = (
     ),
     Framework(
         key="adk",
-        title="Google ADK",
+        title="Google ADK (with `load_agent(...)`)",
         cli_label="Google ADK",
         module="decimalai.adk",
-        entry_point="`instrument(enable_skill_loader=True)` / "
-                    "`DecimalaiPlugin(enable_skill_loader=True)`",
-        init_flag="adk",
+        entry_point="`load_agent(name)` + `DecimalaiPlugin()`",
+        init_flag=None,
+        init_flag_note="— (no flag; tracing is `DecimalaiPlugin()` in `App(plugins=[...])`)",
         extra="adk",
         # moved from NO_PROMPT_SEAM on 2026-09-03 (seam proven by C14 and a live Gemini
         # end-to-end test) and to TEMPLATE on 2026-09-05: google-genai reads
@@ -337,11 +337,12 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             manifest="✅ full (model, instruction, tools, sub-agents)",
             schema_depth="Names + descriptions",
             handoffs="✅",
-            skills_rail="Prompt injection (0.12.0+)",
+            skills_rail="`load_skill` tool",
         ),
-        use_for="Google ADK — native `BasePlugin`, one trace per invocation; skills appended "
-                "to `system_instruction` (0.12.0+); `skills()` feeds ADK's `SkillToolset` "
-                "(0.16+)",
+        use_for="Google ADK — `load_agent(name)` returns the agent's prompt and skills as an "
+                "instruction provider and `load_skill` for your own `LlmAgent`; "
+                "`DecimalaiPlugin()` in `App(plugins=[...])` makes one trace per invocation, "
+                "nothing patched (0.20+); `skills()` feeds ADK's `SkillToolset` (0.16+)",
     ),
     Framework(
         key="llamaindex",

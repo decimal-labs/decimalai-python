@@ -3,15 +3,15 @@
 ADK (the Agent Development Kit) is Gemini-native and ships its own plugin
 system: a ``BasePlugin`` registered on the ``Runner`` receives before/after
 callbacks for the run, every model generation, and every tool call. The
-DecimalAI adapter (``decimalai.adk.DecimalaiPlugin`` / ``install()``) builds
-**one** :class:`RunTrace` per ADK invocation from those callbacks — capturing
+DecimalAI adapter (``decimalai.adk.DecimalaiPlugin``, put in ``App(plugins=[...])``)
+builds **one** :class:`RunTrace` per ADK invocation from those callbacks — capturing
 the LLM steps, the tool calls, and an auto-detected manifest of the root
 agent (model / instruction / tools / sub-agents).
 
 This test proves that path end-to-end with a **real Gemini-backed ADK agent**:
 
   * Build a 2-tool (`get_price`, `calculate`) shopping agent on a Gemini model.
-  * Attach ``DecimalaiPlugin`` to an ``InMemoryRunner`` and actually run it.
+  * Put ``DecimalaiPlugin`` in the ``App`` an ``InMemoryRunner`` runs, and run it.
   * Assert the assembled backend trace carries ≥1 LLM step, ≥1 tool call, and
     records the Gemini model — i.e. the native-plugin trace build works, not
     just that the agent ran.
@@ -50,6 +50,7 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
     os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "0")
 
     from google.adk.agents import LlmAgent
+    from google.adk.apps import App
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
@@ -78,12 +79,10 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
         tools=[get_price, calculate],
     )
 
-    app_name = "decimal-adk-test"
-    runner = InMemoryRunner(
-        agent=agent,
-        app_name=app_name,
-        plugins=[DecimalaiPlugin(agent_name=agent_name)],
-    )
+    app_name = "decimal_adk_test"
+    runner = InMemoryRunner(app=App(
+        name=app_name, root_agent=agent, plugins=[DecimalaiPlugin(agent_name=agent_name)],
+    ))
 
     user_msg = types.Content(role="user", parts=[types.Part(text=(
         "A cart has 3 widgets and 2 gadgets. Use get_price to look up the unit "

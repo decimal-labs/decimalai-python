@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
-from ._agent_binding import AgentBinding
+from ._agent_binding import AgentBinding, attach_prompt_records
 from ._agent_binding import MissingPromptVariable as MissingPromptVariable
 from ._agent_binding import template_variables as template_variables
 from ._native import Load, NativeLoads
@@ -2769,7 +2769,7 @@ class DecimalTracingProcessor:
                 entry["hash"] = h
             active_skills_list.append(entry)
 
-        _attach_prompt_records(acc.spans, run_rail.get("decimal_prompts"))
+        attach_prompt_records(acc.spans, run_rail.get("decimal_prompts"))
 
         trace = RunTrace(
             id=uuid4(),
@@ -3206,39 +3206,6 @@ def _attach_system_prompts(
         if text in already:
             continue
         messages.insert(0, {"role": "system", "content": text})
-
-
-def _attach_prompt_records(spans: List[TraceSpan], records: Any) -> None:
-    """Put each `load_agent()` prompt record on its agent's span, as attributes.
-
-    The backend stores span attributes as they come, so a trace says which
-    prompt version a run used, with which placeholder NAMES (never values:
-    those are often personal data), without a column of its own. An agent with
-    no span of its own gets a span named ``decimalai.prompt``.
-    """
-    if not isinstance(records, dict) or not records:
-        return
-    for agent_name, record in records.items():
-        attributes = {
-            "decimal.agent": record.get("decimal_agent"),
-            "decimal.prompt.source": record.get("source"),
-            "decimal.prompt.version": record.get("version"),
-            "decimal.prompt.content_hash": record.get("content_hash"),
-            "decimal.prompt.variables": list(record.get("variables") or []),
-        }
-        if record.get("skills_unavailable"):
-            attributes["decimal.skills.unavailable"] = record["skills_unavailable"]
-        target = next(
-            (s for s in spans if s.span_type == SpanType.AGENT and s.name == agent_name),
-            None,
-        )
-        if target is None:
-            spans.append(TraceSpan(
-                span_type=SpanType.OTHER, name="decimalai.prompt",
-                attributes={**attributes, "decimal.prompt.agent": agent_name},
-            ))
-        else:
-            target.attributes.update(attributes)
 
 
 def _normalize_messages(raw: Any) -> Optional[List[Dict[str, Any]]]:

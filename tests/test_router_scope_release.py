@@ -33,7 +33,6 @@ way the framework reaches it, and nothing else.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
 import sys
 import types
@@ -175,84 +174,56 @@ def _assert_every_slot_released(router: SkillRouter, overflow: List[str]) -> Non
 # ── Google ADK ───────────────────────────────────────────────────────────────
 
 
-def _real_adk_installed() -> bool:
-    """Asked at import time, as tests/test_adk_skill_delivery.py does, so a stub
-    left in sys.modules by a fixture is never mistaken for the real thing."""
-    try:
-        return importlib.util.find_spec("google.adk.plugins.base_plugin") is not None
-    except (ImportError, ValueError):
-        return False
-
-
-HAS_REAL_ADK = _real_adk_installed()
-
-
-class _LlmRequest:
-    """``google.adk.models.llm_request.LlmRequest`` on the members the adapter
-    touches — the stand-in tests/test_adk_skill_delivery.py pins to the real
-    class wherever google-adk is installed."""
-
-    def __init__(self) -> None:
-        self.model = "gemini-3.6-flash"
-        self.config = SimpleNamespace(system_instruction=CALLER_PROMPT)
-        self.contents = [SimpleNamespace(role="user", parts=[SimpleNamespace(text=QUESTION)])]
-
-    def append_instructions(self, instructions: List[str]) -> None:
-        self.config.system_instruction += "\n\n" + "\n\n".join(instructions)
-
-
 @pytest.fixture
 def adk_plugin(monkeypatch, router, client):
+    pytest.importorskip("google.adk")
     import decimalai.adk as adk
 
     monkeypatch.setattr(adk, "_skill_router_singleton", router)
-    monkeypatch.setattr(adk, "_manifest_ids", {})
-    monkeypatch.setattr(adk, "_manifest_trackers", {})
-    monkeypatch.setattr(adk, "_pending_manifests", {})
-    if not HAS_REAL_ADK:
-        # Stub the one import `_plugin_class()` makes; the real BasePlugin only
-        # stores its name.
-        monkeypatch.setattr(adk, "_PluginClass", None)
-        base_plugin = types.ModuleType("google.adk.plugins.base_plugin")
-
-        class BasePlugin:
-            def __init__(self, name):
-                self.name = name
-
-        base_plugin.BasePlugin = BasePlugin
-        for name in ("google", "google.adk", "google.adk.plugins"):
-            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-        monkeypatch.setitem(sys.modules, "google.adk.plugins.base_plugin", base_plugin)
-    return adk.DecimalaiPlugin(agent_name="support", enable_skill_loader=True)
+    for name, value in (("_PluginClass", None), ("_manifest_ids", {}), ("_manifest_trackers", {}),
+                        ("_pending_manifests", {}), ("_live_runs", {})):
+        monkeypatch.setattr(adk, name, value)
+    return adk.DecimalaiPlugin(agent_name="support")
 
 
 class TestAdk:
-    def test_runs_past_the_cap_hold_no_slot(self, router, adk_plugin, client, overflow_warnings):
-        agent = SimpleNamespace(
-            name="root_agent", model="gemini-3.6-flash", instruction=CALLER_PROMPT,
-            tools=[], sub_agents=[],
-        )
-        last_request: List[Any] = []
+    def test_runs_past_the_cap_hold_no_slot(self, monkeypatch, router, adk_plugin, client, overflow_warnings):
+        import decimalai._agent as agent_mod
+        import decimalai._agent_binding as binding
+        import decimalai.adk as adk
+        from decimalai._agent import SavedPrompt
+
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(agent_mod, "read_prompt",
+                            lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=None))
+        support = adk.load_agent("support")
+        agent = SimpleNamespace(name="root_agent", model="gemini-3.6-flash", instruction=support.instruction,
+                                tools=[], sub_agents=[])
+        prompts: List[str] = []
+        loads: List[str] = []
 
         async def _runs() -> None:
             # One event loop for every run; ADK runs many invocations on one.
             for i in range(RUNS):
                 ic = SimpleNamespace(agent=agent, invocation_id=f"inv-{i}", user_content=QUESTION)
-                cc = SimpleNamespace(invocation_id=f"inv-{i}", agent_name=None)
-                request = _LlmRequest()
+                ctx = SimpleNamespace(invocation_id=f"inv-{i}", agent_name="root_agent",
+                                      user_content=QUESTION, state={}, _invocation_context=ic)
                 await adk_plugin.before_run_callback(invocation_context=ic)
-                await adk_plugin.before_agent_callback(agent=agent, callback_context=cc)
-                await adk_plugin.before_model_callback(callback_context=cc, llm_request=request)
-                await adk_plugin.after_agent_callback(agent=agent, callback_context=cc)
-                last_request[:] = [request]
+                await adk_plugin.before_agent_callback(agent=agent, callback_context=ctx)
+                prompts[:] = [await support.instruction(ctx)]
+                token = adk._RUN.set(ctx.invocation_id)
+                try:
+                    loads[:] = [await support._load("refund-policy")]
+                finally:
+                    adk._RUN.reset(token)
+                await adk_plugin.after_agent_callback(agent=agent, callback_context=ctx)
 
         asyncio.run(_runs())
 
-        # Releasing must not cost the delivery itself.
-        assert SENTINEL in last_request[0].config.system_instruction
+        assert "refund-policy" in prompts[0] and SENTINEL in loads[0], "the text arrives by load_skill"
         assert client.traces == RUNS
         assert client.last.routing_id == ROUTING_ID
-        assert client.last.skills_delivered == ["refund-policy"]
+        assert client.last.skills_loaded_by_agent == ["refund-policy"]
         _assert_every_slot_released(router, overflow_warnings())
 
 

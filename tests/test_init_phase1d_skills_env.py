@@ -153,18 +153,6 @@ class TestAutoTraceOptOut:
         assert lc._installed is True
         assert loader == [1]
 
-    @pytest.mark.parametrize("framework, module", [
-        ("adk", "adk"),
-    ])
-    @pytest.mark.parametrize("skills_env, expected", [("0", False), (None, True)])
-    def test_other_loader_frameworks_follow_the_variable(
-        self, monkeypatch, framework, module, skills_env, expected,
-    ):
-        calls = _record_instrument(monkeypatch, module)
-        _auto_trace(monkeypatch, framework, skills_env)
-        assert len(calls) == 1, f"DECIMAL_AUTO_TRACE={framework} installed nothing"
-        assert calls[0]["enable_skill_loader"] is expected
-
     @pytest.mark.parametrize("skills_env", ["0", None])
     def test_openai_agents_auto_trace_installs_tracing_either_way(self, monkeypatch, skills_env):
         """Since 0.18 the OpenAI Agents flag has no skill loader to turn off:

@@ -14,8 +14,9 @@ The four things that must never regress:
      without it traces perfectly and delivers none of the agent's skills —
      silently. That is the single most important line in the template. On
      openai-agents (0.18+) the equivalent is `load_agent()`'s two pieces in
-     `Agent(...)`, and on pydantic-ai (0.19+) `load_agent()`'s capability in
-     `Agent(capabilities=[...])`: nothing else gives those agents their skills.
+     `Agent(...)`, on pydantic-ai (0.19+) `load_agent()`'s capability in
+     `Agent(capabilities=[...])`, and on adk (0.20+) `load_agent()`'s instruction
+     and tools in `LlmAgent(...)`: nothing else gives those agents their skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
      files traces against a different agent than the one the user configured;
@@ -277,8 +278,8 @@ class TestTemplateIsCode:
 
 
 #: The templates with no instrument() at all: `load_agent()` hands the pieces to the
-#: file's own Agent (openai-agents since 0.18, pydantic-ai since 0.19).
-LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai")
+#: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20).
+LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk")
 
 #: The templates whose skills arrive through instrument()'s loader.
 LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAMEWORKS]
@@ -375,6 +376,27 @@ class TestSkillLoaderIsOn:
         keywords = {kw.arg: kw.value for kw in agent.keywords}
         assert isinstance(keywords["capabilities"], ast.List)
         assert any(reads(e, "support") for e in keywords["capabilities"].elts)
+
+    def test_adk_passes_load_agent_to_the_llm_agent_and_the_plugin_to_the_app(self):
+        """Nothing patches ADK since 0.20: the skills reach the model only because the
+        file passes `load_agent()`'s instruction and tools into its own `LlmAgent`,
+        and the run is traced only because `DecimalaiPlugin()` is in its `App`."""
+        tree = parse(render_agent_file(AGENT, "adk", SKILLS))
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "load_agent")
+        assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (agent,) = calls(tree, "LlmAgent")
+        keywords = {kw.arg: kw.value for kw in agent.keywords}
+        assert _support_attr(keywords["instruction"], "instruction")
+        assert any(isinstance(e, ast.Starred) and _support_attr(e.value, "tools")
+                   for e in keywords["tools"].elts)
+        (app,) = calls(tree, "App")
+        plugins = {kw.arg: kw.value for kw in app.keywords}["plugins"]
+        assert [ast.unparse(e) for e in plugins.elts] == ["DecimalaiPlugin()"]
+        (runner,) = calls(tree, "InMemoryRunner")
+        assert [kw.arg for kw in runner.keywords] == ["app"]
 
 
 # ── 2b. the agent's own system prompt is what it runs on ─────────────
@@ -497,7 +519,7 @@ class TestAgentNameBinding:
                               for t in n.targets))
         assert holder.value is carriers[0]
 
-    @pytest.mark.parametrize("framework", LOAD_AGENT_FRAMEWORKS)
+    @pytest.mark.parametrize("framework", ["openai-agents", "pydantic-ai"])
     def test_the_framework_agent_is_named_from_the_constant(self, framework):
         """The framework's own Agent name comes from AGENT_NAME — a literal there
         was the copy a rename used to miss. It is ``support.name``: the canonical
@@ -535,7 +557,7 @@ class TestAgentNameBinding:
         run time, so they follow a rename instead of keeping the old name."""
         tree = parse(render_agent_file(name, "adk", SKILLS))
         assert kwarg_reads(calls(tree, "LlmAgent")[0], "name", "NODE_NAME")
-        assert kwarg_reads(calls(tree, "InMemoryRunner")[0], "app_name", "NODE_NAME")
+        assert kwarg_reads(calls(tree, "App")[0], "name", "NODE_NAME")
         assert self._adk_node_name(name) == node
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)

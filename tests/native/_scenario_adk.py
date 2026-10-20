@@ -1,13 +1,15 @@
 """google-adk native mode, child side: ADK's own ``SkillToolset`` over
-``decimalai.adk.skills()``, a scripted ``BaseLlm``, ``decimalai.init(adk=True)``
-pointed at a probe. Runs in a child process (``_runner.run_scenario``) with the
-project as its working directory. Observes only; the assertions are the parent's.
+``decimalai.adk.skills()``, a scripted ``BaseLlm``, and ``decimalai.adk.DecimalaiPlugin``
+in the ``App``, pointed at a probe. Runs in a child process (``_runner.run_scenario``)
+with the project as its working directory. Observes only; the assertions are the
+parent's.
 
 * :func:`column`: the native conformance column's scenario (see ``column.py``).
-* :func:`native`: the same two runs, plus what ``test_adk_native.py`` grades beyond
-  the column: the system instruction of every model call (is the router out of the
-  native agent's requests?), a control agent with no toolset (is the router on at
-  all?), and the ``decimalai.adk`` log lines.
+* :func:`native`: the same two runs with ``decimalai.adk.load_agent()``'s instruction
+  and tools on the toolset agent too, plus what ``test_adk_native.py`` grades beyond
+  the column: the system instruction of every model call (does ``load_agent()`` stay
+  out of the agent with a toolset?), a control agent with ``load_agent()``'s pieces
+  and no toolset (does it list skills at all?), and the ``decimalai.adk`` log lines.
 * :func:`live`: the live native check's trials (``tests/native/live.py``): the same
   toolset with a real OpenAI model through ``LiteLlm``.
 """
@@ -28,7 +30,7 @@ from tests.native.column import (
     update_to_v2,
 )
 
-#: What the probe's router serves. Only an injected menu or body can carry these.
+#: What the probe's router serves. Only DecimalAI's skill list or load_skill can carry these.
 ROUTER_SKILL = {
     "name": "router-only-skill",
     "description": "A skill only DecimalAI's router offers.",
@@ -56,7 +58,9 @@ def _watch() -> _Logs:
     return handler
 
 
-def _agent(name: str, *, toolset: bool):
+def _agent(name: str, *, toolset: bool, support: Any = None):
+    """An LlmAgent: ADK's SkillToolset when ``toolset``, and ``load_agent()``'s
+    instruction and load_skill when a ``support`` config is given."""
     from google.adk.agents import LlmAgent
     from google.adk.code_executors.unsafe_local_code_executor import (
         UnsafeLocalCodeExecutor,
@@ -68,22 +72,35 @@ def _agent(name: str, *, toolset: bool):
 
     tools = [SkillToolset(skills=decimalai.adk.skills(),
                           code_executor=UnsafeLocalCodeExecutor())] if toolset else []
+    if support is not None:
+        return LlmAgent(name=name, model=ScriptedLlm(model="scripted"),
+                        instruction=support.instruction, tools=[*tools, *support.tools])
     return LlmAgent(name=name, model=ScriptedLlm(model="scripted"),
                     instruction="Answer refund questions.", tools=tools)
+
+
+def _runner(agent, app_name: str):
+    """ADK's runner for ``agent``, traced by DecimalAI's plugin in its App."""
+    from google.adk.apps import App
+    from google.adk.runners import InMemoryRunner
+
+    import decimalai.adk
+
+    return InMemoryRunner(app=App(name=app_name.replace("-", "_"), root_agent=agent,
+                                  plugins=[decimalai.adk.DecimalaiPlugin()]))
 
 
 def _invoke(agent, steps, run: Run, calls: List[Dict[str, Any]]) -> None:
     """One invocation of ``agent`` on a fresh runner and session, the model following
     ``steps``. Every tool result the model is handed goes to ``run.saw``."""
-    from google.adk.runners import InMemoryRunner
     from google.genai import types
 
     model = agent.model
     model._steps, model._responses, model._instructions = list(steps), [], []
 
     async def go() -> None:
-        runner = InMemoryRunner(agent=agent, app_name="native")
-        session = await runner.session_service.create_session(app_name="native", user_id="u")
+        runner = _runner(agent, "native")
+        session = await runner.session_service.create_session(app_name=runner.app_name, user_id="u")
         msg = types.Content(role="user", parts=[types.Part(text="refund for $100 after 45 days?")])
         async for _ in runner.run_async(user_id="u", session_id=session.id, new_message=msg):
             pass
@@ -114,8 +131,8 @@ def _run2_steps():
     return [call("load_skill", skill_name=TARGET), answer("done")]
 
 
-def _two_runs(s: Session, calls: List[Dict[str, Any]]) -> None:
-    agent = _agent("support", toolset=True)
+def _two_runs(s: Session, calls: List[Dict[str, Any]], support: Any = None) -> None:
+    agent = _agent("support", toolset=True, support=support)
 
     def run1(run: Run) -> None:
         _invoke(agent, _run1_steps(), run, calls)
@@ -131,22 +148,27 @@ def _two_runs(s: Session, calls: List[Dict[str, Any]]) -> None:
 
 
 def column(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    s = Session("google-adk", distributions=["google-adk"], adk=True)
+    s = Session("google-adk", distributions=["google-adk"])
     _two_runs(s, [])
     return s.result()
 
 
 def native(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    import decimalai.adk
+
     logs = _watch()
-    s = Session("google-adk", distributions=["google-adk"], adk=True)
+    s = Session("google-adk", distributions=["google-adk"])
     s.probe.skills = [dict(ROUTER_SKILL)]
+    for name in ("support", "plain"):
+        s.probe.register_agent(name)
     calls: List[Dict[str, Any]] = []
-    _two_runs(s, calls)
+    _two_runs(s, calls, support=decimalai.adk.load_agent("support"))
+    plain = decimalai.adk.load_agent("plain")
 
     def control(run: Run) -> None:
         from tests.native_loaders.stubs.adk_llm import answer
 
-        _invoke(_agent("plain", toolset=False), [answer("done")], run, calls)
+        _invoke(_agent("plain", toolset=False, support=plain), [answer("done")], run, calls)
 
     s.run(control)
     out = s.result()
@@ -173,7 +195,6 @@ def _live_trial(run: Run) -> None:
         UnsafeLocalCodeExecutor,
     )
     from google.adk.models.lite_llm import LiteLlm
-    from google.adk.runners import InMemoryRunner
     from google.adk.tools.skill_toolset import SkillToolset
     from google.genai import types
 
@@ -188,8 +209,8 @@ def _live_trial(run: Run) -> None:
     errors: List[str] = []
 
     async def go() -> None:
-        runner = InMemoryRunner(agent=agent, app_name="native-live")
-        session = await runner.session_service.create_session(app_name="native-live",
+        runner = _runner(agent, "native-live")
+        session = await runner.session_service.create_session(app_name=runner.app_name,
                                                                user_id="u")
         msg = types.Content(role="user", parts=[types.Part(text=live.QUESTION)])
         try:
@@ -221,7 +242,7 @@ def live(ctx: Dict[str, Any]) -> Dict[str, Any]:
     trials, each a fresh agent with a real model, set up as :func:`column` is."""
     from tests.native import live as live_check
 
-    s = Session("google-adk", distributions=["google-adk", "litellm"], adk=True)
+    s = Session("google-adk", distributions=["google-adk", "litellm"])
     for _ in range(live_check.trials(ctx)):
         s.run(_live_trial)
     return s.result()

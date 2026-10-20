@@ -52,11 +52,8 @@ DECLARED_NA: Dict[str, str] = {
     # the correction that came out of the 2026-08-28 defect.
     "langchain:C13b": "model_can_load_skill_bodies",
     "anthropic:C13b": "model_can_load_skill_bodies",
-    # ADK moved here from `has_skills_rail` on 2026-09-03. The rail exists and
-    # is graded (C8, C13, C14); what is absent is the LOADER. ADK ships its own
-    # SkillToolset, but this adapter registers no load_skill tool and does not
-    # bridge SkillToolset, so the model cannot ask DecimalAI for a body.
-    "adk:C13b": "model_can_load_skill_bodies",
+    # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.load_agent()`
+    # gives the agent a real load_skill tool, so C13b is graded on its pulls.
     # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
     # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
     # graded; the model still cannot ASK for a body (no load_skill tool), so
@@ -132,7 +129,9 @@ DECLARED_NA: Dict[str, str] = {
 # Raised 30 -> 36 on 2026-10-14 by two new ITEMS, C18 and C19, which grade
 # routing and are N/A on exactly the three drivers that have no rail (the same
 # three, by the same flag, as C8). C17 added none: every driver has tools.
-NA_BUDGET = 36
+# Lowered 36 -> 35 on 2026-10-20: ADK's C13b is graded, now that load_agent()
+# gives the model a load_skill tool to pull a body with.
+NA_BUDGET = 35
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -148,9 +147,6 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # A patched `messages.create()` is one provider request; the tool loop is the
     # caller's own while-loop, which this adapter never sees.
     "anthropic:tool_loaded": "decimalai/anthropic.py",
-    # The adapter's seam is ADK's plugin hooks, and it registers no load_skill
-    # tool for a result to come back from (nor bridges ADK's own SkillToolset).
-    "adk:tool_loaded": "decimalai/adk.py",
     # CrewAI's before_llm_call hook edits one call's messages and registers no
     # tool. CrewAI itself runs a tool loop, so this is the SEAM's limit, the same
     # kind langchain's invoke-layer patch and ADK's plugin hooks declare.
@@ -168,7 +164,9 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
 # on that same evidence: the driver asks for the tool loop in the tool_loaded
 # cell, and the N/A holds only while the adapter refuses on the run and no body
 # arrives by a tool. A load_skill tool on the Agent would retire this line.
-DELIVERY_NA_BUDGET = 4
+# Lowered 4 -> 3 on 2026-10-20: ADK's line retired. `decimalai.adk.load_agent()`
+# gives the agent a load_skill tool, so its tool_loaded cell delivers and is graded.
+DELIVERY_NA_BUDGET = 3
 
 # ── journey-axis N/As ────────────────────────────────────────────────────────
 

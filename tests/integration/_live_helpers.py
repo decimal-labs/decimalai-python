@@ -315,6 +315,21 @@ def post_regression_check(agent_name: str, candidate_manifest_id: str) -> dict:
         return json.loads(r.read())
 
 
+def create_agent(agent_name: str, system_prompt: str) -> dict:
+    """Create an agent with a saved prompt, which is what ``load_agent()`` reads."""
+    req = urllib.request.Request(
+        f"{BACKEND_URL}/api/v1/agents",
+        data=json.dumps({"agent_name": agent_name, "system_prompt": system_prompt}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
 def get_trace_detail(trace_id: str) -> dict:
     url = f"{BACKEND_URL}/api/v1/traces/{trace_id}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})

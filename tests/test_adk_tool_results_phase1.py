@@ -66,9 +66,8 @@ def client(monkeypatch):
         ("_manifest_ids", {}),
         ("_manifest_trackers", {}),
         ("_pending_manifests", {}),
-        ("_skill_loader_enabled", False),
         ("_skill_router_singleton", None),
-        ("_instrument_config", adk._InstrumentationConfig()),
+        ("_live_runs", {}),
     ):
         monkeypatch.setattr(adk, name, value)
     yield mock

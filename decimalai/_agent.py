@@ -461,8 +461,15 @@ def _record_turn(fields: Dict[str, Any]) -> bool:
     )
 
 
-def _serve_and_record(router: Any, name: str, *, scope: Optional[str], agent_name: str) -> str:
-    """One skill's text for the model; a served body is recorded on the live run."""
+def _serve_and_record(
+    router: Any, name: str, *, scope: Optional[str], agent_name: str, record: Any = None,
+) -> str:
+    """One skill's text for the model; a served body is recorded on the live run.
+
+    ``record`` takes the load (``loaded``, ``loaded_hashes``, ``delivered_versions``)
+    for a framework whose trace is not built from OpenTelemetry spans; by default it
+    goes on the OpenTelemetry run live now.
+    """
     if router is None:
         return "load_skill error: skill router unavailable."
     try:
@@ -477,9 +484,9 @@ def _serve_and_record(router: Any, name: str, *, scope: Optional[str], agent_nam
             hashes = router.consume_loaded_hashes(scope=scope) or {}
             versions = router.consume_delivered_versions(scope=scope)
             if served:
-                from .otel import record_skill_rail
-
-                record_skill_rail(loaded=served, loaded_hashes=hashes, delivered_versions=versions)
+                if record is None:
+                    from .otel import record_skill_rail as record
+                record(loaded=served, loaded_hashes=hashes, delivered_versions=versions)
         except Exception:
             logger.debug("load_skill record failed (non-fatal)", exc_info=True)
     return body

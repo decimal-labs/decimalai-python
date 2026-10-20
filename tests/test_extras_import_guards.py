@@ -66,14 +66,21 @@ class TestWarningGuards:
             cas.instrument()
         assert 'decimalai[claude-agent-sdk]' in caplog.text
 
-    def test_adk_install_warns_with_extra(self, monkeypatch, caplog):
+    def test_adk_load_agent_and_plugin_name_the_extra_before_any_call(self, monkeypatch):
+        """ADK's skills come from load_agent() and its traces from DecimalaiPlugin, and
+        both need the framework outright: they raise, naming the extra, before init()
+        or any request."""
+        import decimalai._agent as agent_mod
         import decimalai.adk as adk
 
         _block(monkeypatch, "google.adk")
-        monkeypatch.setattr(adk, "_runner_patched", False)
-        with caplog.at_level("WARNING"):
-            adk.instrument()
-        assert 'decimalai[adk]' in caplog.text
+        monkeypatch.setattr(adk, "_PluginClass", None)
+        monkeypatch.setattr(agent_mod, "_ensure_initialized",
+                            lambda: pytest.fail("set up before the import check"))
+        with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
+            adk.load_agent("support")
+        with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
+            adk.DecimalaiPlugin()
 
     def test_pydantic_ai_load_agent_names_the_extra_before_any_call(self, monkeypatch):
         """Pydantic AI's skills come from load_agent(), which needs the framework

@@ -6,6 +6,44 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed (breaking): Google ADK agents get their prompt and skills from `load_agent()`
+
+- **New:** `decimalai.adk.load_agent(name, fallback=..., on_unavailable="continue")` returns
+  `instruction`, an ADK instruction provider for `LlmAgent(instruction=...)`: the agent's saved
+  prompt (`{{placeholders}}` filled from the session's state), then the skill list routed on the
+  invocation's message. Its `tools` is `load_skill`, limited to the agent's skills: ADK agents
+  can fetch a skill's text mid-turn for the first time. Each invocation is routed once, on its
+  own message, the way OpenAI Agents runs are. Built only on ADK's public instruction and tool
+  APIs.
+- `DecimalaiPlugin()` goes in `App(plugins=[...])`, ADK's own place for plugins. An invocation
+  whose agent has `load_agent()`'s instruction is one trace filed under that DecimalAI agent,
+  with its prompt version, placeholder names and the skills offered, loaded and delivered.
+  `load_skill`'s results are in the trace's model inputs.
+- **Removed:** `decimalai.adk.instrument()`, `init(adk=True)` and the `Runner.__init__` patch
+  behind both, which added the plugin to every runner in the process; the plugin's skill
+  injection (a menu and a body pasted into `system_instruction`); and its `enable_skill_loader`
+  and `enable_load_skill_tool` parameters. `DECIMAL_AUTO_TRACE=adk` now logs a warning that
+  says to add the plugin, and traces nothing.
+- An agent that carries ADK's own `SkillToolset`, or another tool named `load_skill`, gets no
+  DecimalAI skills, with one warning.
+- `decimalai init --framework adk` writes the new shape.
+
+Migration:
+
+```python
+# before
+decimalai.init(adk=True, agent_name="support")
+agent = LlmAgent(name="support", model=MODEL, instruction=BASE, tools=[lookup_order])
+runner = InMemoryRunner(agent=agent)
+
+# after
+from decimalai.adk import DecimalaiPlugin, load_agent
+support = load_agent("support", fallback=BASE)
+agent = LlmAgent(name="support", model=MODEL, instruction=support.instruction,
+                 tools=[lookup_order, *support.tools])
+runner = InMemoryRunner(app=App(name="support", root_agent=agent, plugins=[DecimalaiPlugin()]))
+```
+
 ### Fixed: OpenAI Agents traces record OpenAI's cached input tokens
 
 - Each model call's `cache_read_tokens` now carries the cached-input count OpenAI reports

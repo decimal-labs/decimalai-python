@@ -21,13 +21,13 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 
    EXPLICITLY, and that is the design, not an implementation detail: the
    prompt lands in a variable in THEIR file and is passed to the model by a
-   line they can see. On langchain and adk skills go the other way
-   (instrument() injects them), because a skill menu is additive and a system
-   prompt is not — silently replacing one means their repo says "Never issue
-   refunds over $500" while the model receives something else, which is
-   unfixable from their side. On openai-agents and pydantic-ai nothing is
-   injected: `load_agent()` returns the prompt and the skills together, and
-   the file hands both to its own `Agent(...)`.
+   line they can see. On langchain skills go the other way (instrument()
+   injects them), because a skill menu is additive and a system prompt is not —
+   silently replacing one means their repo says "Never issue refunds over $500"
+   while the model receives something else, which is unfixable from their
+   side. On openai-agents, pydantic-ai and adk nothing is injected:
+   `load_agent()` returns the prompt and the skills together, and the file
+   hands both to its own agent.
 
    `load_agent()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
@@ -41,13 +41,13 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    scaffold is worth shipping: without the flag the model is handed a list of
    skill titles it cannot read. Every generated file whose adapter has a
    loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
-   one stops. The openai-agents (0.18+) and pydantic-ai (0.19+) files have no
-   loader to turn on: their skills reach the model only through the
-   `load_agent()` pieces they pass to `Agent(...)`, which the same tests check.
-   (`init(langchain=True)`, `init(openai_agents=True)`, `init(adk=True)` and
-   `init(crewai=True)` turn the loader on themselves since 2026-10-14; the
-   templates keep the explicit `instrument()` line because it is where the
-   adapter's other options go.)
+   one stops. The openai-agents (0.18+), pydantic-ai (0.19+) and adk (0.20+)
+   files have no loader to turn on: their skills reach the model only through
+   the `load_agent()` pieces they pass to their agent, which the same tests
+   check.
+   (`init(langchain=True)` and `init(crewai=True)` turn the loader on
+   themselves since 2026-10-14; the langchain template keeps the explicit
+   `instrument()` line because it is where the adapter's other options go.)
 
 2. The agent name is BOUND, and written ONCE. An unbound name means the
    adapter auto-detects one off the runnable ("langchain-agent" when it cannot
@@ -145,8 +145,11 @@ share is identical, deliberately:
     carries no framework flag.
   * pydantic-ai: `load_agent(AGENT_NAME)` passed as `Agent(capabilities=[support])`,
     with `init(..., otel=True)` and `Agent.instrument_all()` for the spans.
-    That is the same rule: exactly one span source per file. On the other two
-    the adapter IS the span source; here it is not (point 4).
+    That is the same rule: exactly one span source per file. On langchain and
+    openai-agents the adapter IS the span source; here it is not (point 4).
+  * adk: `load_agent(AGENT_NAME)`'s instruction and tools go into the file's own
+    `LlmAgent(...)`, and `DecimalaiPlugin()` into its `App(plugins=[...])`, the one
+    span source; init() carries no framework flag.
 
 Two differences are intentional. The snippets name the agent on
 `instrument(agent_name=...)`; the templates name it on `init(agent_name=...)`
@@ -160,9 +163,9 @@ WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. Six adapters have one: `enable_skill_loader` on four
-(langchain, anthropic, adk, crewai) and a `load_agent()` binding on two
-(openai_agents, pydantic_ai). The rest — llamaindex, claude_agent_sdk,
+loader can use. Six adapters have one: `enable_skill_loader` on three
+(langchain, anthropic, crewai) and a `load_agent()` binding on three
+(openai_agents, pydantic_ai, adk). The rest — llamaindex, claude_agent_sdk,
 autogen/otel — trace and version but have no loader, and generating a file for
 them would hand someone a program that looks correct and quietly ignores every
 skill they picked. `--framework` names the reason rather than printing a bare
@@ -781,17 +784,18 @@ def _render_adk(
         "import re",
         "",
         "import decimalai",
-        "from decimalai.adk import instrument",
+        "from decimalai.adk import DecimalaiPlugin, load_agent",
         "from google.adk.agents import LlmAgent",
+        "from google.adk.apps import App",
         "from google.adk.runners import InMemoryRunner",
         "from google.genai import types",
         "",
         "# Any Gemini model your key can reach. ADK resolves a bare `gemini-*` name",
         "# natively; for another provider wrap it: model=LiteLlm(\"openai/gpt-4o-mini\").",
         f"MODEL = {_py(model)}",
-        *_agent_name_lines(agent_name),
+        *_agent_name_lines(agent_name, load_agent_routes=True),
         "# ADK node names must be Python identifiers, and not \"user\"; the DecimalAI",
-        "# name need not be. Traces still file under AGENT_NAME — init() carries it.",
+        "# name need not be. Traces still file under AGENT_NAME: load_agent() names them.",
         "NODE_NAME = re.sub(r\"\\W\", \"_\", AGENT_NAME)",
         "if not NODE_NAME.isidentifier() or NODE_NAME == \"user\":",
         "    NODE_NAME = \"agent_\" + NODE_NAME",
@@ -810,34 +814,35 @@ def _render_adk(
         "# file you are going to commit.",
         _init_call(base_url),
         "",
-        "# enable_skill_loader=True is what actually delivers this agent's skills:",
-        "# every model turn is routed and the routed BODIES are appended to the",
-        "# request's system_instruction from the plugin's before_model hook. ADK",
-        "# registers no load_skill tool, so injection is the only body channel.",
-        "#",
-        "# This call patches Runner.__init__ to attach the DecimalAI plugin, so it",
-        "# must stay ABOVE the InMemoryRunner(...) below. No agent_name here: init()",
-        "# above already named the agent. Do not also pass adk=True to init(): that",
-        "# is this same install, so one of the two is noise.",
-        "instrument(enable_skill_loader=True)",
+        "# This agent's prompt and skills, from DecimalAI. Nothing is injected behind",
+        "# your back: the two lines in LlmAgent(...) below are where they go in.",
+        "#   support.instruction  the prompt saved in the dashboard, then the list of",
+        "#                        this agent's skills picked for each message. Re-read",
+        "#                        at most once a minute, so a prompt saved in the",
+        "#                        dashboard reaches a run within a minute, with no",
+        "#                        redeploy. {{placeholders}} in it are filled from the",
+        "#                        session's state.",
+        "#   support.tools        the load_skill tool the model reads a skill with.",
+        "# With no prompt saved, the agent gets only the skill list: nothing this file",
+        "# made up. Pass load_agent(AGENT_NAME, fallback=...) to supply one.",
+        "support = load_agent(AGENT_NAME)",
         "",
-        "# Your agent's system prompt, as it stands in the dashboard right now.",
-        "# Read at run time, so editing it in the dashboard changes the next run.",
-        "support = decimalai.load_agent(AGENT_NAME)",
-        "",
-        "# Your tools go here. An empty list is a WORKING agent, not a stub.",
+        "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
+        "# loop runs, and load_skill sits beside your tools.",
         "TOOLS: list = []",
         "",
         "agent = LlmAgent(",
         "    name=NODE_NAME,",
         "    model=MODEL,",
-        "    # `or \"\"` because None is a REAL state (no prompt set; a failed read",
-        "    # raises instead) and ADK's instruction field takes a string, never None.",
-        "    instruction=support.prompt or \"\",",
-        "    tools=TOOLS,",
+        "    instruction=support.instruction,",
+        "    # Your own tools go first; DecimalAI adds load_skill.",
+        "    tools=[*TOOLS, *support.tools],",
         ")",
         "",
-        "runner = InMemoryRunner(agent=agent, app_name=NODE_NAME)",
+        "# DecimalaiPlugin makes each run one trace, filed under AGENT_NAME. ADK's App",
+        "# is where plugins go: runners built from this app are traced, nothing else.",
+        "app = App(name=NODE_NAME, root_agent=agent, plugins=[DecimalaiPlugin()])",
+        "runner = InMemoryRunner(app=app)",
         "",
         "",
         "async def _turn(question: str) -> str:",

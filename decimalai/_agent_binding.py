@@ -126,6 +126,42 @@ def _clean_names(names: Any) -> List[str]:
     return [n for n in names if isinstance(n, str) and n.strip()]
 
 
+def attach_prompt_records(spans: List[Any], records: Any) -> None:
+    """Put each `load_agent()` prompt record on its agent's span, as attributes.
+
+    The backend stores span attributes as they come, so a trace says which
+    prompt version a run used, with which placeholder NAMES (never values:
+    those are often personal data), without a column of its own. An agent with
+    no span of its own gets a span named ``decimalai.prompt``.
+    """
+    if not isinstance(records, dict) or not records:
+        return
+    for agent_name, record in records.items():
+        attributes = {
+            "decimal.agent": record.get("decimal_agent"),
+            "decimal.prompt.source": record.get("source"),
+            "decimal.prompt.version": record.get("version"),
+            "decimal.prompt.content_hash": record.get("content_hash"),
+            "decimal.prompt.variables": list(record.get("variables") or []),
+        }
+        if record.get("skills_unavailable"):
+            attributes["decimal.skills.unavailable"] = record["skills_unavailable"]
+        from .schema.common import SpanType
+        from .schema.trace import TraceSpan
+
+        target = next(
+            (s for s in spans if s.span_type == SpanType.AGENT and s.name == agent_name),
+            None,
+        )
+        if target is None:
+            spans.append(TraceSpan(
+                span_type=SpanType.OTHER, name="decimalai.prompt",
+                attributes={**attributes, "decimal.prompt.agent": agent_name},
+            ))
+        else:
+            target.attributes.update(attributes)
+
+
 class AgentBinding:
     """One DecimalAI agent's prompt and skills, served per run.
 
