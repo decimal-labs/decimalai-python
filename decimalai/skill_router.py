@@ -420,6 +420,13 @@ def _registry_skill_path(ref: Any, suffix: str = "") -> str:
     return f"{_REGISTRY_SKILLS_PREFIX}{_path_part(ref)}{suffix}"
 
 
+def _agent_skill_path(agent_name: Any, skill_id: Any) -> str:
+    """``/api/v1/agents/{agent_name}/skills/{skill_id}``, each value one encoded
+    segment: the route takes a single segment for each, so unlike a skill name
+    a ``/`` here is encoded rather than kept."""
+    return f"/api/v1/agents/{quote(str(agent_name), safe='')}/skills/{quote(str(skill_id), safe='')}"
+
+
 def _skill_body_path(name: str) -> str:
     """``/api/v1/skills/{name}/body`` with the name percent-encoded."""
     return _skill_path(name, _BODY_SUFFIX)
@@ -3238,6 +3245,7 @@ class SkillRouter:
         category: Optional[str] = None,
         stability: str = "stable",
         trigger_phrases: Optional[List[str]] = None,
+        offer_scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new skill on the platform.
 
@@ -3250,9 +3258,15 @@ class SkillRouter:
             category: Optional category grouping.
             stability: One of 'stable', 'experimental', 'deprecated'.
             trigger_phrases: Optional list of trigger phrases.
+            offer_scope: Who the trigger router offers the skill to.
+                ``"workspace"`` (the default) is every agent in the org;
+                ``"restricted"`` is only the agents you assign it to with
+                :meth:`assign_skill`. Set here, the skill is never offered
+                org-wide, not even until a later :meth:`update_skill`.
 
         Returns:
-            Created skill descriptor.
+            Created skill descriptor: ``skill_id``, ``name``, ``version`` and
+            ``offer_scope``.
         """
         payload: Dict[str, Any] = {
             "name": name,
@@ -3266,7 +3280,15 @@ class SkillRouter:
             payload["category"] = category
         if trigger_phrases:
             payload["trigger_phrases"] = trigger_phrases
-        return self._request("POST", "/api/v1/skills", json=payload)
+        if offer_scope is not None:
+            payload["offer_scope"] = offer_scope
+        result = self._request("POST", "/api/v1/skills", json=payload)
+        if offer_scope is not None and result.get("offer_scope") != offer_scope:
+            # An older backend ignores the field and does not echo it: set it
+            # the way callers had to before.
+            self.update_skill(result["skill_id"], offer_scope=offer_scope)
+            result = {**result, "offer_scope": offer_scope}
+        return result
 
     def update_skill(
         self,
@@ -3296,8 +3318,8 @@ class SkillRouter:
             offer_scope: Who the trigger router offers the skill to.
                 ``"workspace"`` (the default) is every agent in the org;
                 ``"restricted"`` is only the agents it has been assigned to
-                (``POST /api/v1/agents/{name}/skills/{skill_id}``). Metadata
-                only: it does not create a new version.
+                (:meth:`assign_skill`). Metadata only: it does not create a
+                new version.
             change_summary: Description of body changes (for version history).
             author: Author of the change.
 
@@ -3334,6 +3356,51 @@ class SkillRouter:
             skill_id: The skill UUID.
         """
         return self._request("DELETE", _skill_path(skill_id))
+
+    # ── Assignment ───────────────────────────────────────
+
+    def assign_skill(
+        self,
+        agent_name: str,
+        skill_id: str,
+        *,
+        pin_version_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Assign a skill to one agent, so the router offers it to that agent.
+
+        This is how an ``offer_scope="restricted"`` skill reaches an agent. A
+        ``"workspace"`` skill is offered to every agent already; assigning it
+        ranks it ahead of equally relevant unassigned skills for this agent and
+        lets you pin a version. Safe to repeat: assigning again only updates
+        the pin.
+
+        Args:
+            agent_name: The name your code runs the agent under (``load_agent(name)``,
+                ``Agent(name=...)``). An agent DecimalAI has not seen yet is created.
+            skill_id: The skill's UUID: one of your organization's skills, or a
+                public registry skill, which is then linked for this agent only.
+            pin_version_id: Serve this skill version instead of the latest.
+
+        Returns:
+            ``{"status": "ok", "action": "assigned" | "updated",
+            "subscription_id": ..., "pinned_version_id": ...}``.
+        """
+        return self._request(
+            "POST", _agent_skill_path(agent_name, skill_id),
+            params={"pin_version_id": pin_version_id},
+        )
+
+    def unassign_skill(self, agent_name: str, skill_id: str) -> Dict[str, Any]:
+        """Remove a skill assignment from one agent (needs a key with admin permission).
+
+        A ``"restricted"`` skill is no longer offered to the agent; a
+        ``"workspace"`` one still is, as to every agent.
+
+        Returns:
+            ``{"status": "ok", "action": "unassigned"}``, or ``"noop"`` when
+            there was no assignment to remove.
+        """
+        return self._request("DELETE", _agent_skill_path(agent_name, skill_id))
 
     # ── Versions ─────────────────────────────────────────
 

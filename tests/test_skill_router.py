@@ -217,6 +217,66 @@ class TestSkillRouterCRUD:
             mock.assert_called_once_with("DELETE", "/api/v1/skills/skill-id-1")
             assert result["deleted"] is True
 
+    def test_create_skill_offer_scope(self):
+        """`offer_scope` rides in the create payload, so a restricted skill is
+        one call: never offered org-wide, not even until a PUT."""
+        router = self._router()
+        reply = {"status": "ok", "skill_id": "x", "name": "s", "version": 1, "offer_scope": "restricted"}
+        with patch.object(router, "_request", return_value=reply) as mock:
+            result = router.create_skill("s", "d", "# Body", offer_scope="restricted")
+            mock.assert_called_once()
+            assert mock.call_args[1]["json"]["offer_scope"] == "restricted"
+            assert result == reply
+        with patch.object(router, "_request", return_value={"skill_id": "x"}) as mock:
+            router.create_skill("s", "d", "# Body")
+            mock.assert_called_once()
+            assert "offer_scope" not in mock.call_args[1]["json"]
+
+    def test_create_skill_offer_scope_on_an_older_backend(self):
+        """An older backend ignores the field and does not echo it, so the SDK
+        sets it with the PUT callers used to write themselves."""
+        router = self._router()
+        replies = [{"status": "ok", "skill_id": "x", "name": "s", "version": 1}, {"status": "ok"}]
+        with patch.object(router, "_request", side_effect=replies) as mock:
+            result = router.create_skill("s", "d", "# Body", offer_scope="restricted")
+        assert [c[0] for c in mock.call_args_list] == [
+            ("POST", "/api/v1/skills"), ("PUT", "/api/v1/skills/x"),
+        ]
+        assert mock.call_args_list[1][1]["json"] == {"offer_scope": "restricted"}
+        assert result["offer_scope"] == "restricted"
+
+    def test_assign_skill(self):
+        router = self._router()
+        reply = {"status": "ok", "action": "assigned", "subscription_id": "sub-1", "pinned_version_id": None}
+        with patch.object(router, "_request", return_value=reply) as mock:
+            assert router.assign_skill("tutorial-order-support", "skill-id-1") == reply
+            mock.assert_called_once_with(
+                "POST", "/api/v1/agents/tutorial-order-support/skills/skill-id-1",
+                params={"pin_version_id": None},
+            )
+            # Each value is one path segment, so a "/" in an agent name is encoded.
+            router.assign_skill("support bot/v2", "skill-id-1", pin_version_id="ver-9")
+            assert mock.call_args[0][1] == "/api/v1/agents/support%20bot%2Fv2/skills/skill-id-1"
+            assert mock.call_args[1]["params"] == {"pin_version_id": "ver-9"}
+
+    def test_assign_skill_sends_no_pin_when_none_given(self):
+        """Through the real `_request`: no `pin_version_id` query parameter at
+        all (the route reads its absence as "follow the latest version")."""
+        router = SkillRouter(api_key="dai_sk_test", base_url="http://localhost:8000")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "ok", "action": "assigned"}
+        with patch("decimalai.skill_router.httpx.request", return_value=response) as request:
+            assert router.assign_skill("billing-bot", "skill-id-1")["action"] == "assigned"
+        method, url = request.call_args[0]
+        assert (method, url) == ("POST", "http://localhost:8000/api/v1/agents/billing-bot/skills/skill-id-1")
+        assert request.call_args[1]["params"] == {}
+
+    def test_unassign_skill(self):
+        router = self._router()
+        with patch.object(router, "_request", return_value={"status": "ok", "action": "unassigned"}) as mock:
+            assert router.unassign_skill("tutorial-order-support", "skill-id-1")["action"] == "unassigned"
+            mock.assert_called_once_with("DELETE", "/api/v1/agents/tutorial-order-support/skills/skill-id-1")
+
 
 class TestSkillRouterVersions:
     """Tests for the version methods."""

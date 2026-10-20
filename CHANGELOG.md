@@ -19,6 +19,21 @@ and patch releases are fixes.
 - The generic tracer and the LangChain adapter no longer repeat a registration that the client
   has already retried (429, 502-504) or that a retry cannot fix (other 4xx, a plan quota).
 
+### Added: assign a skill to an agent, and create it restricted, from `SkillRouter`
+
+- `SkillRouter.assign_skill(agent_name, skill_id, pin_version_id=None)` assigns one of your
+  skills, or a public registry skill, to one agent (`POST /api/v1/agents/{name}/skills/{id}`).
+  Assigning again updates the pin. `unassign_skill(agent_name, skill_id)` removes it (with a key
+  that has admin permission). Before, this took a raw REST call.
+- `create_skill(..., offer_scope="restricted")` creates a skill offered only to the agents it
+  is assigned to, in one call, so it is never offered org-wide in between. Against an older
+  backend, which ignores the field, it follows up with `update_skill(offer_scope=...)`, the
+  call you used to make yourself.
+- `get_trace()`'s type lists the skill fields the API returns. `skills_delivered` holds names
+  only; the delivered versions and where each body sits in the prompts are
+  `skills_delivered_versions` and `skills_delivered_sites` (older backends mixed them into
+  `skills_delivered`).
+
 ## [0.18.0] — 2026-10-20
 
 ### Changed (breaking): OpenAI Agents SDK agents get their prompt and skills from `load_agent()`

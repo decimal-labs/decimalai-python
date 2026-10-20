@@ -114,11 +114,21 @@ class TraceListResponse(TypedDict):
 
 class TraceDetailResponse(TraceListItem, total=False):
     """Single-trace response from `GET /api/v1/traces/{id}`. Inherits list fields,
-    adds spans / llm_calls / active_skills / eval_breakdown."""
+    adds spans / llm_calls / active_skills / the skill rungs / eval_breakdown."""
 
     spans: List[Dict[str, Any]]
     llm_calls: List[Dict[str, Any]]
     active_skills: List[Dict[str, Any]]
+    # The run's skills, rung by rung. None: the SDK that sent the trace did not
+    # report that rung; []: it reported none.
+    routing_id: Optional[str]
+    skills_offered_in_prompt: Optional[List[str]]
+    skills_delivered: Optional[List[str]]
+    # {name, hash, skill_id?, version_id?, routing_id?} per delivered body
+    skills_delivered_versions: Optional[List[Dict[str, Any]]]
+    # {skill, llm_call_id, message_index, role, body_start, body_end}
+    skills_delivered_sites: List[Dict[str, Any]]
+    skills_loaded_by_agent: Optional[List[str]]
     eval_breakdown: Optional[Dict[str, Any]]
     eval_details_json: Optional[Dict[str, Any]]
     error_message: Optional[str]
