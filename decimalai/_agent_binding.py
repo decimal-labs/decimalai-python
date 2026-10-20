@@ -217,6 +217,33 @@ class AgentBinding:
         return getattr(self._prompt, "version_number", None)
 
     @property
+    def prompt_hash(self) -> Optional[str]:
+        """The content hash of the saved prompt in use, or None for fallback text."""
+        return getattr(self._prompt, "content_hash", None)
+
+    @property
+    def prompt_source(self) -> str:
+        """Where the prompt in use came from.
+
+        ``"decimal"`` (read from DecimalAI), ``"decimal (cached copy)"`` (DecimalAI was
+        unreachable at the last read), ``"fallback"`` (unreachable, nothing cached:
+        the ``fallback=`` text), or ``"code"`` (no prompt saved: the ``fallback=`` text).
+        """
+        with self._lock:
+            prompt = self._prompt
+        return self._source_of(prompt)
+
+    @staticmethod
+    def _source_of(prompt: Any) -> str:
+        if getattr(prompt, "system_prompt", None) is None:
+            return "code"
+        if getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
+            return "fallback"
+        if getattr(prompt, "is_fallback", False):
+            return "decimal (cached copy)"
+        return "decimal"
+
+    @property
     def variables(self) -> List[str]:
         """The placeholders the prompt in use needs a value for on each run."""
         return template_variables(self._template())
@@ -380,18 +407,10 @@ class AgentBinding:
         return text
 
     def _prompt_record(self, prompt: Any, template: str, unavailable: Optional[str], agent: Any) -> Dict[str, Any]:
-        if getattr(prompt, "system_prompt", None) is None:
-            source = "code"
-        elif getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
-            source = "fallback"
-        elif getattr(prompt, "is_fallback", False):
-            source = "decimal (cached copy)"
-        else:
-            source = "decimal"
         return {
             "agent": self._agent_label(agent) or self.name,
             "decimal_agent": self.name,
-            "source": source,
+            "source": self._source_of(prompt),
             "version": getattr(prompt, "version_number", None),
             "content_hash": getattr(prompt, "content_hash", None),
             "variables": template_variables(template),
@@ -480,7 +499,7 @@ class AgentBinding:
             _in_background(self._refresh_prompt)
 
     def _refresh_prompt(self) -> None:
-        from ._agent import load_agent as _load_prompt
+        from ._agent import read_prompt as _load_prompt
         from ._client import AgentNotFoundError
 
         try:

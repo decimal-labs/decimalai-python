@@ -326,7 +326,7 @@ from unittest.mock import patch
 
 from unittest.mock import MagicMock
 
-from decimalai import AgentConfig
+from decimalai._agent import SavedPrompt
 
 _stack = contextlib.ExitStack()
 {router}
@@ -351,15 +351,14 @@ _flush = _stack.enter_context(patch("decimalai.flush"))
 # and where a wrong name should fail. Unstubbed it would reach a real backend
 # from the test suite, so it is stubbed exactly like init().
 #
-# With the REAL AgentConfig, never a MagicMock: a Mock answers to any attribute
-# name, so a template that read `config.system_prmopt` would sail through this
-# test and ship a file that dies for the user on line one.
-_config = AgentConfig(agent_name={agent!r}, system_prompt={prompt!r})
+# With a REAL SavedPrompt, never a MagicMock: a Mock answers to any attribute
+# name, so a binding that read a misspelt field would sail through this test and
+# ship a file that dies for the user on line one.
+_config = SavedPrompt(agent_name={agent!r}, system_prompt={prompt!r})
 _load = MagicMock(return_value=_config)
-# The templates call decimalai.load_agent(); OpenAI's load_agent() reads the same
-# prompt through decimalai._agent.load_agent. One stub answers both.
-_stack.enter_context(patch("decimalai.load_agent", _load))
-_stack.enter_context(patch("decimalai._agent.load_agent", _load))
+# Every load_agent(), decimalai's and OpenAI's, reads the prompt through
+# decimalai._agent.read_prompt, so one stub answers both.
+_stack.enter_context(patch("decimalai._agent.read_prompt", _load))
 
 with _stack:
     _mod = runpy.run_path({path!r}, run_name="__main__")

@@ -160,6 +160,37 @@ def _model_recovery_attributes(span: Any) -> Dict[str, Any]:
         attempts.append({k: fields[k] for k in ("attempt", "outcome", "failure_kind") if k in fields})
     return {"decimalai.model_requests": attempts} if attempts else {}
 
+
+#: The run record a ``load_agent()`` binding sets on the span that is current when
+#: it composes a turn (see ``decimalai._agent._prompt_attributes``). Content-free
+#: by construction: an agent name, a prompt version and hash, placeholder NAMES
+#: (never their values) and why skills were unavailable. Carried through as-is;
+#: every other attribute stays behind, as for the recovery events above.
+_DECIMAL_RECORD_ATTRIBUTES = (
+    "decimal.agent",
+    "decimal.prompt.source",
+    "decimal.prompt.version",
+    "decimal.prompt.content_hash",
+    "decimal.prompt.variables",
+    "decimal.skills.unavailable",
+)
+
+
+def _decimal_record_attributes(span: Any) -> Dict[str, Any]:
+    """The span's DecimalAI run-record attributes, for the exported span."""
+    attrs = getattr(span, "attributes", None) or {}
+    record: Dict[str, Any] = {}
+    for key in _DECIMAL_RECORD_ATTRIBUTES:
+        if key in attrs:
+            value = attrs[key]
+            record[key] = list(value) if isinstance(value, tuple) else value
+    return record
+
+
+def _exported_attributes(span: Any) -> Dict[str, Any]:
+    """What of an OTel span's own attributes reaches the DecimalAI span."""
+    return {**_model_recovery_attributes(span), **_decimal_record_attributes(span)}
+
 # The agent whose run is executing in THIS context (thread, or asyncio task
 # descended from it). A ContextVar rather than a module global on purpose: eight
 # concurrent runs of eight different agents in one process each need their own
@@ -1429,7 +1460,7 @@ class DecimalSpanExporter:
                     parent_span_id=parent_uuid,
                     span_type=SpanType.LLM,
                     name=f"llm:{model}",
-                    attributes=_model_recovery_attributes(otel_span),
+                    attributes=_exported_attributes(otel_span),
                     status=llm_call.status,
                     started_at=started_at,
                     ended_at=ended_at,
@@ -1485,7 +1516,7 @@ class DecimalSpanExporter:
                     parent_span_id=parent_uuid,
                     span_type=span_type,
                     name=name,
-                    attributes=_model_recovery_attributes(otel_span),
+                    attributes=_exported_attributes(otel_span),
                     status=span_status,
                     started_at=started_at,
                     ended_at=ended_at,

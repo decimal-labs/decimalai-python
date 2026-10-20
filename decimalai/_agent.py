@@ -1,59 +1,60 @@
-"""`decimalai.load_agent()` — the agent's configuration, read at run time.
+"""`decimalai.load_agent()` — an agent's prompt and skills, read at run time.
 
-An agent's system prompt is typed in the dashboard and stored as a versioned
-object on the platform. This is how a running process reads it.
+An agent's prompt is typed in the dashboard and stored as a versioned object on
+the platform, and its skills are assigned there. This is how a running process
+gets both, for code that calls a model itself (a raw provider SDK, a hand-written
+tool loop)::
+
+    support = decimalai.load_agent("refund-bot", fallback=BASE_PROMPT)
+    system = support.system(question, context=customer)  # prompt, then skill list
+    tools = [support.tool_spec]                          # the load_skill tool
+    text = support.load_skill(name)                      # when the model calls it
+
+A framework with its own adapter has its own ``load_agent()`` that returns the
+same two things in that framework's shape: ``decimalai.openai_agents.load_agent``.
+All of them share `decimalai._agent_binding.AgentBinding`.
 
 EXPLICIT, NEVER AUTO-INJECTED
 -----------------------------
-The prompt comes back as data and the caller passes it to their framework
-themselves::
+The prompt comes back as data and the caller hands it to the model themselves.
+Injecting it silently would mean their repo reads "Never issue refunds over
+$500" while the model was handed "You are a helpful assistant", and nothing in
+their own source would show it.
 
-    config = decimalai.load_agent("refund-bot")
-    system_prompt = config.system_prompt  # given to the framework's agent
-
-The framework adapters' skill loaders DO inject skills, and that asymmetry is
-the deliberate part. (On the OpenAI Agents SDK both arrive through one explicit
-call instead: ``decimalai.openai_agents.load_agent()`` returns the prompt and
-the skills for the caller's own ``Agent(...)``.) A skill menu is ADDITIVE — worst case it costs a few hundred tokens the model ignores.
-A system prompt is the agent's core instruction, and injecting it silently
-means their repo reads "Never issue refunds over $500" while the model was
-handed "You are a helpful assistant". There is no way for the customer to see
-that from their own source, which makes it unfixable from their side.
-
-Explicit does NOT cost the no-redeploy property. `load_agent()` fetches at run
-time, so editing the prompt in the dashboard changes what the next process
-start sends. The line in their file stays the same; only the value moves.
+Explicit does NOT cost the no-redeploy property: the prompt is read at run time
+and re-read in the background, so a dashboard edit reaches the next turns.
 
 FAIL CLOSED
 -----------
-`system_prompt is None` means one thing and only one thing: the agent exists
-and has no prompt set. That is a real state — `system_prompt` is optional at
-creation — so it MUST NOT also be reachable from a 404, a timeout, a missing
+`SavedPrompt.system_prompt is None` means one thing only: the agent exists and
+has no prompt set. It MUST NOT also be reachable from a 404, a timeout, a missing
 key, or a response shape this SDK did not expect. An agent that silently runs
-with no instructions at all is worse than one that refuses to start, and it
-looks identical to a working one until someone reads the output closely.
+with no instructions at all is worse than one that refuses to start.
 
 That is why `_from_payload` checks for the KEY and never reaches for
 `payload.get("system_prompt")`: `.get()` turns every wrong-shaped 200 — an
 older backend, a captive-portal login page, a proxy's error envelope — into a
-plausible-looking empty prompt. Same shape as the `?? 'free'` default that told
-paying customers they were on the free plan.
+plausible-looking empty prompt.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from uuid import uuid4
+
+from ._agent_binding import AgentBinding
 
 logger = logging.getLogger("decimalai")
 
 
 @dataclass(frozen=True, repr=False)
-class AgentConfig:
-    """What the platform knows about an agent, as of this call.
+class SavedPrompt:
+    """What the platform knows about an agent's prompt, as of one read.
 
     A frozen dataclass, not a dict, for two reasons. Against a backend older
     than a field, `config.system_prompt` fails at the attribute — at startup,
@@ -114,7 +115,7 @@ class AgentConfig:
             else f"<{len(self.system_prompt)} chars>"
         )
         return (
-            f"AgentConfig(agent_name={self.agent_name!r}, system_prompt={body}, "
+            f"SavedPrompt(agent_name={self.agent_name!r}, system_prompt={body}, "
             f"version_number={self.version_number!r}, "
             f"content_hash={self.content_hash!r})"
         )
@@ -122,7 +123,7 @@ class AgentConfig:
     @classmethod
     def _from_payload(
         cls, payload: Any, *, requested_name: str
-    ) -> "AgentConfig":
+    ) -> "SavedPrompt":
         """Build from `GET /api/v1/agents/{name}/prompt`, or raise.
 
         The membership check on `system_prompt` is the load-bearing line of
@@ -185,7 +186,7 @@ def _summarize(payload: Any) -> str:
 _WARNED_RENAMES: Set[Tuple[str, str]] = set()
 
 
-def _warn_if_renamed(config: AgentConfig) -> None:
+def _warn_if_renamed(config: SavedPrompt) -> None:
     """Say so when the server canonicalized the name — traces do NOT follow.
 
     A rename is handled asymmetrically on the server, and the halves are easy
@@ -210,7 +211,7 @@ def _warn_if_renamed(config: AgentConfig) -> None:
         return
     _WARNED_RENAMES.add(key)
     logger.warning(
-        "decimalai.load_agent: agent %r was renamed to %r. Its prompt and "
+        "decimalai: agent %r was renamed to %r. Its prompt and "
         "skills still resolve under the old name, but trace ingest does NOT "
         "follow a rename — your instrument(agent_name=%r) is still filing "
         "traces under the old name. Update it to %r.",
@@ -222,7 +223,7 @@ def _warn_if_renamed(config: AgentConfig) -> None:
 #: agent_name -> (config, fetched_at_monotonic). Process-local; a cached entry is
 #: served only while it is younger than `cache_ttl_seconds`, or — regardless of
 #: age — when the platform cannot be reached at all. See load_agent().
-_prompt_cache: Dict[str, "tuple[AgentConfig, float]"] = {}
+_prompt_cache: Dict[str, "tuple[SavedPrompt, float]"] = {}
 _prompt_cache_lock = Lock()
 
 #: Default: DO NOT serve a cached prompt in place of a live read.
@@ -249,51 +250,27 @@ def _reset_prompt_cache() -> None:
         _prompt_cache.clear()
 
 
-def load_agent(
+def read_prompt(
     agent_name: str,
     *,
     version: Optional[int] = None,
     fallback: Optional[str] = None,
     cache_ttl_seconds: float = _DEFAULT_PROMPT_CACHE_TTL_S,
-) -> AgentConfig:
-    """Read an agent's configuration from DecimalAI.
+) -> SavedPrompt:
+    """Read an agent's saved prompt from DecimalAI: one HTTP request.
 
-    Call it once, where the agent is built — it is one HTTP request, and it is
-    meant to run at process start, not per turn::
-
-        import decimalai
-        decimalai.init()
-
-        config = decimalai.load_agent("refund-bot")
-        system_prompt = config.system_prompt  # give it to your framework's agent
-
-    `config.system_prompt` is `None` when the agent has no prompt set. Send no
-    system message in that case; do not substitute one, or the agent silently
-    starts following instructions nobody wrote.
-
-    On the OpenAI Agents SDK, use :func:`decimalai.openai_agents.load_agent`
-    instead: it returns this prompt together with the agent's skills, for your
-    ``Agent(...)``.
+    The read every ``load_agent()`` starts with and re-runs to refresh its copy.
 
     Args:
         agent_name: The agent as it exists on DecimalAI. A renamed agent still
-            answers to its old name — `config.agent_name` comes back
-            canonical, and a one-time warning says so.
+            answers to its old name — `agent_name` comes back canonical, and a
+            one-time warning says so.
         version: Read one historical version instead of the effective one.
-            Rarely what you want: the effective prompt already honours a pin.
         fallback: A prompt to use if the platform cannot be reached AND nothing
-            is cached. Supply it in anything that has to boot during an outage —
-            it is the difference between an agent that degrades and one that
-            does not start. The returned config carries `is_fallback=True`.
-        cache_ttl_seconds: Opt in to serving a previously-fetched config without
-            re-asking. Default 0 — every call reads the platform, so a dashboard
-            edit reaches the next run and a revoked key still fails. Regardless
-            of this setting, the last good value IS served when the platform is
-            unreachable: stale beats down.
-
-    Returns:
-        A frozen :class:`AgentConfig`. Check `is_fallback` if you care whether
-        it came from the platform on this call.
+            is cached. The result then carries `is_fallback=True`.
+        cache_ttl_seconds: Serve a previously-fetched prompt without re-asking.
+            Default 0. Regardless of it, the last good value IS served when the
+            platform is unreachable: stale beats down.
 
     Raises:
         DecimalConfigError: `decimalai.init()` has not been called.
@@ -301,14 +278,6 @@ def load_agent(
         ValueError: `agent_name` is empty, or the response was not a prompt
             payload this SDK can read.
         DecimalAPIError: any other HTTP failure (bad key, unresolvable pin).
-
-    A prompt that cannot be read still stops the process — fail-closed is right
-    for a prompt, because substituting one silently makes the agent follow
-    instructions nobody wrote. What changed on 2026-08-28 is that there is now
-    something to fall back TO. Before, `load_agent()` had no cache, no retry and
-    no fallback, so an unreachable platform meant a generated agent could not
-    boot at all — which made the documented promise "turn DecimalAI off and your
-    agent still works" false for every agent `decimalai init` produces.
     """
     if not str(agent_name or "").strip():
         raise ValueError(
@@ -345,18 +314,18 @@ def load_agent(
             cached, fetched_at = entry
             age = time.monotonic() - fetched_at
             logger.warning(
-                "decimalai.load_agent(%r): platform unreachable (%s) — serving the "
-                "cached prompt, %.0fs old. config.is_fallback is True.",
+                "decimalai: platform unreachable reading %r's prompt (%s) — serving the "
+                "cached copy, %.0fs old.",
                 agent_name, exc, age,
             )
             return replace(cached, is_fallback=True, stale_age_seconds=age)
         if fallback is not None:
             logger.warning(
-                "decimalai.load_agent(%r): platform unreachable (%s) and nothing "
-                "cached — using the fallback prompt. config.is_fallback is True.",
+                "decimalai: platform unreachable reading %r's prompt (%s) and nothing "
+                "cached — using the fallback prompt.",
                 agent_name, exc,
             )
-            return AgentConfig(
+            return SavedPrompt(
                 agent_name=str(agent_name),
                 system_prompt=fallback,
                 is_fallback=True,
@@ -365,7 +334,7 @@ def load_agent(
 
     # `get_agent_prompt` only returns None for a 304, which needs a conditional
     # request this call never makes.
-    config = AgentConfig._from_payload(payload, requested_name=str(agent_name))
+    config = SavedPrompt._from_payload(payload, requested_name=str(agent_name))
     _warn_if_renamed(config)
     with _prompt_cache_lock:
         _prompt_cache[key] = (config, time.monotonic())
@@ -383,3 +352,288 @@ def _is_availability_failure(exc: BaseException) -> bool:
     if status is None:
         status = getattr(exc, "status_code", None)
     return status in (500, 502, 503, 504)
+
+
+# ── what decimalai.load_agent() returns ──────────────────────────────────────
+
+#: The turn `AgentConfig.system()` last composed in this context. `load_skill()`
+#: is served against that turn's routing decision, so call it in the same thread
+#: or task as the `system()` it follows.
+_TURN: "ContextVar[Optional[str]]" = ContextVar("decimalai_agent_turn", default=None)
+
+#: The SkillRouter behind every `load_agent()` config. `init()` drops it (see
+#: `_drop_adapter_skill_routers`) when a re-init changes the key or workspace.
+_skill_router_singleton: Any = None
+
+
+def _get_skill_router() -> Any:
+    """The SkillRouter for `AgentConfig`, built on first use; None when switched off."""
+    global _skill_router_singleton
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return None
+    if _skill_router_singleton is not None:
+        return _skill_router_singleton
+    try:
+        from ._config import _get_config
+        from .skill_router import SkillRouter
+
+        config = _get_config()
+        _skill_router_singleton = SkillRouter(
+            api_key=config.api_key, base_url=config.base_url,
+            # Every routing call names its agent; no router default.
+            agent_name=None,
+            # Skill text reaches the model through load_skill, not the prompt.
+            inject_body=False,
+        )
+        return _skill_router_singleton
+    except Exception:
+        logger.debug("SkillRouter init failed", exc_info=True)
+        return None
+
+
+def _ensure_initialized() -> None:
+    """`decimalai.init()` from the environment when nothing initialized the SDK yet."""
+    from . import _config
+
+    if _config._client is None:
+        import decimalai
+
+        decimalai.init()
+
+
+#: The span attributes a prompt record becomes (see `_prompt_attributes`).
+_PROMPT_ATTRIBUTES = (
+    ("decimal.agent", "decimal_agent"),
+    ("decimal.prompt.source", "source"),
+    ("decimal.prompt.version", "version"),
+    ("decimal.prompt.content_hash", "content_hash"),
+    ("decimal.prompt.variables", "variables"),
+)
+
+
+def _prompt_attributes(record: Dict[str, Any]) -> Dict[str, Any]:
+    """A run's prompt record as OpenTelemetry span attributes (names, never values)."""
+    attributes: Dict[str, Any] = {}
+    for attribute, key in _PROMPT_ATTRIBUTES:
+        value = record.get(key)
+        if value is None:
+            continue
+        attributes[attribute] = list(value) if isinstance(value, (list, tuple)) else value
+    if record.get("skills_unavailable"):
+        attributes["decimal.skills.unavailable"] = record["skills_unavailable"]
+    return attributes
+
+
+def _annotate_current_span(attributes: Dict[str, Any]) -> None:
+    """Set attributes on the OpenTelemetry span that is current, if one is recording."""
+    try:
+        from opentelemetry import trace as trace_api
+    except ImportError:
+        return
+    try:
+        span = trace_api.get_current_span()
+        if span is None or not span.is_recording():
+            return
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+    except Exception:  # a record must never break a turn
+        logger.debug("could not annotate the current span", exc_info=True)
+
+
+class AgentConfig(AgentBinding):
+    """One agent's prompt and skills from DecimalAI, for code that calls a model itself.
+
+    Made by :func:`load_agent`::
+
+        support = decimalai.load_agent("support", fallback=BASE_PROMPT)
+        system = support.system(question, context=customer)
+        response = client.messages.create(
+            model=MODEL, system=system, tools=[*my_tools, support.tool_spec], ...)
+        # when the model calls load_skill:
+        text = support.load_skill(tool_input["name"])
+
+    Each `system()` call is one turn: it routes that message (the first turn
+    before it returns, later ones in the background unless the agent's list is
+    cut to fit), fills the prompt's ``{{placeholders}}`` from ``context``, and
+    returns the prompt, then the skill list, then a sentence naming the tool.
+    With an OpenTelemetry run live (``decimalai.init(openai=True)``,
+    ``decimalai.agent_run()``), the turn's record goes on that run's trace.
+
+    Attributes:
+        name: The agent's canonical DecimalAI name.
+    """
+
+    _VALUES_HINT = "Pass them as system(..., context=...), as attributes or dict keys."
+
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+        super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        self._tool_names: List[str] = []
+
+    def __repr__(self) -> str:
+        return (
+            f"AgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"skills={self.skill_names!r})"
+        )
+
+    # ── the pieces ───────────────────────────────────────────
+    @property
+    def prompt(self) -> Optional[str]:
+        """The saved prompt as written (placeholders unfilled), else the fallback."""
+        with self._lock:
+            text = getattr(self._prompt, "system_prompt", None)
+        return text if text is not None else self._fallback
+
+    def system(self, message: Optional[str] = None, *, context: Any = None) -> str:
+        """This turn's system text: the prompt, filled from ``context``, then the skill list.
+
+        Args:
+            message: The user's latest message, which the skills are routed on.
+                Without one, the skills come in the platform's fixed order.
+            context: Values for the prompt's ``{{placeholders}}``, as attributes
+                or dict keys (``{{customer.name}}`` reads ``context.customer.name``
+                or ``context["customer"]["name"]``).
+
+        Raises:
+            MissingPromptVariable: the prompt needs a value ``context`` lacks.
+            RuntimeError: ``on_unavailable="fail"`` and DecimalAI never returned
+                this agent's skills.
+        """
+        turn = f"turn_{uuid4().hex}"
+        _TURN.set(turn)
+        context_of_turn = {"message": message, "values": context}
+        state = self._prepare_run_sync(context_of_turn, None, turn)
+        return self._compose(context_of_turn, None, turn, state)
+
+    @property
+    def tool_spec(self) -> Dict[str, Any]:
+        """The ``load_skill`` tool as ``{name, description, parameters}`` (JSON Schema).
+
+        Translate it to your provider's tool type. Its ``name`` argument is an enum
+        of the agent's skills when the whole list fits; otherwise free text.
+        """
+        from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
+
+        with self._lock:
+            names = list(self._tool_names)
+        return {
+            "name": LOAD_SKILL_TOOL_NAME,
+            "description": LOAD_SKILL_TOOL_DESCRIPTION,
+            "parameters": self._tool_schema(names),
+        }
+
+    def load_skill(self, name: str) -> str:
+        """One listed skill's full text, for the model's ``load_skill`` call.
+
+        Served against the routing decision of the latest `system()` in this
+        thread or task. Always returns text the model can act on: a skill already
+        loaded this turn, an unknown name or an outage come back as a sentence.
+        """
+        return self._load_sync(str(name or "").strip())
+
+    # ── the seams AgentBinding asks for ─────────────────────
+    def _router(self) -> Any:
+        return _get_skill_router()
+
+    def _run_key(self) -> Optional[str]:
+        return _TURN.get()
+
+    def _message(self, context: Any, agent: Any) -> Optional[str]:
+        message = context.get("message")
+        return message.strip() or None if isinstance(message, str) else None
+
+    def _values(self, context: Any) -> Any:
+        return context.get("values")
+
+    def _agent_label(self, agent: Any) -> Optional[str]:
+        return None
+
+    def _on_menu(self, names: List[str]) -> None:
+        with self._lock:
+            self._tool_names = list(names)
+
+    def _record(self, **fields: Any) -> bool:
+        from .otel import record_skill_rail
+
+        if isinstance(fields.get("prompt"), dict):
+            _annotate_current_span(_prompt_attributes(fields["prompt"]))
+        return record_skill_rail(
+            routing_id=fields.get("routing_id"),
+            offered=fields.get("offered"),
+            delivered=fields.get("delivered"),
+            delivered_versions=fields.get("delivered_versions"),
+            prompt_text=fields.get("system_prompt"),
+        )
+
+    def _serve_load(self, name: str) -> str:
+        router = self._router()
+        if router is None:
+            return "load_skill error: skill router unavailable."
+        scope = self._run_key()
+        try:
+            body = router.load_skill(name, scope=scope, agent_name=self.name)
+        except Exception:
+            logger.debug("load_skill failed (non-fatal)", exc_info=True)
+            return f"load_skill error: could not load {name!r} (transient error)."
+        if scope is not None:
+            # Only names whose body was actually served reach the record.
+            try:
+                served = router.consume_loaded_names(scope=scope)
+                hashes = router.consume_loaded_hashes(scope=scope) or {}
+                versions = router.consume_delivered_versions(scope=scope)
+                if served:
+                    from .otel import record_skill_rail
+
+                    record_skill_rail(loaded=served, loaded_hashes=hashes, delivered_versions=versions)
+            except Exception:
+                logger.debug("load_skill record failed (non-fatal)", exc_info=True)
+        return body
+
+
+def load_agent(
+    agent_name: str,
+    *,
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+) -> AgentConfig:
+    """Pull an agent's prompt and skills from DecimalAI, for code that calls a model itself.
+
+    ::
+
+        import decimalai
+
+        support = decimalai.load_agent("support", fallback=BASE_PROMPT)
+        system = support.system(question, context=customer)
+        tools = [*my_tools, support.tool_spec]
+        # ... when the model calls load_skill(name): support.load_skill(name)
+
+    Reads the agent's saved prompt here (so a misspelled name fails now) and
+    keeps a local copy, re-read in the background at most once a minute. Each
+    `AgentConfig.system()` call routes its message: the first turn before it
+    returns, later ones in the background, and every turn of an agent with more
+    skills than fit the list. Initializes the SDK from ``DECIMAL_API_KEY`` when
+    ``decimalai.init()`` has not been called.
+
+    A framework with its own adapter has its own ``load_agent()``, which hands
+    the same prompt and skills over in that framework's shape:
+    ``decimalai.openai_agents.load_agent``.
+
+    Args:
+        agent_name: The agent's name in DecimalAI.
+        fallback: The prompt to use when the agent has no saved prompt, or when
+            DecimalAI cannot be reached now. Without one, an unreachable
+            DecimalAI raises here rather than starting an agent with no prompt.
+        on_unavailable: ``"continue"`` (default) composes turns without skills
+            when DecimalAI never returned them, and the record says so;
+            ``"fail"`` raises from `AgentConfig.system()` instead.
+
+    Raises:
+        AgentNotFoundError: DecimalAI has no agent by this name.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
+    """
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
+    _ensure_initialized()
+    prompt = read_prompt(agent_name, fallback=fallback)
+    return AgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)

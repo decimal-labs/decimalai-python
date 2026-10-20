@@ -216,7 +216,7 @@ def _scaffold_agent_file(
     if project_dir and not dry_run and os.path.lexists(project_dir):
         raise click.ClickException(f"{project_dir} already exists; choose a new project directory.")
 
-    from .._agent import AgentConfig
+    from .._agent import SavedPrompt
     from .._client import DecimalAIClient
     client = DecimalAIClient(api_key=resolved_key, base_url=base_url)
 
@@ -330,7 +330,7 @@ def _scaffold_agent_file(
     prompt = None
     prompt_unreadable = False
     try:
-        prompt = AgentConfig._from_payload(
+        prompt = SavedPrompt._from_payload(
             client.get_agent_prompt(agent_name), requested_name=agent_name,
         )
     except AgentNotFoundError:

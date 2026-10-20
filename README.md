@@ -145,6 +145,26 @@ OpenAI SDK is patched and other agents in the process are untouched. Each run is
 prompt version and the skills offered, loaded and delivered. `init(openai_agents=True)` (or
 `instrument()`) traces runs and changes no agent; skills come only from `load_agent()`.
 
+### Your own model calls
+
+For code that calls a model itself (a provider SDK, your own tool loop), the top-level
+`decimalai.load_agent()` hands over the same prompt and skills as plain values:
+
+```python
+import decimalai
+
+support = decimalai.load_agent("support", fallback=BASE_PROMPT)
+
+system = support.system(question, context=customer)  # the prompt, filled, then this turn's skill list
+tools = [*my_tools, support.tool_spec]                # load_skill as {name, description, parameters}
+# ...and when the model calls load_skill:
+text = support.load_skill(tool_input["name"])
+```
+
+Each `system()` call is one turn, routed on its message the way an OpenAI Agents run is, with
+`{{placeholders}}` filled from `context=`. `support.prompt` is the saved prompt as written, for code
+that wants only the text.
+
 `init(langchain=True)`, `init(adk=True)` and `init(crewai=True)` install the same thing as that adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both.
 
 ### Any Framework — Manual Tracing
@@ -313,8 +333,8 @@ decimalai.init()
 from decimalai.crewai import instrument
 instrument(agent_name="support", enable_skill_loader=True)
 
-config = decimalai.load_agent("support")
-agent = Agent(role="Support", goal="Resolve the ticket", backstory=config.system_prompt or "", llm=llm)
+support = decimalai.load_agent("support")
+agent = Agent(role="Support", goal="Resolve the ticket", backstory=support.prompt or "", llm=llm)
 Crew(agents=[agent], tasks=[Task(description=question, expected_output="the answer", agent=agent)]).kickoff()
 ```
 

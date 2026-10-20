@@ -1,6 +1,8 @@
-"""`decimalai.load_agent()` — the agent's system prompt, read at run time.
+"""`read_prompt()` — the agent's saved prompt, read at run time.
 
-THE ONE INVARIANT THIS MODULE EXISTS FOR: `config.system_prompt is None` means
+Every `load_agent()` starts with this read and re-runs it to refresh its copy.
+
+THE ONE INVARIANT THIS MODULE EXISTS FOR: `prompt.system_prompt is None` means
 the agent exists and has no prompt set, and it means nothing else. It is a real
 state (the prompt is optional at creation), which is exactly why every OTHER
 way of ending up with an empty prompt has to raise instead — a 404, a 5xx, a
@@ -21,7 +23,7 @@ import httpx
 import pytest
 
 import decimalai
-from decimalai import AgentConfig
+from decimalai._agent import SavedPrompt, read_prompt
 from decimalai._client import AgentNotFoundError, DecimalAIClient, DecimalAPIError
 from decimalai._config import DecimalConfigError
 
@@ -83,7 +85,7 @@ def _always(status=200, json_body=None, text=None, record=None):
 class TestReadsTheRealStates:
     def test_a_configured_prompt_comes_back_whole(self, monkeypatch):
         _client(_always(json_body=_payload()), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
 
         assert config.system_prompt == PROMPT
         assert config.agent_name == AGENT
@@ -100,7 +102,7 @@ class TestReadsTheRealStates:
             system_prompt=None, version_id=None, version_number=None,
             content_hash=None, label=None, provenance=None,
         )), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
 
         assert config.system_prompt is None
         assert config.version_number is None
@@ -110,7 +112,7 @@ class TestReadsTheRealStates:
         _client(_always(json_body=_payload(
             version_mode="pinned", pinned_version_number=2, version_number=2,
         )), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
         assert (config.version_mode, config.pinned_version_number) == ("pinned", 2)
 
     def test_a_renamed_agent_answers_to_its_old_name(self, monkeypatch):
@@ -120,7 +122,7 @@ class TestReadsTheRealStates:
         _client(_always(json_body=_payload(
             agent_name="refunds", resolved_from=AGENT,
         )), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
         assert config.agent_name == "refunds"
         assert config.resolved_from == AGENT
 
@@ -138,7 +140,7 @@ class TestReadsTheRealStates:
         monkeypatch.setattr("decimalai._agent._WARNED_RENAMES", set())
 
         with caplog.at_level(logging.WARNING, logger="decimalai"):
-            config = decimalai.load_agent(AGENT)
+            config = read_prompt(AGENT)
 
         assert len(caplog.records) == 1
         msg = caplog.records[0].getMessage()
@@ -158,8 +160,8 @@ class TestReadsTheRealStates:
         monkeypatch.setattr("decimalai._agent._WARNED_RENAMES", set())
 
         with caplog.at_level(logging.WARNING, logger="decimalai"):
-            decimalai.load_agent(AGENT)
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
+            read_prompt(AGENT)
 
         assert len(caplog.records) == 1
 
@@ -170,7 +172,7 @@ class TestReadsTheRealStates:
         monkeypatch.setattr("decimalai._agent._WARNED_RENAMES", set())
 
         with caplog.at_level(logging.WARNING, logger="decimalai"):
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
 
         assert caplog.records == []
 
@@ -184,7 +186,7 @@ class TestFailsClosed:
             "detail": f"Agent '{AGENT}' not found — no traces or manifests in this org",
         }), monkeypatch)
         with pytest.raises(AgentNotFoundError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
 
         msg = str(exc.value)
         assert AGENT in msg
@@ -201,18 +203,18 @@ class TestFailsClosed:
         sends someone to rename an agent that was never the problem."""
         _client(_always(404, json_body={"detail": "Not Found"}), monkeypatch)
         with pytest.raises(AgentNotFoundError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "matched no route" in str(exc.value)
 
     def test_a_5xx_raises(self, monkeypatch):
         _client(_always(500, json_body={"detail": "boom"}), monkeypatch)
         with pytest.raises(DecimalAPIError):
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
 
     def test_a_bad_key_raises(self, monkeypatch):
         _client(_always(401, json_body={"detail": "Invalid API key"}), monkeypatch)
         with pytest.raises(DecimalAPIError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "Invalid API key" in str(exc.value)
 
     def test_an_unresolvable_pin_raises_rather_than_falling_back(self, monkeypatch):
@@ -222,7 +224,7 @@ class TestFailsClosed:
             "error": "prompt_version_unresolvable", "message": "pinned version is gone",
         }}), monkeypatch)
         with pytest.raises(DecimalAPIError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "prompt_version_unresolvable" in str(exc.value)
 
     def test_a_network_failure_raises(self, monkeypatch):
@@ -230,19 +232,19 @@ class TestFailsClosed:
             raise httpx.ConnectError("connection refused", request=request)
         _client(handler, monkeypatch)
         with pytest.raises(httpx.ConnectError):
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
 
     def test_a_timeout_raises(self, monkeypatch):
         def handler(request):
             raise httpx.ReadTimeout("timed out", request=request)
         _client(handler, monkeypatch)
         with pytest.raises(httpx.ReadTimeout):
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
 
     def test_an_uninitialized_sdk_raises(self, monkeypatch):
         monkeypatch.setattr("decimalai._config._client", None)
         with pytest.raises(DecimalConfigError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "init" in str(exc.value)
 
     def test_an_empty_name_is_refused_before_any_request(self, monkeypatch):
@@ -250,7 +252,7 @@ class TestFailsClosed:
         _client(_always(json_body=_payload(), record=seen), monkeypatch)
         for name in ("", "   ", None):
             with pytest.raises(ValueError):
-                decimalai.load_agent(name)  # type: ignore[arg-type]
+                read_prompt(name)  # type: ignore[arg-type]
         assert seen == []
 
 
@@ -270,7 +272,7 @@ class TestRefusesAResponseItCannotRead:
     def test_a_wrong_shaped_200_raises(self, body, monkeypatch):
         _client(_always(json_body=body), monkeypatch)
         with pytest.raises(ValueError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "system_prompt" in str(exc.value)
         assert "Refusing to treat this as 'no prompt set'" in str(exc.value)
 
@@ -281,24 +283,24 @@ class TestRefusesAResponseItCannotRead:
         html = "<html><body>Sign in to continue</body></html>"
         _client(_always(text=html), monkeypatch)
         with pytest.raises(Exception) as exc:  # noqa: PT011 — JSON or ValueError
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "Sign in to continue" not in str(exc.value)
 
     def test_a_non_string_prompt_raises(self, monkeypatch):
         _client(_always(json_body=_payload(system_prompt={"text": PROMPT})),
                 monkeypatch)
         with pytest.raises(ValueError) as exc:
-            decimalai.load_agent(AGENT)
+            read_prompt(AGENT)
         assert "not a string" in str(exc.value)
 
 
 # ── the shape of what comes back ─────────────────────────────────────
 
 
-class TestAgentConfigShape:
+class TestSavedPromptShape:
     def test_it_is_frozen(self, monkeypatch):
         _client(_always(json_body=_payload()), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
         with pytest.raises(dataclasses.FrozenInstanceError):
             config.system_prompt = "something else"  # type: ignore[misc]
 
@@ -307,28 +309,28 @@ class TestAgentConfigShape:
         AttributeError on the line that reads it, not a KeyError days later
         inside a request handler."""
         _client(_always(json_body=_payload()), monkeypatch)
-        config = decimalai.load_agent(AGENT)
+        config = read_prompt(AGENT)
         with pytest.raises(AttributeError):
             config.systen_prompt  # noqa: B018 — the typo is the test
 
     def test_repr_reports_the_prompt_without_printing_it(self, monkeypatch):
         """A prompt runs to 100,000 characters and lands in every traceback."""
         _client(_always(json_body=_payload()), monkeypatch)
-        text = repr(decimalai.load_agent(AGENT))
+        text = repr(read_prompt(AGENT))
         assert PROMPT not in text
         assert f"<{len(PROMPT)} chars>" in text
         assert AGENT in text
 
     def test_repr_still_distinguishes_no_prompt(self, monkeypatch):
         _client(_always(json_body=_payload(system_prompt=None)), monkeypatch)
-        assert "system_prompt=None" in repr(decimalai.load_agent(AGENT))
+        assert "system_prompt=None" in repr(read_prompt(AGENT))
 
     def test_it_carries_no_model(self):
-        """The platform stores no per-agent model, so AgentConfig does not
+        """The platform stores no per-agent model, so SavedPrompt does not
         pretend to. A field that is always None is a gap wearing a real value's
         costume, and `model=config.model` would silently build every agent on
         the framework's default."""
-        assert "model" not in {f.name for f in dataclasses.fields(AgentConfig)}
+        assert "model" not in {f.name for f in dataclasses.fields(SavedPrompt)}
 
 
 # ── the request itself ───────────────────────────────────────────────
@@ -342,7 +344,7 @@ class TestTheRequest:
         the first one dropped."""
         seen = []
         _client(_always(json_body=_payload(), record=seen), monkeypatch)
-        decimalai.load_agent(AGENT)
+        read_prompt(AGENT)
 
         assert len(seen) == 1
         assert seen[0].url.path == f"/api/v1/agents/{AGENT}/prompt"
@@ -353,7 +355,7 @@ class TestTheRequest:
     ):
         seen = []
         _client(_always(json_body=_payload(), record=seen), monkeypatch)
-        decimalai.load_agent("[Demo] support/agent")
+        read_prompt("[Demo] support/agent")
         # raw_path, not path: `path` hands back the decoded form, which would
         # look identical whether or not the slash was escaped. The slash is the
         # one that matters — unescaped it addresses a different route entirely.
@@ -365,7 +367,7 @@ class TestTheRequest:
         seen = []
         _client(_always(json_body=_payload(version_number=2), record=seen),
                 monkeypatch)
-        assert decimalai.load_agent(AGENT, version=2).version_number == 2
+        assert read_prompt(AGENT, version=2).version_number == 2
         assert seen[0].url.params["version"] == "2"
 
     def test_load_agent_never_sends_a_conditional_request(self, monkeypatch):
@@ -375,7 +377,7 @@ class TestTheRequest:
         break the no-redeploy property the call is sold on."""
         seen = []
         _client(_always(json_body=_payload(), record=seen), monkeypatch)
-        decimalai.load_agent(AGENT)
+        read_prompt(AGENT)
         assert "if-none-match" not in seen[0].headers
 
     def test_the_client_can_still_poll_with_an_etag(self):

@@ -6,6 +6,37 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed (breaking): `decimalai.load_agent()` returns the agent's prompt and skills
+
+- `decimalai.load_agent(name, fallback=..., on_unavailable="continue")` returns an `AgentConfig`
+  that works like `decimalai.openai_agents.load_agent()`, for code that calls a model itself:
+  `system(message, context=...)` is this turn's system text (the saved prompt with its
+  `{{placeholders}}` filled from `context`, then the skill list routed on `message`), `tool_spec`
+  is the `load_skill` tool as `{name, description, parameters}`, and `load_skill(name)` returns a
+  skill's text. `prompt`, `prompt_version`, `prompt_hash`, `prompt_source`, `variables` and
+  `skill_names` describe what it holds. Inside an OpenTelemetry run, each turn's record (prompt
+  version, placeholder names, skills offered and loaded) goes on that run's trace.
+- **Removed:** the prompt-only `AgentConfig` it returned before (`system_prompt`,
+  `version_number`, `content_hash`, `is_fallback`, …) and `load_agent()`'s `version=` and
+  `cache_ttl_seconds=`. `support.prompt` is what `config.system_prompt` was, except that it is
+  the `fallback=` text when no prompt is saved.
+- `decimalai init` files and the Support project read `support.prompt`.
+- `decimalai.MissingPromptVariable` is importable from the top level.
+- The OpenTelemetry exporter keeps DecimalAI's own record attributes on the exported span:
+  `decimal.agent` and `decimal.prompt.*` (version, hash, placeholder names, never their values).
+
+Migration:
+
+```python
+# before
+config = decimalai.load_agent("support")
+agent = create_agent(model, tools=tools, system_prompt=config.system_prompt)
+
+# after
+support = decimalai.load_agent("support")
+agent = create_agent(model, tools=tools, system_prompt=support.prompt)
+```
+
 ### Fixed: a refusing platform gets fewer retries, spread out
 
 - A retry after a 429 or a 502/503/504 now waits a random time under a ceiling that doubles

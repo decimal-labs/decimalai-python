@@ -1624,7 +1624,7 @@ def load_agent(
         raise ValueError("on_unavailable must be 'continue' or 'fail'")
     _require_agents_sdk()
     _ensure_initialized()
-    from ._agent import load_agent as _load_prompt
+    from ._agent import read_prompt as _load_prompt
 
     prompt = _load_prompt(agent_name, fallback=fallback)
     config = OpenAIAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)

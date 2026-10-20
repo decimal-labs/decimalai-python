@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 import decimalai
-from decimalai._agent import _reset_prompt_cache
+from decimalai._agent import _reset_prompt_cache, read_prompt
 from decimalai.skill_router import (
     _COLD_PATH_TIMEOUT,
     _DEFAULT_HOT_PATH_READ_S,
@@ -80,8 +80,9 @@ class TestLoadAgentSurvivesAnOutage:
         _reset_prompt_cache()
         decimalai.init(api_key="dai_sk_t", base_url=UNREACHABLE, verify=False)
         cfg = decimalai.load_agent("bot", fallback="You are a returns agent.")
-        assert cfg.system_prompt == "You are a returns agent."
-        assert cfg.is_fallback is True
+        assert cfg.prompt == "You are a returns agent."
+        assert cfg.prompt_version is None
+        assert read_prompt("bot", fallback="You are a returns agent.").is_fallback is True
 
     def test_without_a_fallback_it_still_fails_closed(self):
         """Fail-closed is deliberate: substituting a prompt nobody wrote makes
@@ -111,15 +112,17 @@ class TestLoadAgentSurvivesAnOutage:
         try:
             decimalai.init(api_key="dai_sk_t", base_url=url, verify=False)
             live = decimalai.load_agent("bot")
-            assert live.system_prompt == "LIVE"
-            assert live.is_fallback is False
+            assert live.prompt == "LIVE"
+            assert live.prompt_version == 3
         finally:
             _stop(srv)
 
         stale = decimalai.load_agent("bot")
-        assert stale.system_prompt == "LIVE"
-        assert stale.is_fallback is True
-        assert stale.stale_age_seconds is not None
+        assert stale.prompt == "LIVE"
+        assert stale.prompt_version == 3
+        again = read_prompt("bot")
+        assert again.is_fallback is True
+        assert again.stale_age_seconds is not None
 
     def test_a_404_still_raises_even_with_a_fallback(self):
         """A reachable platform saying "no such agent" is a real answer, not an

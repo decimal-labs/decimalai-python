@@ -183,7 +183,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 from .. import _frameworks as _registry
 
 if TYPE_CHECKING:  # keeps this module pure — at run time it imports only the registry
-    from .._agent import AgentConfig
+    from .._agent import SavedPrompt
 
 # ── what this command knows about each framework ─────────────────────
 #
@@ -362,7 +362,7 @@ def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
     return lines
 
 
-def _prompt_comment_lines(prompt: Optional["AgentConfig"]) -> List[str]:
+def _prompt_comment_lines(prompt: Optional["SavedPrompt"]) -> List[str]:
     """The `# System prompt …` line: whether this agent has one, not what it says.
 
     Never the prompt TEXT. A copy pasted into the file is a second source of
@@ -397,7 +397,7 @@ def _header_lines(
     agent_name: str,
     framework: str,
     skills: Sequence[Mapping[str, Any]],
-    prompt: Optional["AgentConfig"] = None,
+    prompt: Optional["SavedPrompt"] = None,
 ) -> List[str]:
     # _clean() before quoting, not after: this string lands inside a `#`
     # comment, so a name carrying a newline would end the comment and take
@@ -520,7 +520,7 @@ def _render_langchain(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "config = decimalai.load_agent(AGENT_NAME)",
+        "support = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, the skills rail delivers, and adding a tool later needs no",
@@ -535,14 +535,14 @@ def _render_langchain(
         "TOOLS: list = []",
         "",
         "# create_agent runs the tool loop and returns the final state. The system",
-        "# prompt is handed to it BY THIS LINE, from the config read above — and",
+        "# prompt is handed to it BY THIS LINE, from the prompt read above — and",
         "# None (this agent has no prompt set, a real state; a failed read raises",
         "# instead) means it sends no system message at all, rather than one this",
         "# file invented.",
         "agent = create_agent(",
         "    init_chat_model(MODEL),",
         "    tools=TOOLS,",
-        "    system_prompt=config.system_prompt,",
+        "    system_prompt=support.prompt,",
         ")",
         "",
         "",
@@ -731,7 +731,7 @@ def _render_pydantic_ai(
         "#",
         "# Read at run time, so editing the prompt in the dashboard changes the",
         "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "config = decimalai.load_agent(AGENT_NAME)",
+        "support = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
         "# loop runs, the skills rail delivers, and adding a tool later needs no",
@@ -751,7 +751,7 @@ def _render_pydantic_ai(
         "    # a failed read raises instead) and Pydantic AI's system_prompt takes a",
         "    # string or a sequence, never None. An empty tuple sends no system",
         "    # prompt at all, rather than one this file invented.",
-        "    system_prompt=config.system_prompt or (),",
+        "    system_prompt=support.prompt or (),",
         "    tools=TOOLS,",
         ")",
         "",
@@ -842,7 +842,7 @@ def _render_adk(
         "",
         "# Your agent's system prompt, as it stands in the dashboard right now.",
         "# Read at run time, so editing it in the dashboard changes the next run.",
-        "config = decimalai.load_agent(AGENT_NAME)",
+        "support = decimalai.load_agent(AGENT_NAME)",
         "",
         "# Your tools go here. An empty list is a WORKING agent, not a stub.",
         "TOOLS: list = []",
@@ -852,7 +852,7 @@ def _render_adk(
         "    model=MODEL,",
         "    # `or \"\"` because None is a REAL state (no prompt set; a failed read",
         "    # raises instead) and ADK's instruction field takes a string, never None.",
-        "    instruction=config.system_prompt or \"\",",
+        "    instruction=support.prompt or \"\",",
         "    tools=TOOLS,",
         ")",
         "",
@@ -1149,7 +1149,7 @@ def render_agent_file(
     *,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
-    prompt: Optional["AgentConfig"] = None,
+    prompt: Optional["SavedPrompt"] = None,
 ) -> str:
     """Return the complete source of a runnable agent file.
 

@@ -38,7 +38,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from decimalai import AgentConfig
+from decimalai._agent import SavedPrompt
 from decimalai._client import AgentNotFoundError, DecimalAPIError
 from decimalai.cli.main import cli
 from decimalai.cli.scaffold import (
@@ -410,7 +410,7 @@ class TestPromptIsRead:
         the next dashboard edit — the whole point of reading it at run time."""
         source = render_agent_file(
             AGENT, framework, SKILLS,
-            prompt=AgentConfig(agent_name=AGENT, system_prompt=PROMPT,
+            prompt=SavedPrompt(agent_name=AGENT, system_prompt=PROMPT,
                                version_number=3),
         )
         assert PROMPT not in source
@@ -421,7 +421,7 @@ class TestPromptIsRead:
     def test_an_agent_with_no_prompt_says_so_and_still_generates(self, framework):
         source = render_agent_file(
             AGENT, framework, SKILLS,
-            prompt=AgentConfig(agent_name=AGENT, system_prompt=None),
+            prompt=SavedPrompt(agent_name=AGENT, system_prompt=None),
         )
         compile(source, "agent.py", "exec")
         assert "no system prompt set" in source

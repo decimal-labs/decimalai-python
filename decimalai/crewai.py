@@ -8,9 +8,9 @@ Setup::
     from decimalai.crewai import instrument
     instrument(agent_name="support", enable_skill_loader=True)
 
-    config = decimalai.load_agent("support")
+    support = decimalai.load_agent("support")
     agent = Agent(role="Support", goal="Resolve the ticket",
-                  backstory=config.system_prompt or "", llm=llm)
+                  backstory=support.prompt or "", llm=llm)
     crew = Crew(agents=[agent], tasks=[Task(description=question,
                                             expected_output="the answer", agent=agent)])
     crew.kickoff()
