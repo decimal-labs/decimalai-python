@@ -179,6 +179,14 @@ def test_one_runs_tool_spec_is_the_list_it_was_shown(platform):
     assert run.tool_spec["parameters"]["properties"]["name"]["enum"] == ["damaged-item", "order-support"]
 
 
+def test_a_cut_lists_tool_spec_takes_any_name_so_a_skill_the_cap_left_off_loads(platform):
+    platform.truncated = True
+    run = decimalai.agent_config("support").run("My keyboard arrived cracked.", variables=SAM)
+    assert "| order-support |" not in run.system, "the cap left it off this run's list"
+    assert "enum" not in run.tool_spec["parameters"]["properties"]["name"]
+    assert run.load_skill("order-support").startswith("## Skill: order-support")
+
+
 def test_on_unavailable_must_be_continue_or_fail(platform):
     with pytest.raises(ValueError, match="on_unavailable"):
         decimalai.agent_config("support", on_unavailable="sometimes")

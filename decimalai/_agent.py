@@ -534,7 +534,9 @@ class Run:
         """The ``load_skill`` tool as ``{name, description, parameters}`` (JSON Schema).
 
         Translate it to your provider's tool type. Its ``name`` argument is an enum
-        of the agent's skills when the whole list fits; otherwise free text.
+        of the skills on this run's list when the agent's whole list fits. When the
+        list was cut to fit it takes any name: the platform serves a skill of the
+        agent's that the cap left off.
         """
         from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
 
