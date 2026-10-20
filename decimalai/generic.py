@@ -620,7 +620,12 @@ class TraceContext:
             # 4xx auth errors since they'll never resolve on their own —
             # falling through to the synthetic-id branch is the right
             # behavior there, and the actual cause (401/403) is captured
-            # so export_status() can surface it.
+            # so export_status() can surface it. Nor a refusal (429,
+            # 502-504): the client has already been through its own retries
+            # for those, and another attempt here would re-run all of them
+            # (`_client._retry_is_futile`).
+            from ._client import _retry_is_futile
+
             _backoffs_s = (0.0, 0.1, 0.5)
             last_exc: Optional[BaseException] = None
             registered = False
@@ -651,6 +656,8 @@ class TraceContext:
                     # real error to export_status().
                     msg = str(exc)
                     if "401" in msg or "403" in msg:
+                        break
+                    if _retry_is_futile(exc):
                         break
             if not registered and last_exc is not None:
                 # Final fallback: synthetic id. The trace POST that

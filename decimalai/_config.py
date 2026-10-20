@@ -735,13 +735,21 @@ _sender = BackgroundSender()
 # 2026-09-04T09:33Z, every one from this SDK.
 #
 # So the long ladder lives HERE, on the background sender, where waiting costs
-# the customer's agent nothing. Five attempts, each jittered +/-50% so a fleet
-# of processes that lost their instance together does not re-attempt in
-# lockstep. `_request_with_retry` spends up to 7 s of its own 429 ladder inside
-# each attempt, so the whole thing is bounded at roughly 30-60 s: long enough to
-# bridge a restart, short enough that one trace cannot own the sender thread.
-# The tuple IS the bound -- there is no wall-clock cap to drift out of test.
-_MANIFEST_RETRY_BACKOFFS_S = (0.0, 1.0, 2.0, 4.0, 8.0)
+# the customer's agent nothing. Each step is ONE request
+# (`_client._one_attempt_per_request`). Until 2026-10-20 each of five steps re-ran
+# the client's own 4-attempt ladder inside it, and the first went out the instant
+# the caller's ladder had been refused, so one held trace sent up to 20
+# registrations to a platform that was refusing them (60 through the LangChain
+# adapter, which adds a ladder of its own in between).
+#
+# Every step waits first, under a ceiling that doubles. Each wait is drawn
+# between half its ceiling and the ceiling: random, so a fleet of processes that
+# lost their instance together does not re-attempt in lockstep, and never under
+# half, so the ladder spans 31-62 s whatever the draws -- long enough to bridge a
+# restart, short enough that one trace cannot own the sender thread. A
+# Retry-After the platform sent is added under the next wait. The tuple IS the
+# bound -- there is no wall-clock cap to drift out of test.
+_MANIFEST_RETRY_BACKOFFS_S = (2.0, 4.0, 8.0, 16.0, 32.0)
 
 
 def submit_trace_pending_manifest(
@@ -762,13 +770,17 @@ def _ingest_when_manifest_lands(
     import random
     import time as _time
 
-    for delay in _MANIFEST_RETRY_BACKOFFS_S:
-        if delay:
-            _time.sleep(delay * (0.5 + random.random()))
-        manifest_id = reregister()
+    from ._client import _one_attempt_per_request
+
+    retry_after = 0.0
+    for ceiling in _MANIFEST_RETRY_BACKOFFS_S:
+        _time.sleep(retry_after + random.uniform(ceiling / 2, ceiling))
+        with _one_attempt_per_request() as ladder:
+            manifest_id = reregister()
         if manifest_id:
             trace.manifest_id = manifest_id
             return client.ingest_trace(trace)
+        retry_after = ladder.retry_after
 
     # Still refused. Do NOT post: the platform's answer to a local id is a
     # certainty, and a certain 400 is only noise on top of a loss that has

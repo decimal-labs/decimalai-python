@@ -25,6 +25,10 @@ from decimalai._client import (
     DecimalRateLimitError,
     _AUTO_FLUSH_THRESHOLD,
     _MAX_RETRIES,
+    _MAX_RETRY_DELAY,
+    _backoff_delay,
+    _one_attempt_per_request,
+    _retry_is_futile,
 )
 from decimalai.schema.trace import RunTrace
 
@@ -81,6 +85,19 @@ def _mock_5xx_response(status: int = 503) -> httpx.Response:
         status,
         headers={"Content-Type": "text/html; charset=UTF-8"},
         text="<html><title>503 Service Unavailable</title></html>",
+        request=request,
+    )
+
+
+def _mock_edge_abort_429() -> httpx.Response:
+    """Cloud Run's refusal when the service has no free instance: 429, no Retry-After.
+
+    It never reaches the application, so none of the platform's own headers are on it.
+    """
+    request = httpx.Request("POST", "http://localhost:9999/api/v1/manifests")
+    return httpx.Response(
+        429,
+        text="The request was aborted because there was no available instance.",
         request=request,
     )
 
@@ -219,14 +236,21 @@ class TestRetryOnTransientServerErrors:
         assert mock_req.call_count == 1
         mock_sleep.assert_not_called()
 
+    @pytest.mark.parametrize("refusal", ["edge_429", "lb_503"])
     @patch("time.sleep")
-    def test_503_uses_the_same_backoff_ladder_as_429(self, mock_sleep):
-        """One ladder — 1s, 2s, 4s — so there is a single scheme to reason about."""
-        client = _make_client()
+    def test_503_uses_the_same_backoff_ladder_as_429(self, mock_sleep, refusal):
+        """One ladder — ceilings 1s, 2s, 4s — so there is a single scheme to reason about.
 
-        with patch.object(client._http, "request") as mock_req:
-            mock_req.return_value = _mock_5xx_response(503)
-            with pytest.raises(httpx.HTTPStatusError):
+        Each wait is a random draw under its ceiling (TestBackoffIsJitteredAndCapped);
+        pinning the draw to the top of its range shows the ceilings themselves.
+        """
+        client = _make_client()
+        resp = _mock_edge_abort_429() if refusal == "edge_429" else _mock_5xx_response(503)
+
+        with patch("random.uniform", side_effect=lambda lo, hi: hi), \
+                patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = resp
+            with pytest.raises((DecimalRateLimitError, httpx.HTTPStatusError)):
                 client.ingest_trace(RunTrace(agent_name="test"))
 
         assert mock_req.call_count == _MAX_RETRIES + 1
@@ -256,6 +280,151 @@ class TestRetryOnTransientServerErrors:
                 client.ingest_trace(RunTrace(agent_name="test"))
 
         assert ei.value.status_code == 503
+
+
+class TestBackoffIsJitteredAndCapped:
+    """Every process refused in the same instant must not retry in the same instant.
+
+    The waits used to be exactly 1, 2 and 4 s. On 2026-10-19 a restart of the
+    DecimalAI fleet hit a backend with no free instance; Cloud Run refused with a
+    429 that carries no Retry-After, and every process came back at the same
+    offsets. 574 manifest registrations in ~30 minutes, most of them retries.
+    """
+
+    def test_waits_are_random_draws_under_a_doubling_ceiling(self):
+        for attempt, ceiling in enumerate([1.0, 2.0, 4.0, 8.0]):
+            draws = [_backoff_delay(attempt) for _ in range(2000)]
+            assert all(0.0 <= d <= ceiling for d in draws), (attempt, min(draws), max(draws))
+            # Full jitter spans the whole range, not a band near the ceiling.
+            assert min(draws) < 0.1 * ceiling and max(draws) > 0.9 * ceiling
+
+    def test_the_ceiling_stops_doubling_at_the_cap(self):
+        with patch("random.uniform", side_effect=lambda lo, hi: hi):
+            assert _backoff_delay(10) == _MAX_RETRY_DELAY
+            assert _backoff_delay(50) == _MAX_RETRY_DELAY
+
+    def test_retry_after_is_a_floor_and_the_jitter_goes_on_top(self):
+        """Never earlier than the server asked; and a crowd told "come back in 2 s"
+        must not come back in the same instant either."""
+        draws = [_backoff_delay(2, retry_after=2.0) for _ in range(2000)]
+        assert all(2.0 <= d <= 6.0 for d in draws)
+        assert max(draws) - min(draws) > 3.0
+
+    @patch("time.sleep")
+    def test_processes_refused_together_retry_spread_out(self, mock_sleep):
+        """Fifty clients, all refused at t=0 by the edge abort. Before: all fifty
+        retried at exactly t=1.0 s, again at 3.0 s, again at 7.0 s."""
+        first_retry_at = []
+        for _ in range(50):
+            client = _make_client()
+            mock_sleep.reset_mock()
+            with patch.object(client._http, "request") as mock_req:
+                mock_req.side_effect = [_mock_edge_abort_429(), _mock_200_response()]
+                client.ingest_trace(RunTrace(agent_name="test"))
+            first_retry_at.append(mock_sleep.call_args[0][0])
+
+        assert len(set(first_retry_at)) == 50, "two clients retried at the same instant"
+        assert max(first_retry_at) - min(first_retry_at) > 0.5
+        assert all(0.0 <= t <= 1.0 for t in first_retry_at)
+
+    @patch("time.sleep")
+    def test_a_long_retry_after_still_gives_up_inside_the_wait_budget(self, mock_sleep):
+        """The total-sleep cap survives the jitter: a Retry-After past the budget is
+        not cut short, the request gives up instead."""
+        client = _make_client()
+        with patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = _mock_429_response(retry_after="45")
+            with pytest.raises(DecimalRateLimitError) as ei:
+                client.ingest_trace(RunTrace(agent_name="test"))
+        assert mock_req.call_count == 1
+        mock_sleep.assert_not_called()
+        assert ei.value.retry_after == 45.0
+
+
+class TestAnOuterLadderGetsOneAttemptPerRequest:
+    """A caller that runs its own ladder must not have the client's ladder nested
+    inside each step: 5 steps x 4 attempts was 20 registrations for one held trace."""
+
+    @patch("time.sleep")
+    def test_one_attempt_no_sleep_and_the_retry_after_is_reported(self, mock_sleep):
+        client = _make_client()
+        with patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = _mock_429_response(retry_after="2")
+            with _one_attempt_per_request() as ladder:
+                with pytest.raises(DecimalRateLimitError):
+                    client.ingest_trace(RunTrace(agent_name="test"))
+        assert mock_req.call_count == 1
+        mock_sleep.assert_not_called()
+        assert ladder.retry_after == 2.0
+
+    @patch("time.sleep")
+    def test_a_503_is_one_attempt_too(self, mock_sleep):
+        client = _make_client()
+        resp = _mock_5xx_response(503)
+        resp.headers["Retry-After"] = "3"
+        with patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = resp
+            with _one_attempt_per_request() as ladder:
+                with pytest.raises(DecimalAPIError) as ei:
+                    client.ingest_trace(RunTrace(agent_name="test"))
+        assert ei.value.status_code == 503
+        assert mock_req.call_count == 1
+        mock_sleep.assert_not_called()
+        assert ladder.retry_after == 3.0
+
+    @patch("time.sleep")
+    def test_the_full_ladder_is_back_once_the_block_exits(self, mock_sleep):
+        client = _make_client()
+        with _one_attempt_per_request():
+            pass
+        with patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = _mock_edge_abort_429()
+            with pytest.raises(DecimalRateLimitError):
+                client.ingest_trace(RunTrace(agent_name="test"))
+        assert mock_req.call_count == _MAX_RETRIES + 1
+
+    @patch("time.sleep")
+    def test_it_covers_only_the_thread_that_set_it(self, mock_sleep):
+        """The sender thread's ladder must not strip retries from the caller's thread."""
+        import threading
+
+        client = _make_client()
+        calls = []
+        with patch.object(client._http, "request") as mock_req:
+            mock_req.return_value = _mock_edge_abort_429()
+
+            def other_thread():
+                try:
+                    client.ingest_trace(RunTrace(agent_name="test"))
+                except DecimalRateLimitError:
+                    pass
+                calls.append(mock_req.call_count)
+
+            with _one_attempt_per_request():
+                t = threading.Thread(target=other_thread)
+                t.start()
+                t.join()
+        assert calls == [_MAX_RETRIES + 1]
+
+
+class TestRetryIsFutile:
+    """What an adapter's own attempt loop may stop on without losing anything."""
+
+    def test_answers_the_client_already_retried_or_that_cannot_change(self):
+        assert _retry_is_futile(DecimalRateLimitError(retry_after=0))
+        assert _retry_is_futile(DecimalQuotaExceededError(dimension="traces"))
+        for status in (400, 401, 403, 404, 409, 422, 502, 503, 504):
+            assert _retry_is_futile(DecimalAPIError(_mock_status(status))), status
+
+    def test_leaves_the_outer_loop_what_the_client_does_not_retry(self):
+        assert not _retry_is_futile(DecimalAPIError(_mock_status(500)))
+        assert not _retry_is_futile(httpx.ConnectError("connection refused"))
+        assert not _retry_is_futile(RuntimeError("503 Service Unavailable"))
+
+
+def _mock_status(status: int) -> httpx.Response:
+    request = httpx.Request("POST", "http://localhost:9999/api/v1/manifests")
+    return httpx.Response(status, json={"detail": "x"}, request=request)
 
 
 class TestFlushBufferPreservation:

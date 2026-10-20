@@ -312,9 +312,10 @@ def _forget_manifests_if_tracker_reset() -> None:
 
 
 # Same ladder as `generic._maybe_register_manifest`: registration runs on the
-# caller's thread at root-run end, so the whole budget is 0.6s and only spent
-# while the platform is refusing. A Cloud Run admission abort answers in ~0ms;
-# a few hundred ms later is a different admission decision.
+# caller's thread at root-run end, so this adds 0.6 s at most. It is for what the
+# client does not retry itself — a transport error, a 500. A refusal (429, 502-504)
+# has already been through the client's own ladder by the time it gets here, and
+# an outer attempt would re-run all of that (`_client._retry_is_futile`).
 _REGISTER_BACKOFFS_S = (0.0, 0.1, 0.5)
 
 
@@ -341,6 +342,7 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
     global _manifest_id
 
     from . import _config
+    from ._client import _retry_is_futile
 
     with _manifest_lock:
         _forget_manifests_if_tracker_reset()
@@ -363,6 +365,8 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
                 last_exc = exc
                 if _is_permanent_registration_failure(exc):
                     break  # 401/403 will not come back to life; do not burn the budget.
+                if _retry_is_futile(exc):
+                    break  # The client already retried this, or no retry changes it.
                 continue
             manifest_id = _registered_manifest_id(result, snapshot)
             logger.info(

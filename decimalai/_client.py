@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 import threading
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, cast
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, List, Optional, cast
 from uuid import UUID
 
 import httpx
@@ -33,7 +36,8 @@ from .schema.trace import RunTrace
 logger = logging.getLogger("decimalai")
 
 _MAX_RETRIES = 3
-_DEFAULT_RETRY_DELAY = 1.0  # seconds
+_DEFAULT_RETRY_DELAY = 1.0  # seconds; the first retry's ceiling, doubled per retry
+_MAX_RETRY_DELAY = 8.0  # cap on any one retry's ceiling, before a Retry-After is added
 _MAX_RETRY_WAIT = 30.0  # total sleep per request; never retry before Retry-After
 
 # How many traces `buffer_trace` accumulates before auto-flushing — and, because
@@ -90,6 +94,60 @@ def _parse_retry_after(value: Optional[str]) -> float:
         return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
     except Exception:
         return 0.0
+
+
+def _backoff_delay(attempt: int, retry_after: float = 0.0) -> float:
+    """How long to wait after failed attempt ``attempt`` (0-based) before the next.
+
+    Capped exponential backoff with full jitter: the ceiling doubles per attempt
+    (1 s, 2 s, 4 s, ... never above ``_MAX_RETRY_DELAY``) and the wait is drawn
+    uniformly between zero and that ceiling. A ``Retry-After`` is a floor and the
+    jitter goes on top of it, so the server's instruction is never cut short and
+    a crowd told "come back in 2 s" does not come back in the same instant.
+
+    The jitter is the point. The wait used to be exactly 1, 2 and 4 s, so every
+    process refused in the same instant retried in the same instant. Cloud Run's
+    "no available instance" 429 carries no Retry-After, and on 2026-10-19 a
+    restart of the DecimalAI fleet sent 574 manifest registrations in ~30 minutes,
+    most of them retries, while the backend's single instance stayed saturated.
+    """
+    ceiling = min(_MAX_RETRY_DELAY, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+    return retry_after + random.uniform(0.0, ceiling)
+
+
+class _OuterLadder:
+    """What `_request_with_retry` reports to a caller that runs its own ladder."""
+
+    __slots__ = ("retry_after",)
+
+    def __init__(self) -> None:
+        # The longest Retry-After the platform sent while the ladder was open, so
+        # the caller's next wait can honour it.
+        self.retry_after = 0.0
+
+
+# Set while a caller runs its OWN retry ladder around client calls (today the
+# sender's refused-manifest ladder, `_config._ingest_when_manifest_lands`). Inside
+# it `_request_with_retry` makes ONE attempt and leaves the waiting to that
+# caller. Before this, every outer step re-ran the whole inner ladder: 5 steps x
+# 4 attempts = 20 `POST /api/v1/manifests` for one held trace, and 60 through the
+# LangChain adapter, whose re-registration wraps a ladder of its own in between.
+# A ContextVar, so it covers only the thread that set it.
+_outer_ladder: "ContextVar[Optional[_OuterLadder]]" = ContextVar(
+    "decimalai_outer_ladder", default=None
+)
+
+
+@contextmanager
+def _one_attempt_per_request() -> Iterator[_OuterLadder]:
+    """Make each client request in this block a single attempt (see `_outer_ladder`)."""
+    ladder = _OuterLadder()
+    token = _outer_ladder.set(ladder)
+    try:
+        yield ladder
+    finally:
+        _outer_ladder.reset(token)
+
 
 # Warn-once latch. ``init(verify=True)`` caches the backend's
 # ``require_manifest_on_ingest`` flag onto the global config; honoring the
@@ -348,6 +406,22 @@ def _raise_for_status(resp: "httpx.Response") -> None:
     raise DecimalAPIError(resp)
 
 
+def _retry_is_futile(exc: BaseException) -> bool:
+    """True when calling the client again cannot help.
+
+    For a caller that wraps a client call in an attempt loop of its own. A rate
+    limit, a plan quota and any HTTP status but 500 leave `_request_with_retry`
+    either after its own retries (429, 502, 503, 504) or as the server's verdict
+    on the payload (4xx). Calling again re-runs that whole ladder, so each outer
+    attempt multiplied what a refusing platform received. What is left — a
+    transport error, a 500, anything unrecognised — is what the inner ladder does
+    not retry, and an outer attempt is still worth something there.
+    """
+    if isinstance(exc, (DecimalRateLimitError, DecimalQuotaExceededError)):
+        return True
+    return isinstance(exc, DecimalAPIError) and exc.status_code != 500
+
+
 class DecimalAIClient:
     """Client for the Decimal platform API.
 
@@ -426,11 +500,13 @@ class DecimalAIClient:
 
         Retries up to ``_MAX_RETRIES`` times on HTTP 429 and on the transient
         server-side statuses in ``_RETRYABLE_STATUSES`` (502/504 from a proxy,
-        503 from a load balancer with no healthy instance). Uses the
-        ``Retry-After`` header if present, otherwise exponential backoff
-        (1s, 2s, 4s) — one ladder, shared by both.
-        Total retry sleep is capped at 30 seconds. If the next server-directed
-        wait exceeds that budget, raise instead of retrying too early.
+        503 from a load balancer with no healthy instance). Each wait is
+        `_backoff_delay`: a random draw under a ceiling of 1 s, 2 s, 4 s, on top
+        of the ``Retry-After`` header when there is one — one ladder, shared by
+        both. Total retry sleep is capped at 30 seconds. If the next
+        server-directed wait exceeds that budget, raise instead of retrying too
+        early. Inside `_one_attempt_per_request` there is one attempt and no
+        sleep: the caller runs the ladder.
 
         ``idempotent=True`` adds 500 to that set. It is opt-in per call site
         because a 500 means the application ran and failed part-way, so blindly
@@ -448,8 +524,10 @@ class DecimalAIClient:
         """
         last_exc: Optional[httpx.HTTPStatusError] = None
         waited = 0.0
+        ladder = _outer_ladder.get()
+        max_retries = 0 if ladder is not None else _MAX_RETRIES
 
-        for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2, 3
+        for attempt in range(max_retries + 1):  # 0, 1, 2, 3
             resp = self._http.request(method, url, **kwargs)
 
             if resp.status_code == 429:
@@ -474,7 +552,9 @@ class DecimalAIClient:
 
                 # 429 — parse Retry-After (delta-seconds OR HTTP-date) and maybe retry
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
+                if ladder is not None:
+                    ladder.retry_after = max(ladder.retry_after, retry_after)
+                delay = _backoff_delay(attempt, retry_after)
 
                 last_exc = httpx.HTTPStatusError(
                     "429 Too Many Requests",
@@ -482,10 +562,10 @@ class DecimalAIClient:
                     response=resp,
                 )
 
-                if attempt < _MAX_RETRIES and waited + delay <= _MAX_RETRY_WAIT:
+                if attempt < max_retries and waited + delay <= _MAX_RETRY_WAIT:
                     logger.warning(
                         "Rate limited (429). Retrying in %.1fs (attempt %d/%d)",
-                        delay, attempt + 1, _MAX_RETRIES,
+                        delay, attempt + 1, max_retries,
                     )
                     time.sleep(delay)
                     waited += delay
@@ -502,21 +582,24 @@ class DecimalAIClient:
             retryable = resp.status_code in _RETRYABLE_STATUSES or (
                 idempotent and resp.status_code == 500
             )
-            if retryable and attempt < _MAX_RETRIES:
+            if retryable:
                 # A load-balancer 503 rarely carries Retry-After, but honour it
                 # when it does — same precedence and same ladder as the 429 path
                 # above, so there is only ever one backoff scheme to reason about.
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                delay = max(retry_after, _DEFAULT_RETRY_DELAY * (2 ** attempt))
-                if waited + delay > _MAX_RETRY_WAIT:
-                    _raise_for_status(resp)
-                logger.warning(
-                    "Server error (HTTP %d) on %s %s. Retrying in %.1fs (attempt %d/%d)",
-                    resp.status_code, method, url, delay, attempt + 1, _MAX_RETRIES,
-                )
-                time.sleep(delay)
-                waited += delay
-                continue
+                if ladder is not None:
+                    ladder.retry_after = max(ladder.retry_after, retry_after)
+                if attempt < max_retries:
+                    delay = _backoff_delay(attempt, retry_after)
+                    if waited + delay > _MAX_RETRY_WAIT:
+                        _raise_for_status(resp)
+                    logger.warning(
+                        "Server error (HTTP %d) on %s %s. Retrying in %.1fs (attempt %d/%d)",
+                        resp.status_code, method, url, delay, attempt + 1, max_retries,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
 
             # A caller that gives a status its own meaning (a conditional GET's
             # 304, a lookup's 404) gets the response back unraised, so it can

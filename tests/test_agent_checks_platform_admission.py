@@ -49,7 +49,8 @@ def test_eight_uncached_skill_reads_recover_from_free_tier_burst():
             snapshot = configuration_snapshot(client, "support")
         assert len(snapshot["skills"]) == 8
         assert snapshot["skills"][-1]["body"] == "# skill-7\nVerified instruction."
-        assert state["sleeps"] == [1.0]
+        # One wait: the Retry-After, plus the first retry's jitter (up to 1 s) on top.
+        assert len(state["sleeps"]) == 1 and 1.0 <= state["sleeps"][0] <= 2.0
         assert len(state["requests"]) == 12
         assert state["requests"][-1] == state["requests"][-2]
         assert "agent_name=support" in state["requests"][-1]
@@ -109,8 +110,12 @@ def test_persistent_throttling_has_finite_attempt_and_wait_budgets():
         with patch("decimalai._client.time.sleep") as sleep, pytest.raises(DecimalRateLimitError):
             client.verify_auth()
         assert len(requests) <= _MAX_RETRIES + 1
-        assert sum(c.args[0] for c in sleep.call_args_list) <= _MAX_RETRY_WAIT
-        assert [c.args[0] for c in sleep.call_args_list] == [12.0, 12.0]
+        sleeps = [c.args[0] for c in sleep.call_args_list]
+        assert sum(sleeps) <= _MAX_RETRY_WAIT
+        # Never sooner than Retry-After; the jitter on top stays under each retry's
+        # ceiling (1 s, then 2 s), and a third 12 s wait would overrun the budget.
+        assert len(sleeps) == 2
+        assert 12.0 <= sleeps[0] <= 13.0 and 12.0 <= sleeps[1] <= 14.0
     finally:
         client.close()
 

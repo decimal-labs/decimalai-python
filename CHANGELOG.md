@@ -4,6 +4,21 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed: a refusing platform gets fewer retries, spread out
+
+- A retry after a 429 or a 502/503/504 now waits a random time under a ceiling that doubles
+  (1 s, 2 s, 4 s, capped at 8 s), on top of any `Retry-After`, instead of exactly 1, 2 and 4 s.
+  Processes refused at the same moment no longer come back at the same moment.
+- When a manifest registration is refused, the background sender's re-registration makes one
+  request per step instead of running the client's own retries inside each step, and waits
+  before its first step. One trace whose registration stays refused now sends at most 9
+  registrations, down from 24 on most adapters, 32 on the generic tracer and 72 on LangChain.
+  The steps still span 31-62 s, long enough to bridge a backend restart.
+- The generic tracer and the LangChain adapter no longer repeat a registration that the client
+  has already retried (429, 502-504) or that a retry cannot fix (other 4xx, a plan quota).
+
 ## [0.18.0] — 2026-10-20
 
 ### Changed (breaking): OpenAI Agents SDK agents get their prompt and skills from `load_agent()`

@@ -26,13 +26,17 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
+import httpx
 import pytest
 
 import decimalai
 import decimalai._config as cfg
 import decimalai.langchain as lc
+from decimalai._client import DecimalAIClient, DecimalRateLimitError, _MAX_RETRIES
 from decimalai.schema.manifest import ManifestTracker
 
 # The stub's clock. Every `time.sleep` in the process advances it instead of
@@ -281,3 +285,111 @@ def test_every_adapter_can_rereg_ister_on_the_sender_thread(module_name):
     assert '"401"' in src and '"403"' in src, (
         f"{module_name} retries a credential refusal, which cannot succeed"
     )
+
+
+# ── A refusal must not be multiplied ─────────────────────────────────────────
+#
+# 2026-10-19: a restart of the DecimalAI fleet sent 574 `POST /api/v1/manifests`
+# in ~30 minutes, most of them retries, while the backend's one instance stayed
+# saturated. Every retry loop on this path wrapped another one. A held trace sent
+# 4 registrations from the client's ladder on the caller's thread, then 5 sender
+# steps x 4 = 20 more: 24. The generic tracer re-ran the client's ladder three
+# times on the caller's thread (32), and LangChain's re-registration also ran its
+# own loop inside every sender step (72). Now: the client's ladder once on the
+# caller's thread, then ONE request per sender step.
+
+_REGISTRATIONS_PER_HELD_TRACE = (_MAX_RETRIES + 1) + len(cfg._MANIFEST_RETRY_BACKOFFS_S)
+
+
+def test_one_held_langchain_trace_costs_a_bounded_number_of_registrations(prod):
+    _WINDOW[0] = 1e9
+    handler = lc.CallbackHandler(auto_send=False, agent_name="support-bot")
+    handler._auto_send(_one_run())
+    cfg._sender.flush(timeout=60.0)
+    assert len(prod.aborted) == _REGISTRATIONS_PER_HELD_TRACE, (
+        f"one refused trace sent {len(prod.aborted)} registrations to a platform that "
+        f"was refusing them; the bound is {_REGISTRATIONS_PER_HELD_TRACE}"
+    )
+    assert prod.rejected == []
+
+
+def test_one_held_generic_trace_costs_a_bounded_number_of_registrations(prod, generic_state):
+    _WINDOW[0] = 1e9
+    with decimalai.start_trace(agent_name="native-bot") as t:
+        t.log_llm_call(
+            model="gemini-3.6-flash",
+            input=[{"role": "user", "content": "hi"}],
+            output={"role": "assistant", "content": "hello"},
+        )
+    cfg._sender.flush(timeout=60.0)
+    assert len(prod.aborted) == _REGISTRATIONS_PER_HELD_TRACE, (
+        f"one refused trace sent {len(prod.aborted)} registrations to a platform that "
+        f"was refusing them; the bound is {_REGISTRATIONS_PER_HELD_TRACE}"
+    )
+    assert prod.rejected == []
+
+
+def _held_trace():
+    return SimpleNamespace(agent_name="support-bot", id="t-1", manifest_id=None)
+
+
+def test_the_sender_waits_before_every_attempt_and_spans_a_restart(monkeypatch):
+    """The step that used to go out the instant the caller's ladder was refused now
+    waits too, and the ladder spans half the sum of its ceilings whatever the draws."""
+    waits = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    attempted_after = []
+
+    def reregister():
+        attempted_after.append(len(waits))
+        return None
+
+    with pytest.raises(RuntimeError, match="still refused"):
+        cfg._ingest_when_manifest_lands(None, _held_trace(), reregister)
+
+    assert attempted_after == [1, 2, 3, 4, 5], "an attempt went out without a wait first"
+    for wait, ceiling in zip(waits, cfg._MANIFEST_RETRY_BACKOFFS_S):
+        assert ceiling / 2 <= wait <= ceiling
+    assert sum(waits) >= sum(cfg._MANIFEST_RETRY_BACKOFFS_S) / 2
+
+
+def test_the_sender_waits_are_random(monkeypatch):
+    """Processes that lost their instance together must not re-attempt together."""
+    first_waits = set()
+    for _ in range(20):
+        waits = []
+        monkeypatch.setattr("time.sleep", waits.append)
+        with pytest.raises(RuntimeError):
+            cfg._ingest_when_manifest_lands(None, _held_trace(), lambda: None)
+        first_waits.add(waits[0])
+    assert len(first_waits) == 20
+
+
+def test_each_sender_step_is_one_request_and_honours_retry_after(monkeypatch):
+    """Through a real client: the client's own ladder does not run inside a step,
+    and the platform's Retry-After lands under the sender's next wait."""
+    waits = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    client = DecimalAIClient(api_key="dai_sk_test", base_url="http://localhost:9999")
+    shed = httpx.Response(
+        429,
+        headers={"Retry-After": "10"},
+        json={"detail": "Server is shedding background load. Retry shortly."},
+        request=httpx.Request("POST", "http://localhost:9999/api/v1/manifests"),
+    )
+
+    def reregister():
+        try:
+            client._request_with_retry("POST", "/api/v1/manifests", json={})
+        except DecimalRateLimitError:
+            return None
+
+    with patch.object(client._http, "request", return_value=shed) as mock_req:
+        with pytest.raises(RuntimeError):
+            cfg._ingest_when_manifest_lands(client, _held_trace(), reregister)
+
+    assert mock_req.call_count == len(cfg._MANIFEST_RETRY_BACKOFFS_S)
+    assert len(waits) == len(cfg._MANIFEST_RETRY_BACKOFFS_S), "the client slept inside a step"
+    assert waits[0] <= cfg._MANIFEST_RETRY_BACKOFFS_S[0], "no Retry-After had been seen yet"
+    for wait, ceiling in zip(waits[1:], cfg._MANIFEST_RETRY_BACKOFFS_S[1:]):
+        assert 10.0 + ceiling / 2 <= wait <= 10.0 + ceiling
