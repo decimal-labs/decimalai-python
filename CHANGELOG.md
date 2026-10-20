@@ -4,6 +4,29 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **One lost packet no longer costs an agent its skill.** `SkillRouter` gave every request one
+  attempt, with 1 s to open the connection. The operating system re-sends a lost first packet
+  after about 1 s, so a single dropped packet failed the call. Inside a turn that is silent:
+  `load_skill` tells the model the skill is unavailable, and the agent answers without it. On
+  2026-10-20 the OpenAI tutorial's skill load failed this way in 1.2 s while the platform was
+  serving other requests normally. Now:
+  - A connection that could not be opened is retried once, for any request (nothing reached the
+    platform). The connect budget for in-turn calls (`/skills/route`, `/skills/menu`, skill
+    bodies) is 2 s instead of 1 s. An unreachable platform now costs about 4 s per call instead
+    of 1 s; the circuit breaker still opens after three failed calls.
+  - A dropped connection or a read timeout is retried once for requests that are safe to
+    repeat: GETs, `assign_skill` and `unassign_skill`. An in-turn read gets a 2 s budget for
+    the retry. Routing requests are not retried after a read timeout (a slow route falls back
+    to the agent's menu), and the menu fallback reads once.
+  - Calls share one connection pool per process instead of opening a new connection each time.
+    A run's later calls skip the TCP and TLS handshake (0.59 s → 0.32 s per call from Indonesia
+    in the live check).
+  A call that fails both attempts still counts once in `routing_status()`.
+
 ## [0.21.0] — 2026-10-20
 
 ### Changed (breaking): `load_agent()` is now `agent_config()`, and each message is a `Run`

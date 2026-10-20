@@ -8,7 +8,8 @@ or erroring route one request for it serves the agent's skills.
 What must hold, each pinned below through the real `_request`:
   * only a slow route (timeout, 504) or one that errored (500) earns the extra
     request; a platform shedding load (429, 503), an unreachable one, or an open
-    breaker gets no second request;
+    breaker gets no menu request (an unreachable one's route gets the connect
+    retry every call gets);
   * the fallback has its own 2 s read budget and never waits out a Retry-After;
   * a menu that fails too leaves today's empty menu, cached as a slow failure;
   * after a fallback, routes from that host and key pause for 30 s, then resume.
@@ -115,18 +116,20 @@ def test_the_load_agent_call_gets_the_menu_as_its_prefix(monkeypatch):
     assert "refund-policy" in prefix and routing_id == ROUTING_ID
 
 
-@pytest.mark.parametrize("route_failure", [
-    httpx.Response(429, json={"detail": "no available instance"}),
-    httpx.Response(503, json={"detail": "service unavailable"}),
-    httpx.ConnectError("connection refused"),
+@pytest.mark.parametrize("route_failure, sent", [
+    (httpx.Response(429, json={"detail": "no available instance"}), [ROUTE]),
+    (httpx.Response(503, json={"detail": "service unavailable"}), [ROUTE]),
+    # The route's own connect retry (every call gets one: nothing reached the
+    # platform), then no menu.
+    (httpx.ConnectError("connection refused"), [ROUTE, ROUTE]),
 ], ids=["http_429", "http_503", "transport"])
-def test_a_shedding_or_unreachable_platform_gets_no_second_request(monkeypatch, route_failure):
+def test_a_shedding_or_unreachable_platform_gets_no_second_request(monkeypatch, route_failure, sent):
     platform = _Platform(route_failure, _ok(MENU))
     monkeypatch.setattr(sr.httpx, "request", platform)
 
     fragment, routing_id = _router().build_prompt_fragment("how do refunds work?")
 
-    assert platform.paths() == [ROUTE]
+    assert platform.paths() == sent
     assert (fragment, routing_id) == ("", None)
     assert routing_status().menu_fallbacks == 0
 

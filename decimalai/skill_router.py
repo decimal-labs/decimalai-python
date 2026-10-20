@@ -26,6 +26,7 @@ import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from copy import deepcopy
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from threading import Lock
 from threading import local as _thread_local
 from typing import Any, Dict, List, Optional, Tuple
@@ -354,15 +355,111 @@ def _hot_path_read_budget() -> float:
     return max(_HOT_PATH_READ_FLOOR_S, min(_HOT_PATH_READ_CEILING_S, value))
 
 
+# WHY CONNECT GETS 2 SECONDS, NOT 1 (changed 2026-10-20).
+#
+# httpcore applies the connect budget to the TCP connection and again to the
+# TLS handshake. A healthy handshake from the OpenAI tutorial's laptop
+# (Indonesia, Cloudflare's Singapore edge) takes ~0.08 s, so 1 s looked
+# generous. But the OS re-sends a lost SYN after ~1 s (the initial retransmit
+# timeout), so ONE lost packet used the whole budget: on 2026-10-20 trace
+# a3f2c0ab's load_skill failed in 1.21 s with `(timeout)` while the backend
+# served other requests normally, and the model answered without its skill.
+# 2 s survives a re-sent SYN with up to ~1 s of round trip, and the connect
+# retry in `_request` gives a second, fresh connection on top.
+#
+# The cost is the unreachable case: two attempts x 2 s = 4 s per call (was
+# 1 s), still under the 5 s a hung backend already costs, and the breaker
+# opens after three such calls.
+_HOT_PATH_CONNECT_S = 2.0
+#: The read budget for the one retry of a hot read whose first attempt timed
+#: out. `/body` and `/menu` answer in well under 1 s at the 95th percentile on
+#: prod (1.01 s and 0.34 s on 2026-10-20), so a 5 s read timeout means that
+#: request stalled, not that the platform is slow; a second try usually lands.
+#: Short, so a stalled hot read costs a turn at most this much more.
+_HOT_PATH_READ_RETRY_S = 2.0
+
+
 def _hot_path_timeout(read_s: Optional[float] = None) -> httpx.Timeout:
     """connect/read/write/pool. Read is the one that matters: a hung backend
     must not hold a turn open. The caller degrades to an empty menu, which is
     correct — the agent answers without skills rather than not answering.
     ``read_s`` overrides the read budget for one call (the menu fallback's)."""
     return httpx.Timeout(
-        connect=1.0, read=_hot_path_read_budget() if read_s is None else read_s,
+        connect=_HOT_PATH_CONNECT_S,
+        read=_hot_path_read_budget() if read_s is None else read_s,
         write=2.0, pool=1.0,
     )
+
+
+# ── Transport: one retry per failure kind, and a shared connection pool ───
+#
+# Before 2026-10-20 a request got exactly one attempt: any transport error was
+# final. In a turn that is silent — `load_skill` tells the model the skill is
+# unavailable and not to retry — so one dropped packet cost the answer its
+# skill. `_request` now retries once when it is safe:
+#
+#   * The connection could not be opened (`_CONNECT_FAILURES`): nothing was
+#     sent, so the platform never saw the request. Retried for every method.
+#   * The connection dropped before an answer (`_DROPPED_FAILURES`, e.g. a
+#     reset or a pooled connection the far end had closed): retried when the
+#     request is safe to replay (a GET, the routing request, an endpoint
+#     documented idempotent).
+#   * The read timed out: retried for those same requests except the routing
+#     request. A slow route is the platform's own latency, a retry would add to
+#     the load that made it slow, and the menu fallback already covers it.
+#
+# Each kind is retried at most once per call, however many admission (429)
+# retries the call also makes, and a call that fails both attempts counts as
+# ONE failure for the breaker.
+_CONNECT_FAILURES = (httpx.ConnectError, httpx.ConnectTimeout)
+_DROPPED_FAILURES = (httpx.ReadError, httpx.RemoteProtocolError)
+_ROUTE_PATH = "/api/v1/skills/route"
+
+# One `httpx.Client` per process instead of a fresh one per call
+# (`httpx.request` builds a client, an SSL context and a TCP+TLS connection
+# every time). Successive calls in a turn — menu, then `load_skill` a model call
+# later — reuse the connection, so they skip the handshake the 2026-10-20
+# failure happened in, and the CPU of building an SSL context.
+#
+# Rebuilt in a forked child: a pool inherited across `fork` (a pre-fork server
+# that imported a router) shares sockets with the parent. Idle connections
+# expire after httpx's default 5 s, below common servers' keep-alive timeout
+# (uvicorn's is 5 s), so a reused connection has rarely been closed under it;
+# when one has, the request fails as a dropped connection, retried above.
+_platform_http: Optional[httpx.Client] = None
+_platform_http_pid: Optional[int] = None
+_platform_http_lock = Lock()
+
+
+def _platform_client() -> httpx.Client:
+    global _platform_http, _platform_http_pid
+    pid = os.getpid()
+    with _platform_http_lock:
+        if _platform_http is None or _platform_http_pid != pid:
+            # Same defaults as `httpx.request` (verify, trust_env, no redirects),
+            # and like it keeps no cookies: one pool serves every router and API
+            # key in the process, so a stored cookie would ride along on another
+            # key's requests.
+            _platform_http = httpx.Client(
+                cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+            )
+            _platform_http_pid = pid
+        return _platform_http
+
+
+def _send(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """One HTTP attempt, through the shared pool.
+
+    Test suites here and in other DecimalAI repos stand in for the platform by
+    patching ``httpx.request``. Sending through the pool unconditionally would
+    route around every such stub to a real network, so a patched
+    ``httpx.request`` is used instead — the pre-pool behaviour, one fresh
+    connection per call. Unpatched, ``httpx.request`` is ``httpx._api.request``.
+    """
+    library_request = getattr(getattr(httpx, "_api", None), "request", None)
+    if httpx.request is not library_request:
+        return httpx.request(method, url, **kwargs)
+    return _platform_client().request(method, url, **kwargs)
 
 
 # ── The menu fallback (2026-10-20) ────────────────────────────────────────
@@ -1653,11 +1750,6 @@ class SkillRouter:
         # `get` -> `move_to_end` -> `popitem` sequences below are not atomic.
         # Never held across a network call or a resolver callback.
         self._rail_lock = Lock()
-        # NOTE: transport is still module-level `httpx.request`, so every call pays a
-        # fresh TCP+TLS handshake. Pooling it is a real win but moves the patch point
-        # the whole suite mocks (`httpx.request`), so it is deliberately a separate
-        # change rather than a rider on the availability fixes.
-        self._http_lock = Lock()
         # Full-menu cache (single slot, force-refresh to invalidate).
         # Cache the menu per (category, project_id, effective_agent) so a
         # second get_menu() with different args doesn't return the first call's
@@ -1698,6 +1790,8 @@ class SkillRouter:
         hot: Optional[bool] = None,
         read_budget_s: Optional[float] = None,
         admission_wait_s: Optional[float] = None,
+        replay_safe: Optional[bool] = None,
+        read_retry_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Make an HTTP request to the platform API.
 
@@ -1708,6 +1802,14 @@ class SkillRouter:
             read_budget_s: a hot call's read budget in place of the default.
             admission_wait_s: the most this call may wait out ``Retry-After``
                 on a 429 (default ``_ADMISSION_MAX_WAIT_S``); 0 never waits.
+            replay_safe: whether the request may be sent again after the
+                platform may have received it (admission waits, a dropped
+                connection, a read timeout). Defaults to GETs and the routing
+                request; pass ``True`` for an endpoint documented idempotent.
+            read_retry_s: the read budget of the one retry after a read
+                timeout. Defaults to ``_HOT_PATH_READ_RETRY_S`` for a hot call
+                (capped at its own read budget) and the cold budget otherwise;
+                0 never retries a read timeout.
 
         Raises:
             SkillRouterError: on transport failure, non-2xx response, or
@@ -1744,27 +1846,70 @@ class SkillRouter:
                     f"{key_breaker.last_status_code}). Skills are unavailable this turn."
                 )
 
-        # Freeze the caller's auth/scope and request inputs across admission
-        # retries. Only reads and the routing request qualify; publishing and
+        # Freeze the caller's auth/scope and request inputs across retries.
+        # Only reads, the routing request and endpoints the caller marks
+        # `replay_safe` are sent twice after the platform may have seen them
+        # (admission waits, dropped connections, read timeouts); publishing and
         # other writes are not replayed. A positive Retry-After is required:
         # an unmarked edge abort or plan quota must remain fail-fast.
-        admission_safe = method.upper() == "GET" or (
-            method.upper() == "POST" and path == "/api/v1/skills/route"
-        )
+        if replay_safe is None:
+            replay_safe = method.upper() == "GET" or (
+                method.upper() == "POST" and path == _ROUTE_PATH
+            )
+        admission_safe = replay_safe
+        if read_retry_s is None:
+            read_retry_s = (
+                min(_HOT_PATH_READ_RETRY_S, read_budget_s or _hot_path_read_budget())
+                if hot else _COLD_PATH_TIMEOUT
+            )
+        retry_read_timeout = replay_safe and path != _ROUTE_PATH and read_retry_s > 0
         headers = dict(self._headers())
         request_json = deepcopy(json)
         request_params = deepcopy(clean_params)
         started = time.monotonic()
         waited = 0.0
         max_wait = _ADMISSION_MAX_WAIT_S if admission_wait_s is None else admission_wait_s
+        # One spare attempt per transport failure kind, for the whole call (see
+        # "Transport" above `_platform_client`).
+        spare = {"connect": True, "dropped": replay_safe, "read": retry_read_timeout}
+        base_timeout: Any = _hot_path_timeout(read_budget_s) if hot else _COLD_PATH_TIMEOUT
+        retry_timeout: Any = (
+            _hot_path_timeout(read_retry_s) if hot
+            else httpx.Timeout(_COLD_PATH_TIMEOUT, read=read_retry_s)
+        )
+
+        def attempt_once() -> httpx.Response:
+            timeout = base_timeout
+            while True:
+                err: httpx.HTTPError
+                try:
+                    return _send(
+                        method, url, params=request_params, json=request_json,
+                        headers=headers, timeout=timeout,
+                    )
+                except _CONNECT_FAILURES as e:
+                    kind, err = "connect", e
+                except _DROPPED_FAILURES as e:
+                    kind, err = "dropped", e
+                except httpx.ReadTimeout as e:
+                    kind, err = "read", e
+                if not spare[kind]:
+                    raise err
+                spare[kind] = False
+                if kind == "read":
+                    timeout = retry_timeout
+                logger.info(
+                    "SkillRouter %s on %s %s (%s: %s); retrying once",
+                    {"connect": "could not connect", "dropped": "connection dropped",
+                     "read": "read timed out"}[kind],
+                    method, path, type(err).__name__, err,
+                )
+
         try:
             for attempt in range(_ADMISSION_MAX_RETRIES + 1):
-                resp = httpx.request(
-                    method, url, params=request_params, json=request_json, headers=headers,
-                    # Retain the existing per-request latency budgets. Admission
-                    # recovery never retries transport errors or generic 5xx.
-                    timeout=_hot_path_timeout(read_budget_s) if hot else _COLD_PATH_TIMEOUT,
-                )
+                # Admission recovery never retries generic 5xx; transport
+                # failures get their one spare attempt inside `attempt_once`.
+                resp = attempt_once()
                 if not admission_safe or resp.status_code != 429 or attempt >= _ADMISSION_MAX_RETRIES:
                     break
                 if resp.headers.get("X-Quota-Exceeded"):
@@ -1972,7 +2117,9 @@ class SkillRouter:
             menu = self._request(
                 "GET", "/api/v1/skills/menu", params=params,
                 read_budget_s=min(_MENU_FALLBACK_READ_S, _hot_path_read_budget()),
-                admission_wait_s=0.0,
+                # No second read either: a failed route may cost a turn at most
+                # `_MENU_FALLBACK_READ_S` more.
+                admission_wait_s=0.0, read_retry_s=0.0,
             )
         except SkillRouterError as e:
             logger.warning("skill routing failed (%s) and so did the menu fallback: %s", route_failure, e)
@@ -3506,6 +3653,9 @@ class SkillRouter:
         return self._request(
             "POST", _agent_skill_path(agent_name, skill_id),
             params={"pin_version_id": pin_version_id},
+            # Idempotent (see above), so a dropped connection or a read timeout
+            # is retried once, like a read.
+            replay_safe=True,
         )
 
     def unassign_skill(self, agent_name: str, skill_id: str) -> Dict[str, Any]:
@@ -3518,7 +3668,11 @@ class SkillRouter:
             ``{"status": "ok", "action": "unassigned"}``, or ``"noop"`` when
             there was no assignment to remove.
         """
-        return self._request("DELETE", _agent_skill_path(agent_name, skill_id))
+        return self._request(
+            # Retried once like a read: a repeat after the first one landed
+            # answers "noop", which leaves the same state.
+            "DELETE", _agent_skill_path(agent_name, skill_id), replay_safe=True,
+        )
 
     # ── Versions ─────────────────────────────────────────
 

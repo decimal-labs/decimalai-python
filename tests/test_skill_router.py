@@ -252,7 +252,7 @@ class TestSkillRouterCRUD:
             assert router.assign_skill("tutorial-order-support", "skill-id-1") == reply
             mock.assert_called_once_with(
                 "POST", "/api/v1/agents/tutorial-order-support/skills/skill-id-1",
-                params={"pin_version_id": None},
+                params={"pin_version_id": None}, replay_safe=True,
             )
             # Each value is one path segment, so a "/" in an agent name is encoded.
             router.assign_skill("support bot/v2", "skill-id-1", pin_version_id="ver-9")
@@ -275,7 +275,9 @@ class TestSkillRouterCRUD:
         router = self._router()
         with patch.object(router, "_request", return_value={"status": "ok", "action": "unassigned"}) as mock:
             assert router.unassign_skill("tutorial-order-support", "skill-id-1")["action"] == "unassigned"
-            mock.assert_called_once_with("DELETE", "/api/v1/agents/tutorial-order-support/skills/skill-id-1")
+            mock.assert_called_once_with(
+                "DELETE", "/api/v1/agents/tutorial-order-support/skills/skill-id-1", replay_safe=True,
+            )
 
 
 class TestSkillRouterVersions:
