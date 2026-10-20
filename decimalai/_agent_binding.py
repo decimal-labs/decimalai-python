@@ -13,7 +13,14 @@ for one process, and serves them run by run:
 - the model reads a listed skill's full text with ``load_skill``. A load waits
   briefly for its run's own decision and never names another agent's;
 - each run's record (prompt version, variable names, skills offered and
-  delivered, routing id) goes wherever the framework's trace is built.
+  delivered, routing id) goes wherever the framework's trace is built;
+- a conversation keeps what its first run was shown. Claude rejects a
+  conversation whose system prompt or tool definitions changed once a thinking
+  block is in its history (HTTP 400, "bound to a different conversation"), so a
+  framework that can name the conversation a run belongs to hands its record
+  back (`ConversationRecord`) and the run reuses that system text and
+  ``load_skill`` definition byte for byte. A newer saved prompt, a changed skill
+  list or a re-picked cut list reaches the next conversation instead.
 
 Nothing here knows a framework. A framework module subclasses
 :class:`AgentBinding` and supplies the seams: how to name the current run, read
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import logging
 import re
 import threading
@@ -50,8 +58,83 @@ _MAX_CONFIG_RUNS = 256
 #: How long a load waits for its run's background routing decision.
 _LOAD_WAITS_FOR_ROUTING_S = 2.0
 
+#: The version of `ConversationRecord.to_state`'s shape.
+_CONVERSATION_STATE_VERSION = 1
+
 _config_pool: Optional[ThreadPoolExecutor] = None
 _config_pool_lock = threading.Lock()
+
+
+def is_claude(model_name: Any) -> bool:
+    """Whether a model name is Claude's, in any provider's spelling.
+
+    ``claude-haiku-5-5``, ``anthropic/claude-…`` (LiteLLM), ``anthropic.claude-…``
+    (Bedrock), ``claude-…@…`` (Vertex). Claude binds a thinking block to the system
+    prompt and tools it was made under, so a Claude conversation must keep both.
+    """
+    return isinstance(model_name, str) and "claude" in model_name.lower()
+
+
+class ConversationRecord:
+    """What one conversation keeps from its first run: DecimalAI's text and ``load_skill``.
+
+    Attributes:
+        text: The system text DecimalAI composed: the prompt, filled, then the list.
+        names: The skills that list offers.
+        tool: Whether ``load_skill`` was given to the model.
+        tool_names: The names its ``name`` argument is an enum of (empty: any name).
+        cut: The list was cut to fit; later loads name ``routing_id``'s decision.
+        routing_id: The decision a cut list came from.
+        prompt: The prompt record (version, hash, variable names).
+        delivered: Skills whose text was pasted into ``text``.
+        unavailable: Why the list is missing, when it is.
+        pasted: Skill text was pasted in (``load_skill`` switched off).
+    """
+
+    __slots__ = ("text", "names", "tool", "tool_names", "cut", "routing_id", "prompt",
+                 "delivered", "unavailable", "pasted")
+
+    def __init__(self, *, text: str, names: List[str], tool: bool, tool_names: List[str],
+                 cut: bool, routing_id: Optional[str], prompt: Optional[Dict[str, Any]],
+                 delivered: List[str], unavailable: Optional[str], pasted: bool) -> None:
+        self.text = text
+        self.names = names
+        self.tool = tool
+        self.tool_names = tool_names
+        self.cut = cut
+        self.routing_id = routing_id
+        self.prompt = prompt
+        self.delivered = delivered
+        self.unavailable = unavailable
+        self.pasted = pasted
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, ConversationRecord) and all(
+            getattr(self, slot) == getattr(other, slot) for slot in self.__slots__)
+
+    def to_state(self, agent: str) -> Dict[str, Any]:
+        """JSON-ready, for whatever the framework keeps the conversation in."""
+        return copy.deepcopy({
+            "version": _CONVERSATION_STATE_VERSION, "agent": agent, "system": self.text,
+            "skills": self.names, "load_skill": self.tool, "load_skill_names": self.tool_names,
+            "skills_cut": self.cut, "routing_id": self.routing_id, "prompt": self.prompt,
+            "delivered": self.delivered, "skills_unavailable": self.unavailable,
+            "pasted": self.pasted,
+        })
+
+    @classmethod
+    def from_state(cls, state: Any, agent: str) -> Optional["ConversationRecord"]:
+        """The record in ``state``, or None when it is another agent's or another shape's."""
+        if (not isinstance(state, Mapping) or state.get("version") != _CONVERSATION_STATE_VERSION
+                or state.get("agent") != agent or not isinstance(state.get("system"), str)):
+            return None
+        return cls(
+            text=state["system"], names=_clean_names(state.get("skills")),
+            tool=bool(state.get("load_skill")), tool_names=_clean_names(state.get("load_skill_names")),
+            cut=bool(state.get("skills_cut")), routing_id=state.get("routing_id"),
+            prompt=copy.deepcopy(state.get("prompt")), delivered=_clean_names(state.get("delivered")),
+            unavailable=state.get("skills_unavailable"), pasted=bool(state.get("pasted")),
+        )
 
 
 class MissingPromptVariable(KeyError):
@@ -246,6 +329,18 @@ class AgentBinding:
         """Fetch one skill's text for the model, recording a delivery. Override."""
         raise NotImplementedError
 
+    def _conversation(self, context: Any, agent: Any) -> Optional[ConversationRecord]:
+        """The record of the conversation this run continues, or None: compose afresh.
+
+        A framework that can name a run's conversation, and knows the model needs
+        it kept (`is_claude`), returns what that conversation's first run kept.
+        """
+        return None
+
+    def _keep_conversation(self, context: Any, agent: Any, run_key: Optional[str],
+                           record: ConversationRecord) -> None:
+        """A run composed afresh: keep its record where its conversation's later runs look."""
+
     # ── what the agent currently gets ────────────────────────
     @property
     def prompt_version(self) -> Optional[int]:
@@ -305,6 +400,13 @@ class AgentBinding:
                 state = self._runs.get(key)
             if state is not None:
                 return state, {}
+        try:
+            record = self._conversation(context, agent)
+        except Exception:  # noqa: BLE001 — a record we cannot read means compose afresh
+            self._log.debug("could not read the conversation's record (non-fatal)", exc_info=True)
+            record = None
+        if record is not None:
+            return self._continue_conversation(context, agent, run_key, key, record), {}
         self._refresh_prompt_if_stale()
         from ._config import _disabled_by_init
 
@@ -320,7 +422,8 @@ class AgentBinding:
             # a loader beside one that already serves the agent, only misleads.
             state = {"query": None, "route_now": True, "routing_id": None, "prefix": "",
                      "names": [], "unavailable": None, "text": None, "loaded": set(),
-                     "tool": False, "delivered": [], "delivered_versions": []}
+                     "tool": False, "tool_names": [], "cut": False, "pasted": False,
+                     "delivered": [], "delivered_versions": []}
             if run_key is not None:
                 with self._lock:
                     self._runs[key] = state
@@ -363,6 +466,11 @@ class AgentBinding:
                 "query": query, "route_now": plan["route_now"], "routing_id": routing_id,
                 "prefix": menu[0], "names": menu[1], "unavailable": unavailable,
                 "text": None, "tool": tool,
+                # The load_skill names for the whole run: a decision landing mid-run
+                # must not change a tool the model already saw (one Claude run
+                # replays its thinking between tool calls). A cut list names none.
+                "tool_names": [] if self._menu_truncated else list(menu[1]),
+                "cut": bool(self._menu_truncated), "pasted": inject,
                 # A skill whose text is already in the instructions is not sent again.
                 "loaded": set(delivered) if tool else set(),
                 "delivered": delivered, "delivered_versions": versions,
@@ -429,12 +537,25 @@ class AgentBinding:
             menu = f"{state['prefix']}\n{LOAD_SKILL_PROMPT_HINT}" if state["tool"] else state["prefix"]
             text = f"{text}\n\n{menu}" if text else menu
         self._on_compose(agent)
+        prompt_record = self._prompt_record(prompt, template, state["unavailable"], agent)
         self._record(
             agent=agent, system_prompt=text, offered=state["names"],
             routing_id=state["routing_id"], user_input=state["query"],
-            prompt=self._prompt_record(prompt, template, state["unavailable"], agent),
+            prompt=prompt_record,
             delivered=state["delivered"], delivered_versions=state["delivered_versions"],
         )
+        record = ConversationRecord(
+            text=text, names=list(state["names"]), tool=bool(state["names"]) and bool(state["tool"]),
+            tool_names=list(state.get("tool_names") or []), cut=bool(state.get("cut")),
+            routing_id=state["routing_id"], prompt=copy.deepcopy(prompt_record),
+            delivered=list(state["delivered"]), unavailable=state["unavailable"],
+            pasted=bool(state.get("pasted")),
+        )
+        state["conversation"] = record
+        try:
+            self._keep_conversation(context, agent, run_key, record)
+        except Exception:  # noqa: BLE001 — keeping a record must never cost the run
+            self._log.debug("could not keep the conversation's record (non-fatal)", exc_info=True)
         if not state["route_now"]:
             # The local copy is this agent's whole menu, whatever was asked. The
             # run's own decision, ranked on its message, is recorded in the
@@ -443,6 +564,59 @@ class AgentBinding:
             self._note_pending(run_key, pending)
             state["pending"] = pending
         return text
+
+    def _continue_conversation(self, context: Any, agent: Any, run_key: Optional[str],
+                               key: Tuple[Any, Any], record: ConversationRecord) -> Dict[str, Any]:
+        """A later run of a conversation: its system text and tool are the conversation's.
+
+        A whole list: the message is routed in the background and the decision is
+        recorded on this run when it offers the list shown. A cut list: the message
+        is not routed again, and the run and its loads name the decision that
+        produced the conversation's list, so a skill the model was shown is served.
+        The kill switch leaves both in place (changing them would break the chat);
+        ``load_skill`` then answers with an error.
+        """
+        from ._config import _disabled_by_init
+
+        self._refresh_prompt_if_stale()  # for the next conversation
+        query = self._message(context, agent)
+        routing_id = record.routing_id if record.cut else None
+        state: Dict[str, Any] = {
+            "query": query, "route_now": False, "routing_id": routing_id, "prefix": "",
+            "names": list(record.names), "unavailable": record.unavailable, "text": record.text,
+            "tool": record.tool, "tool_names": list(record.tool_names), "cut": record.cut,
+            "pasted": record.pasted,
+            # Skill text already in the system text is not sent again.
+            "loaded": set(record.delivered), "delivered": [], "delivered_versions": [],
+            "conversation": record,
+        }
+        if run_key is not None:
+            with self._lock:
+                self._runs[key] = state
+                while len(self._runs) > _MAX_CONFIG_RUNS:
+                    self._runs.popitem(last=False)
+        if record.pasted:
+            self._warn_once(agent, (
+                "the load_skill tool is off, so skill text is pasted into the instructions; a "
+                "conversation keeps its first message's text (Claude rejects a changed system "
+                "prompt), so later messages get no new skill text."))
+        self._on_compose(agent)
+        self._record(
+            agent=agent, system_prompt=record.text, offered=list(record.names), routing_id=routing_id,
+            user_input=query, prompt=copy.deepcopy(record.prompt), delivered=[], delivered_versions=[],
+        )
+        if _disabled_by_init() or not record.names:
+            return state
+        if record.cut:
+            router = self._router()
+            remember = getattr(router, "_remember_run_routing", None)
+            if run_key is not None and routing_id and callable(remember):
+                remember(run_key, routing_id)
+        else:
+            pending = _in_background(self._route_run, run_key, list(record.names), query)
+            self._note_pending(run_key, pending)
+            state["pending"] = pending
+        return state
 
     def _prompt_record(self, prompt: Any, template: str, unavailable: Optional[str], agent: Any) -> Dict[str, Any]:
         return {

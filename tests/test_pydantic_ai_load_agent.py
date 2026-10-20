@@ -253,3 +253,67 @@ def test_the_callers_own_instructions_stay_a_leading_unedited_prefix(platform):
     first, second = (request["instructions"] for request in model.requests)
     assert first.startswith("CALLER RULES.") and second.startswith("CALLER RULES.")
     assert "Hello Sam.\n\n## Available Skills" in first
+
+
+# ── conversations on Claude ─────────────────────────────────
+
+
+def claude_agent(support, model, model_name="claude-haiku-5-5"):
+    return Agent(FunctionModel(model, model_name=model_name), name=support.name,
+                 capabilities=[support], deps_type=dict)
+
+
+def save_prompt(platform, support, text, version):
+    platform.saved = SavedPrompt(agent_name="support", system_prompt=text, version_number=version,
+                                 content_hash=str(version) * 64)
+    support._refresh_prompt()
+
+
+def test_on_claude_a_conversation_keeps_its_instructions_and_load_skill(platform):
+    support = pai.agent_config("support")
+    model = Model("answer", ("call", "order-support"), "answer", "answer")
+    agent = claude_agent(support, model)
+    first = agent.run_sync("My keyboard arrived cracked.", deps=SAM)
+    save_prompt(platform, support, "Hi {{customer.name}}, be brief.", 5)
+    platform.skills = ["damaged-item"]
+    support._route_run(None, [], "anything")  # the local copy follows
+
+    second = agent.run_sync("Where is my order?", deps=SAM, message_history=first.all_messages())
+    one, two, three = model.requests[:3]
+    assert two["instructions"] == three["instructions"] == one["instructions"], \
+        "Claude rejects a conversation whose system prompt changed"
+    assert two["tools"] == one["tools"] and one["tools"]["load_skill"]["properties"]["name"]["enum"] == [
+        "damaged-item", "order-support"]
+    assert three["returns"][-1].startswith("## Skill: order-support")
+    assert list(platform.queries.values())[-1] == "Where is my order?", "still routed, for the record"
+
+    agent.run_sync("Hello", deps=SAM)  # a new conversation
+    assert model.requests[3]["instructions"].startswith("Hi Sam, be brief.")
+    assert model.requests[3]["tools"]["load_skill"]["properties"]["name"]["enum"] == ["damaged-item"]
+    assert second.all_messages()[0].metadata["decimalai.conversation"]["support"]["prompt"]["version"] == 4
+
+
+def test_on_claude_the_record_travels_with_the_serialized_history(platform):
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+    support = pai.agent_config("support")
+    model = Model("answer", "answer")
+    first = claude_agent(support, model).run_sync("My keyboard arrived cracked.", deps=SAM)
+    stored = ModelMessagesTypeAdapter.dump_json(first.all_messages())
+    save_prompt(platform, support, "Hi {{customer.name}}.", 5)
+
+    elsewhere = pai.agent_config("support")  # another worker, which read version 5
+    claude_agent(elsewhere, model).run_sync(
+        "Where is my order?", deps=SAM, message_history=ModelMessagesTypeAdapter.validate_json(stored))
+    assert model.requests[1]["instructions"] == model.requests[0]["instructions"]
+
+
+def test_on_other_models_each_run_shows_the_newest_prompt_as_before(platform):
+    support = pai.agent_config("support")
+    model = Model("answer", "answer")
+    agent = claude_agent(support, model, model_name="gpt-5.4-mini")
+    first = agent.run_sync("My keyboard arrived cracked.", deps=SAM)
+    assert "decimalai.conversation" not in (first.all_messages()[0].metadata or {})
+    save_prompt(platform, support, "Hi {{customer.name}}.", 5)
+    agent.run_sync("Where is my order?", deps=SAM, message_history=first.all_messages())
+    assert model.requests[1]["instructions"].startswith("Hi Sam.")

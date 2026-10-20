@@ -26,6 +26,14 @@ Every run is routed on its own prompt: the first run before its first model requ
 later runs from a local copy while their own decision is recorded in the background,
 and every run of an agent with more skills than fit the list.
 
+On a Claude model, a conversation keeps its first run's instructions and ``load_skill``:
+Claude rejects a conversation whose system prompt or tools changed once a thinking
+block is in its history (HTTP 400, "bound to a different conversation"; Pydantic AI
+then drops the reasoning and retries). The capability keeps what it showed in the
+run's request ``metadata``, which travels with ``result.all_messages()``, so a run
+given that ``message_history`` (in any process) shows the same text and tool. A newer
+saved prompt or skill list reaches the next conversation.
+
 Tracing is DecimalAI's OpenTelemetry exporter, ``decimalai.init(otel=True)``, carrying
 Pydantic AI's own spans (``Agent.instrument_all()``; any provider) or a provider
 instrumentor's (``decimalai.init(openai=True)``). Pick one, or a model call is reported
@@ -46,9 +54,13 @@ from typing import Any, List, NoReturn, Optional
 
 from decimalai._provider_recovery import retry_model_requests as retry_model_requests
 
-from ._agent_binding import AgentBinding
+from ._agent_binding import AgentBinding, ConversationRecord, is_claude
 
 logger = logging.getLogger("decimalai.pydantic_ai")
+
+#: Where a run's conversation record goes: ``ModelRequest.metadata[...][agent name]``.
+#: Pydantic AI keeps request metadata in the history and never sends it to the model.
+_HISTORY_KEY = "decimalai.conversation"
 
 #: The run whose ``wrap_run`` is active in this context. Pydantic AI hands the
 #: instructions function and the tool their ``RunContext``; everything else that
@@ -198,6 +210,43 @@ def _native_skills(agent: Any) -> Optional[bool]:
         return None
 
 
+def _model_name(ctx: Any) -> Optional[str]:
+    """The name of the model a run calls, or None."""
+    return getattr(getattr(ctx, "model", None), "model_name", None)
+
+
+def _record_in_history(ctx: Any, agent_name: str) -> Optional[ConversationRecord]:
+    """The record an earlier run of this conversation kept in its request, or None."""
+    from pydantic_ai.messages import ModelRequest
+
+    run_id = getattr(ctx, "run_id", None)
+    for message in reversed(list(getattr(ctx, "messages", None) or [])):
+        if not isinstance(message, ModelRequest) or getattr(message, "run_id", None) == run_id:
+            continue
+        kept = (getattr(message, "metadata", None) or {}).get(_HISTORY_KEY)
+        if isinstance(kept, dict) and agent_name in kept:
+            return ConversationRecord.from_state(kept[agent_name], agent_name)
+    return None
+
+
+def _keep_in_history(ctx: Any, agent_name: str, record: ConversationRecord) -> None:
+    """Put the record in this run's first request, where the next run's history has it."""
+    from pydantic_ai.messages import ModelRequest
+
+    run_id = getattr(ctx, "run_id", None)
+    if run_id is None:
+        return
+    for message in getattr(ctx, "messages", None) or []:
+        if isinstance(message, ModelRequest) and getattr(message, "run_id", None) == run_id:
+            metadata = dict(message.metadata or {})
+            kept = dict(metadata.get(_HISTORY_KEY) or {})
+            if agent_name not in kept:
+                kept[agent_name] = record.to_state(agent_name)
+                metadata[_HISTORY_KEY] = kept
+                message.metadata = metadata
+            return
+
+
 def _name_framework_run_span(run_id: Optional[str], agent_name: str) -> None:
     """Name Pydantic AI's own run span for the DecimalAI agent, when it is open here.
 
@@ -240,7 +289,6 @@ class _PydanticAIBinding(AgentBinding):
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
         # Unique per agent in a run; Pydantic AI reserves ":" in capability ids.
         self.id = "decimalai-" + self.name.replace(":", "-")
-        self._tool_names: List[str] = []
         self._toolset = self._build_toolset()
 
     def __repr__(self) -> str:
@@ -273,8 +321,7 @@ class _PydanticAIBinding(AgentBinding):
 
         state = await self._prepare_run(ctx, getattr(ctx, "agent", None), getattr(ctx, "run_id", None))
         show = bool(state["names"]) and state["tool"]
-        with self._lock:
-            names = list(self._tool_names)
+        names = list(state.get("tool_names") or [])
         prepared = []
         for tool_def in tool_defs:
             if getattr(tool_def, "name", None) == LOAD_SKILL_TOOL_NAME:
@@ -283,6 +330,15 @@ class _PydanticAIBinding(AgentBinding):
                 tool_def = dataclasses.replace(tool_def, parameters_json_schema=self._tool_schema(names))
             prepared.append(tool_def)
         return prepared
+
+    async def before_model_request(self, ctx: Any, request_context: Any) -> Any:
+        """On Claude, keep what this run showed in its request, for the conversation's next run."""
+        if is_claude(_model_name(ctx)):
+            state = self._run_state(getattr(ctx, "run_id", None))
+            record = state.get("conversation") if state is not None else None
+            if record is not None:
+                _keep_in_history(ctx, self.name, record)
+        return request_context
 
     async def wrap_run(self, ctx: Any, *, handler: Any) -> Any:
         """One DecimalAI run span around the run, named for the DecimalAI agent."""
@@ -324,9 +380,10 @@ class _PydanticAIBinding(AgentBinding):
         return ("it loads skills with the Pydantic AI harness's Skills capability, a catalog "
                 f"of its own, so DecimalAI adds neither its skill list nor load_skill. {reported}")
 
-    def _on_menu(self, names: List[str]) -> None:
-        with self._lock:
-            self._tool_names = list(names)
+    def _conversation(self, context: Any, agent: Any) -> Optional[ConversationRecord]:
+        if not is_claude(_model_name(context)):
+            return None
+        return _record_in_history(context, self.name)
 
     def _record(self, **fields: Any) -> bool:
         from ._agent import _record_turn

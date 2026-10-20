@@ -113,6 +113,72 @@ def test_a_missing_variable_says_where_the_values_go(platform):
     assert run.system.startswith("Hello Ann.")
 
 
+def save_prompt(platform, support, text, version):
+    """A version saved in the dashboard, and the binding's refresh has fired."""
+    platform.saved = SavedPrompt(agent_name="support", system_prompt=text, version_number=version,
+                                 content_hash=str(version) * 64)
+    support._refresh_prompt()
+
+
+def test_a_conversation_keeps_its_system_text_and_tool_for_every_run(platform):
+    support = decimalai.agent_config("support")
+    chat = support.conversation(variables=SAM)
+    first = chat.run("My keyboard arrived cracked.")
+    assert first.system.startswith("Hello Sam.\n\n## Available Skills")
+    save_prompt(platform, support, "Hi {{customer.name}}, be brief.", 5)
+    platform.skills = ["damaged-item"]
+    support.run("route once more so the local copy follows", variables=SAM)
+
+    later = chat.run("Where is my order?")
+    assert later.system == first.system, "Claude rejects a changed system prompt"
+    assert later.tool_spec == first.tool_spec and first.tool_spec["parameters"]["properties"]["name"][
+        "enum"] == ["damaged-item", "order-support"]
+    assert later.load_skill("order-support").startswith("## Skill: order-support")
+    assert list(platform.queries.values())[-1] == "Where is my order?", "each run is still routed"
+
+    fresh = support.conversation(variables=SAM).run("Hi")
+    assert fresh.system.startswith("Hi Sam, be brief.\n\n## Available Skills")
+    assert fresh.tool_spec["parameters"]["properties"]["name"]["enum"] == ["damaged-item"]
+
+
+def test_a_conversation_resumes_from_its_state_in_another_process(platform):
+    import json
+
+    chat = decimalai.agent_config("support").conversation(variables=SAM)
+    first = chat.run("My keyboard arrived cracked.")
+    saved = json.loads(json.dumps(chat.state))
+    platform.saved = SavedPrompt(agent_name="support", system_prompt="Hi {{customer.name}}.",
+                                 version_number=5, content_hash="5" * 64)
+
+    elsewhere = decimalai.agent_config("support")          # another worker, newer prompt
+    resumed = elsewhere.conversation(state=saved)
+    later = resumed.run("Where is my order?")
+    assert resumed.id == chat.id and later.system == first.system
+    assert later.tool_spec == first.tool_spec
+    assert elsewhere.conversation(variables=SAM).run("Hi").system.startswith("Hi Sam.")
+
+
+def test_a_conversation_state_must_be_this_agents(platform):
+    chat = decimalai.agent_config("support").conversation(variables=SAM)
+    assert chat.state is None
+    chat.run("Hi")
+    platform.saved = SavedPrompt(agent_name="billing", system_prompt="Bill.", version_number=1,
+                                 content_hash="b" * 64)
+    billing = decimalai.agent_config("billing")
+    with pytest.raises(ValueError, match="of agent 'billing'"):
+        billing.conversation(state=chat.state)
+    with pytest.raises(ValueError, match="not both"):
+        decimalai.agent_config("support").conversation(state=chat.state, variables=SAM)
+
+
+def test_one_runs_tool_spec_is_the_list_it_was_shown(platform):
+    support = decimalai.agent_config("support")
+    run = support.run("My keyboard arrived cracked.", variables=SAM)
+    platform.skills = ["damaged-item"]
+    support.run("route once more so the local copy follows", variables=SAM)
+    assert run.tool_spec["parameters"]["properties"]["name"]["enum"] == ["damaged-item", "order-support"]
+
+
 def test_on_unavailable_must_be_continue_or_fail(platform):
     with pytest.raises(ValueError, match="on_unavailable"):
         decimalai.agent_config("support", on_unavailable="sometimes")

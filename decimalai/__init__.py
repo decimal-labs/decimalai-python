@@ -2163,7 +2163,13 @@ def push_langsmith_scores(
 # time), and `AgentConfig` being a real symbol at import is what makes a misspelt
 # attribute fail at the attribute instead of deep inside user code later.
 # `load_agent` is the 0.20 name, kept so an old call fails with the new one's name in the error.
-from ._agent import AgentConfig, Run, agent_config, load_agent  # noqa: E402, F401
+from ._agent import (  # noqa: E402, F401
+    AgentConfig,
+    Conversation,
+    Run,
+    agent_config,
+    load_agent,
+)
 from ._agent_binding import MissingPromptVariable  # noqa: E402, F401
 from .dataset import Dataset  # noqa: E402, F401
 from .generic import (  # noqa: E402, F401
@@ -2217,6 +2223,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "AgentConfig",
+    "Conversation",
     "Run",
     "AgentNotFoundError",
     "MissingPromptVariable",

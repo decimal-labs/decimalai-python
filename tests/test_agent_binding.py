@@ -224,3 +224,109 @@ def test_prompt_source_says_where_the_prompt_came_from(text, version, is_fallbac
     read = SimpleNamespace(agent_name="support", system_prompt=text, version_number=version,
                            content_hash=None, is_fallback=is_fallback)
     assert Binding(read, None, fallback="Be brief.").prompt_source == source
+
+
+# ── conversations ───────────────────────────────────────────
+
+
+class ChatBinding(Binding):
+    """A binding whose runs name their chat: a chat's later runs reuse its first run's record."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.chats: dict = {}
+
+    def _conversation(self, context, agent):
+        return self.chats.get(context.get("chat"))
+
+    def _keep_conversation(self, context, agent, run_key, record):
+        self.chats.setdefault(context.get("chat"), record)
+
+    def chat_run(self, chat, message, values=None):
+        _RUN.set(f"run-{uuid4().hex}")
+        context = {"message": message, "values": values, "chat": chat}
+        state = self._prepare_run_sync(context, None, _RUN.get())
+        if state["text"] is None:
+            state["text"] = self._compose(context, None, _RUN.get(), state)
+        return state
+
+
+def test_a_conversation_keeps_its_first_runs_text_and_tool_after_the_prompt_and_list_change(platform):
+    support = ChatBinding(prompt(), platform.router)
+    first = support.chat_run("a", "My keyboard arrived cracked.")
+    support._prompt = prompt("You help customers with orders. Be brief.", version=4)  # saved, refreshed
+    platform.skills = ["damaged-item"]                                                  # a skill unassigned
+    support._route_run(None, [], "anything")                                            # the copy follows
+
+    later = support.chat_run("a", "Where is my order?")
+    assert later["text"] == first["text"], "byte for byte: Claude rejects a changed system prompt"
+    assert later["tool_names"] == first["tool_names"] == ["damaged-item", "order-support"]
+    assert later["tool"] is True
+    assert support.records[-1]["prompt"]["version"] == 3, "the record names the version the model saw"
+
+    other = support.chat_run("b", "Where is my order?")
+    assert other["text"].startswith("You help customers with orders. Be brief.")
+    assert other["tool_names"] == ["damaged-item"], "a new conversation gets the new prompt and list"
+
+
+def test_a_later_run_of_a_whole_list_is_routed_on_its_own_message_for_the_record(platform):
+    support = ChatBinding(prompt(), platform.router)
+    support.chat_run("a", "My keyboard arrived cracked.")
+    support.chat_run("a", "Where is my order?")
+    routed = [r["routing_id"] for r in support.records if r.get("routing_id")]
+    assert [platform.queries[r] for r in routed][-1] == "Where is my order?"
+
+
+def test_a_later_run_of_a_cut_list_names_the_decision_its_list_came_from(platform):
+    platform.truncated = True
+    support = ChatBinding(prompt(), platform.router)
+    first = support.chat_run("a", "My keyboard arrived cracked.")
+    calls = len(platform.menu_calls())
+    later = support.chat_run("a", "Where is my order?")
+    assert later["text"] == first["text"] and "| order-support |" not in later["text"]
+    assert len(platform.menu_calls()) == calls, "not routed again: its list would offer other skills"
+    assert later["tool_names"] == [] and later["cut"] is True
+    assert support.records[-1]["routing_id"] == first["routing_id"]
+    assert platform.router._run_routing_ids[_RUN.get()] == first["routing_id"], "its loads name that decision"
+    assert support._load_sync("damaged-item").startswith("## Skill: damaged-item")
+
+
+def test_the_kill_switch_leaves_an_open_conversation_its_text_and_tool(platform, monkeypatch):
+    import decimalai._config as cfg
+
+    support = ChatBinding(prompt(), platform.router)
+    first = support.chat_run("a", "My keyboard arrived cracked.")
+    monkeypatch.setattr(cfg, "_disabled_by_init", lambda: True)
+    calls = len(platform.menu_calls())
+    later = support.chat_run("a", "Where is my order?")
+    assert (later["text"], later["tool"]) == (first["text"], True)
+    assert len(platform.menu_calls()) == calls
+    assert support.chat_run("b", "Hi")["text"] == "You help customers with orders.", "a new one gets no skills"
+
+
+def test_one_runs_tool_names_hold_while_a_decision_lands_mid_run(platform):
+    support = ChatBinding(prompt(), platform.router)
+    state = support.chat_run(None, "My keyboard arrived cracked.")
+    platform.skills = ["damaged-item"]
+    support._route_run(None, [], "anything")
+    assert support._run_state(_RUN.get())["tool_names"] == ["damaged-item", "order-support"]
+    assert state["conversation"].tool_names == ["damaged-item", "order-support"]
+
+
+def test_a_record_survives_json_and_refuses_another_agents_state(platform):
+    import json
+
+    support = ChatBinding(prompt(), platform.router)
+    record = support.chat_run("a", "My keyboard arrived cracked.")["conversation"]
+    state = json.loads(json.dumps(record.to_state("support")))
+    assert binding.ConversationRecord.from_state(state, "support") == record
+    assert binding.ConversationRecord.from_state(state, "billing") is None
+    assert binding.ConversationRecord.from_state({**state, "version": 99}, "support") is None
+
+
+@pytest.mark.parametrize("name, claude", [
+    ("claude-haiku-5-5", True), ("anthropic/claude-sonnet-5-5", True), ("anthropic.claude-opus-5-5", True),
+    ("claude-opus-4-8@20260101", True), ("gpt-5.4-mini", False), ("gemini-3.5-flash", False), (None, False),
+])
+def test_is_claude_reads_every_providers_spelling(name, claude):
+    assert binding.is_claude(name) is claude

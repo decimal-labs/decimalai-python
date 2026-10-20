@@ -48,7 +48,7 @@ from threading import Lock
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
 from uuid import uuid4
 
-from ._agent_binding import AgentBinding
+from ._agent_binding import AgentBinding, ConversationRecord
 
 logger = logging.getLogger("decimalai")
 
@@ -582,7 +582,6 @@ class AgentConfig(AgentBinding):
 
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
-        self._tool_names: List[str] = []
 
     def __repr__(self) -> str:
         return (
@@ -619,13 +618,49 @@ class AgentConfig(AgentBinding):
             RuntimeError: ``on_unavailable="fail"`` and DecimalAI never returned
                 this agent's skills.
         """
+        return self._start(message, variables, None)
+
+    def conversation(self, *, variables: Any = None, state: Optional[Dict[str, Any]] = None) -> "Conversation":
+        """One chat whose system text and ``load_skill`` stay the same for every message.
+
+        ::
+
+            chat = support.conversation(variables=customer)   # or conversation(state=saved)
+            run = chat.run(question)                         # run.system: the same text every message
+            tools = [*my_tools, run.tool_spec]               # the same definition every message
+            saved = chat.state                               # store it beside the history
+
+        Claude rejects a conversation whose system prompt or tool definitions
+        changed once a thinking block is in its history (HTTP 400, "bound to a
+        different conversation"). A conversation keeps what its first run was
+        shown, so a newer saved prompt or skill list reaches the next one.
+
+        Args:
+            variables: Values for the prompt's ``{{variables}}``, for every run.
+            state: An earlier conversation's :attr:`Conversation.state`, to
+                continue it here (another process included).
+
+        Raises:
+            ValueError: ``state`` is not this agent's, or both arguments were given.
+        """
+        if state is not None:
+            if variables is not None:
+                raise ValueError("a resumed conversation keeps its first run's variables: "
+                                 "pass state= or variables=, not both")
+            if not isinstance(state, dict) or not isinstance(state.get("id"), str) \
+                    or ConversationRecord.from_state(state.get("conversation"), self.name) is None:
+                raise ValueError(f"state= takes a Conversation.state of agent {self.name!r} "
+                                 "from this version of decimalai")
+        return Conversation(self, variables, state)
+
+    def _start(self, message: Optional[str], variables: Any, chat: Optional["Conversation"]) -> Run:
+        """One run: routed, composed (or the conversation's, reused), and its tool names."""
         key = f"run_{uuid4().hex}"
-        context = {"message": message, "values": variables}
+        context = {"message": message, "values": variables, "conversation": chat}
         state = self._prepare_run_sync(context, None, key)
-        system = self._compose(context, None, key, state)
-        with self._lock:
-            tool_names = list(self._tool_names)
-        return Run(self, key, system, tool_names, list(state["names"]))
+        if state["text"] is None:
+            state["text"] = self._compose(context, None, key, state)
+        return Run(self, key, state["text"], list(state.get("tool_names") or []), list(state["names"]))
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
@@ -644,15 +679,75 @@ class AgentConfig(AgentBinding):
     def _agent_label(self, agent: Any) -> Optional[str]:
         return None
 
-    def _on_menu(self, names: List[str]) -> None:
-        with self._lock:
-            self._tool_names = list(names)
-
     def _record(self, **fields: Any) -> bool:
         return _record_turn(fields)
 
     def _serve_load(self, name: str) -> str:
         return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name)
+
+    def _conversation(self, context: Any, agent: Any) -> Optional[ConversationRecord]:
+        chat = context.get("conversation")
+        return chat._current() if chat is not None else None
+
+    def _keep_conversation(self, context: Any, agent: Any, run_key: Optional[str],
+                           record: ConversationRecord) -> None:
+        chat = context.get("conversation")
+        if chat is not None:
+            chat._fix(record)
+
+
+class Conversation:
+    """One chat of an :class:`AgentConfig`: its system text and tool, fixed at its first run.
+
+    Made by :meth:`AgentConfig.conversation`. Each message is a :meth:`run`, still
+    routed on its own message for the record; the text and tool the model sees do
+    not move. Everything else in ``system`` and ``tools`` has to stay the same too,
+    your own parts included: facts that change per message belong in the user message.
+
+    Attributes:
+        id: This conversation's id.
+    """
+
+    def __init__(self, config: AgentConfig, variables: Any, state: Optional[Dict[str, Any]]) -> None:
+        self._config = config
+        self._variables = variables
+        self._lock = Lock()
+        self._record: Optional[ConversationRecord] = (
+            ConversationRecord.from_state(state["conversation"], config.name) if state else None)
+        self.id: str = state["id"] if state else uuid4().hex
+
+    def __repr__(self) -> str:
+        return f"Conversation(agent={self._config.name!r}, id={self.id!r})"
+
+    def run(self, message: Optional[str] = None) -> Run:
+        """One user message of this conversation.
+
+        The first run composes the system text (the prompt filled from ``variables``,
+        then the skill list routed on ``message``) and the ``load_skill`` definition;
+        later runs reuse both and route their message in the background, for the record.
+        """
+        return self._config._start(message, self._variables, self)
+
+    @property
+    def state(self) -> Optional[Dict[str, Any]]:
+        """The conversation as JSON-ready data; None before its first run.
+
+        Pass it to ``support.conversation(state=...)`` to continue the
+        conversation in another process with the same system text and tool.
+        """
+        record = self._current()
+        if record is None:
+            return None
+        return {"id": self.id, "conversation": record.to_state(self._config.name)}
+
+    def _fix(self, record: ConversationRecord) -> None:
+        with self._lock:
+            if self._record is None:
+                self._record = record
+
+    def _current(self) -> Optional[ConversationRecord]:
+        with self._lock:
+            return self._record
 
 
 def agent_config(
