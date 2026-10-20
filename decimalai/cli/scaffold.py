@@ -25,9 +25,10 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    injects them), because a skill menu is additive and a system prompt is not —
    silently replacing one means their repo says "Never issue refunds over $500"
    while the model receives something else, which is unfixable from their
-   side. On openai-agents, pydantic-ai and adk nothing is injected:
+   side. On openai-agents, pydantic-ai, adk and anthropic nothing is injected:
    `agent_config()` returns the prompt and the skills together, and the file
-   hands both to its own agent.
+   hands both to its own agent (on anthropic, to the SDK's Tool Runner, one
+   run per question).
 
    `agent_config()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
@@ -41,10 +42,10 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    scaffold is worth shipping: without the flag the model is handed a list of
    skill titles it cannot read. Every generated file whose adapter has a
    loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
-   one stops. The openai-agents (0.18+), pydantic-ai (0.19+) and adk (0.20+)
-   files have no loader to turn on: their skills reach the model only through
-   the `agent_config()` pieces they pass to their agent, which the same tests
-   check.
+   one stops. The openai-agents (0.18+), pydantic-ai (0.19+), adk (0.20+) and
+   anthropic (0.22+) files have no loader to turn on: their skills reach the
+   model only through the `agent_config()` pieces they pass to their agent, which
+   the same tests check.
    (`init(langchain=True)` and `init(crewai=True)` turn the loader on
    themselves since 2026-10-14; the langchain template keeps the explicit
    `instrument()` line because it is where the adapter's other options go.)
@@ -91,7 +92,9 @@ FIVE THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    where that bites. `decimalai init` ends by printing "The trace appears at →
    /agents/<name>", which is a promise about the file it just wrote. The
    langchain and openai-agents adapters keep it themselves — their `instrument()`
-   installs a callback handler / a trace processor. `decimalai.pydantic_ai`
+   installs a callback handler / a trace processor — and so does
+   `decimalai.anthropic.agent_config()`, which turns on Anthropic tracing for the
+   calls made inside its runs. `decimalai.pydantic_ai`
    deliberately does not: its `agent_config()` capability ships the prompt, the
    skills and the run BOUNDARY (one DecimalAI run span per run) and leaves the
    span content to Pydantic AI's own instrumentation or a provider instrumentor. `init()` with no flags installs no
@@ -150,6 +153,11 @@ share is identical, deliberately:
   * adk: `agent_config(AGENT_NAME)`'s instruction and tools go into the file's own
     `LlmAgent(...)`, and `DecimalAIPlugin()` into its `App(plugins=[...])`, the one
     span source; init() carries no framework flag.
+  * anthropic: `agent_config(AGENT_NAME)` once, then per question
+    `with support.run(question) as turn:` around the Tool Runner, with
+    `system=turn.system` and `tools=[*TOOLS, *turn.tools]`. init() carries no
+    flag: `agent_config()` traces its own runs, and `anthropic=True` would also
+    trace every other Anthropic call in the process.
 
 Two differences are intentional. The snippets name the agent on
 `instrument(agent_name=...)`; the templates name it on `init(agent_name=...)`
@@ -163,20 +171,20 @@ WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. Six adapters have one: `enable_skill_loader` on three
-(langchain, anthropic, crewai) and an agent config on three
-(openai_agents, pydantic_ai, adk). The rest — llamaindex, claude_agent_sdk,
+loader can use. Six adapters have one: `enable_skill_loader` on two
+(langchain, crewai) and an agent config on four (openai_agents,
+pydantic_ai, adk, anthropic). The rest — llamaindex, claude_agent_sdk,
 autogen/otel — trace and version but have no loader, and generating a file for
 them would hand someone a program that looks correct and quietly ignores every
 skill they picked. `--framework` names the reason rather than printing a bare
 "invalid choice".
 
-Of the six, four are scaffolded. `anthropic` is a holdout and the reason is
-not "nobody got to it": that adapter patches one `messages.create()` call, so it
-owns no tool loop — a generated file there would be a hand-rolled while-loop this
-template would have to invent, and the body could only arrive by injection.
-`crewai` is the other, and that one IS "nobody got to it yet": its loader
-shipped on 2026-10-08, ahead of a template.
+Of the six, five are scaffolded. `crewai` is the holdout, and that one IS
+"nobody got to it yet": its loader shipped on 2026-10-08, ahead of a template.
+`anthropic` was one until 0.22, for a different reason: its adapter patched one
+`messages.create()` call and owned no tool loop, so a generated file would have
+been a hand-rolled while-loop this template had to invent. `agent_config()` now
+gives each run a `load_skill` tool, and the SDK's own Tool Runner is the loop.
 """
 
 from __future__ import annotations
@@ -874,11 +882,111 @@ def _render_adk(
     ]
 
 
+def _render_anthropic(
+    agent_name: str, model: str, base_url: Optional[str]
+) -> List[str]:
+    # The run's handle is `turn`, not `run`: inside `def run(...)`, `as run:`
+    # would rebind the function's own name.
+    return [
+        "import os",
+        "",
+        "import anthropic",
+        "import decimalai",
+        "from anthropic import beta_tool",
+        "from decimalai.anthropic import agent_config",
+        "",
+        "# Any Claude model your Anthropic key can reach.",
+        f"MODEL = {_py(model)}",
+        *_agent_name_lines(agent_name, load_agent_routes=True),
+        "# The Tool Runner's cap on model calls for one question. Loading a skill",
+        "# takes one call of its own; raise it if your agent chains many tools.",
+        "MAX_TURNS = 20",
+        "MAX_TOKENS = 4096",
+        "",
+        *_key_guard_lines("anthropic", model),
+        "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
+        "# file you are going to commit.",
+        _init_call(base_url),
+        "",
+        "# This agent's prompt and skills, from DecimalAI, one run per question.",
+        "# Nothing is injected behind your back: run() below passes both to the",
+        "# Tool Runner.",
+        "#   turn.system  the prompt saved in the dashboard, then the list of this",
+        "#                agent's skills. Re-read at most once a minute, so a prompt",
+        "#                saved in the dashboard reaches a run within a minute, with",
+        "#                no redeploy. {{placeholders}} in it are filled from",
+        "#                support.run(..., variables=...).",
+        "#   turn.tools   the load_skill tool the model reads a skill with.",
+        "# Each run is one trace, filed under AGENT_NAME: agent_config() traces the",
+        "# Claude calls made inside it. With no prompt saved, the agent gets only the",
+        "# skill list: nothing this file made up. Pass agent_config(AGENT_NAME,",
+        "# fallback=...) to supply one.",
+        "support = agent_config(AGENT_NAME)",
+        "",
+        "client = anthropic.Anthropic()",
+        "",
+        "",
+        "@beta_tool",
+        "def lookup_order(order_id: str) -> str:",
+        "    \"\"\"Look up an order's status by its id.",
+        "",
+        "    Args:",
+        "        order_id: The order id, for example A1001.",
+        "    \"\"\"",
+        "    # An example. Replace it with a call to your own system.",
+        "    return f\"Order {order_id}: shipped, arriving in two days.\"",
+        "",
+        "",
+        "# Your tools go here, as @beta_tool functions; DecimalAI adds load_skill.",
+        "TOOLS: list = [lookup_order]",
+        "",
+        "",
+        "def run(question: str) -> str:",
+        "    \"\"\"One question: the Tool Runner calls tools until the model answers.",
+        "",
+        "    The question is sent with no earlier messages. For a chat, keep one",
+        "    support.conversation() per chat instead: its system and tools stay the",
+        "    same for every message, which Anthropic requires once a thinking block",
+        "    is in the history.",
+        "    \"\"\"",
+        "    # Consume the Tool Runner inside the `with` block: it makes its model calls",
+        "    # only when consumed, and the run's trace closes with the block.",
+        "    with support.run(question) as turn:",
+        "        answer = client.beta.messages.tool_runner(",
+        "            model=MODEL,",
+        "            max_tokens=MAX_TOKENS,",
+        "            max_iterations=MAX_TURNS,",
+        "            system=turn.system,",
+        "            # Your own tools go first; DecimalAI adds load_skill.",
+        "            tools=[*TOOLS, *turn.tools],",
+        "            messages=[{\"role\": \"user\", \"content\": question}],",
+        "        ).until_done()",
+        "    if answer.stop_reason == \"tool_use\":",
+        "        # The model kept calling tools without answering. Usually it is chasing",
+        "        # a tool the prompt names but this file does not define (the Tool Runner",
+        "        # answers such a call with an error and lets the model carry on) —",
+        "        # check the Tools line in your system prompt against TOOLS above.",
+        "        return (",
+        "            f\"[{AGENT_NAME}] stopped after {MAX_TURNS} model calls without an \"",
+        "            \"answer. See the comment in run().\"",
+        "        )",
+        "    return \"\".join(block.text for block in answer.content if block.type == \"text\")",
+        "",
+        "",
+        'if __name__ == "__main__":',
+        '    print(run("What can you help me with?"))',
+        "    # Short-lived scripts exit before the background sender drains. init()",
+        "    # registers an atexit flush; this makes it explicit.",
+        "    decimalai.flush()",
+    ]
+
+
 _RENDERERS = {
     "langchain": _render_langchain,
     "openai-agents": _render_openai_agents,
     "pydantic-ai": _render_pydantic_ai,
     "adk": _render_adk,
+    "anthropic": _render_anthropic,
 }
 
 #: What the user has to install and export for the generated file to run.
@@ -1094,7 +1202,7 @@ def provider_key(framework: str, model: Optional[str] = None) -> Optional[str]:
         "langchain": _PROVIDER_REQUIREMENTS,
         "pydantic-ai": _PYDANTIC_AI_PROVIDERS,
     }.get(framework)
-    if table is None:  # openai-agents: the default OpenAIProvider; adk: its own guard
+    if table is None:  # openai-agents, anthropic: the provider's own key; adk: its own guard
         vars_ = ENV_VARS[framework]
         return vars_[1] if len(vars_) > 1 else None
     if framework == "pydantic-ai" and model == "test":

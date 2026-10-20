@@ -198,6 +198,9 @@ EXTRA_SLUGS: Dict[str, Set[str]] = {
     "pydantic-ai": {"pydantic-ai"},
     "adk": {"google-adk"},
     "llamaindex": {"llamaindex"},
+    # The Anthropic SDK and its instrumentor, for decimalai.anthropic.agent_config()
+    # (0.22+), whose row the capability table gained with it.
+    "anthropic": {"anthropic-messages-api"},
 }
 
 #: Extras that install no framework adapter, each with the reason. Anything
@@ -322,6 +325,11 @@ contract is wrong — fix contract.py so every framework gets the fix.
 # ── the guards ───────────────────────────────────────────────────────────────
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "0.22 adds the Anthropic Messages API row (anthropic-messages-api) to the capability "
+    "table; the docs describe what PyPI serves, so decimalai-docs regenerates its tables "
+    "with the 0.22 release. Remove this mark then: strict, so the regenerated page turns "
+    "it red. Same mark as tests/test_frameworks_registry.py's docs-tables test."))
 def test_advertised_snapshot_matches_docs() -> None:
     """The vendored advertised list is what the docs actually advertise.
 
@@ -829,9 +837,10 @@ def test_every_journey_na_is_declared_and_counted() -> None:
     in either direction.
 
     Which makes the ledger self-clearing in the direction that matters: the day
-    somebody writes a template for the Anthropic Messages adapter, the framework
-    moves out of ``UNSCAFFOLDED_WITH_SEAM``, ``anthropic:J1`` stops being N/A and
-    starts being GRADED — and this test fails until the stale line is deleted.
+    somebody writes a template for CrewAI, the framework moves out of
+    ``UNSCAFFOLDED_WITH_SEAM``, ``crewai:J1`` stops being N/A and starts being
+    GRADED — and this test fails until the stale line is deleted. That is how
+    ``anthropic:J1`` left, with the 0.22 template.
     The alternative, a list of names typed here, would have kept skipping the
     cell for a journey that had quietly started working.
     """
@@ -1022,7 +1031,9 @@ OBSERVER_SURFACES: Dict[str, str] = {
     "crewai": "decimalai.crewai",
     "generic-otel": "decimalai.otel",
     "claude-agent-sdk": "decimalai.claude_agent_sdk",
-    "anthropic": "decimalai.anthropic",
+    # Anthropic's instrument() is a stub that raises since 0.22: a run, and its
+    # on_trace, come from agent_config().
+    "anthropic": "decimalai.anthropic:agent_config",
     "pydantic-ai": "decimalai.pydantic_ai",
 }
 

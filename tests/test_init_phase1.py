@@ -211,17 +211,24 @@ class TestFlagFormDeliversSkills:
         """`anthropic=True` is the provider TRACING rail, and the docs pair it
         with framework adapters that deliver skills themselves (Pydantic AI on
         an Anthropic model). Patching `messages.create` from it would inject a
-        second copy of the skills under that adapter. Raw-Messages skills stay
-        `decimalai.anthropic.instrument(enable_skill_loader=True)`."""
-        import decimalai.anthropic as da
+        second copy of the skills under that adapter. Raw-Messages skills come
+        from `decimalai.anthropic.agent_config()`, which patches nothing either."""
         import decimalai.providers as providers
 
-        monkeypatch.setattr(providers, "instrument", lambda **k: None)
-        loader = _counter(monkeypatch, da, "_install_skill_loader")
+        calls: List[Any] = []
+        monkeypatch.setattr(providers, "instrument", lambda **k: calls.append(k))
+        try:
+            from anthropic.resources.messages import AsyncMessages, Messages
+        except ImportError:
+            classes: tuple = ()
+        else:
+            classes = (Messages, AsyncMessages)
+        before = {(cls, name): vars(cls)[name] for cls in classes for name in ("create", "stream", "parse")}
 
         _init(anthropic=True, agent_name="support")
 
-        assert loader == []
+        assert [call["anthropic"] for call in calls] == [True]
+        assert {key: vars(key[0])[key[1]] for key in before} == before, "the Anthropic SDK was patched"
 
     @pytest.mark.parametrize("skills, authority, reads_disk", [
         (True, None, False),       # router is the skills channel: no disk sync

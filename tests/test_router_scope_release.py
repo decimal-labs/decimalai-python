@@ -21,8 +21,8 @@ pydantic_ai, and in openai_agents' loaded rail too. All five now release through
 ``skill_router._release_scoped_routing_rail``.
 
 Every test here runs ``_MAX_SCOPED_RAILS + 4`` runs through the adapter's own
-entry point — ADK's plugin callbacks, Anthropic's patched ``messages.create``,
-an agent config and the openai_agents trace processor, the pydantic_ai
+entry point — ADK's plugin callbacks, an Anthropic `agent_config()` run, an
+agent config and the openai_agents trace processor, the pydantic_ai
 system-prompt hook, CrewAI's ``before_llm_call`` hook — against a REAL
 ``SkillRouter`` whose two network calls are stubbed. The adapters' delivery
 tests use a stand-in router, which has no slots to leak; that is how this went
@@ -34,10 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
-import types
 from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, List
 from unittest.mock import MagicMock
 
 import pytest
@@ -230,64 +228,43 @@ class TestAdk:
 # ── Anthropic ────────────────────────────────────────────────────────────────
 
 
-class _Messages:
-    """``anthropic.resources.messages.Messages``: ``create`` hands back the
-    request it would have sent."""
-
-    def create(self, *args: Any, **kwargs: Any) -> dict:
-        return kwargs
-
-
-class _AsyncMessages:
-    async def create(self, *args: Any, **kwargs: Any) -> dict:
-        return kwargs
-
-
-@pytest.fixture
-def anthropic_messages(monkeypatch, router):
-    """The documented one-liner, ``instrument(enable_skill_loader=True)``,
-    installed onto a fake ``Messages`` class instead of the SDK's."""
-    import decimalai.anthropic as anthropic_adapter
-
-    module = types.ModuleType("anthropic.resources.messages")
-    module.Messages = _Messages
-    module.AsyncMessages = _AsyncMessages
-    monkeypatch.setitem(sys.modules, "anthropic.resources.messages", module)
-    monkeypatch.setattr(_Messages, "create", _Messages.create)  # undone after
-    monkeypatch.setattr(_AsyncMessages, "create", _AsyncMessages.create)
-    monkeypatch.setattr(anthropic_adapter, "_skill_loader_installed", False)
-    monkeypatch.setattr(anthropic_adapter, "_install_agent_name", None)
-    monkeypatch.setattr(anthropic_adapter, "_skill_router_singleton", router)
-    anthropic_adapter.instrument(enable_skill_loader=True, agent_name="support")
-    return _Messages()
-
-
 class TestAnthropic:
     def test_runs_past_the_cap_hold_no_slot(
-        self, router, anthropic_messages, pipeline, client, overflow_warnings,
+        self, monkeypatch, router, pipeline, client, overflow_warnings,
     ):
-        from decimalai.providers import agent_run
+        """A `agent_config()` run per message, each loading the skill it was shown,
+        the way the Tool Runner's `load_skill` call reaches `run.tool_result()`."""
+        pytest.importorskip("anthropic")
+        import decimalai._agent as agent_mod
+        import decimalai._agent_binding as binding
+        import decimalai.anthropic as da
+        from decimalai._agent import SavedPrompt
 
+        monkeypatch.setattr(da, "_skill_router_singleton", router)
+        monkeypatch.setattr(da, "_tracing_turned_on", True)  # the pipeline is this test's
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(agent_mod, "read_prompt",
+                            lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=CALLER_PROMPT))
+        support = da.agent_config("support")
         tracer = pipeline.get_tracer("fake-anthropic-instrumentor")
-        sent: Optional[dict] = None
+        system: List[dict] = []
+        loads: List[Any] = []
         for _ in range(RUNS):
-            with agent_run("support", tracer_provider=pipeline):
-                sent = anthropic_messages.create(
-                    model="claude-sonnet-5-5",
-                    system=CALLER_PROMPT,
-                    messages=[{"role": "user", "content": QUESTION}],
-                )
+            with support.run(QUESTION) as run:
+                system[:] = run.system
+                loads[:] = [run.tool_result({"type": "tool_use", "id": "toolu_1", "name": "load_skill",
+                                      "input": {"name": "refund-policy"}})]
                 # The span the OpenInference instrumentor emits for the call.
                 with tracer.start_as_current_span("Messages", attributes={
                     "gen_ai.system": "anthropic", "gen_ai.request.model": "claude-sonnet-5-5",
                 }):
                     pass
 
-        assert sent is not None and SENTINEL in sent["system"]
-        assert sent["system"].startswith(CALLER_PROMPT)
+        assert system[0]["text"] == CALLER_PROMPT and "refund-policy" in system[-1]["text"]
+        assert SENTINEL in loads[0]["content"], "the text arrives by load_skill"
         assert client.traces == RUNS
         assert client.last.routing_id == ROUTING_ID
-        assert client.last.skills_delivered == ["refund-policy"]
+        assert client.last.skills_loaded_by_agent == ["refund-policy"]
         _assert_every_slot_released(router, overflow_warnings())
 
 

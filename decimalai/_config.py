@@ -222,18 +222,18 @@ class DecimalConfig:
     # True/False — from init(inject_skill_body=...) or DECIMALAI_INJECT_SKILL_BODY=0/1 — always wins.
     #
     # This was a plain `bool` defaulting False until 2026-08-28, and that default silently broke the
-    # whole point of the skill rail on every adapter with no tool loop: langchain and anthropic
-    # register no `load_skill` tool, so prompt injection is their ONLY body channel, and False meant
-    # the model got a menu of titles it could never read. Verified end to end — a skill body saying
+    # whole point of the skill rail on every adapter with no tool loop: langchain (and anthropic,
+    # before its 0.21 agent_config()) registers no `load_skill` tool, so prompt injection is its ONLY
+    # body channel, and False meant the model got a menu of titles it could never read. Verified end to end — a skill body saying
     # "opened boxes carry a 23.5% restocking fee" against a real model produced 15% (confabulated)
     # with the old default and 23.5% with injection on. Do not flatten this back to a bool.
     inject_skill_body: Optional[bool] = field(
         default_factory=lambda: _tristate_env("DECIMALAI_INJECT_SKILL_BODY")
     )
-    # Progressive disclosure: register the native load_skill tool on
-    # adapters that own their tool loop (openai_agents, pydantic_ai) whenever
-    # the skill loader is enabled — so a surfaced description is always
-    # executable. On by default; kill switch DECIMALAI_LOAD_SKILL_TOOL=0 or
+    # Progressive disclosure: every agent_config() (openai_agents, pydantic_ai,
+    # adk, anthropic) hands the model the load_skill tool beside its skill
+    # list — so a surfaced description is always executable. On by default;
+    # kill switch DECIMALAI_LOAD_SKILL_TOOL=0 or
     # init(load_skill_tool=False).
     load_skill_tool: bool = field(
         default_factory=lambda: os.environ.get("DECIMALAI_LOAD_SKILL_TOOL", "1").strip().lower()
@@ -305,17 +305,18 @@ class DecimalConfig:
         An explicit setting always wins — init(inject_skill_body=...) or
         DECIMALAI_INJECT_SKILL_BODY=0/1. Unset, the answer comes from the adapter:
 
-          no tool loop  (langchain, anthropic)      => True
+          no tool loop  (langchain, crewai)         => True
               Prompt injection is the ONLY body channel these have. Without it the model
               is handed a menu of skill titles it has no mechanism to read, which is not a
               degraded rail — it is a rail that cannot work.
 
-          has tool loop (openai_agents, pydantic_ai) => False
+          has tool loop (every agent_config(): openai_agents, pydantic_ai, adk, anthropic) => False
               These register a real `load_skill` tool, so the model fetches on demand.
               Injecting as well would double-deliver and double the token cost.
 
-        Only reached once an adapter's skill loader is enabled (`enable_skill_loader=True`),
-        which is opt-in and off by default — so nobody who never asked for skills is affected.
+        Only reached once an adapter's skills were asked for — its skill loader enabled
+        (`enable_skill_loader=True`, off by default) or a `agent_config()` — so nobody who
+        never asked for skills is affected.
         """
         if self.inject_skill_body is not None:
             return bool(self.inject_skill_body)

@@ -525,117 +525,69 @@ class TestFragmentCacheIsPerRun:
         assert router._request.call_count == 1
 
 
-# ── the adapters record only what they injected ──────────────────────────────
+# ── a agent_config() run records only its own decision ─────────────────────────
 
 
-class TestAnthropicClaimsOnlyWhatItInjected:
-    def test_an_empty_fragment_claims_no_routing_decision(self, _sdk_enabled):
-        """The guard that used to be in the wrong order: ``_set_routing_id`` sat
-        ABOVE the empty-fragment check, so a call that injected nothing still
-        reported that the model had been routed."""
-        import decimalai.anthropic as da
+class TestAnthropicRecordsItsOwnRun:
+    """`decimalai.anthropic.agent_config()`: each run's record is its own decision."""
 
-        pipe = _Pipeline(agent_name="agent-a")
-        router = MagicMock()
-        router.build_prompt_fragment.return_value = ("", "rt_empty")
-        prev, da._skill_router_singleton = da._skill_router_singleton, router
-        try:
-            with providers.agent_run("agent-a", tracer_provider=pipe.provider):
-                out = da.skill_system("base prompt", query="hello")
-                assert out == "base prompt"
-                assert not _skill_rails
-                pipe.llm_span()
-        finally:
-            da._skill_router_singleton = prev
-
-        (trace,) = pipe.traces(_sdk_enabled)
-        assert trace.routing_id is None
-        assert trace.skills_offered_in_prompt == []
-
-    def test_an_injected_fragment_is_recorded_against_this_run(self, _sdk_enabled):
+    @pytest.fixture
+    def support(self, monkeypatch):
+        pytest.importorskip("anthropic")
+        import decimalai._agent as agent_mod
+        import decimalai._agent_binding as binding
         import decimalai.anthropic as da
         from decimalai import skill_router as sr
+        from decimalai._agent import SavedPrompt
 
-        pipe = _Pipeline(agent_name="agent-a")
         router = MagicMock()
 
-        def _build(**kwargs: Any) -> Any:
-            # What the real router does one statement before the adapter drains.
+        def _parts(query=None, **kwargs: Any) -> Any:
+            # What the real router does one statement before the binding drains.
             sr._last_offered_names_ctx.set(["alpha", "beta"])
-            return "Available skills:\n- alpha\n- beta", "rt_live"
+            return "Available skills:\n- alpha\n- beta", "", "rt_live"
 
-        router.build_prompt_fragment.side_effect = _build
-        prev, da._skill_router_singleton = da._skill_router_singleton, router
+        router.build_prompt_parts.side_effect = _parts
+        monkeypatch.setattr(da, "_skill_router_singleton", router)
+        monkeypatch.setattr(da, "_tracing_turned_on", True)  # the pipeline is this test's
+        monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+        monkeypatch.setattr(agent_mod, "read_prompt",
+                            lambda name, **kw: SavedPrompt(agent_name=name, system_prompt="base prompt"))
         try:
-            with providers.agent_run("agent-a", tracer_provider=pipe.provider):
-                out = da.skill_system("base prompt", query="hello")
-                assert "alpha" in out and "base prompt" in out
-                pipe.llm_span()
+            yield da.agent_config("agent-a"), router
         finally:
-            da._skill_router_singleton = prev
             sr._last_offered_names_ctx.set(None)
+
+    def test_a_list_shown_and_never_loaded_is_an_offer_not_an_activation(self, _sdk_enabled, support):
+        """Shown is NOT activated. A skill the model was offered and never loaded is
+        exactly what is most likely to be promoted to a fabricated activation; nothing
+        may land in active_skills / skills_loaded_by_agent here (refused 2026-09-05,
+        pinned)."""
+        config, _router = support
+        pipe = _Pipeline(agent_name="agent-a")
+        with config.run("hello") as run:
+            assert run.system[0]["text"] == "base prompt" and "alpha" in run.system[-1]["text"]
+            assert [tool["name"] for tool in run.tool_params] == ["load_skill"]
+            pipe.llm_span()
 
         (trace,) = pipe.traces(_sdk_enabled)
         assert trace.routing_id == "rt_live"
         assert trace.skills_offered_in_prompt == ["alpha", "beta"]
-        # Injected is NOT an activation. The Anthropic adapter has no tool loop,
-        # so a body it injects is exactly what is most likely to be promoted to a
-        # fabricated activation; nothing may land in active_skills /
-        # skills_loaded_by_agent here (refused 2026-09-05, pinned).
         assert trace.skills_loaded_by_agent == []
         assert (getattr(trace, "active_skills", None) or []) == []
 
-    def test_without_agent_run_the_skills_still_reach_the_model(self, _sdk_enabled):
-        """A raw-SDK user who skips ``agent_run()`` still gets skills injected —
-        the rail degrades to silence, it does not break the call.
+    def test_each_run_names_itself_to_the_router(self, _sdk_enabled, support):
+        """A run must name itself to the router, or two concurrent runs share a
+        fragment-cache slot and therefore a routing decision. That includes a later
+        run, whose own decision is made in the background."""
+        config, router = support
+        _Pipeline(agent_name="agent-a")
+        keys = []
+        for question in ("hello", "again"):
+            with config.run(question) as run:
+                keys.append(run.key)
 
-        The docs already require ``agent_run()`` on the raw provider rails, and
-        frame it as being about trace SHAPE. It is now also what makes the
-        skills rail attributable: without it there is no run to file the routing
-        decision under, so the fields stay empty rather than being guessed onto
-        somebody else's trace.
-        """
-        import decimalai.anthropic as da
-        from decimalai import skill_router as sr
-
-        pipe = _Pipeline(agent_name="agent-a")
-        router = MagicMock()
-
-        def _build(**kwargs: Any) -> Any:
-            sr._last_offered_names_ctx.set(["alpha"])
-            return "Available skills:\n- alpha", "rt_unscoped"
-
-        router.build_prompt_fragment.side_effect = _build
-        prev, da._skill_router_singleton = da._skill_router_singleton, router
-        try:
-            # No agent_run anywhere.
-            out = da.skill_system("base prompt", query="hello")
-            assert "alpha" in out and "base prompt" in out
-            assert not _skill_rails
-            with providers.agent_run("agent-a", tracer_provider=pipe.provider):
-                pipe.llm_span()
-        finally:
-            da._skill_router_singleton = prev
-            sr._last_offered_names_ctx.set(None)
-
-        (trace,) = pipe.traces(_sdk_enabled)
-        assert trace.routing_id is None
-        assert trace.skills_offered_in_prompt == []
-
-    def test_the_run_scope_is_threaded_into_the_router(self, _sdk_enabled):
-        """The adapter must name its run to the router, or two concurrent runs
-        share a fragment-cache slot and therefore a routing decision."""
-        import decimalai.anthropic as da
-
-        pipe = _Pipeline(agent_name="agent-a")
-        router = MagicMock()
-        router.build_prompt_fragment.return_value = ("frag", "rt_x")
-        prev, da._skill_router_singleton = da._skill_router_singleton, router
-        try:
-            with providers.agent_run("agent-a", tracer_provider=pipe.provider):
-                expected = f"{current_run_key():032x}"
-                da.skill_system(None, query="hello")
-        finally:
-            da._skill_router_singleton = prev
-
-        assert router.build_prompt_fragment.call_args.kwargs["scope"] == expected
+        calls = router.build_prompt_parts.call_args_list
+        assert [call.args[0] for call in calls] == ["hello", "again"]
+        assert [call.kwargs["scope"] for call in calls] == keys
+        assert len(set(keys)) == 2

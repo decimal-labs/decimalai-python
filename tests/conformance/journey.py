@@ -24,8 +24,9 @@ The probe already stands in for ``api.decimal.ai``. Teaching it the three routes
 ``…/{name}/prompt`` — see ``probe.py``) means the whole journey runs with no
 backend, no provider key, no network and no cost. The MODEL half is stood in for
 the same way, by :class:`JourneyModel` — a real HTTP server speaking the OpenAI
-wire format, which the generated file reaches through its real provider SDK over
-a real socket. Nothing is monkeypatched into the SDK under test.
+wire format (and Gemini's and Anthropic's), which the generated file reaches
+through its real provider SDK over a real socket. Nothing is monkeypatched into
+the SDK under test.
 
 What runs where
 ---------------
@@ -79,6 +80,9 @@ from .drivers._openai_wire import (
     _turns_taken,
 )
 from .drivers import StubTurn, _importable
+# Same rule for the Anthropic Messages API: one source for what a `Message` looks
+# like, shared with the anthropic driver's stub service.
+from .drivers.anthropic import _message_payload as _anthropic_payload
 from .harness import Phase
 from .isolation import CONFORMANCE_SKILLS, body_sentinel, jobs
 from .probe import Probe, Recorded
@@ -129,6 +133,26 @@ def _gemini_turns_taken(body: Dict[str, Any]) -> int:
         for part in content.get("parts") or []:
             if isinstance(part, dict) and "functionResponse" in part:
                 n += 1
+    return n
+
+
+def _anthropic_turns_taken(body: Dict[str, Any]) -> int:
+    """Anthropic's turn counter: one ``tool_result`` block per completed tool turn.
+
+    The Messages API sends a tool's answer back as a ``tool_result`` block in a
+    ``user`` message, never as a message of its own, so the OpenAI counter (a
+    ``tool``-role message) and the Gemini one (``contents``) both read zero.
+    """
+    n = 0
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            n += sum(
+                1 for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            )
     return n
 
 
@@ -305,7 +329,7 @@ def missing_requirements(framework: str) -> List[str]:
 
 class JourneyModel:
     """A real HTTP server speaking the OpenAI wire format — and Gemini's
-    ``:generateContent`` — and the witness.
+    ``:generateContent`` and Anthropic's ``/v1/messages`` — and the witness.
 
     Two differences from ``drivers/_openai_wire.py``, both forced by what the
     journey is:
@@ -384,7 +408,8 @@ class JourneyModel:
 
     @property
     def root_url(self) -> str:
-        """Host root, no ``/v1``: google-genai appends ``/v1beta/models/...`` itself."""
+        """Host root, no ``/v1``: google-genai appends ``/v1beta/models/...`` itself,
+        and the Anthropic SDK ``/v1/messages``."""
         return self.base_url[: -len("/v1")]
 
     # ── answering ────────────────────────────────────────────
@@ -424,7 +449,7 @@ class JourneyModel:
             self.requests.append({"path": path, "body": body})
 
         offered = self._offered_tools(body) | _gemini_offered_tools(body)
-        taken = _turns_taken(body) + _gemini_turns_taken(body)
+        taken = _turns_taken(body) + _gemini_turns_taken(body) + _anthropic_turns_taken(body)
         if "load_skill" in offered and taken == 0:
             turn = StubTurn(("load_skill", {"name": self.skill_name}), "", 17, 5)
         elif (
@@ -438,6 +463,11 @@ class JourneyModel:
             turn = StubTurn(None, JOURNEY_ANSWER_SENTINEL, 23, 7)
 
         model_name = body.get("model") or "conformance-journey-stub"
+        # The Tool Runner posts to /v1/messages?beta=true: the route is the path
+        # without its query string.
+        route = path.split("?", 1)[0]
+        if route.endswith("/v1/messages"):
+            return 200, _anthropic_payload(model_name, turn, f"toolu_journey_{taken}")
         if path.endswith(":generateContent"):
             # /v1beta/models/{model}:generateContent — the model is in the PATH.
             model_name = path.rsplit("/models/", 1)[-1].split(":", 1)[0]
@@ -576,6 +606,12 @@ def _base_env(probe: Probe) -> Dict[str, str]:
         "GEMINI_API_KEY",
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_LOCATION",
+        # The Anthropic SDK reads all three. An inherited base URL would send
+        # the run to whatever it names, and a real key or token must never go
+        # with it: the run sets the stub's URL and key itself.
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
     ):
         env.pop(key, None)
     # Off, explicitly. Both default off, but an inherited `true` would ship every
@@ -662,6 +698,8 @@ def run_journey(driver_name: str, framework: str) -> JourneyCapture:
         # this for the Gemini API and appends /v1beta/models/... itself — host
         # root only, no /v1.
         run_env["GOOGLE_GEMINI_BASE_URL"] = model.root_url
+        # The Anthropic SDK reads this and appends /v1/messages itself.
+        run_env["ANTHROPIC_BASE_URL"] = model.root_url
         capture.run_command = [sys.executable, str(_RUNNER), str(out_path)]
         run = _run(capture.run_command, workdir, run_env)
         capture.run_returncode = run.returncode
@@ -684,6 +722,7 @@ def run_journey(driver_name: str, framework: str) -> JourneyCapture:
             hostile_env["OPENAI_BASE_URL"] = hostile.base_url
             hostile_env["OPENAI_API_BASE"] = hostile.base_url
             hostile_env["GOOGLE_GEMINI_BASE_URL"] = hostile.root_url
+            hostile_env["ANTHROPIC_BASE_URL"] = hostile.root_url
             hostile_run = _run(capture.run_command, workdir, hostile_env)
             capture.unknown_tool = JOURNEY_UNKNOWN_TOOL
             capture.unknown_returncode = hostile_run.returncode

@@ -142,7 +142,8 @@ def assert_versions(traces, parents, *, observed=None, loaded=False):
             assert callback.skills_delivered_versions == witness
 
 
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai"])
+# Not anthropic: since 0.21 its prompt comes from agent_config() (graded below).
+@pytest.mark.parametrize("adapter", ["crewai"])
 def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(monkeypatch, sdk, adapter):
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry.sdk.trace import TracerProvider
@@ -167,14 +168,11 @@ def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(mo
         with start_trace(agent_name=f"parent-{index}", auto_send=False) as parent:
             with agent_run(f"child-{index}", tracer_provider=provider) as root:
                 record_run_link(root.get_span_context().trace_id, parent_trace_id=parent.get_trace_id(), on_trace=observe)
-                if adapter == "anthropic":
-                    prompt = module.skill_system("caller", query=f"request-{index}")
-                else:
-                    messages = [{"role": "user", "content": f"request-{index}"}]
-                    module._skill_hook(SimpleNamespace(
-                        executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
-                    ))
-                    prompt = "\n".join(message["content"] for message in messages)
+                messages = [{"role": "user", "content": f"request-{index}"}]
+                module._skill_hook(SimpleNamespace(
+                    executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
+                ))
+                prompt = "\n".join(message["content"] for message in messages)
                 assert BODIES[index] in prompt and BODIES[1 - index] not in prompt
                 with tracer.start_as_current_span("model", attributes={"gen_ai.request.model": "offline-stub"}):
                     pass
@@ -189,8 +187,8 @@ def test_otel_adapter_prompt_witnesses_reach_observer_and_export_concurrently(mo
 
 
 def test_load_agent_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
-    """The load every OpenTelemetry-rail agent_config() shares (decimalai's and
-    Pydantic AI's): two runs at once each record their own body's version."""
+    """The load every OpenTelemetry-rail agent_config() shares (decimalai's, Pydantic
+    AI's and Anthropic's): two runs at once each record their own body's version."""
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -219,6 +217,110 @@ def test_load_agent_load_skill_carries_exact_scoped_witness(monkeypatch, sdk):
         assert_versions(sent(sdk), parents, loaded=True)
     finally:
         provider.shutdown()
+
+
+def _anthropic_pasting(monkeypatch, sdk, skill_router):
+    """An Anthropic `agent_config()` config with the load_skill tool switched off, so
+    each run pastes its routed skill's text into `run.system`; and the provider its
+    runs open their spans on, exporting to the mocked client."""
+    pytest.importorskip("anthropic")
+    pytest.importorskip("opentelemetry.sdk.trace")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    import decimalai._agent as agent_mod
+    import decimalai.anthropic as da
+    import decimalai.providers as providers
+    from decimalai._agent import SavedPrompt
+    from decimalai.otel import DecimalSpanExporter
+
+    monkeypatch.setattr(sdk, "_config", sdk.DecimalConfig(api_key="dai_sk_test", enabled=True, load_skill_tool=False))
+    monkeypatch.setattr(da, "_skill_router_singleton", skill_router)
+    monkeypatch.setattr(da, "_tracing_turned_on", True)  # the provider is this test's
+    monkeypatch.setattr(agent_mod, "read_prompt",
+                        lambda name, **kw: SavedPrompt(agent_name=name, system_prompt="caller"))
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(DecimalSpanExporter()))
+    monkeypatch.setattr(providers, "_last_provider", provider)
+    return da, provider
+
+
+def test_anthropic_load_agent_pasted_witnesses_reach_observer_and_export_concurrently(monkeypatch, sdk):
+    """Two Anthropic runs at once, each served a different version of the same skill
+    pasted into its `run.system`: each trace carries its own version, in the observer's
+    copy and on the wire, and an observer that edits its copy changes nothing sent."""
+    from decimalai.generic import start_trace
+
+    da, provider = _anthropic_pasting(monkeypatch, sdk, router(monkeypatch))
+    tracer = provider.get_tracer("delivery-proof")
+    observed = []
+
+    def observe(trace):
+        observed.append(trace.model_copy(deep=True))
+        trace.skills_delivered_versions[0]["version_id"] = str(uuid4())
+
+    support = da.agent_config("child", on_trace=observe)
+
+    def invoke(index):
+        _lane.set(index)
+        with start_trace(agent_name=f"parent-{index}", auto_send=False) as parent:
+            with support.run(f"request-{index}") as run:
+                prompt = "\n".join(block["text"] for block in run.system)
+                assert BODIES[index] in prompt and BODIES[1 - index] not in prompt
+                assert run.tool_params == [], "the tool is switched off"
+                with tracer.start_as_current_span("model", attributes={"gen_ai.request.model": "offline-stub"}):
+                    pass
+            return parent.get_trace_id()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            parents = list(pool.map(invoke, range(2)))
+        assert_versions(sent(sdk), parents, observed=observed)
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
+def test_a_failed_route_cannot_certify_the_next_pasted_body_on_anthropic_load_agent(monkeypatch, sdk, failure):
+    """The Anthropic `agent_config()` binding pastes what `build_prompt_parts` returned.
+    A route that fails after writing a version witness, or a stale witness already in
+    the caller's context, must not certify the next run's body, which this router
+    cannot version: reusing the failed body's UUID would be false evidence."""
+    stale = {"name": NAME, "hash": HASHES[0], "skill_id": SKILL_ID, "version_id": VERSION_IDS[0]}
+
+    class FailedThenUnversionedRouter:
+        def __init__(self):
+            self.calls = 0
+
+        def build_prompt_parts(self, query=None, **kwargs):
+            self.calls += 1
+            sr._last_offered_names_ctx.set([NAME])
+            sr._last_delivered_names_ctx.set([NAME])
+            if self.calls == 1:
+                if failure == "writes-then-fails":
+                    sr._last_delivered_versions_ctx.set([dict(stale)])
+                raise ValueError("synthetic optional router failure")
+            return NAME + ": " + BODIES[1], "", None
+
+    da, provider = _anthropic_pasting(monkeypatch, sdk, FailedThenUnversionedRouter())
+    if failure == "stale-before-fails":
+        sr._last_delivered_versions_ctx.set([dict(stale)])
+    support = da.agent_config("child")
+    prompts = []
+    try:
+        for _ in range(2):
+            with support.run("synthetic request") as run:
+                prompts.append("\n".join(block["text"] for block in run.system))
+            if not prompts[1:]:
+                assert sr._last_delivered_versions_ctx.get() is None
+        failed, served = sent(sdk)
+    finally:
+        provider.shutdown()
+
+    assert BODIES[1] not in prompts[0] and BODIES[1] in prompts[1]
+    assert failed.skills_delivered == [] and failed.skills_delivered_versions == []
+    assert served.skills_delivered == [NAME]
+    assert served.skills_delivered_versions == []
 
 
 @pytest.mark.parametrize("loaded", [False, True], ids=["prompt", "tool"])
@@ -321,8 +423,9 @@ def test_partial_or_noncanonical_pair_preserves_legacy_hash_only(pair):
 
 
 # Not openai_agents or adk: since 0.18 and 0.20 they never build a body into a prompt
-# (load_skill only).
-@pytest.mark.parametrize("adapter", ["anthropic", "crewai", "langchain"])
+# (load_skill only). Not anthropic: since 0.21 its prompt comes from agent_config(),
+# graded above by test_a_failed_route_cannot_certify_the_next_pasted_body_on_anthropic_load_agent.
+@pytest.mark.parametrize("adapter", ["crewai", "langchain"])
 @pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
 def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapter, failure):
     import decimalai.otel as otel
@@ -357,8 +460,6 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
         sr._last_delivered_versions_ctx.set([dict(stale)])
 
     def build():
-        if adapter == "anthropic":
-            return module.skill_system("caller", query="synthetic request")
         if adapter == "crewai":
             messages = [{"role": "user", "content": "synthetic request"}]
             module._skill_hook(SimpleNamespace(
@@ -380,7 +481,7 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
     current[0] = 42
     prompt = build()
     assert BODIES[1] in prompt
-    if adapter in {"anthropic", "crewai"}:
+    if adapter == "crewai":
         rail = otel._pop_skill_rail(42)
         assert rail["delivered"] == [NAME]
         assert rail["delivered_versions"] == []

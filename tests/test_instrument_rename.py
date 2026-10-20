@@ -6,14 +6,16 @@ removed in 0.18: "install" also named adding a skill to a workspace (now
 Pydantic AI has neither since 0.19: `agent_config()` returns a capability, and
 tracing is Pydantic AI's own OpenTelemetry. Google ADK has neither since 0.20:
 `agent_config()` returns an instruction provider and a tool, and tracing is
-`DecimalAIPlugin()` in ADK's `App(plugins=[...])`.
+`DecimalAIPlugin()` in ADK's `App(plugins=[...])`. Anthropic's entry point is
+`agent_config()` since 0.21; its `instrument()` is kept only to raise, naming it,
+and tracing is `decimalai.init(anthropic=True)`.
 """
 import importlib
 
 import pytest
 
 MODULES = [
-    "anthropic", "autogen", "claude_agent_sdk", "langchain",
+    "autogen", "claude_agent_sdk", "langchain",
     "llamaindex", "openai_agents", "otel",
 ]
 
@@ -35,3 +37,11 @@ def test_adk_has_load_agent_and_a_plugin_and_nothing_to_install():
     mod = importlib.import_module("decimalai.adk")
     assert callable(mod.agent_config) and callable(mod.DecimalAIPlugin)
     assert not hasattr(mod, "instrument") and not hasattr(mod, "install")
+
+
+def test_anthropic_has_load_agent_and_its_instrument_names_it():
+    mod = importlib.import_module("decimalai.anthropic")
+    assert callable(mod.agent_config)
+    assert not hasattr(mod, "install")
+    with pytest.raises(TypeError, match="agent_config"):
+        mod.instrument()

@@ -345,6 +345,40 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "nothing patched (0.20+); `skills()` feeds ADK's `SkillToolset` (0.16+)",
     ),
     Framework(
+        key="anthropic",
+        title="Anthropic Messages API (with `agent_config(...)`)",
+        cli_label="The Anthropic Messages API",
+        module="decimalai.anthropic",
+        entry_point="`agent_config(name)`",
+        # `init(anthropic=True)` traces every Anthropic call in the process; agent_config()
+        # turns the same tracing on for the calls made inside its runs, so it needs no flag.
+        init_flag=None,
+        init_flag_note="— (no flag; `agent_config()` traces its runs, `anthropic=True` every call)",
+        extra="anthropic",
+        # a template since 0.22: agent_config() gives each run a load_skill tool, and the
+        # SDK's own Tool Runner is the loop. Was SEAM_NO_TEMPLATE while the adapter patched
+        # one `messages.create()` call and owned no loop.
+        scaffold=TEMPLATE,
+        install='pip install "decimalai[anthropic]"',
+        env_vars=("DECIMAL_API_KEY", "ANTHROPIC_API_KEY"),
+        # The budget tier, like the other templates' defaults. Other names are not refused:
+        # a gateway behind ANTHROPIC_BASE_URL can serve models not named `claude-*`.
+        default_model="claude-haiku-5-5",
+        capability=Capability(
+            tier="Supported",
+            # What the exporter registers from the traced requests: the model, the system
+            # text and each tool, tools by name (no schema hash or description).
+            manifest="✅ full (model, system prompt, tools)",
+            schema_depth="Names only",
+            handoffs="—",
+            skills_rail="`load_skill` tool",
+        ),
+        use_for="Anthropic Messages API — `agent_config(name)`; each `support.run(question)` gives "
+                "`run.system` (the prompt, then the skill list) and `load_skill` in `run.tools` "
+                "for the Tool Runner (`run.tool_params` and `run.tool_result()` for your own "
+                "`messages.create()` loop), one trace per run, nothing patched (0.22+)",
+    ),
+    Framework(
         key="llamaindex",
         title="LlamaIndex",
         cli_label="LlamaIndex",
@@ -451,23 +485,6 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "Agent Framework and Strands, from their own spans (0.16+)",
     ),
     # ── not rows of the docs' tables ──
-    Framework(
-        key="anthropic",
-        title="Anthropic Messages API",
-        cli_label="The Anthropic Messages adapter",
-        module="decimalai.anthropic",
-        entry_point="`instrument(enable_skill_loader=True)` / `skill_system()`",
-        # `init(anthropic=True)` is the raw-provider TRACING rail (OpenInference), not this
-        # adapter, so this adapter has no flag of its own.
-        init_flag=None,
-        init_flag_note="— (`anthropic=True` is provider tracing, not this adapter)",
-        extra=None,
-        # A seam (it patches one `messages.create()` call) but no tool loop of its own, so
-        # a template would be a hand-rolled while-loop this SDK would have to invent.
-        scaffold=SEAM_NO_TEMPLATE,
-        install="pip install decimalai anthropic",
-        env_vars=("DECIMAL_API_KEY", "ANTHROPIC_API_KEY"),
-    ),
     Framework(
         key="autogen",
         title="AutoGen / AG2",

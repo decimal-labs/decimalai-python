@@ -154,6 +154,41 @@ def _openinference_bound_to(name: str, provider: Any) -> bool:
     return recorded is None or getattr(instrumentor, "_tracer", None) is recorded
 
 
+# Providers whose tracing a ``agent_config()`` turned on for its own runs only: the
+# exporter drops a finished trace whose root is one of their calls made outside a
+# DecimalAI run (``otel._dropped_outside_a_run``). An explicit ``instrument()`` /
+# ``init(<provider>=True)`` asks for every call and takes the provider out again.
+_runs_only: Set[str] = set()
+
+
+def _runs_only_scopes() -> List[str]:
+    """The instrumentation scopes whose out-of-run root spans are not sent."""
+    return [_PROVIDERS[name].instrumentor_module for name in list(_runs_only)]
+
+
+def instrument_for_runs(name: str) -> None:
+    """Trace ``name``'s SDK calls made inside DecimalAI runs, for a ``agent_config()``.
+
+    Turns the provider's instrumentor on (process-wide: it wraps the SDK's
+    classes) unless tracing is already on, and sends only the calls a DecimalAI
+    run contains. When tracing is already on, through ``init(<provider>=True)``
+    or a caller's own ``instrument(tracer_provider=...)``, every call keeps being
+    sent, as that caller asked.
+    """
+    spec = _PROVIDERS[name]
+    instrumentor_cls = _load_instrumentor(spec)
+    on = instrumentor_cls is not None and getattr(
+        instrumentor_cls(), "is_instrumented_by_opentelemetry", False)
+    if on:
+        return
+    # Not on, whatever this module recorded: an `uninstrument()` made elsewhere
+    # turned it off, and runs would carry no model calls.
+    _instrumented.discard(name)
+    instrument(**{name: True})
+    if name in _instrumented:
+        _runs_only.add(name)
+
+
 def _sdk_present(sdk_module: str) -> bool:
     """True if the provider's SDK is importable (without importing it)."""
     try:
@@ -238,8 +273,19 @@ def _ensure_pipeline(agent_name: Optional[str], tracer_provider: Any = None) -> 
     if _pipeline_provider is not None:
         return _pipeline_provider
 
-    exporter = DecimalSpanExporter(agent_name=agent_name)
     current = trace_api.get_tracer_provider()
+    from . import otel as _otel
+
+    with _otel._installed_providers_lock:
+        has_exporter = any(installed is current for installed in _otel._installed_providers)
+    if has_exporter:
+        # ``otel.instrument()`` (``init(otel=True)``) already put a DecimalAI exporter
+        # on this provider: a second one would send every trace twice.
+        _pipeline_provider = current
+        _last_provider = current
+        return current
+
+    exporter = DecimalSpanExporter(agent_name=agent_name)
     if hasattr(current, "add_span_processor"):
         provider = current
     else:
@@ -297,6 +343,11 @@ def instrument(
     explicit_provider = tracer_provider is not None
     requested = {"openai": openai, "anthropic": anthropic, "google": google}
     auto_all = all(v is None for v in requested.values())
+    # Asked for by name (or by a bare instrument()): every call is sent from now on,
+    # including ones a agent_config() was sending only inside its runs.
+    for name, flag in requested.items():
+        if flag is True or (flag is None and auto_all):
+            _runs_only.discard(name)
 
     # Publish the name BEFORE the early return below. The instrumentors are
     # process-wide singletons, so a second call has nothing left to instrument

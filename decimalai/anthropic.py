@@ -1,109 +1,104 @@
-"""Anthropic SDK integration.
+"""Anthropic Messages API: an agent's DecimalAI prompt and skills, one run at a time.
 
-One-line setup::
-
-    import decimalai
-    decimalai.init()
-
-    from decimalai.anthropic import instrument
-    instrument(enable_skill_loader=True)
+::
 
     import anthropic
+    from decimalai.anthropic import agent_config
+
     client = anthropic.Anthropic()
-    # Every `client.messages.create()`, `.stream()` and `.parse()` call now
-    # has skills injected into `system` — sync and async clients alike.
+    support = agent_config("support", fallback=BASE_SYSTEM)
 
-`instrument()` monkey-patches ``create``, ``stream`` and ``parse`` on
-`anthropic.resources.messages.Messages` and `AsyncMessages`, so the `system`
-argument is augmented with the platform-routed skill fragment before the
-request is built. All three are patched because in anthropic 1.x the
-``stream()`` and ``parse()`` helpers build their own request and never go
-through ``create()``. The beta surface (``client.beta.messages.*``, including
-``tool_runner()``) is NOT patched; use :func:`skill_system` there.
+    with support.run(question, variables=customer) as run:
+        runner = client.beta.messages.tool_runner(
+            model="claude-haiku-5-5", max_tokens=4096,
+            system=run.system,                          # the saved prompt, then the skill list
+            tools=[lookup_order, *run.tools],           # your tools, then load_skill
+            messages=[{"role": "user", "content": question}],
+        )
+        answer = runner.until_done()
 
-User ``system`` content is preserved and kept FIRST; the skill fragment is
-appended after it, so the caller's own instructions stay in the cacheable
-prefix (the fragment is rebuilt per query and so differs on every call —
-in front, it would break the prompt cache for everything behind it).
+A hand-written loop around ``client.messages.create`` takes ``run.tool_params``
+(the same tool as a plain definition) and ``run.tool_result(block)``, which
+answers a ``load_skill`` call and returns ``None`` for any other tool.
 
-On the async client the routing call (a blocking HTTP request) runs on a
-worker thread, so it never stalls the event loop. ``AsyncMessages.stream()``
-therefore routes when its ``async with`` block is entered, not when
-``stream()`` is called.
+One run is one user message, from the question to the final answer. Opening it
+routes the message, fills the prompt's ``{{variables}}`` from ``variables`` and
+starts the run's trace, filed under the DecimalAI agent; closing it sends the
+trace with the run's record (prompt version, skills offered and loaded, routing
+id). ``support.run()`` itself calls no model. Make the model calls inside the
+``with`` block: a Tool Runner is lazy, so consume it there. ``async with`` routes
+off the event loop and gives async tools for the async Tool Runner.
 
-Manual / explicit path::
+A chat keeps one conversation, whose ``system`` and tools stay the same for
+every message::
 
-    from decimalai.anthropic import skill_system
+    chat = support.conversation(variables=customer)        # or conversation(state=saved)
+    with chat.run(question) as run:
+        ...
+    saved = chat.state                                   # store it beside the chat's history
 
-    resp = client.messages.create(
-        model="claude-opus-5-5",
-        system=skill_system("You are helpful", query=user_msg),
-        messages=[{"role": "user", "content": user_msg}],
-    )
+Anthropic rejects a conversation whose system prompt or tool definitions change
+once a thinking block is in its history, so a newer saved prompt or skill list
+reaches the next conversation, not an open one. ``chat.state`` lets a server that
+keeps no chat in memory resume the conversation exactly.
 
-Note on Anthropic's own Agent Skills (generally available since 2026-08-19:
-``client.skills`` and ``container={"skills": [...]}`` on the Messages API):
-this adapter does not upload to or attach those. It delivers DecimalAI-routed
-skills through the system prompt only, and leaves a ``container`` you pass
-untouched.
+Nothing DecimalAI does changes the SDK's behaviour, and other clients get no
+skills. ``agent_config()`` turns on Anthropic tracing (OpenInference's
+instrumentor, which wraps the SDK's classes for the process; installed by
+``decimalai[anthropic]``) and sends only the calls made inside its runs, unless
+``decimalai.init(anthropic=True)`` asked for every call.
+
+Anthropic's own Agent Skills (``container={"skills": [...]}``) are the other way
+to give an agent skills; an agent that uses both shows the model two lists.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
-import inspect
+import copy
 import logging
-from contextvars import Context, ContextVar, copy_context
-from typing import Any, Callable, List, Optional, Union
+import threading
+import time
+from contextvars import ContextVar
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
+from uuid import uuid4
+
+from ._agent_binding import (
+    _MAX_CONFIG_RUNS,
+    AgentBinding,
+    _in_background,
+    template_variables,
+)
 
 logger = logging.getLogger("decimalai.anthropic")
 
+#: The run whose ``with`` block is open in this context. The background routing
+#: and a load's scope read it; a tool sets it around its own call.
+_RUN: "ContextVar[Optional[str]]" = ContextVar("decimalai_anthropic_run", default=None)
 
-# ── SkillRouter routing-id context ──────────────────────────
-_routing_id_ctx: ContextVar[Optional[str]] = ContextVar(
-    "decimalai_skill_router_routing_id_anthropic", default=None,
-)
+#: How long a closed run's trace waits for a routing decision still in flight.
+#: The wait is off the caller's path: the block exits at once.
+_EXIT_WAITS_FOR_ROUTING_S = 3.0
 
+#: ``agent_config(cache_control=...)``'s default: one breakpoint on the system text.
+_DEFAULT_CACHE_CONTROL: Dict[str, Any] = {"type": "ephemeral"}
 
-def _set_routing_id(routing_id: Optional[str]) -> None:
-    _routing_id_ctx.set(routing_id)
+#: The version of `Conversation.state`'s shape.
+_STATE_VERSION = 1
 
+_UNSET: Any = object()
 
-def get_current_routing_id() -> Optional[str]:
-    """Read (without clearing) the current routing_id, for trace stamping."""
-    return _routing_id_ctx.get()
-
-
-def _scope() -> Optional[str]:
-    """This run's routing scope — the live OTel trace id, or None.
-
-    Passed to the Router so two concurrent runs of one agent do not share a
-    fragment-cache slot (and therefore a routing decision). Outside a run there
-    is nothing to scope to, and None keeps the pre-existing behaviour.
-    """
-    try:
-        from .otel import current_run_key
-        key = current_run_key()
-    except Exception:
-        return None
-    return None if key is None else f"{key:032x}"
-
-
-# ── SkillRouter dynamic loader ──────────────────────────────
-_skill_loader_installed = False
-# Set by `instrument(agent_name=...)`. Forwarded on every auto-injected
-# `messages.create()` / `.stream()` / `.parse()` so agent-scope skills
-# resolve; None keeps the old org-wide-only behaviour.
-_install_agent_name: Optional[str] = None
+#: The SkillRouter behind every config this module builds. `decimalai.init()`
+#: drops it when a re-init changes the key or workspace.
 _skill_router_singleton: Any = None
+
+_tracing_lock = threading.Lock()
+_tracing_turned_on = False
 
 
 def _get_skill_router() -> Any:
-    """Lazily construct a SkillRouter using the SDK's global config."""
+    """The SkillRouter for this module's configs, built on first use; None when switched off."""
     global _skill_router_singleton
-    # The kill switch: a later init(enabled=False) withholds the router (kept
-    # for a re-enable) from a loader an earlier init installed.
     from ._config import _disabled_by_init
 
     if _disabled_by_init():
@@ -113,487 +108,1100 @@ def _get_skill_router() -> Any:
     try:
         from ._config import _get_config
         from .skill_router import SkillRouter
+
         config = _get_config()
         _skill_router_singleton = SkillRouter(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            # Every routing call names its agent; no router default (see
-            # `skill_router._AGENT_FROM_INIT`).
+            api_key=config.api_key, base_url=config.base_url,
+            # Every routing call names its agent; no router default.
             agent_name=None,
-            inject_body=config.resolve_inject_body(has_tool_loop=False),
+            # Skill text reaches the model through load_skill, not the prompt.
+            inject_body=False,
         )
         return _skill_router_singleton
     except Exception:
-        logger.debug("SkillRouter singleton init failed", exc_info=True)
+        logger.debug("SkillRouter init failed", exc_info=True)
         return None
 
 
-def _extract_query_from_anthropic_messages(messages: Any) -> Optional[str]:
-    """Walk an Anthropic-format messages list backward for the latest user msg."""
-    if not isinstance(messages, list):
+def _require_anthropic() -> None:
+    try:
+        import anthropic  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "decimalai.anthropic.agent_config() needs the Anthropic SDK: "
+            'pip install "decimalai[anthropic]"'
+        ) from exc
+
+
+def _turn_on_tracing() -> None:
+    """Anthropic tracing for DecimalAI runs, once per process."""
+    global _tracing_turned_on
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return
+    with _tracing_lock:
+        if _tracing_turned_on:
+            return
+        _tracing_turned_on = True
+    try:
+        from .providers import instrument_for_runs
+
+        instrument_for_runs("anthropic")
+    except Exception:
+        logger.warning("DecimalAI could not turn on Anthropic tracing (continuing)", exc_info=True)
+
+
+def _enclosing_trace_id() -> Optional[str]:
+    """The live ``decimalai.start_trace()`` context's id, or None (never a wrong parent)."""
+    try:
+        from .generic import _get_current_trace
+
+        ctx = _get_current_trace()
+        return ctx.get_trace_id() if ctx is not None else None
+    except Exception:
         return None
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            # Multi-modal: concatenate text blocks.
-            parts = [
-                blk.get("text", "")
-                for blk in content
-                if isinstance(blk, dict) and blk.get("type") == "text"
-            ]
-            joined = " ".join(p for p in parts if p).strip()
-            if joined:
-                return joined
-    return None
 
 
-def skill_system(
-    base: Optional[Union[str, List[Any]]] = None,
-    *,
-    query: Optional[str] = None,
-    agent_name: Optional[str] = None,
-) -> Union[str, List[Any]]:
-    """Build a ``system`` parameter for ``messages.create()`` with skills appended.
+def _tool_use_parts(block: Any) -> Tuple[Any, Any, Any]:
+    """(name, input, id) of a ``tool_use`` block, as an SDK object or a plain dict."""
+    if isinstance(block, dict):
+        return block.get("name"), block.get("input"), block.get("id")
+    return getattr(block, "name", None), getattr(block, "input", None), getattr(block, "id", None)
 
-    The function returns whichever shape best matches the input:
 
-    - If ``base`` is None or a string → returns a string with the skill
-      fragment appended after it.
-    - If ``base`` is a list of content blocks → returns a new list that is
-      the caller's blocks unchanged, in their original order, with ONE skill
-      block added at the end.
+def _is_error(text: str) -> bool:
+    """Whether a load's answer is a refusal rather than a skill (or a repeat notice)."""
+    return not (text.startswith("## Skill:") or "already loaded earlier in this run" in text)
 
-    Order matters for cost, not just for reading. The fragment is rebuilt from
-    ``query`` on every call, so it is different bytes each time; the caller's
-    ``base`` is the same bytes each time. Anthropic matches a cached prefix up
-    to each ``cache_control`` breakpoint, so a varying block in FRONT of the
-    caller's blocks moves every one of them off their cached offset and turns
-    a hit into a full miss. Appending leaves the caller's blocks — and any
-    ``cache_control`` hints they carry — byte-identical and in place.
 
-    Args:
-        base: The user's normal system prompt — string or content-block list.
-        query: Optional query for semantic routing. None = full menu.
-        agent_name: Optional override forwarded to the Router.
-
-    Returns:
-        The augmented system payload, ready to pass straight to
-        ``client.messages.create(system=...)``.
-    """
-    router = _get_skill_router()
-    if router is None:
-        return base if base is not None else ""
-
-    from .skill_router import (
-        _release_scoped_routing_rail,
-        consume_last_delivered_names,
-        consume_last_delivered_versions,
-        consume_last_offered_names,
-    )
-
-    scope = _scope()
-    consume_last_delivered_versions()
+def _event_loop_running() -> bool:
     try:
-        fragment, routing_id = router.build_prompt_fragment(
-            query=query, agent_name=agent_name, scope=scope,
-        )
-    except Exception:
-        consume_last_delivered_versions()
-        logger.debug("skill_system build_prompt_fragment failed (non-fatal)", exc_info=True)
-        return base if base is not None else ""
-    finally:
-        # The router keeps its own copy of this decision under the run's scope,
-        # for adapters that read it back from there. This one reads the
-        # per-call rails below, so the copy is released here or never.
-        _release_scoped_routing_rail(router, scope)
-
-    offered = consume_last_offered_names()
-    delivered = consume_last_delivered_names()
-    delivered_versions = consume_last_delivered_versions()
-
-    # Claim nothing for a call we inject nothing into. This guard used to sit
-    # BELOW the routing-id stamp, so a call that got an empty fragment still
-    # reported a routing decision — a trace asserting the model was routed when
-    # its prompt was untouched.
-    if not fragment:
-        return base if base is not None else ""
-
-    if routing_id:
-        _set_routing_id(routing_id)
-
-    # Record against the run's trace, in the same breath as returning the text
-    # that goes into `system`. The drains below are the per-call CONTEXTVAR
-    # rails, written by build_prompt_fragment one statement ago on this thread —
-    # NOT the router's instance rails, which are process-global clear-on-read
-    # state that under a concurrent fanout hands lane 1 everybody's names.
-    try:
-        from .otel import record_skill_rail
-        record_skill_rail(
-            routing_id=routing_id,
-            offered=offered,
-            delivered=delivered,
-            delivered_versions=delivered_versions,
-            prompt_text=fragment,
-        )
-    except Exception:
-        logger.debug("skill rail recording failed (non-fatal)", exc_info=True)
-
-    # The caller's blocks are copied through untouched and in order — no
-    # rewriting, no re-tagging — so any `cache_control` breakpoint they carry
-    # still sits at the same offset in the request it did before we ran.
-    if isinstance(base, list):
-        return [*base, {"type": "text", "text": fragment}]
-    if isinstance(base, str) and base:
-        return f"{base}\n\n{fragment}"
-    return fragment
-
-
-def _routing_agent_name() -> Optional[str]:
-    """The DecimalAI agent an auto-patched call's skills are routed for.
-
-    The name the TRACE is filed under, so routing and attribution agree: the
-    run-scoped name the OTel rail stamps onto every span of this run
-    (``decimalai.otel._active_agent_name``, set by ``providers.agent_run(...)``
-    and by ``providers.instrument(agent_name=...)``) first, then this adapter's
-    own ``instrument(agent_name=...)``. Agent-scope skills (every registry
-    skill pulled onto one agent), version pins and restricted skills only
-    resolve when the name is sent, so routing a named run as nobody offered
-    none of them while its trace said it had been routed.
-    """
-    try:
-        from .otel import _active_agent_name
-
-        name = _active_agent_name.get()
-    except Exception:
-        name = None
-    return name or _install_agent_name
-
-
-def _inject_skills_into_create_kwargs(kwargs: dict) -> None:
-    """Mutate create/stream/parse kwargs in place: add/augment the system param."""
-    base = kwargs.get("system")
-    messages = kwargs.get("messages") or []
-    query = _extract_query_from_anthropic_messages(messages)
-    # Forward the agent's name so agent-scope Use rows resolve — see
-    # `_routing_agent_name`. `skill_system` has always accepted `agent_name`;
-    # the auto-patch path first sent none, then only the install name, so a run
-    # named with `agent_run(...)` was routed for no agent (or the wrong one).
-    kwargs["system"] = skill_system(
-        base, query=query, agent_name=_routing_agent_name(),
-    )
-
-
-#: The ``Messages`` / ``AsyncMessages`` methods that send a message. In
-#: anthropic 1.x each builds its own request, so each needs its own patch.
-_PATCHED_METHODS = ("create", "stream", "parse")
-
-# Set while a patched method is injecting, so a patched method that calls
-# another one (say a ``stream()`` built on ``create(stream=True)``) injects
-# once, in the outer call. A ContextVar rather than a global: concurrent calls
-# on other threads or asyncio tasks each start with it unset.
-_injecting: ContextVar[bool] = ContextVar(
-    "decimalai_anthropic_injecting", default=False,
-)
-
-
-def _inject_best_effort(kwargs: dict) -> None:
-    """Inject into ``kwargs``, never raising: a router failure sends the
-    caller's own prompt, untouched."""
-    try:
-        _inject_skills_into_create_kwargs(kwargs)
-    except Exception:
-        logger.debug("Skill injection failed (non-fatal)", exc_info=True)
-
-
-def _inject_once(kwargs: dict) -> Any:
-    """Inject unless an outer patched call already did. Returns a reset token,
-    or None when this call is the inner one and must leave kwargs alone."""
-    if _injecting.get():
-        return None
-    token = _injecting.set(True)
-    _inject_best_effort(kwargs)
-    return token
-
-
-# ── the async client: route on a worker thread ──────────────────────────────
-#
-# The router is a synchronous HTTP client: one routing call is a route request
-# plus a body fetch, each with its own read budget, plus admission retries.
-# Made inline from a coroutine, it stalled every other coroutine on the event
-# loop (in an async server, every other conversation in the process) until the
-# platform answered.
-
-_UNSET = object()
-
-
-def _running_asyncio_loop() -> Optional[asyncio.AbstractEventLoop]:
-    """The asyncio loop running on this thread, or None.
-
-    None under another async library: anthropic's async client is built on
-    anyio and also runs under trio.
-    """
-    try:
-        return asyncio.get_running_loop()
+        asyncio.get_running_loop()
+        return True
     except RuntimeError:
-        return None
+        return False
 
 
-def _adopt_sdk_context_writes(ctx: Context) -> None:
-    """Copy into the current Context what routing wrote into ``ctx``.
+# ── runs whose trace is still finishing ──────────────────────
 
-    Only this SDK's own variables (named ``decimalai_*``): this adapter's
-    routing id (read back with :func:`get_current_routing_id`), the router's
-    per-call rails that :func:`skill_system` drains, and the router's per-turn
-    body budget, which a later ``router.load_skill()`` in the same coroutine
-    reads. The caller is left with the Context an inline call would have left.
-    Anything else a worker thread set stays in that thread's copy.
+_finishing: set = set()
+_finishing_lock = threading.Lock()
+_finishing_done = threading.Condition(_finishing_lock)
+_drain_registered = False
+
+
+def _finish_later(run: "Run", pending: Any, end_ns: int) -> None:
+    """End ``run``'s span once its routing decision is in, or after the wait: off the caller's path."""
+    global _drain_registered
+    with _finishing_lock:
+        _finishing.add(run)
+        if not _drain_registered:
+            _drain_registered = True
+            _register_drain_at_exit()
+
+    def finish(*_args: Any) -> None:
+        run._end(end_ns)
+        with _finishing_lock:
+            _finishing.discard(run)
+            _finishing_done.notify_all()
+
+    timer = threading.Timer(_EXIT_WAITS_FOR_ROUTING_S, finish)
+    timer.daemon = True
+    timer.start()
+    pending.add_done_callback(finish)
+
+
+def _drain_finishing(timeout: float = _EXIT_WAITS_FOR_ROUTING_S + 0.5) -> None:
+    """Wait for closed runs whose trace is still waiting on a decision; end the rest now.
+
+    ``decimalai.flush()`` calls it, so a short script reports on traces that exist.
     """
-    for var, value in ctx.items():
-        if var.name.startswith("decimalai_") and var.get(_UNSET) is not value:
-            var.set(value)
+    deadline = time.monotonic() + timeout
+    with _finishing_lock:
+        while _finishing and time.monotonic() < deadline:
+            _finishing_done.wait(timeout=max(0.0, deadline - time.monotonic()))
+        left = list(_finishing)
+    for run in left:
+        run._end(run._exit_ns or time.time_ns())
+        with _finishing_lock:
+            _finishing.discard(run)
 
 
-async def _inject_once_off_loop(kwargs: dict) -> Any:
-    """`_inject_once` for the async client, with the routing call on a worker
-    thread. Returns a reset token for the caller to reset, or None.
-
-    The thread runs in a COPY of the caller's Context, so everything routing
-    reads from it is the caller's: the run's agent name set by
-    ``providers.agent_run()``, and the live OTel span that the run's routing
-    decision is filed under. Its writes are then copied back
-    (`_adopt_sdk_context_writes`).
-
-    On asyncio, cancelling the caller while the router is in flight cancels
-    the call at once (anyio, under trio, waits for the thread). The abandoned
-    routing call finishes on its thread and the message is never sent, though
-    the decision it made is still recorded against the run.
-    """
-    if _injecting.get():
-        return None
-    ctx = copy_context()
-    started: List[bool] = []
-
-    def route() -> None:
-        started.append(True)
-        _inject_best_effort(kwargs)
-
+def _register_drain_at_exit() -> None:
+    """Drain during ``threading._shutdown()``, before the OTel pipelines shut down (see otel)."""
     try:
-        loop = _running_asyncio_loop()
-        if loop is not None:
-            await loop.run_in_executor(None, ctx.run, route)
-        else:
-            import anyio.to_thread
-
-            await anyio.to_thread.run_sync(ctx.run, route)
+        threading._register_atexit(_drain_finishing)  # type: ignore[attr-defined]
     except Exception:
-        # Only the hand-off can fail here (`route` never raises), for example
-        # an executor that is shutting down. If routing never started, route
-        # inline: a blocked loop for one call is better than a call that
-        # silently goes out without its skills.
-        logger.debug("off-loop skill routing hand-off failed", exc_info=True)
-        if not started:
-            _inject_best_effort(kwargs)
-    else:
-        _adopt_sdk_context_writes(ctx)
-    return _injecting.set(True)
+        import atexit
+
+        atexit.register(_drain_finishing)
 
 
-def _patch_async_call(original: Any) -> Any:
-    """Wrap ``AsyncMessages.create`` or ``.parse``.
+# ── what a conversation fixes ────────────────────────────────
 
-    ``parse`` is a coroutine function. ``create`` is anthropic's
-    ``@required_args`` wrapper, a plain function that returns the coroutine.
-    Both bind ``kwargs`` when called, so this awaits the routing first and calls
-    the original after. The guard stays up while the request is awaited, so a
-    helper built on another patched method does not route again.
+
+class _Fixed:
+    """A conversation's system text and tool, as its first run composed them."""
+
+    __slots__ = ("text", "blocks", "names", "tool_def", "prompt_record", "delivered",
+                 "unavailable", "inject", "cut", "routing_id", "shown")
+
+    def __init__(self, *, text: str, blocks: List[Dict[str, Any]], names: List[str],
+                 tool_def: Optional[Dict[str, Any]], prompt_record: Optional[Dict[str, Any]],
+                 delivered: List[str], unavailable: Optional[str], inject: bool, cut: bool,
+                 routing_id: Optional[str], shown: Optional[Dict[str, Optional[str]]] = None) -> None:
+        self.text = text
+        self.blocks = blocks
+        self.names = names
+        self.tool_def = tool_def
+        self.prompt_record = prompt_record
+        self.delivered = delivered
+        self.unavailable = unavailable
+        self.inject = inject
+        self.cut = cut
+        self.routing_id = routing_id
+        #: Every skill this conversation has shown the model (in ``system``, or in a
+        #: later user message), and the routing decision that showed it.
+        self.shown: Dict[str, Optional[str]] = dict(shown) if shown else {n: routing_id for n in names}
+
+    def to_state(self, agent: str, conversation_id: str) -> Dict[str, Any]:
+        return copy.deepcopy({
+            "version": _STATE_VERSION, "agent": agent, "id": conversation_id,
+            "system": self.blocks, "tool": self.tool_def, "skills": self.names,
+            "skills_cut": self.cut, "routing_id": self.routing_id,
+            "prompt": self.prompt_record, "delivered": self.delivered,
+            "skills_unavailable": self.unavailable, "pasted": self.inject,
+            "skills_shown": self.shown,
+        })
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "_Fixed":
+        blocks = copy.deepcopy(list(state["system"]))
+        return cls(
+            text="".join(str(block.get("text", "")) for block in blocks), blocks=blocks,
+            names=list(state.get("skills") or []), tool_def=copy.deepcopy(state.get("tool")),
+            prompt_record=copy.deepcopy(state.get("prompt")),
+            delivered=list(state.get("delivered") or []),
+            unavailable=state.get("skills_unavailable"), inject=bool(state.get("pasted")),
+            cut=bool(state.get("skills_cut")), routing_id=state.get("routing_id"),
+            shown=state.get("skills_shown"),
+        )
+
+
+class Conversation:
+    """Messages that share one ``system`` and one ``load_skill`` definition.
+
+    Made by :meth:`AnthropicAgentConfig.conversation`. Its first run composes the
+    system text (the prompt filled from ``variables``, then the skill list) and the
+    tool; every later run reuses both, byte for byte, and is still routed on its
+    own message. Keep one per chat, beside the chat's message history; a server
+    that keeps no chat in memory stores :attr:`state` with the history and
+    resumes with ``support.conversation(state=...)``.
+
+    Everything in ``system`` and ``tools`` has to stay the same for the whole
+    conversation, your own parts included: per-message facts belong in the user
+    message.
+
+    Attributes:
+        id: This conversation's id; its runs' traces carry it as ``session_id``.
     """
-    @functools.wraps(original)
-    async def patched(self, *args, **kwargs):
-        token = await _inject_once_off_loop(kwargs)
-        try:
-            result = original(self, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        finally:
-            if token is not None:
-                _injecting.reset(token)
-    return patched
+
+    def __init__(self, config: "AnthropicAgentConfig", context: Any,
+                 state: Optional[Dict[str, Any]] = None) -> None:
+        self._config = config
+        self._values = context
+        self._lock = threading.Lock()
+        self._fixed: Optional[_Fixed] = _Fixed.from_state(state) if state else None
+        self.id: str = str(state["id"]) if state else uuid4().hex
+        self._runs = 0
+
+    def __repr__(self) -> str:
+        return f"Conversation(agent={self._config.name!r}, id={self.id!r}, runs={self._runs})"
+
+    def run(self, message: Optional[str]) -> "Run":
+        """One user message of this conversation, from the question to the final answer.
+
+        Use it as a context manager (``with`` or ``async with``); see :class:`Run`.
+        """
+        return Run(self._config, self, message)
+
+    @property
+    def state(self) -> Optional[Dict[str, Any]]:
+        """What the conversation keeps, as JSON-ready data; None before its first run.
+
+        The system blocks (variables already filled), the ``load_skill``
+        definition, the prompt version and the routing decision the list came
+        from. Pass it to ``support.conversation(state=...)`` to continue the
+        conversation in another process.
+        """
+        fixed = self._current()
+        return fixed.to_state(self._config.name, self.id) if fixed is not None else None
+
+    def _fix(self, fixed: _Fixed) -> _Fixed:
+        """Keep ``fixed`` unless another run fixed the conversation first."""
+        with self._lock:
+            if self._fixed is None:
+                self._fixed = fixed
+            return self._fixed
+
+    def _current(self) -> Optional[_Fixed]:
+        with self._lock:
+            return self._fixed
 
 
-class _OffLoopMessageStreamManager:
-    """What the patched ``AsyncMessages.stream()`` returns in place of the
-    SDK's ``AsyncMessageStreamManager``.
+class Run:
+    """One user message, from the question to the final answer.
 
-    The SDK's ``stream()`` is a plain function that puts ``system`` into the
-    request body when it is called, so nothing can be awaited before the body
-    is built. This manager calls the real ``stream()`` in ``__aenter__``, after
-    the routing has been awaited on a worker thread, and hands back the SDK's
-    own ``AsyncMessageStream``. It has the manager's interface
-    (``async with``), not its class.
+    Open it with ``with`` (a sync client and the sync Tool Runner) or ``async
+    with`` (``AsyncAnthropic`` and the async Tool Runner). Opening routes the
+    message and starts the run's trace; closing sends it. The model calls for
+    this message belong inside the block.
+
+    Attributes:
+        system: The value for ``system=``: text blocks holding the agent's prompt,
+            then its skill list and one sentence naming ``load_skill``. Add your
+            own blocks after it (``[*run.system, {...}]``), never format it into a
+            string.
+        tools: ``load_skill`` for ``client.beta.messages.tool_runner(tools=[...])``,
+            async after ``async with``; empty when the run has no skill list.
+        tool_params: ``load_skill`` as a plain definition, for ``client.messages.create``.
     """
 
-    def __init__(self, open_stream: Callable[[], Any], kwargs: dict) -> None:
-        self._open_stream = open_stream
-        self._kwargs = kwargs
-        self._manager: Any = None
+    def __init__(self, config: "AnthropicAgentConfig", conversation: Conversation,
+                 message: Optional[str]) -> None:
+        self._config = config
+        self._conversation = conversation
+        self._message = message
+        self.key = f"run_{uuid4().hex}"
+        self._lock = threading.Lock()
+        self._mode: Optional[str] = None
+        self._exited = False
+        self._ended = False
+        self._exit_ns: Optional[int] = None
+        self._fixed: Optional[_Fixed] = None
+        self._fixed_by_me = False
+        self._state: Optional[Dict[str, Any]] = None
+        self._span: Any = None
+        self._otel_ctx: Any = None
+        self._tokens: List[Tuple[Any, Any]] = []
+        self._read: set = set()
+        self._tools: Optional[List[Any]] = None
 
-    async def __aenter__(self) -> Any:
-        if self._manager is not None:
-            # Entered twice: let the SDK's manager answer as it would.
-            return await self._manager.__aenter__()
-        token = await _inject_once_off_loop(self._kwargs)
+    def __repr__(self) -> str:
+        return f"Run(agent={self._config.name!r}, open={self._mode is not None and not self._exited})"
+
+    # ── opening and closing ─────────────────────────────────
+    def __enter__(self) -> "Run":
+        if _event_loop_running():
+            self._config._warn_once(None, (
+                "a run opened with `with` inside a running event loop routes on that loop "
+                "and blocks it; use `async with support.run(...)` with AsyncAnthropic."))
+        self._open("sync")
         try:
-            self._manager = self._open_stream()
-            # The guard stays up until the request is sent. A stream() built
-            # on create(stream=True) runs that create inside this __aenter__,
-            # and it must see that this call has already routed.
-            return await self._manager.__aenter__()
-        finally:
-            if token is not None:
-                _injecting.reset(token)
+            self._prepare_sync()
+        except BaseException as exc:
+            self._exit(type(exc), exc)
+            raise
+        return self
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
-        if self._manager is None:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._exit(exc_type, exc)
+
+    async def __aenter__(self) -> "Run":
+        self._open("async")
+        try:
+            await self._prepare_async()
+        except BaseException as exc:
+            self._exit(type(exc), exc)
+            raise
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._exit(exc_type, exc)
+
+    def _open(self, mode: str) -> None:
+        if self._mode is not None:
+            raise RuntimeError("a DecimalAI run is opened once; start another with support.run(...)")
+        self._mode = mode
+        self._start_span()
+        self._tokens.append((_RUN, _RUN.set(self.key)))
+        self._config._open(self)
+        try:
+            trace_id = self._span.get_span_context().trace_id if self._span is not None else 0
+            parent = _enclosing_trace_id()
+            if trace_id and (parent or self._config._on_trace is not None):
+                from .otel import record_run_link
+
+                record_run_link(trace_id, parent_trace_id=parent, on_trace=self._config._on_trace)
+        except Exception:
+            self._config._log.debug("could not link the run's trace", exc_info=True)
+
+    def _start_span(self) -> None:
+        """The run's span: a new trace of its own, linked to any span already open."""
+        try:
+            from opentelemetry import context as otel_context
+            from opentelemetry import trace as trace_api
+
+            from . import otel, providers
+        except ImportError:
+            return
+        name = self._config.name
+        try:
+            provider = providers._last_provider or trace_api.get_tracer_provider()
+            current = trace_api.get_current_span().get_span_context()
+            links = [trace_api.Link(current)] if current.is_valid else None
+            attributes = {
+                otel._GENAI_OPERATION: otel._INVOKE_AGENT, otel._GENAI_AGENT_NAME: name,
+                otel._DECIMAL_AGENT_NAME: name, otel.SESSION_ID_ATTRIBUTE: self._conversation.id,
+            }
+            # A new root, not a child of whatever is open (a web server's request
+            # span, another run): one run, one trace.
+            span = provider.get_tracer("decimalai").start_span(
+                otel.RUN_SPAN_NAME, context=otel_context.Context(), attributes=attributes, links=links)
+            self._span = span
+            self._otel_ctx = trace_api.set_span_in_context(span, otel_context.get_current())
+            self._tokens.append((otel_context, otel_context.attach(self._otel_ctx)))
+            self._tokens.append((otel._active_agent_name, otel._active_agent_name.set(name)))
+        except Exception:
+            self._config._log.debug("could not start the run's span", exc_info=True)
+
+    def _exit(self, exc_type: Any, exc: Any) -> None:
+        config = self._config
+        with self._lock:
+            if self._exited:
+                return
+            self._exited = True
+            self._exit_ns = time.time_ns()
+        if exc_type is None:
+            self._warn_at_exit()
+        self._record_this_messages_decision()
+        for holder, token in reversed(self._tokens):
+            try:
+                if hasattr(holder, "detach"):
+                    holder.detach(token)
+                else:
+                    holder.reset(token)
+            except Exception:
+                # Closed in another context than it was opened in (a generator
+                # driven step by step); the values die with that context.
+                pass
+        self._tokens.clear()
+        if self._span is not None and exc is not None:
+            try:
+                from opentelemetry.trace import Status, StatusCode
+
+                self._span.record_exception(exc)
+                self._span.set_status(Status(StatusCode.ERROR, str(exc)))
+            except Exception:
+                pass
+        pending = (self._state or {}).get("pending")
+        if self._span is not None and pending is not None and not pending.done():
+            _finish_later(self, pending, self._exit_ns)
+        else:
+            self._end(self._exit_ns)
+
+    def _record_this_messages_decision(self) -> None:
+        """A later message of a cut-list conversation: its own decision goes on its trace
+        when every skill it offered has been shown to the model."""
+        state, fixed = self._state or {}, self._fixed
+        routing_id = state.get("routing_now")
+        if fixed is None or routing_id is None:
+            return
+        new = state.get("new_names") or []
+        if new and "message" not in self._read:
+            self._config._warn_once(None, (
+                "this message's routed skills were not shown to the model: send run.message as the "
+                "user turn (it carries the skills new to the conversation)."))
+            return
+        try:
+            from .otel import record_skill_rail
+
+            record_skill_rail(routing_id=routing_id, offered=list(state.get("offered_now") or []))
+        except Exception:
+            self._config._log.debug("could not record the message's decision", exc_info=True)
+        with self._conversation._lock:
+            for name in new:
+                fixed.shown.setdefault(name, routing_id)
+
+    def _end(self, end_ns: int) -> None:
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+        if self._span is not None:
+            try:
+                self._span.end(end_time=end_ns)
+            except Exception:
+                self._config._log.debug("could not end the run's span", exc_info=True)
+        self._config._close(self)
+
+    def _warn_at_exit(self) -> None:
+        config, fixed = self._config, self._fixed
+        if fixed is not None and fixed.tool_def is not None and "system" in self._read \
+                and not self._read & {"tools", "tool_params", "tool_result"}:
+            config._warn_once(None, (
+                "run.system names the load_skill tool, but this run's tools never included it. "
+                "Add *run.tools (Tool Runner) or *run.tool_params (messages.create) to tools=."))
+        if self._span is None or not self._read & {"system", "tools", "tool_params"}:
+            return
+        try:
+            from . import otel, providers
+
+            if "anthropic" not in providers._instrumented:
+                return
+            if otel.spans_started(self._span.get_span_context().trace_id) <= 1:
+                config._warn_once(None, (
+                    "no Claude request was traced inside this run. Make the model calls inside "
+                    "the `with` block (a Tool Runner is lazy: consume it there). On AnthropicVertex "
+                    "and the legacy AnthropicBedrock client, the Tool Runner's requests are not "
+                    "traced; a hand-written messages.create loop is."))
+        except Exception:
+            pass
+
+    # ── preparing ───────────────────────────────────────────
+    def _context(self) -> Dict[str, Any]:
+        return {"message": self._message, "values": self._conversation._values}
+
+    def _prepare_sync(self) -> None:
+        config, ctx = self._config, self._context()
+        fixed = self._conversation._current()
+        if fixed is None:
+            state = config._prepare_run_sync(ctx, None, self.key)
+            text = config._compose(ctx, None, self.key, state)
+            mine = config._fixed_from(self.key, state, text)
+            fixed = self._conversation._fix(mine)
+            self._fixed_by_me = fixed is mine
+        else:
+            routed = config._route_later_run(self.key, ctx, fixed) if config._routes_later(fixed) else None
+            state = config._later_run(ctx, self.key, fixed, routed)
+        self._done_preparing(fixed, state)
+
+    async def _prepare_async(self) -> None:
+        config, ctx = self._config, self._context()
+        fixed = self._conversation._current()
+        if fixed is None:
+            state = await config._prepare_run(ctx, None, self.key)
+            text = config._compose(ctx, None, self.key, state)
+            mine = config._fixed_from(self.key, state, text)
+            fixed = self._conversation._fix(mine)
+            self._fixed_by_me = fixed is mine
+        else:
+            routed = (await asyncio.to_thread(config._route_later_run, self.key, ctx, fixed)
+                      if config._routes_later(fixed) else None)
+            state = config._later_run(ctx, self.key, fixed, routed)
+        self._done_preparing(fixed, state)
+
+    def _done_preparing(self, fixed: _Fixed, state: Dict[str, Any]) -> None:
+        self._fixed, self._state = fixed, state
+        with self._conversation._lock:
+            self._conversation._runs += 1
+            later = self._conversation._runs > 1
+        if later and fixed.inject:
+            self._config._warn_once(None, (
+                "the load_skill tool is off, so skill text is pasted into the system prompt; in a "
+                "conversation that text stays the first message's (Anthropic rejects a changed "
+                "system prompt), so later messages get no new skill text."))
+
+    # ── what the developer reads ────────────────────────────
+    def _require_open(self, what: str) -> _Fixed:
+        if self._fixed is None:
+            raise RuntimeError(
+                f"run.{what} is ready once the run is open: use it inside `with support.run(...) as run:`")
+        return self._fixed
+
+    @property
+    def system(self) -> List[Dict[str, Any]]:
+        fixed = self._require_open("system")
+        self._read.add("system")
+        return copy.deepcopy(fixed.blocks)
+
+    @property
+    def message(self) -> Dict[str, Any]:
+        """This run's user turn, for ``messages=``: the question, plus any skills new to the conversation.
+
+        On a later message of a conversation whose skill list is cut to fit, the
+        skills routed for this message that the conversation has not shown yet
+        follow the question as a second text block. They go in the user turn, not
+        in ``system``: a conversation's history only grows. Append it to the history
+        instead of your own ``{"role": "user", ...}``.
+        """
+        self._require_open("message")
+        self._read.add("message")
+        extra = (self._state or {}).get("new_block")
+        text = self._message if isinstance(self._message, str) else ""
+        if not extra:
+            return {"role": "user", "content": text}
+        return {"role": "user", "content": [{"type": "text", "text": text}, {"type": "text", "text": extra}]}
+
+    @property
+    def tool_params(self) -> List[Dict[str, Any]]:
+        fixed = self._require_open("tool_params")
+        self._read.add("tool_params")
+        return [copy.deepcopy(fixed.tool_def)] if fixed.tool_def is not None else []
+
+    @property
+    def tools(self) -> List[Any]:
+        fixed = self._require_open("tools")
+        self._read.add("tools")
+        if fixed.tool_def is None:
+            return []
+        if self._tools is None:
+            sync_cls, async_cls = _tool_classes()
+            self._tools = [(async_cls if self._mode == "async" else sync_cls)(self)]
+        return list(self._tools)
+
+    def tool_result(self, block: Any) -> Optional[Dict[str, Any]]:
+        """The ``tool_result`` answering a ``load_skill`` ``tool_use`` block; ``None`` for any other tool.
+
+        In an ``async with`` run, ``await run.atool_result(block)`` keeps the load
+        off the event loop.
+        """
+        fixed = self._require_open("tool_result")
+        self._read.add("tool_result")
+        name, tool_input, tool_use_id = _tool_use_parts(block)
+        if fixed.tool_def is None or name != fixed.tool_def["name"]:
             return None
-        return await self._manager.__aexit__(exc_type, exc, tb)
+        if self._mode == "async" and _event_loop_running():
+            self._config._warn_once(None, (
+                "run.tool_result() loads on the event loop; in an `async with` run use "
+                "`await run.atool_result(block)`."))
+        text, error = self._serve(tool_input)
+        return _result_block(tool_use_id, text, error)
 
+    async def atool_result(self, block: Any) -> Optional[Dict[str, Any]]:
+        """`tool_result` for an async loop: the load runs off the event loop."""
+        fixed = self._require_open("atool_result")
+        self._read.add("tool_result")
+        name, tool_input, tool_use_id = _tool_use_parts(block)
+        if fixed.tool_def is None or name != fixed.tool_def["name"]:
+            return None
+        text, error = await self._aserve(tool_input)
+        return _result_block(tool_use_id, text, error)
 
-def _patch_async_stream(original: Any) -> Any:
-    """Wrap ``AsyncMessages.stream``: routing moves to ``__aenter__``."""
-    @functools.wraps(original)
-    def patched(self, *args, **kwargs):
-        # A closure over this call's `kwargs` dict, not functools.partial: a
-        # partial copies the dict now, and the routing writes `system` into it
-        # later.
-        return _OffLoopMessageStreamManager(
-            lambda: original(self, *args, **kwargs), kwargs,
-        )
-    return patched
+    # ── serving load_skill ──────────────────────────────────
+    def _requested(self, tool_input: Any) -> Tuple[Optional[str], Optional[str]]:
+        """(the skill to load, or None and a sentence for the model)."""
+        from ._config import _disabled_by_init
 
+        if self._exited:
+            self._config._warn_once(None, (
+                "load_skill was called after its run closed: the skill is served, but the run's "
+                "record will not show it. Consume the Tool Runner inside the `with` block."))
+        if _disabled_by_init() or not (self._state or {}).get("tool"):
+            return None, "DecimalAI skills are switched off for this agent. Answer without them."
+        raw = tool_input.get("name") if isinstance(tool_input, dict) else None
+        name = str(raw or "").strip()
+        if not name:
+            return None, "load_skill needs the name of one skill from the list."
+        fixed = self._fixed
+        if fixed is not None and not fixed.cut:
+            # The SDK does not hold a tool's input to its schema, so the name is
+            # checked here. A cut list names only some skills; the platform checks those.
+            match = next((n for n in fixed.names if n.lower() == name.lower()), None)
+            if match is None:
+                return None, (f"{name!r} is not one of this agent's skills. Load one of: "
+                              f"{', '.join(fixed.names)}; or answer without one.")
+            name = match
+        return name, None
 
-def _patch(original: Any, *, name: str = "create", async_client: bool = False) -> Any:
-    """Wrap one SDK method so skills are injected into its ``system`` kwarg."""
-    if async_client and name == "stream":
-        return _patch_async_stream(original)
-    if async_client or inspect.iscoroutinefunction(original):
-        return _patch_async_call(original)
-
-    # The sync client: every method binds kwargs when called, so injecting
-    # before the call is enough.
-    @functools.wraps(original)
-    def patched(self, *args, **kwargs):
-        token = _inject_once(kwargs)
+    def _load_context(self) -> Any:
+        """The context a load records in: this run's while it is open, none after."""
         try:
-            return original(self, *args, **kwargs)
+            from opentelemetry import context as otel_context
+        except ImportError:
+            return None, None
+        ctx = self._otel_ctx if (self._otel_ctx is not None and not self._exited) else otel_context.Context()
+        return otel_context, ctx
+
+    def _name_the_showing_decision(self, name: str) -> None:
+        """A skill shown by an earlier message of the conversation is loaded under that decision."""
+        state, fixed = self._state or {}, self._fixed
+        if fixed is None or state.get("offered_now") is None or name in state["offered_now"]:
+            return
+        origin = fixed.shown.get(name)
+        router = self._config._router()
+        remember = getattr(router, "_remember_run_routing", None)
+        if origin and callable(remember):
+            remember(self.key, origin)
+
+    def _serve(self, tool_input: Any) -> Tuple[str, bool]:
+        name, answer = self._requested(tool_input)
+        if name is None:
+            return answer or "", True
+        self._name_the_showing_decision(name)
+        otel_context, ctx = self._load_context()
+        otel_token = otel_context.attach(ctx) if otel_context is not None else None
+        token = _RUN.set(self.key)
+        try:
+            text = self._config._load_sync(name)
         finally:
-            if token is not None:
-                _injecting.reset(token)
-    return patched
+            _RUN.reset(token)
+            if otel_token is not None:
+                otel_context.detach(otel_token)
+        return text, _is_error(text)
+
+    async def _aserve(self, tool_input: Any) -> Tuple[str, bool]:
+        name, answer = self._requested(tool_input)
+        if name is None:
+            return answer or "", True
+        self._name_the_showing_decision(name)
+        otel_context, ctx = self._load_context()
+        otel_token = otel_context.attach(ctx) if otel_context is not None else None
+        token = _RUN.set(self.key)
+        try:
+            text = await self._config._load(name)
+        finally:
+            _RUN.reset(token)
+            if otel_token is not None:
+                otel_context.detach(otel_token)
+        return text, _is_error(text)
 
 
-def _install_skill_loader() -> None:
-    """Monkey-patch create/stream/parse on Anthropic's Messages and AsyncMessages."""
-    global _skill_loader_installed
-    if _skill_loader_installed:
-        return
-    try:
-        from anthropic.resources.messages import AsyncMessages, Messages
-    except ImportError:
-        logger.warning(
-            "enable_skill_loader=True but anthropic SDK not installed; "
-            "skipping skill loader install"
+def _new_skills_block(prefix: str, names: List[str]) -> Optional[str]:
+    """The rows of ``prefix``'s skill table naming ``names``, as a block for the user turn."""
+    rows = []
+    for line in prefix.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if line.lstrip().startswith("|") and cells and cells[0] in names:
+            rows.append(line.strip())
+    if not rows:
+        rows = [f"| {name} | |" for name in names]
+    return ("More skills you can load with load_skill for this message:\n\n"
+            "| Skill | Description |\n|-------|-------------|\n" + "\n".join(rows))
+
+
+def _result_block(tool_use_id: Any, text: str, error: bool) -> Dict[str, Any]:
+    block: Dict[str, Any] = {"type": "tool_result", "tool_use_id": tool_use_id, "content": text}
+    if error:
+        block["is_error"] = True
+    return block
+
+
+_tool_classes_cache: Optional[tuple] = None
+_tool_classes_lock = threading.Lock()
+
+
+def _tool_classes() -> tuple:
+    """The sync and async ``load_skill`` tool classes, built on first use.
+
+    Built on the Anthropic SDK's public ``BetaBuiltinFunctionTool`` bases, whose
+    ``call`` gets the model's input as given, so this module imports without the SDK.
+    """
+    global _tool_classes_cache
+    with _tool_classes_lock:
+        if _tool_classes_cache is None:
+            from anthropic.lib.tools import (
+                BetaAsyncBuiltinFunctionTool,
+                BetaBuiltinFunctionTool,
+                ToolError,
+            )
+
+            class LoadSkillTool(BetaBuiltinFunctionTool):
+                """DecimalAI's ``load_skill`` for one run, for the sync Tool Runner."""
+
+                def __init__(self, run: Run) -> None:
+                    self._run = run
+
+                def to_dict(self) -> Any:
+                    return copy.deepcopy(self._run._fixed.tool_def)
+
+                def call(self, input: object) -> str:
+                    text, error = self._run._serve(input)
+                    if error:
+                        raise ToolError(text)
+                    return text
+
+                def __repr__(self) -> str:
+                    return f"LoadSkillTool(agent={self._run._config.name!r})"
+
+            class AsyncLoadSkillTool(BetaAsyncBuiltinFunctionTool):
+                """DecimalAI's ``load_skill`` for one run, for the async Tool Runner."""
+
+                def __init__(self, run: Run) -> None:
+                    self._run = run
+
+                def to_dict(self) -> Any:
+                    return copy.deepcopy(self._run._fixed.tool_def)
+
+                async def call(self, input: object) -> str:
+                    text, error = await self._run._aserve(input)
+                    if error:
+                        raise ToolError(text)
+                    return text
+
+                def __repr__(self) -> str:
+                    return f"AsyncLoadSkillTool(agent={self._run._config.name!r})"
+
+            LoadSkillTool.__module__ = AsyncLoadSkillTool.__module__ = __name__
+            _tool_classes_cache = (LoadSkillTool, AsyncLoadSkillTool)
+        return _tool_classes_cache
+
+
+# ── the config ───────────────────────────────────────────────
+
+
+class AnthropicAgentConfig(AgentBinding):
+    """One agent's prompt and skills in DecimalAI, for the Anthropic Messages API.
+
+    Made by :func:`agent_config`. Open one run per user message::
+
+        with support.run(question, variables=customer) as run:
+            ...  # system=run.system, tools=[*your_tools, *run.tools]
+
+    or keep one :meth:`conversation` per chat.
+
+    Attributes:
+        name: The agent's canonical DecimalAI name.
+    """
+
+    _log = logger
+    _VALUES_HINT = "Pass them as support.run(..., variables=...), as attributes or dict keys."
+
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str,
+                 cache_control: Optional[Dict[str, Any]], on_trace: Any) -> None:
+        super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        self._cache_control = copy.deepcopy(cache_control) if cache_control else None
+        self._on_trace = on_trace
+        self._open_runs: Dict[str, Run] = {}
+        self._prompt_records: Dict[str, Dict[str, Any]] = {}
+
+    def __repr__(self) -> str:
+        return (
+            f"AnthropicAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"skills={self.skill_names!r})"
         )
-        return
 
-    for cls in (Messages, AsyncMessages):
-        for name in _PATCHED_METHODS:
-            original = getattr(cls, name, None)
-            if original is None:
-                # Say so rather than skip quietly: calls through this method
-                # would otherwise run without skills and nothing would show it.
-                logger.warning(
-                    "anthropic %s.%s not found; calls through it will NOT "
-                    "receive DecimalAI skills",
-                    cls.__name__, name,
-                )
-                continue
-            setattr(cls, name, _patch(
-                original, name=name, async_client=cls is AsyncMessages,
-            ))
-    _skill_loader_installed = True
-    logger.info("DecimalAI SkillRouter loader installed (Anthropic)")
+    # ── the pieces ───────────────────────────────────────────
+    @property
+    def prompt(self) -> Optional[str]:
+        """The saved prompt as written (variables unfilled), else the fallback."""
+        with self._lock:
+            text = getattr(self._prompt, "system_prompt", None)
+        return text if text is not None else self._fallback
+
+    def run(self, message: Optional[str], *, variables: Any = None) -> Run:
+        """One user message with no earlier turns, from the question to the final answer.
+
+        ``support.run()`` calls no model: use it as a context manager, and inside it
+        ``run.system``, ``run.tools``, ``run.tool_params`` and ``run.tool_result()``
+        are this run's. For a message in a chat, use :meth:`conversation`, which
+        keeps ``system`` the same for every message.
+
+        Args:
+            message: The user's message, which the skills are routed on.
+            variables: Values for the prompt's ``{{variables}}``, as attributes or
+                dict keys (``{{customer.name}}`` reads ``variables.customer.name`` or
+                ``variables["customer"]["name"]``).
+
+        Raises (when the run opens):
+            MissingPromptVariable: the prompt needs a value ``variables`` lacks.
+            RuntimeError: ``on_unavailable="fail"`` and DecimalAI never returned
+                this agent's skills.
+        """
+        return Conversation(self, variables).run(message)
+
+    def conversation(self, *, variables: Any = None, state: Optional[Dict[str, Any]] = None) -> Conversation:
+        """A chat of several user messages that share one ``system`` and one tool.
+
+        ``variables`` fills the prompt's ``{{variables}}`` once, for the whole
+        conversation. A prompt saved, a skill assigned or a value changed later
+        reaches the next conversation. ``state`` resumes a conversation from its
+        :attr:`Conversation.state`, in this process or another.
+
+        Raises:
+            ValueError: ``state`` belongs to another agent or another version of
+                this format, or both ``state`` and ``variables`` were given.
+        """
+        if state is not None:
+            if variables is not None:
+                raise ValueError("a resumed conversation keeps the values it started with; "
+                                 "pass state= or variables=, not both")
+            if not isinstance(state, dict) or state.get("version") != _STATE_VERSION:
+                raise ValueError("state= takes a Conversation.state from this version of decimalai")
+            if state.get("agent") != self.name:
+                raise ValueError(f"this conversation state is agent {state.get('agent')!r}'s, "
+                                 f"not {self.name!r}'s")
+        return Conversation(self, variables, state=state)
+
+    # ── open runs ───────────────────────────────────────────
+    def _open(self, run: Run) -> None:
+        with self._lock:
+            self._open_runs[run.key] = run
+
+    def _close(self, run: Run) -> None:
+        with self._lock:
+            self._open_runs.pop(run.key, None)
+            self._prompt_records.pop(run.key, None)
+
+    def _fixed_from(self, run_key: str, state: Dict[str, Any], text: str) -> _Fixed:
+        """What a conversation keeps, from its first run's composed text."""
+        from .skill_router import (
+            LOAD_SKILL_PROMPT_HINT,
+            LOAD_SKILL_TOOL_DESCRIPTION,
+            LOAD_SKILL_TOOL_NAME,
+        )
+
+        prefix = state.get("prefix") or ""
+        tool = bool(state.get("tool")) and bool(state.get("names"))
+        menu = f"{prefix}\n{LOAD_SKILL_PROMPT_HINT}" if (prefix and state.get("tool")) else prefix
+        if menu and text.endswith(menu):
+            head = text[: len(text) - len(menu)].rstrip("\n")
+        else:
+            head, menu = text, ""
+        _tool_on, inject = self._channels()
+        with self._lock:
+            cut = bool(self._menu_truncated)
+            record = self._prompt_records.get(run_key)
+        blocks = self._blocks(head, menu)
+        if blocks and self._cache_control:
+            # At the end of the system text: a run's model calls, and a conversation's
+            # every turn, send the same tools and system, so each request after the
+            # first reads them from the cache.
+            blocks[-1]["cache_control"] = copy.deepcopy(self._cache_control)
+            # And on the prompt when later runs share it but not the list after it (a cut
+            # list, or pasted skill text): the next run reads the prompt from the cache. A
+            # prompt with {{variables}} differs per customer, so it gets none.
+            if len(blocks) == 2 and (cut or inject) and not template_variables(self._template()):
+                blocks[0]["cache_control"] = copy.deepcopy(self._cache_control)
+        tool_def = None
+        if tool:
+            tool_def = {"name": LOAD_SKILL_TOOL_NAME, "description": LOAD_SKILL_TOOL_DESCRIPTION,
+                        "input_schema": self._tool_schema([] if cut else list(state["names"]))}
+        return _Fixed(text="".join(block["text"] for block in blocks), blocks=blocks,
+                      names=list(state.get("names") or []), tool_def=tool_def, prompt_record=record,
+                      delivered=list(state.get("delivered") or []), unavailable=state.get("unavailable"),
+                      inject=bool(inject), cut=cut, routing_id=state.get("routing_id"))
+
+    @staticmethod
+    def _blocks(head: str, menu: str) -> List[Dict[str, Any]]:
+        """The system text as blocks: the prompt exactly as filled, then the skill list."""
+        blocks: List[Dict[str, Any]] = []
+        if head.strip():
+            blocks.append({"type": "text", "text": head})
+        if menu.strip():
+            blocks.append({"type": "text", "text": f"\n\n{menu}" if blocks else menu})
+        return blocks
+
+    def _routes_later(self, fixed: _Fixed) -> bool:
+        """Whether a later message of this conversation is routed before its model call."""
+        from ._config import _disabled_by_init
+
+        tool, _inject = self._channels()
+        return fixed.cut and bool(fixed.tool_def) and tool and not _disabled_by_init()
+
+    def _route_later_run(self, run_key: str, ctx: Dict[str, Any], fixed: _Fixed) -> Any:
+        """This message's own decision, for a conversation whose list is cut (or None)."""
+        try:
+            routed = self._route(run_key, self._message(ctx, None))
+        except Exception:
+            self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+            return None
+        prefix, offered, routing_id, truncated, _delivered, _versions = routed
+        self._store_menu(prefix, offered, routing_id, truncated)
+        return routed
+
+    def _later_run(self, ctx: Dict[str, Any], run_key: str, fixed: _Fixed,
+                   routed: Any = None) -> Dict[str, Any]:
+        """A later run of a conversation: its system and tool are the conversation's.
+
+        A whole list: the message is routed in the background and recorded on its
+        own trace (the decision offers exactly the list shown). A cut list: the
+        message was routed before its call (``routed``); skills it offers that the
+        conversation has not shown go in ``run.message``, and its decision goes on
+        its trace when the run closes (`Run._record_this_messages_decision`). A
+        load names the decision that showed its skill.
+        """
+        from ._config import _disabled_by_init
+
+        self._refresh_prompt_if_stale()  # for the next conversation
+        query = self._message(ctx, None)
+        switched_off = _disabled_by_init()
+        tool, _inject = self._channels()
+        routing_id = None
+        state: Dict[str, Any] = {
+            "query": query, "route_now": False, "routing_id": routing_id, "prefix": "",
+            "names": list(fixed.names), "unavailable": fixed.unavailable, "text": fixed.text,
+            "tool": bool(fixed.tool_def) and tool and not switched_off,
+            # Skill text already in the system prompt is not sent again.
+            "loaded": set(fixed.delivered), "delivered": [], "delivered_versions": [],
+        }
+        with self._lock:
+            self._runs[(run_key, None)] = state
+            while len(self._runs) > _MAX_CONFIG_RUNS:
+                self._runs.popitem(last=False)
+        self._record(
+            agent=None, system_prompt=fixed.text, offered=fixed.names, routing_id=routing_id,
+            user_input=query, prompt=fixed.prompt_record, delivered=[], delivered_versions=[],
+        )
+        if switched_off or not fixed.names:
+            return state
+        if fixed.cut:
+            if routed is not None and routed[2]:
+                prefix, offered, routing_id_now = routed[0], list(routed[1]), routed[2]
+                with self._lock:
+                    shown = set(fixed.shown)
+                new = [name for name in offered if name not in shown]
+                state["offered_now"], state["routing_now"], state["new_names"] = offered, routing_id_now, new
+                state["new_block"] = _new_skills_block(prefix, new) if new else None
+            else:
+                # No decision of its own: loads name the conversation's.
+                router = self._router()
+                remember = getattr(router, "_remember_run_routing", None)
+                if fixed.routing_id and callable(remember):
+                    remember(run_key, fixed.routing_id)
+        else:
+            pending = _in_background(self._route_run, run_key, list(fixed.names), query)
+            self._note_pending(run_key, pending)
+            state["pending"] = pending
+        return state
+
+    # ── the seams AgentBinding asks for ─────────────────────
+    def _router(self) -> Any:
+        return _get_skill_router()
+
+    def _run_key(self) -> Optional[str]:
+        return _RUN.get()
+
+    def _message(self, context: Any, agent: Any) -> Optional[str]:
+        message = context.get("message")
+        return message.strip() or None if isinstance(message, str) else None
+
+    def _values(self, context: Any) -> Any:
+        return context.get("values")
+
+    def _agent_label(self, agent: Any) -> Optional[str]:
+        return None
+
+    def _record(self, **fields: Any) -> bool:
+        from ._agent import _record_turn
+
+        run_key = _RUN.get()
+        if isinstance(fields.get("prompt"), dict) and run_key is not None:
+            with self._lock:
+                self._prompt_records[run_key] = fields["prompt"]
+        return _record_turn(fields)
+
+    def _stamp_routing(self, run_key: Optional[str], routing_id: str) -> None:
+        """A background decision lands on its run's trace only while that trace is open."""
+        from .otel import record_skill_rail
+
+        with self._lock:
+            run = self._open_runs.get(run_key) if run_key is not None else None
+        if run is None:
+            return
+        with run._lock:
+            if run._ended:
+                return
+            record_skill_rail(routing_id=routing_id)
+            fixed = run._fixed
+            if run._fixed_by_me and fixed is not None and not fixed.routing_id:
+                fixed.routing_id = routing_id
+                for name, origin in list(fixed.shown.items()):
+                    if origin is None:
+                        fixed.shown[name] = routing_id
+
+    def _serve_load(self, name: str) -> str:
+        from ._agent import _serve_and_record
+
+        return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name)
 
 
-def instrument(
+def agent_config(
+    agent_name: str,
     *,
-    enable_skill_loader: bool = False,
-    enable_load_skill_tool: bool = False,
-    agent_name: Optional[str] = None,
-) -> None:
-    """Install DecimalAI integration for the Anthropic SDK.
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+    cache_control: Optional[Dict[str, Any]] = _UNSET,
+    on_trace: Any = None,
+) -> AnthropicAgentConfig:
+    """Pull an agent's prompt and skills from DecimalAI, for the Anthropic Messages API.
 
-    Currently this surface is skill-loader-only. Tracing for raw
-    Anthropic SDK calls flows through the generic ``decimalai.trace``
-    decorator or the OpenTelemetry exporter; this module focuses on
-    the prompt-assembly side.
+    ::
 
-    Note: this adapter never reads from or writes to disk, so there is
-    no ``disk_sync`` parameter. If you're running inside a disk-loading
-    runtime (Claude Code, Cursor) — which is especially likely for the
-    Anthropic SDK — ``_warn_if_disk_runtime_detected`` will log a
-    one-shot warning on enable to flag the duplicate-injection risk.
+        from decimalai.anthropic import agent_config
+
+        support = agent_config("support", fallback=BASE_SYSTEM)
+        with support.run(question, variables=customer) as run:
+            runner = client.beta.messages.tool_runner(
+                model=MODEL, max_tokens=4096, system=run.system,
+                tools=[lookup_order, *run.tools],
+                messages=[{"role": "user", "content": question}])
+            answer = runner.until_done()
+
+    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps
+    a local copy, re-read in the background at most once a minute. Each run is
+    routed on its own message: the agent's first run before it opens, later runs
+    from the local copy while their own decision is recorded in the background,
+    and every one-message run of an agent with more skills than fit the list.
+    Turns on Anthropic tracing for DecimalAI runs, and initializes the SDK from
+    ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
+
+    With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
+    ``init(load_skill_tool=False)``), each run is routed and the text of the
+    skills picked for it goes into ``run.system`` instead.
 
     Args:
-        enable_skill_loader: When True, monkey-patch
-            ``client.messages.create()``, ``.stream()`` and ``.parse()`` (sync
-            and async) so skills auto-inject into ``system`` before each
-            request.
-        agent_name: Scopes the routed skill menu to this agent. Required for
-            agent-scope skills (a registry skill pulled onto one agent) to be
-            offered at all — without it the router only sees org-owned
-            workspace-scope skills. A run named with
-            ``decimalai.providers.agent_run(name)`` is routed for THAT name,
-            the one its trace is filed under; this is the fallback outside
-            one. Defaults to the name an earlier call set, else the agent
-            ``decimalai.init()`` named (or ``DECIMAL_AGENT_NAME``). Callers who
-            assemble ``system`` themselves can keep passing it per-call to
-            :func:`skill_system` instead.
-        enable_load_skill_tool: Accepted but DORMANT on this adapter —
-            the patch layer is a single
-            ``messages.create()`` call, which cannot route a tool result
-            back mid-turn — that needs a tool loop the caller owns.
-            Skills stay prompt-injected here (``inject_skill_body`` now
-            trims + budgets bodies); the live load_skill tool ships on
-            ``decimalai.openai_agents`` and ``decimalai.pydantic_ai``.
+        agent_name: The agent's name in DecimalAI.
+        fallback: The system prompt to use when the agent has no saved prompt, or
+            when DecimalAI cannot be reached now. Without one, an unreachable
+            DecimalAI raises here rather than starting an agent with no prompt.
+        on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
+            never returned them, and the run's record says so; ``"fail"`` raises
+            when the run opens instead.
+        cache_control: The prompt-caching breakpoint DecimalAI puts on
+            ``run.system``: at its end, and also after the prompt when later runs
+            share the prompt but not the list (two of a request's four).
+            ``{"type": "ephemeral"}`` by default; ``{"type": "ephemeral", "ttl":
+            "1h"}`` when a later breakpoint of yours lives an hour (an earlier
+            breakpoint may not have the shorter life); ``None`` for none.
+        on_trace: Called with each run's finished trace before it is sent.
+
+    Raises:
+        ImportError: the Anthropic SDK is not installed.
+        AgentNotFoundError: DecimalAI has no agent by this name.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``,
+            or ``cache_control`` is not a dict or None.
     """
-    global _install_agent_name
-    if agent_name is None and _install_agent_name is None:
-        # Named by neither this call nor an earlier one: the agent init()
-        # named (or DECIMAL_AGENT_NAME). `init(anthropic=True)` installs the
-        # tracing half (decimalai.providers), never this module, so this is
-        # the only way init()'s name reaches the skill loader.
-        from ._config import default_agent_name
-        agent_name = default_agent_name()
-    if agent_name is not None:
-        _install_agent_name = agent_name
-    if enable_load_skill_tool:
-        logger.warning(
-            "enable_load_skill_tool is not supported on the anthropic adapter "
-            "(no tool loop to route the result); staying on prompt injection. "
-            "Use openai_agents or pydantic_ai for the native load_skill tool."
-        )
-    if enable_skill_loader:
-        from .skill_router import _warn_if_disk_runtime_detected
-        _warn_if_disk_runtime_detected("anthropic")
-        _install_skill_loader()
-    logger.info(
-        "DecimalAI Anthropic integration installed (skill_loader=%s)",
-        enable_skill_loader,
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
+    if cache_control is _UNSET:
+        cache_control = _DEFAULT_CACHE_CONTROL
+    if cache_control is not None and not isinstance(cache_control, dict):
+        raise ValueError('cache_control must be a dict such as {"type": "ephemeral"}, or None')
+    _require_anthropic()
+    from ._agent import _ensure_initialized, read_prompt
+
+    _ensure_initialized()
+    prompt = read_prompt(agent_name, fallback=fallback)
+    _turn_on_tracing()
+    return AnthropicAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable,
+                                cache_control=cache_control, on_trace=on_trace)
+
+
+def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
+    """The 0.21 name of :func:`agent_config`, kept to say so."""
+    raise TypeError(
+        "decimalai.anthropic.load_agent() is agent_config() (every module was renamed in decimalai 0.21); "
+        "it takes the same arguments and returns the same config: "
+        "from decimalai.anthropic import agent_config"
     )
+
+
+def instrument(*args: Any, **kwargs: Any) -> None:
+    """Removed in decimalai 0.22: use :func:`agent_config`.
+
+    ``instrument(enable_skill_loader=True)`` patched every Anthropic client in the
+    process. Skills now come per agent from ``agent_config()``; tracing is
+    ``decimalai.init(anthropic=True)``, which ``agent_config()`` also turns on for
+    its own runs.
+    """
+    raise TypeError(
+        "decimalai.anthropic.instrument() was removed in decimalai 0.22. For an agent's "
+        "prompt and skills use decimalai.anthropic.agent_config(name) and open a run per "
+        "message (with support.run(question) as run: system=run.system, "
+        "tools=[*your_tools, *run.tools]). For tracing alone: decimalai.init(anthropic=True)."
+    )
+
+
+__all__ = ["AnthropicAgentConfig", "Conversation", "Run", "agent_config"]

@@ -637,6 +637,9 @@ ADVERTISED_SNAPSHOT: frozenset = frozenset({
     "claude-agent-sdk", "claude-code",
     "pydantic-ai",
     "google-adk",
+    # The capability table's Anthropic Messages API row, new with
+    # decimalai.anthropic.agent_config() (0.22).
+    "anthropic-messages-api",
     "llamaindex",
     "crewai",
     "generic-otel",

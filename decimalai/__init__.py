@@ -133,6 +133,14 @@ def _flush_otel_pipelines() -> None:
     which runs during ``threading._shutdown()``, before any plain ``atexit``
     handler.
     """
+    # First the Anthropic runs that closed while a routing decision was still in
+    # flight: their trace is sent when the run span ends, at most a few seconds on.
+    anthropic = sys.modules.get(f"{__name__}.anthropic")
+    if anthropic is not None:
+        try:
+            anthropic._drain_finishing()
+        except Exception:  # noqa: BLE001 — flushing must never raise into the caller
+            logger.debug("Anthropic run drain failed", exc_info=True)
     crewai = sys.modules.get(f"{__name__}.crewai")
     if crewai is not None:
         try:
@@ -915,8 +923,9 @@ def init(
             Tracing only, deliberately: this flag is also the tracing half
             under adapters that deliver skills themselves (Pydantic AI on an
             Anthropic model), where a second injector would put every skill in
-            the prompt twice. For skills on raw ``messages.create()`` calls,
-            add ``decimalai.anthropic.instrument(enable_skill_loader=True)``.
+            the prompt twice. For an agent's prompt and skills on the
+            Messages API, use ``decimalai.anthropic.agent_config()``, which turns
+            this tracing on for its own runs.
         google: If ``True``, auto-trace direct Google GenAI
             (``google.genai``) SDK calls.
         agent_name: The agent this process traces and routes skills for.

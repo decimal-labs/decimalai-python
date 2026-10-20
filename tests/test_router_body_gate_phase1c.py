@@ -5,9 +5,10 @@ THIS query. A small workspace is answered with its whole menu
 (``strategy: "full_menu"``), and ``query_ranked`` there is a word-overlap test
 against the top row: "I want my money back for order 42" shares no word with
 ``refund-policy: Refund rules`` and comes back ``query_ranked: false``, the
-same as "thanks!". On the four adapters that have no ``load_skill`` tool
-(langchain, adk, crewai, anthropic) prompt injection is the only way a body
-reaches the model, so the model was shown a menu row it could not open, and
+same as "thanks!". On the four adapters that had no ``load_skill`` tool then
+(langchain, adk, crewai, anthropic; ADK and Anthropic got one from
+``agent_config()`` in 0.20 and 0.21) prompt injection was the only way a body
+reached the model, so the model was shown a menu row it could not open, and
 nothing said so.
 
 The SDK cannot tell a reworded question from small talk. What it can tell is
@@ -128,7 +129,7 @@ def _parts(router: SkillRouter, query: str) -> str:
 
 
 def _fragment(router: SkillRouter, query: str) -> str:
-    """The anthropic / crewai entry point."""
+    """The crewai entry point."""
     fragment, _rid = router.build_prompt_fragment(query, scope="run")
     return fragment
 

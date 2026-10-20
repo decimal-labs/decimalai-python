@@ -51,9 +51,10 @@ DECLARED_NA: Dict[str, str] = {
     # graded, and so is C14 — the delivery verdict is NOT exempt here, which is
     # the correction that came out of the 2026-08-28 defect.
     "langchain:C13b": "model_can_load_skill_bodies",
-    "anthropic:C13b": "model_can_load_skill_bodies",
     # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.agent_config()`
     # gives the agent a real load_skill tool, so C13b is graded on its pulls.
+    # Anthropic left the same day (decimalai 0.22), for the same reason:
+    # `decimalai.anthropic.agent_config()` gives each run a load_skill tool.
     # CrewAI moved here from `has_skills_rail` on 2026-10-08, when
     # decimalai/crewai.py gained a before_llm_call-hook rail. C8, C13 and C14 are
     # graded; the model still cannot ASK for a body (no load_skill tool), so
@@ -95,13 +96,13 @@ DECLARED_NA: Dict[str, str] = {
     # judgement: test_coverage.test_observer_declarations_match_the_adapter_signatures
     # reads has_invocation_observer off each adapter's signature, so the commit
     # that adds on_trace to one of them fails until its two lines are deleted
-    # here and both items are graded. Three are rail adapters, and for them the
+    # here and both items are graded. Two are rail adapters, and for them the
     # missing link is a live gap the reasons name: a run wrapped in
     # decimalai.start_trace() ships unlinked and a delivery is credited twice.
+    # Anthropic's two came off on 2026-10-20 (decimalai 0.22): agent_config()
+    # takes on_trace, so the observer and the parent link are graded.
     "openai-agents:C15": "has_invocation_observer",
     "openai-agents:C16": "has_invocation_observer",
-    "anthropic:C15": "has_invocation_observer",
-    "anthropic:C16": "has_invocation_observer",
     "pydantic-ai:C15": "has_invocation_observer",
     "pydantic-ai:C16": "has_invocation_observer",
     "llamaindex:C15": "has_invocation_observer",
@@ -131,7 +132,10 @@ DECLARED_NA: Dict[str, str] = {
 # three, by the same flag, as C8). C17 added none: every driver has tools.
 # Lowered 36 -> 35 on 2026-10-20: ADK's C13b is graded, now that agent_config()
 # gives the model a load_skill tool to pull a body with.
-NA_BUDGET = 35
+# Lowered 35 -> 32 on 2026-10-20: Anthropic's C13b, C15 and C16 are graded.
+# `decimalai.anthropic.agent_config()` gives each run a load_skill tool and takes
+# on_trace, where the removed instrument() patch had neither.
+NA_BUDGET = 32
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -144,9 +148,10 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
     # An invoke-layer callback patch observes one model call; it does not own the
     # turn, so a load_skill result has nowhere to be routed back to.
     "langchain:tool_loaded": "decimalai/langchain.py",
-    # A patched `messages.create()` is one provider request; the tool loop is the
-    # caller's own while-loop, which this adapter never sees.
-    "anthropic:tool_loaded": "decimalai/anthropic.py",
+    # Anthropic left here on 2026-10-20 (decimalai 0.22). The patched
+    # `messages.create()` saw one provider request and never the caller's tool
+    # loop; `decimalai.anthropic.agent_config()` hands the loop a load_skill tool
+    # (`run.tools` for the Tool Runner, `run.tool_result(block)` for a hand-written one).
     # CrewAI's before_llm_call hook edits one call's messages and registers no
     # tool. CrewAI itself runs a tool loop, so this is the SEAM's limit, the same
     # kind langchain's invoke-layer patch and ADK's plugin hooks declare.
@@ -166,7 +171,9 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
 # arrives by a tool. A load_skill tool on the Agent would retire this line.
 # Lowered 4 -> 3 on 2026-10-20: ADK's line retired. `decimalai.adk.agent_config()`
 # gives the agent a load_skill tool, so its tool_loaded cell delivers and is graded.
-DELIVERY_NA_BUDGET = 3
+# Lowered 3 -> 2 on 2026-10-20: Anthropic's line retired, the same move:
+# `decimalai.anthropic.agent_config()` gives each run a load_skill tool.
+DELIVERY_NA_BUDGET = 2
 
 # ── journey-axis N/As ────────────────────────────────────────────────────────
 
@@ -188,7 +195,9 @@ DELIVERY_NA_BUDGET = 3
 #: framework therefore turns a skip into a graded cell on the same commit, and
 #: leaves a line here that must be deleted.
 DECLARED_JOURNEY_NA: Dict[str, str] = {
-    "anthropic:J1": "UNSCAFFOLDED_WITH_SEAM",
+    # anthropic left this ledger on 2026-10-20 (decimalai 0.22): `decimalai init
+    # --framework anthropic` writes a Tool Runner file (scaffold.py
+    # `_render_anthropic`), and the journey stub speaks `POST /v1/messages`.
     "llamaindex:J1": "NO_PROMPT_SEAM",
     "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
     # Moved from NO_PROMPT_SEAM on 2026-10-08: the adapter delivers skills now,
@@ -201,7 +210,9 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
 
 #: The number above, written down — same reason as ``NA_BUDGET``. It should go
 #: DOWN: every entry is a framework whose users get no scaffold today.
-JOURNEY_NA_BUDGET = 5
+# Lowered 5 -> 4 on 2026-10-20: anthropic's J1 is graded, now that `decimalai
+# init` has an anthropic template.
+JOURNEY_NA_BUDGET = 4
 
 # ── skips ────────────────────────────────────────────────────────────────────
 

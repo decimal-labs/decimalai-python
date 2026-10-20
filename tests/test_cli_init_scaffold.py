@@ -15,8 +15,9 @@ The four things that must never regress:
      silently. That is the single most important line in the template. On
      openai-agents (0.18+) the equivalent is `agent_config()`'s two pieces in
      `Agent(...)`, on pydantic-ai (0.19+) `agent_config()`'s capability in
-     `Agent(capabilities=[...])`, and on adk (0.20+) `agent_config()`'s instruction
-     and tools in `LlmAgent(...)`: nothing else gives those agents their skills.
+     `Agent(capabilities=[...])`, on adk (0.20+) `agent_config()`'s instruction
+     and tools in `LlmAgent(...)`, and on anthropic (0.22+) a run's `system` and
+     `tools` in the Tool Runner: nothing else gives those agents their skills.
   2. The agent name is BOUND, written ONCE, and survives a name that needs
      escaping. Unbound, the adapter auto-detects a name off the runnable and
      files traces against a different agent than the one the user configured;
@@ -137,6 +138,17 @@ def _header_text(source: str) -> str:
     return " ".join(words)
 
 
+def assigned_node(tree: ast.Module, variable: str) -> ast.AST:
+    """The expression a module-level `variable = ...` / `variable: T = ...` assigns."""
+    values = [n.value for n in tree.body
+              if (isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == variable for t in n.targets))
+              or (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+                  and n.target.id == variable)]
+    assert len(values) == 1, f"expected one {variable} assignment, got {len(values)}"
+    return values[0]
+
+
 def string_literals(tree: ast.Module) -> list:
     return [n.value for n in ast.walk(tree)
             if isinstance(n, ast.Constant) and isinstance(n.value, str)]
@@ -175,14 +187,17 @@ class TestTemplateIsCode:
             "openai-agents": "decimalai.openai_agents",
             "pydantic-ai": "decimalai.pydantic_ai",
             "adk": "decimalai.adk",
+            "anthropic": "decimalai.anthropic",
         }[framework]
         assert expected in mods, f"{framework} must import {expected}"
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_has_one_entry_point_and_one_example_call(self, framework):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        # A decorated function is a tool the file defines (the anthropic
+        # template's example @beta_tool), not a way into the agent.
         funcs = [n.name for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef)]
+                 if isinstance(n, ast.FunctionDef) and not n.decorator_list]
         assert funcs == ["run"], f"expected exactly one entry point, got {funcs}"
         # A bare `run(...)` is the example call; `asyncio.run(...)` (the adk
         # template's event-loop bridge) is an attribute call, not the entry point.
@@ -208,6 +223,7 @@ class TestTemplateIsCode:
         "openai-agents": "gpt-5-mini",
         "pydantic-ai": "openai:gpt-5-mini",
         "adk": "gemini-2.5-pro",
+        "anthropic": "claude-sonnet-5-5",
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -278,8 +294,9 @@ class TestTemplateIsCode:
 
 
 #: The templates with no instrument() at all: `agent_config()` hands the pieces to the
-#: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20).
-LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk")
+#: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
+#: anthropic's Tool Runner since 0.22).
+LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk", "anthropic")
 
 #: The templates whose skills arrive through instrument()'s loader.
 LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAMEWORKS]
@@ -326,6 +343,9 @@ class TestSkillLoaderIsOn:
         "openai-agents": None,
         "pydantic-ai": "otel",
         "adk": None,
+        # agent_config() traces its own runs; anthropic=True would widen that to every
+        # Anthropic call in the process, which a one-agent file has no use for.
+        "anthropic": None,
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -397,6 +417,37 @@ class TestSkillLoaderIsOn:
         assert [ast.unparse(e) for e in plugins.elts] == ["DecimalAIPlugin()"]
         (runner,) = calls(tree, "InMemoryRunner")
         assert [kw.arg for kw in runner.keywords] == ["app"]
+
+    def test_anthropic_hands_each_run_to_the_tool_runner(self):
+        """Nothing patches the Anthropic SDK since 0.21: the prompt, the skill list and
+        load_skill reach the model only because run() opens `support.run(question)`
+        and passes its `system` and `tools` to the Tool Runner, which it consumes
+        inside the `with` block. Consumed after it, the requests are made outside
+        the run: untraced, and load_skill's records miss the run's trace."""
+        tree = parse(render_agent_file(AGENT, "anthropic", SKILLS))
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "agent_config")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (run_fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"]
+        (block,) = [n for n in ast.walk(run_fn) if isinstance(n, ast.With)]
+        (item,) = block.items
+        assert _support_attr(item.context_expr.func, "run")
+        assert [ast.unparse(a) for a in item.context_expr.args] == ["question"]
+        handle = item.optional_vars.id
+        assert handle != "run", "`as run:` inside def run() rebinds the function's own name"
+        inside = ast.Module(body=block.body, type_ignores=[])
+        (runner,) = calls(inside, "tool_runner")
+        assert ast.unparse(runner.func) == "client.beta.messages.tool_runner"
+        keywords = {kw.arg: kw.value for kw in runner.keywords}
+        assert ast.unparse(keywords["system"]) == f"{handle}.system"
+        assert [ast.unparse(e) for e in keywords["tools"].elts] == ["*TOOLS", f"*{handle}.tools"]
+        assert reads(keywords["max_iterations"], "MAX_TURNS")
+        assert reads(keywords["model"], "MODEL")
+        assert len(calls(inside, "until_done")) == 1, "the Tool Runner is consumed inside the run"
+        assert [ast.unparse(e) for e in assigned_node(tree, "TOOLS").elts] == ["lookup_order"]
+        (tool,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
+        assert [ast.unparse(d) for d in tool.decorator_list] == ["beta_tool"]
 
 
 # ── 2b. the agent's own system prompt is what it runs on ─────────────
@@ -915,6 +966,19 @@ class TestCliWritesTheFile:
                            "--framework", "openai-agents"])
         assert 'pip install "decimalai[openai-agents]"' in result.output
 
+    def test_anthropic_next_steps_name_the_extra_and_the_anthropic_key(
+        self, tmp_path, monkeypatch
+    ):
+        """`decimalai[anthropic]` carries the Anthropic SDK and the tracing it needs;
+        a bare `pip install decimalai anthropic` runs the file and traces nothing."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--framework", "anthropic"])
+        assert result.exit_code == 0, result.output
+        assert 'pip install "decimalai[anthropic]"' in result.output
+        assert 'export ANTHROPIC_API_KEY="..."' in result.output
+        assert "OPENAI_API_KEY" not in result.output
+
     @pytest.mark.parametrize("framework", ["adk", "pydantic-ai"])
     def test_an_extra_this_python_cannot_install_is_said_out_loud(
         self, framework, tmp_path, monkeypatch
@@ -1377,6 +1441,7 @@ class TestProviderKeyGuard:
         ("langchain", "anthropic:claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
         ("openai-agents", None, "OPENAI_API_KEY"),
         ("pydantic-ai", "google:gemini-3.6-flash", "GEMINI_API_KEY"),
+        ("anthropic", None, "ANTHROPIC_API_KEY"),
     ])
     def test_guard_names_the_var_the_set_block_prints(self, framework, model, key):
         src = render_agent_file(AGENT, framework, SKILLS, model=model)

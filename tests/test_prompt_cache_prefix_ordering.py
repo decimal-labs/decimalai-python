@@ -271,95 +271,79 @@ class TestLangChainOrdering:
 
 
 @pytest.fixture
-def anthropic_router(monkeypatch, quiet_rails):
+def anthropic_config(monkeypatch):
+    """`agent_config()` configs for one saved prompt, on a router that routes per
+    message (an agent with more skills than fit, so each run's list is picked for
+    its own message and differs between two queries)."""
+    import decimalai._agent_binding as binding
     import decimalai.anthropic as an_mod
+    import decimalai.skill_router as sr
 
-    router = _QueryVaryingRouter()
+    class _PerMessageRouter(_QueryVaryingRouter):
+        def build_prompt_parts(self, query=None, **kwargs):
+            fragment, routing_id = self.build_prompt_fragment(query, **kwargs)
+            sr._last_offered_names_ctx.set([f"skill-{abs(hash(query)) % 97}"])
+            sr._last_menu_truncated_ctx.set(True)
+            return fragment, "", routing_id
+
+    router = _PerMessageRouter()
     monkeypatch.setattr(an_mod, "_skill_router_singleton", router)
-    return an_mod, router
+    monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+
+    def config(prompt: str):
+        saved = types.SimpleNamespace(agent_name="ada", system_prompt=prompt, version_number=1,
+                                      content_hash=None, is_fallback=False)
+        return an_mod.AnthropicAgentConfig(saved, fallback=None, on_unavailable="continue",
+                                           cache_control={"type": "ephemeral"}, on_trace=None)
+
+    return config, router
+
+
+def _anthropic_system(config, query: str) -> List[dict]:
+    """The ``system=`` blocks a run asking ``query`` hands the Messages API."""
+    with config.run(query) as run:
+        return run.system
 
 
 class TestAnthropicOrdering:
-    """`skill_system` — decimalai/anthropic.py."""
+    """`agent_config(...).run(...).system` — decimalai/anthropic.py."""
 
-    def test_string_system_prefix_is_byte_identical_across_queries(
-        self, anthropic_router
-    ):
-        an_mod, _router = anthropic_router
-
-        prefixes = []
-        for query in ("how do refunds work?", "write me a haiku about otters"):
-            out = an_mod.skill_system(CALLER_PROMPT, query=query)
-            assert isinstance(out, str)
-            head, sep, _tail = out.partition(MENU_MARKER)
-            assert sep, f"no fragment in {out!r}"
-            prefixes.append(head.encode())
-
-        _assert_prefix_is_stable(*prefixes, adapter="anthropic/str")
-
-    def test_block_list_prefix_is_byte_identical_across_queries(
-        self, anthropic_router
-    ):
-        """The content-block shape is the one that carries `cache_control`."""
-        an_mod, _router = anthropic_router
-
-        base = [
-            {"type": "text", "text": CALLER_PROMPT},
-            {
-                "type": "text",
-                "text": SECOND_CALLER_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ]
+    def test_blocks_before_the_list_are_byte_identical_across_queries(self, anthropic_config):
+        """The block shape is the one that carries `cache_control`."""
+        make, router = anthropic_config
+        config = make(CALLER_PROMPT)
 
         prefixes = []
-        for query in ("first question", "totally different second question"):
-            out = an_mod.skill_system(list(base), query=query)
-            assert isinstance(out, list)
-            idx = next(
-                i for i, b in enumerate(out) if MENU_MARKER in b.get("text", "")
-            )
+        queries = ("first question", "totally different second question")
+        for query in queries:
+            out = _anthropic_system(config, query)
+            idx = next(i for i, b in enumerate(out) if MENU_MARKER in b.get("text", ""))
             prefixes.append(json.dumps(out[:idx]).encode())
 
-        _assert_prefix_is_stable(*prefixes, adapter="anthropic/blocks")
+        assert router.queries == list(queries)    # each run's list was its own
+        _assert_prefix_is_stable(*prefixes, adapter="anthropic")
 
-    def test_caller_blocks_and_their_cache_control_are_untouched(
-        self, anthropic_router
-    ):
-        """Appending must not rewrite, re-tag, or reorder the caller's blocks.
+    def test_the_prompt_carries_a_breakpoint_of_its_own_before_the_varying_list(self, anthropic_config):
+        """A `cache_control` breakpoint is positional: it means "cache everything up
+        to here". A list that changes with the message is not repeated by the next
+        run, so the prompt before it gets a breakpoint of its own, which the next run
+        reads. The one at the end of the system text serves the run's later requests
+        (and a conversation's later turns), which do repeat the list."""
+        make, _router = anthropic_config
 
-        A `cache_control` breakpoint is positional — it means "cache everything
-        up to here". Move the blocks and the breakpoint now marks a different
-        prefix, which is a silent cache miss AND a silent billing change.
-        """
-        an_mod, _router = anthropic_router
+        prompt, listed = _anthropic_system(make(CALLER_PROMPT), "anything")
 
-        base = [
-            {"type": "text", "text": CALLER_PROMPT},
-            {
-                "type": "text",
-                "text": SECOND_CALLER_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ]
-        original = json.dumps(base)
+        assert prompt == {"type": "text", "text": CALLER_PROMPT, "cache_control": {"type": "ephemeral"}}
+        assert MENU_MARKER in listed["text"]
+        assert listed["cache_control"] == {"type": "ephemeral"}
 
-        out = an_mod.skill_system(base, query="anything")
-
-        assert out[: len(base)] == base, "caller blocks moved or were rewritten"
-        assert json.dumps(base) == original, "caller's list was mutated in place"
-        assert out[len(base)]["type"] == "text"
-        assert MENU_MARKER in out[len(base)]["text"]
-        assert "cache_control" not in out[len(base)], (
-            "the varying fragment must not claim a cache breakpoint of its own"
-        )
-
-    def test_no_base_still_returns_just_the_fragment(self, anthropic_router):
+    def test_empty_prompt_still_returns_just_the_list(self, anthropic_config):
         """Nothing to protect, so nothing changes."""
-        an_mod, _router = anthropic_router
+        make, _router = anthropic_config
 
-        assert MENU_MARKER in an_mod.skill_system(None, query="q")
-        assert MENU_MARKER in an_mod.skill_system("", query="q")
+        (only,) = _anthropic_system(make(""), "q")
+
+        assert only["text"].startswith(MENU_MARKER)
 
 
 # ── OpenAI Agents ────────────────────────────────────────────────

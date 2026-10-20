@@ -303,17 +303,6 @@ class TestInstrumentDefaults:
         dc.instrument()
         assert dc._install_agent_name == "earlier"
 
-    def test_anthropic(self, configured, monkeypatch):
-        import decimalai.anthropic as da
-
-        monkeypatch.setattr(da, "_install_agent_name", None)
-        configured(NAME)
-        da.instrument()
-        assert da._install_agent_name == NAME
-        assert da._routing_agent_name() == NAME
-        da.instrument(agent_name="other")
-        assert da._install_agent_name == "other"
-
     def test_llamaindex(self, configured, monkeypatch):
         pytest.importorskip("llama_index.core")
         import llama_index.core.instrumentation as li_inst

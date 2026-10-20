@@ -404,8 +404,9 @@ child (C16). The observer the `nested` phase hands over is the suite's own
 so one run grades the argument, the copy and the isolation. The phase also leaves
 the CrewAI spans to `decimalai.flush()`, which is how a short-lived process gets
 that trace before it reports. The flag is not declared by judgement:
-`test_coverage` reads it off each adapter's `instrument()` signature (a named
-`on_trace`), so the six adapters without an observer are N/A until the commit
+`test_coverage` reads it off each adapter's own surface (a named `on_trace` on
+its `instrument()`, or on what replaced it: ADK's `DecimalaiPlugin`, Anthropic's
+`agent_config()`), so the five adapters without an observer are N/A until the commit
 that gives them one — and that commit is graded on the link too.
 
 Exact token counts are **not** asserted here — a stub model's numbers are
@@ -425,7 +426,7 @@ fixes and green after them, run with the same task environments:
 | `adk:S1[app_runner]` | `Runner(app=App(...))`, the `adk web` shape, raised `ValueError` after the global install |
 | `openai-agents:S1[sandbox_agent]` | a `SandboxAgent` run made zero router calls |
 | `openai-agents:S1[init_flag_then_instrument]` (`init_flag_then_load_agent` since 0.18) | `init(openai_agents=True)` then `instrument()` shipped every run three times |
-| `anthropic:S1[messages_stream]` | `messages.stream()` got no skills |
+| `anthropic:S1[messages_stream]` (a hand-written `agent_config()` loop since 0.22) | `messages.stream()` got no skills |
 
 **C17** reads every `llm_calls[].tool_calls[]` entry in every phase. A record
 that says the call **finished** must carry what the tool returned; a record the
@@ -466,7 +467,12 @@ with no second shape has no cell rather than an N/A.
 Today's shapes: `adk:app_runner` (`InMemoryRunner(app=App(...))` as `adk web`
 builds it, then `Runner(app=App(..., plugins=[DecimalAIPlugin(...)]))`, both
 after the global install), `openai-agents:sandbox_agent`,
-`openai-agents:init_flag_then_load_agent` and `anthropic:messages_stream`.
+`openai-agents:init_flag_then_load_agent`, and Anthropic's three:
+`anthropic:messages_create_loop` and `anthropic:messages_stream` (a hand-written
+loop inside `agent_config(name).run(message)`, taking `run.tool_params` and
+answering `load_skill` with `run.tool_result(block)`, over `messages.create()` and over
+`messages.stream()`) and `anthropic:async_tool_runner` (`async with` around the
+async Tool Runner).
 
 ### The delivery axis (D1)
 
@@ -479,8 +485,8 @@ off** in that process's environment.
 |---|---|---|
 | what carries the body | the router pastes it into the prompt | the model pulls it with `load_skill` |
 | what is switched off | `DECIMALAI_LOAD_SKILL_TOOL=0` | `DECIMALAI_INJECT_SKILL_BODY=0` |
-| langchain / anthropic / adk / crewai | graded | N/A — framework limit, re-proven every run |
-| openai-agents / pydantic-ai | graded | graded |
+| langchain / crewai | graded | N/A — framework limit, re-proven every run |
+| openai-agents / pydantic-ai / adk / anthropic | graded | graded |
 
 Why it exists: C14 asks whether a body reached the model **at all**, which closes
 "zero channels". The defect that produced C14 was *arithmetic* — langchain had
@@ -526,7 +532,10 @@ It is hermetic for the same reason the rest of the tier is: the probe already
 stands in for `api.decimal.ai`, so it was taught the three routes `decimalai
 init` calls — `GET /api/v1/agents` (the unpaginated list it resolves the name
 against), `…/{name}/skills` and `…/{name}/prompt` — and `journey.JourneyModel`
-stands in for the provider the same way `drivers/_openai_wire.py` does. No
+stands in for the provider the same way `drivers/_openai_wire.py` does, speaking
+OpenAI's endpoints, Gemini's `:generateContent` and Anthropic's `/v1/messages`
+(the generated file reaches it through `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`
+and `ANTHROPIC_BASE_URL`). No
 backend, no key, no network, no cost. Verified: with every non-loopback route
 pointed at a dead proxy, both cells still pass in the same time.
 
@@ -555,9 +564,10 @@ loop; neither is scripted for by name. A per-framework script would be a driver
 artifact in the one cell that exists to be channel-agnostic.
 
 **Which frameworks get a cell** is read off `decimalai/cli/scaffold.py`
-directly — `SUPPORTED_FRAMEWORKS` today is langchain, openai-agents, pydantic-ai and
-adk (it was two until 2026-09-03; a doc test keeps this sentence honest). The other
-five drivers are a declared N/A whose reason is the SDK's own
+directly — `SUPPORTED_FRAMEWORKS` today is langchain, openai-agents, pydantic-ai, adk
+and anthropic (it was two until 2026-09-03, and anthropic joined with its 0.22
+template; a doc test keeps this sentence honest). The other four drivers are a
+declared N/A whose reason is the SDK's own
 `UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM` classification, recomputed and
 compared by `test_coverage.test_every_journey_na_is_declared_and_counted`. Write
 a template and the exemption fails until the ledger line is deleted; the cell
@@ -803,7 +813,7 @@ Stated so nobody mistakes a green cell for a guarantee.
   differently for having it. That question needs a real model and belongs to
   the live end-to-end tier that runs against a real backend and a real model.
 - **The journey on a framework with no scaffold.** J1 only exists where
-  `decimalai init` writes a file — four frameworks today. The other five are a
+  `decimalai init` writes a file — five frameworks today. The other four are a
   declared N/A, and the exemption is only as good as the day somebody writes
   their template.
 - **The journey's own install set.** J1's langchain cell needs `langchain` and
@@ -815,11 +825,12 @@ Stated so nobody mistakes a green cell for a guarantee.
   `DECIMAL_CONFORMANCE_REQUIRE_ALL=1`, silently without. If the extras are ever
   reorganised, `journey_requirements()` names exactly what is missing.
 - **The parent link on adapters with no observer.** C16 is graded only where
-  C15 is: on the three adapters that hand their caller a run (langchain, adk,
-  crewai). The other six are N/A, and three of those carry a skills rail — a run
-  on anthropic, openai-agents or pydantic-ai wrapped in `decimalai.start_trace()`
-  ships unlinked today, so a routed delivery is credited on both traces. Their
-  N/A reasons say so, and giving any of them an `on_trace` turns both items on.
+  C15 is: on the four adapters that hand their caller a run (langchain, adk,
+  crewai, and anthropic's `agent_config()`). The other five are N/A, and two of
+  those carry a skills rail — a run on openai-agents or pydantic-ai wrapped in
+  `decimalai.start_trace()` ships unlinked today, so a routed delivery is
+  credited on both traces. Their N/A reasons say so, and giving either an
+  `on_trace` turns both items on.
 - **Exact token counts, cost, latency.** Tier B's job.
 - **Cross-driver isolation.** Fixed: each driver's phases now run in their own
   process (see [One driver, one process](#one-driver-one-process)), so a late

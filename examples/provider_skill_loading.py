@@ -1,18 +1,21 @@
 """DecimalAI Provider-Specific Skill Loading Example
 
 Demonstrates how each provider integration gives an agent its DecimalAI
-skills: ``instrument(enable_skill_loader=True)`` on the Anthropic SDK, and
-``agent_config()`` on the OpenAI Agents SDK and Pydantic AI. Their ``load_skill``
-tool is not an ``agent_config()`` argument: it is config-driven via
-``decimalai.init(load_skill_tool=...)`` / ``DECIMALAI_LOAD_SKILL_TOOL``.
+skills: ``agent_config()`` on the Anthropic Messages API, the OpenAI Agents SDK
+and Pydantic AI. Their ``load_skill`` tool is not a ``agent_config()`` argument:
+it is config-driven via ``decimalai.init(load_skill_tool=...)`` /
+``DECIMALAI_LOAD_SKILL_TOOL``.
 
 This example shows:
-- Anthropic SDK with skill injection into system prompts (no tool loop)
+- Anthropic Messages API: one run per user message, handed to the SDK's Tool Runner
 - OpenAI Agents SDK with the live load_skill tool
 - Pydantic AI with agent_config()'s capability (skill list + load_skill tool)
+- Anthropic again, in a hand-written client.messages.create() loop
+
+The two Anthropic examples call the model only when ANTHROPIC_API_KEY is set.
 
 Prerequisites:
-    pip install "decimalai[openai-agents,pydantic-ai]" anthropic
+    pip install "decimalai[anthropic,openai-agents,pydantic-ai]"
 
 Environment variables:
     DECIMAL_API_KEY=dai_sk_...  # Get at https://app.decimal.ai/settings
@@ -24,14 +27,30 @@ import asyncio
 import os
 
 
-def example_anthropic_skill_loader():
-    """Anthropic SDK example with skill injection into system prompts.
+MODEL = "claude-haiku-5-5"
 
-    The enable_skill_loader=True option monkey-patches client.messages.create()
-    so skills are automatically injected into the system prompt before each request.
+
+def _text(message) -> str:
+    """The text blocks of an Anthropic message, joined."""
+    return "".join(block.text for block in message.content if block.type == "text")
+
+
+def example_anthropic_tool_runner():
+    """Anthropic Messages API: the agent's prompt and skills, one run per message.
+
+    Nothing in the Anthropic SDK is installed or patched. agent_config() reads the
+    agent, and each user message is a run whose two pieces you put into your own
+    request:
+    1. ``run.system`` — the agent's saved prompt, then the skill list routed on
+       this message
+    2. ``run.tools`` — the load_skill tool the model fetches a skill's body with
+
+    The SDK's Tool Runner owns the tool loop, so a load_skill result goes back to
+    the model mid-turn. support.run() calls no model: the model calls go inside
+    the ``with`` block, which is also the run's trace.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 1: Anthropic SDK with Skill Injection")
+    print("EXAMPLE 1: Anthropic Messages API with agent_config()")
     print("="*70)
 
     import decimalai
@@ -39,27 +58,41 @@ def example_anthropic_skill_loader():
 
     try:
         import anthropic
+        from anthropic import beta_tool
 
-        from decimalai.anthropic import instrument, skill_system
+        from decimalai.anthropic import agent_config
 
-        # Turn on the skill loader — skills will auto-inject into system prompts
-        instrument(enable_skill_loader=True)
+        @beta_tool
+        def check_account_status(customer_id: str) -> str:
+            """Check the status of a customer account."""
+            return f"Account {customer_id}: Active, good standing"
 
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-        # Every client.messages.create() now has skills injected automatically.
-        # Internally, this monkey-patches the create method.
-
-        # You can also manually inject skills using skill_system():
-        system_with_skills = skill_system(
-            base="You are a helpful customer support assistant.",
-            query="How do I reset my password?",  # Optional: for semantic routing
+        support = agent_config(
+            "support-agent",
+            fallback="You are a helpful customer support agent. Use tools to help.",
         )
+        print("✅ Anthropic agent configured from DecimalAI")
+        print(f"  - prompt version {support.prompt_version} and skills {support.skill_names}")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            print("  - set ANTHROPIC_API_KEY to send one message through the Tool Runner\n")
+            return
 
-        print("✅ Anthropic skill loader installed")
-        print(f"Sample system prompt with skills:\n{system_with_skills[:200]}...\n")
+        client = anthropic.Anthropic()
+        question = "How do I reset my password?"
+        with support.run(question) as run:
+            runner = client.beta.messages.tool_runner(
+                model=MODEL,
+                max_tokens=1024,
+                system=run.system,                          # saved prompt, then skill list
+                tools=[check_account_status, *run.tools],   # your tools, then load_skill
+                messages=[{"role": "user", "content": question}],
+            )
+            answer = runner.until_done()                    # consume it inside the run
+        print(f"Answer: {_text(answer)[:300]}\n")
 
     except ImportError as e:
+        print(f"⚠️  Anthropic example skipped: {e}")
+    except Exception as e:  # e.g. no such agent in this workspace
         print(f"⚠️  Anthropic example skipped: {e}")
 
 
@@ -163,40 +196,76 @@ async def example_pydantic_ai_skill_loading():
         print(f"⚠️  Pydantic AI example skipped: {e}")
 
 
-def example_manual_skill_system():
-    """Advanced: Manually inject skills without auto-loader.
+def example_anthropic_messages_create_loop():
+    """Advanced: Anthropic in a client.messages.create() loop you write yourself.
 
-    If you prefer more control, you can manually call skill_system()
-    to build skill-injected prompts.
+    The run gives the same load_skill tool as a plain definition
+    (``run.tool_params``) and answers the model's load_skill calls for you:
+    ``run.tool_result(block)`` returns the tool_result for a load_skill block and
+    None for any other tool, which your own code answers.
     """
     print("\n" + "="*70)
-    print("EXAMPLE 4: Manual Skill Injection (Advanced)")
+    print("EXAMPLE 4: Anthropic in a hand-written messages.create() loop (Advanced)")
     print("="*70)
 
     import decimalai
     decimalai.init(verify=False)
 
     try:
-        from decimalai.anthropic import skill_system
+        import anthropic
 
-        base_prompt = "You are a helpful assistant. Answer user questions clearly."
-        user_query = "How do I report a bug?"
+        from decimalai.anthropic import agent_config
 
-        # Manually build system prompt with skills
-        system_with_skills = skill_system(
-            base=base_prompt,
-            query=user_query,  # Skills routed based on user input
-            agent_name="support-agent",
+        report_bug = {
+            "name": "report_bug",
+            "description": "File a bug report and return its ticket id.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        }
+        support = agent_config(
+            "support-agent",
+            fallback="You are a helpful assistant. Answer user questions clearly.",
         )
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            print("  - set ANTHROPIC_API_KEY to run the loop\n")
+            return
 
-        print("✅ Manual skill injection example")
-        print(f"Base prompt: {base_prompt}")
-        print(f"User query: {user_query}")
-        print("\nResulting system prompt (first 300 chars):")
-        print(f"{system_with_skills[:300]}...\n")
+        client = anthropic.Anthropic()
+        question = "How do I report a bug?"
+        with support.run(question) as run:
+            messages = [{"role": "user", "content": question}]
+            while True:
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=1024,
+                    system=run.system,
+                    tools=[report_bug, *run.tool_params],
+                    messages=messages,
+                )
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason != "tool_use":
+                    break
+                results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    result = run.tool_result(block)  # load_skill: answered by DecimalAI
+                    if result is None:               # one of your tools
+                        result = {"type": "tool_result", "tool_use_id": block.id,
+                                  "content": "Filed as BUG-1042."}
+                    results.append(result)
+                messages.append({"role": "user", "content": results})
+
+        print("✅ Hand-written loop finished")
+        print(f"Answer: {_text(response)[:300]}\n")
 
     except ImportError as e:
-        print(f"⚠️  Manual skill injection example skipped: {e}")
+        print(f"⚠️  messages.create() loop example skipped: {e}")
+    except Exception as e:  # e.g. no such agent in this workspace
+        print(f"⚠️  messages.create() loop example skipped: {e}")
 
 
 def main():
@@ -206,15 +275,15 @@ def main():
     print("DecimalAI Provider-Specific Skill Loading Examples")
     print("="*70)
     print("\nThis script demonstrates the provider skill-loading options:")
-    print("  - instrument(enable_skill_loader=True): Auto-inject skills into prompts")
+    print("  - Anthropic Messages API: decimalai.anthropic.agent_config(name), a run per message")
     print("  - OpenAI Agents SDK: decimalai.openai_agents.agent_config(name)")
     print("  - Pydantic AI: decimalai.pydantic_ai.agent_config(name), a capability")
-    print("  - load_skill tool on both: config-driven via init(load_skill_tool=) /")
+    print("  - load_skill tool on all three: config-driven via init(load_skill_tool=) /")
     print("    DECIMALAI_LOAD_SKILL_TOOL")
 
     # Example 1: Anthropic
     try:
-        example_anthropic_skill_loader()
+        example_anthropic_tool_runner()
     except Exception as e:
         print(f"Anthropic example error: {e}")
 
@@ -230,11 +299,11 @@ def main():
     except Exception as e:
         print(f"Pydantic AI example error: {e}")
 
-    # Example 4: Manual injection
+    # Example 4: Anthropic, hand-written loop
     try:
-        example_manual_skill_system()
+        example_anthropic_messages_create_loop()
     except Exception as e:
-        print(f"Manual injection example error: {e}")
+        print(f"messages.create() loop example error: {e}")
 
     print("\n" + "="*70)
     print("Next Steps")
@@ -244,12 +313,12 @@ def main():
 
 Provider-specific options summary:
 
-1. ANTHROPIC SDK (decimalai.anthropic)
-   - instrument(enable_skill_loader=True) → skills injected into system prompts
-   - load_skill tool: NOT available. instrument() accepts an
-     enable_load_skill_tool parameter but it is dormant — there is no tool
-     loop to route the result back, so passing True only logs a warning and
-     stays on prompt injection.
+1. ANTHROPIC MESSAGES API (decimalai.anthropic)
+   - agent_config(name), then `with support.run(question) as run:` for each user
+     message → pass run.system and [*your_tools, *run.tools] to the Tool Runner,
+     or run.tool_params and run.tool_result(block) to your own messages.create()
+     loop. A chat keeps one support.conversation(), whose system and tools stay
+     the same for every message. Nothing is installed or patched in the SDK.
 
 2. OPENAI AGENTS (decimalai.openai_agents)
    - agent_config(name) → pass .instructions and .tools into your own Agent(...)

@@ -525,7 +525,8 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
     the narrower and permanent fact this set records. `crewai` joined on
     2026-10-08 the same way, on the commit that shipped its rail (a
     before_llm_call hook): graded on C8/C13/C14, and no load_skill tool.
-    `adk` left with 0.20, when `agent_config()` gave it a load_skill tool.
+    `adk` left with 0.20, when `agent_config()` gave it a load_skill tool, and
+    `anthropic` with 0.22 the same way.
     """
     from tests.conformance.drivers import all_drivers
 
@@ -534,7 +535,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
         for d in all_drivers()
         if not d.capabilities.model_can_load_skill_bodies
     }
-    assert set(off) == {"langchain", "anthropic", "crewai"}, off
+    assert set(off) == {"langchain", "crewai"}, off
     for name, reason in off.items():
         assert "prompt-injection" in reason, name
         assert "load_skill" in reason, name

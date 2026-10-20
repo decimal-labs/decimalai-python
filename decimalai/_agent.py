@@ -578,15 +578,21 @@ class AgentConfig(AgentBinding):
 
         support = decimalai.agent_config("support", fallback=BASE_PROMPT)
         run = support.run(question, variables=customer)
-        response = client.messages.create(
-            model=MODEL, system=run.system, tools=[*my_tools, run.tool_spec], ...)
+        response = client.chat.completions.create(   # OpenAI's shape: {"type": "function", ...}
+            model=MODEL, messages=[{"role": "system", "content": run.system}, *messages],
+            tools=[*my_tools, {"type": "function", "function": run.tool_spec}])
         # when the model calls load_skill:
-        text = run.load_skill(tool_input["name"])
+        text = run.load_skill(arguments["name"])
 
     `run()` routes the message (the first run before it returns, later ones in the
     background unless the agent's list is cut to fit) and fills the prompt's
     ``{{variables}}``. With an OpenTelemetry run live (``decimalai.init(openai=True)``,
     ``decimalai.providers.agent_run()``), the run's record goes on that run's trace.
+
+    On the Anthropic Messages API use :func:`decimalai.anthropic.agent_config`
+    instead. Anthropic reads a tool's schema from ``input_schema`` and rejects
+    ``tool_spec``'s ``parameters``; that module's runs hand over the tool in
+    Anthropic's shape and keep a chat's ``system`` the same for every message.
 
     Attributes:
         name: The agent's canonical DecimalAI name.
@@ -790,7 +796,8 @@ def agent_config(
 
     A framework with its own adapter has its own ``agent_config()``, which hands
     the same prompt and skills over in that framework's shape:
-    ``decimalai.openai_agents.agent_config``.
+    ``decimalai.openai_agents.agent_config``, ``decimalai.pydantic_ai.agent_config``,
+    ``decimalai.adk.agent_config`` and ``decimalai.anthropic.agent_config``.
 
     Args:
         agent_name: The agent's name in DecimalAI.

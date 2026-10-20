@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from decimalai.cli.scaffold import render_agent_file
+from decimalai.cli.scaffold import provider_key, render_agent_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT = "refund-bot"
@@ -218,6 +218,95 @@ print("SKILL_OFFERED:", "restocking-policy" in _first)
 print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
 """,
     },
+    "anthropic": {
+        "requires": "anthropic",
+        # The transport, and only the transport: the real `anthropic.Anthropic`
+        # client, the real Tool Runner loop and agent_config()'s run all stay on the
+        # path, and an httpx2 mock transport answers for `POST /v1/messages`. The
+        # loop is the body channel here: load_skill's result goes back to the model
+        # as a tool_result in the next request.
+        "stub": """
+import json as _json
+
+import anthropic as _anthropic
+import httpx2 as _httpx2
+
+_sent = []
+
+
+def _messages(request):
+    # The whole request, verbatim: this is the evidence the canary is read from.
+    body = _json.loads(request.content)
+    _sent.append(body)
+    tools = [t.get("name") for t in body.get("tools") or []]
+    # A tool result already came back -> this is the answering turn. Read off the
+    # REQUEST, so the script does not have to know how many turns a run takes.
+    answered = any(
+        isinstance(m.get("content"), list)
+        and any(b.get("type") == "tool_result" for b in m["content"])
+        for m in body.get("messages") or []
+    )
+    if "load_skill" in tools and not answered:
+        content = [{"type": "tool_use", "id": "toolu_1", "name": "load_skill",
+                    "input": {"name": "restocking-policy"}}]
+        stop = "tool_use"
+    else:
+        content = [{"type": "text", "text": "stubbed answer"}]
+        stop = "end_turn"
+    return _httpx2.Response(200, json={
+        "id": "msg_" + str(len(_sent)), "type": "message", "role": "assistant",
+        "model": body.get("model"), "content": content, "stop_reason": stop,
+        "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+
+_real_client_init = _anthropic.Anthropic.__init__
+
+
+def _stub_transport(self, *args, **kwargs):
+    kwargs["http_client"] = _httpx2.Client(transport=_httpx2.MockTransport(_messages))
+    _real_client_init(self, *args, **kwargs)
+
+
+_stack.enter_context(patch.object(_anthropic.Anthropic, "__init__", _stub_transport))
+
+# The name each run's span is opened with, which is the name its trace is filed
+# under: what the run read off agent_config(), not the literal from the template.
+import decimalai.anthropic as _da
+import decimalai.otel as _otel
+_runs = []
+_start_span = _da.Run._start_span
+
+
+def _named_span(self):
+    _start_span(self)
+    _runs.append((getattr(self._span, "attributes", None) or {}).get(_otel._DECIMAL_AGENT_NAME))
+
+
+_stack.enter_context(patch.object(_da.Run, "_start_span", _named_span))
+""",
+        "probe": """
+# What the model was handed, request by request. A run's system is the agent's
+# prompt, then its skill list; its tools end with load_skill.
+_first = _sent[0] if _sent else {}
+_system = "".join(b.get("text", "") for b in _first.get("system") or [])
+print("PROMPT_SEEN:", _system.split("## Available Skills")[0].strip() or "<none>")
+print("LOADER:", "load_skill" in [t.get("name") for t in _first.get("tools") or []])
+print("BOUND:", _runs[0] if _runs else "<no run span>")
+print("TURNS:", len(_sent))
+
+# Every tool_result the model was sent back, across every request.
+_results = [
+    str(b.get("content")) for body in _sent for m in body.get("messages") or []
+    if isinstance(m.get("content"), list) for b in m["content"]
+    if b.get("type") == "tool_result"
+]
+_all = "\\n".join([_system] + _results)
+print("SKILL_OFFERED:", "restocking-policy" in _system)
+print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
+print("BODY_IN_TOOL_RESULT:", any("23.5% restocking fee" in r for r in _results))
+""",
+    },
     "langchain": {
         "requires": "langchain",
         "stub": """
@@ -310,6 +399,10 @@ BODY_CHANNEL_OBSERVABLE = {
         "Pydantic AI owns the loop, so the body should have come back as a tool "
         "result mid-turn."
     ),
+    "anthropic": (
+        "A run's tools include load_skill and the Tool Runner owns the loop, so the "
+        "body should have come back as a tool_result mid-run."
+    ),
 }
 
 #: The shape `SkillRouter._request` sees from the real backend, reduced to the
@@ -392,6 +485,7 @@ _ENV = {
     # The template's own provider-key guard runs before anything else; every
     # model call below is stubbed, so this value is never sent anywhere.
     "OPENAI_API_KEY": "sk-stub-for-the-guard-only",
+    "ANTHROPIC_API_KEY": "sk-ant-stub-for-the-guard-only",
     # The generated file legitimately turns the loader on; inside a
     # disk-runtime harness that prints a duplicate-skills warning to
     # stderr, which is correct advice and noise here.
@@ -442,9 +536,10 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     assert "INIT: True" in out and "FLUSH: True" in out, out
 
     # The load-bearing one: the skills rail did not merely parse, it is ON.
-    # Through `instrument(enable_skill_loader=True)` (langchain, adk) the
-    # adapter accepted it and the loader is INSTALLED; through agent_config()
-    # (openai-agents, pydantic-ai) load_skill was in the model's first request.
+    # Through `instrument(enable_skill_loader=True)` (langchain) the adapter
+    # accepted it and the loader is INSTALLED; through agent_config()
+    # (openai-agents, pydantic-ai, anthropic) load_skill was in the model's
+    # first request.
     # A template that passes an argument the adapter silently ignores, or
     # builds an Agent without agent_config()'s pieces, would satisfy every AST
     # assertion in the sibling module and fail here.
@@ -521,6 +616,13 @@ def test_generated_file_executes(framework, prompt, tmp_path):
         # Two model requests: ask for the body, then answer with it. One would
         # mean the loop never closed — the shape a bare model call has.
         assert "TURNS: 2" in out, out
+
+    if framework == "anthropic":
+        # Two requests (ask for the body, answer with it), and the body came back
+        # as load_skill's tool_result, not pasted into system: with the tool there,
+        # pasting it too would deliver it twice.
+        assert "TURNS: 2" in out, out
+        assert "BODY_IN_TOOL_RESULT: True" in out, out
 
 
 # ── the langchain template must be an AGENT, not a chat completion ───
@@ -796,21 +898,23 @@ _stack.enter_context(patch.object(
 
 @pytest.mark.parametrize("framework", sorted(RUNTIMES))
 def test_missing_provider_key_is_a_one_line_refusal(framework, tmp_path):
-    """Without the guard a missing OPENAI_API_KEY is a traceback from inside the
-    provider client — after init(), instrument() and agent_config() have all made
-    their network calls. The file must refuse on line one and point at the
-    `Set:` block `decimalai init` printed."""
+    """Without the guard a missing provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY)
+    is a traceback from inside the provider client — after init(), instrument()
+    and agent_config() have all made their network calls. The file must refuse on
+    line one and point at the `Set:` block `decimalai init` printed."""
     spec = RUNTIMES[framework]
     if not _have(spec["requires"]):
         pytest.skip(f"{spec['requires']} not installed")
     agent_py = tmp_path / "agent.py"
     agent_py.write_text(render_agent_file(AGENT, framework, SKILLS))
-    env = {k: v for k, v in _ENV.items() if k != "OPENAI_API_KEY"}
+    key = provider_key(framework)
+    assert key in _ENV, f"{framework}'s guard reads {key}, which _ENV does not set"
+    env = {k: v for k, v in _ENV.items() if k != key}
     proc = subprocess.run(
         [sys.executable, str(agent_py)], capture_output=True, text=True,
         cwd=tmp_path, timeout=120, env=env,
     )
     assert proc.returncode == 1, proc.stderr
-    assert "OPENAI_API_KEY is not set" in proc.stderr, proc.stderr
+    assert f"{key} is not set" in proc.stderr, proc.stderr
     assert "Traceback" not in proc.stderr, proc.stderr   # a refusal, not a stack
     assert "decimalai init" in proc.stderr, proc.stderr

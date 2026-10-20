@@ -391,3 +391,41 @@ def test_under_the_kill_switch_agent_config_runs_on_its_fallback_without_asking(
     assert support.run("Hi").system == "You help."
     with pytest.raises(RuntimeError, match="switched off"):
         decimalai.agent_config("support")
+
+
+def test_anthropic_load_agent_skills_stop_after_a_disabled_reinit(monkeypatch, tmp_path):
+    """The same for an Anthropic `agent_config()` config, through a real re-init: built
+    while enabled, it neither routes nor shows its copy of the skill list in
+    `run.system` after `init(enabled=False)`; the prompt it read still runs."""
+    pytest.importorskip("anthropic")
+    import decimalai
+    import decimalai._config as cfg
+    import decimalai.anthropic as da
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING", "1")
+    monkeypatch.setattr(cfg, "_config", None, raising=False)
+    monkeypatch.setattr(cfg, "_client", None, raising=False)
+    monkeypatch.setattr(da, "_skill_router_singleton", None)
+    # agent_config() turns on Anthropic tracing for the process; not from a unit test.
+    monkeypatch.setattr(da, "_tracing_turned_on", True)
+    fake = _RoutingPlatform()
+    monkeypatch.setattr(httpx, "request", fake)
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9")
+    monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
+        "agent_name": name, "system_prompt": "You help.", "version_number": 1,
+    })
+    support = da.agent_config("support")
+
+    def system(text):
+        with support.run(text) as run:
+            return "\n".join(block["text"] for block in run.system)
+
+    assert "Recommended Skills" in system("how do refunds work?"), "control"
+
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=False)
+    before = list(fake.skill_calls())
+    shown = system("can I return an opened box?")
+    assert "Recommended Skills" not in shown and shown.startswith("You help.")
+    assert fake.skill_calls() == before

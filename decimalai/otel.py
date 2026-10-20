@@ -500,6 +500,39 @@ def _notify_trace_observer(observer: Callable[[RunTrace], None], trace: RunTrace
         logger.exception("Trace observer failed for %s", trace.id)
 
 
+#: Spans started per OTel trace on a DecimalAI pipeline, newest traces last. A run
+#: that knows its own trace id reads it at exit (`spans_started`) to notice that
+#: none of its model calls was traced. Bounded like the rail: oldest evicted first.
+_SPANS_STARTED_MAX = 1024
+_spans_started: "OrderedDict[int, int]" = OrderedDict()
+_spans_started_lock = threading.Lock()
+
+
+def _note_span_started(span: Any) -> None:
+    try:
+        tid = span.get_span_context().trace_id
+    except Exception:
+        return
+    if not tid:
+        return
+    with _spans_started_lock:
+        _spans_started[tid] = _spans_started.get(tid, 0) + 1
+        _spans_started.move_to_end(tid)
+        while len(_spans_started) > _SPANS_STARTED_MAX:
+            _spans_started.popitem(last=False)
+
+
+def spans_started(trace_id: int) -> int:
+    """How many spans a DecimalAI pipeline saw start in this trace (0 if none or evicted)."""
+    with _spans_started_lock:
+        return _spans_started.get(trace_id, 0)
+
+
+#: The run span's attribute naming the conversation it belongs to; the exporter
+#: files it as the trace's ``session_id`` so a chat's turns group together.
+SESSION_ID_ATTRIBUTE = "decimal.session_id"
+
+
 class _AgentNameStamper:
     """A span processor that records, at span START, whose agent the span is.
 
@@ -516,6 +549,7 @@ class _AgentNameStamper:
     """
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
+        _note_span_started(span)
         try:
             name = _active_agent_name.get()
             if not name:
@@ -955,6 +989,27 @@ class _AgentManifestState:
         self.adoption_checked = False
 
 
+def _dropped_outside_a_run(root: Any) -> bool:
+    """Whether a finished trace's root is a provider call DecimalAI should not send.
+
+    True only for a call whose instrumentor a ``agent_config()`` turned on for its own
+    runs (``decimalai.providers._runs_only``) and that happened outside such a run.
+    ``init(<provider>=True)`` asks for every call and clears that.
+    """
+    if root is None:
+        return False
+    try:
+        from .providers import _runs_only_scopes
+
+        scopes = _runs_only_scopes()
+        if not scopes:
+            return False
+        scope = getattr(getattr(root, "instrumentation_scope", None), "name", None) or ""
+        return any(scope.startswith(prefix) for prefix in scopes)
+    except Exception:
+        return False
+
+
 class DecimalSpanExporter:
     """OpenTelemetry ``SpanExporter`` that routes spans to DecimalAI.
 
@@ -1050,10 +1105,26 @@ class DecimalSpanExporter:
         # Taken before anything can fail, so a run whose trace is never sent does not
         # leave its native loads in the shared store until the cap evicts them.
         native = _pop_native_rail(tid)
+        root = next((span for span in group if _get_parent_span_id(span) is None), None)
+        if _dropped_outside_a_run(root):
+            # Traced only because a agent_config() turned the provider's tracing on, and
+            # not inside one of its runs: this call is not DecimalAI's to send.
+            _pop_skill_rail(tid)
+            _pop_run_link(tid)
+            return
         try:
             result = self._assemble_trace(group)
             if result is not None:
                 run_trace, seen_model, seen_tools, seen_prompts = result
+                root_attrs = getattr(root, "attributes", None) or {}
+                if root_attrs.get(SESSION_ID_ATTRIBUTE) and not run_trace.session_id:
+                    run_trace.session_id = str(root_attrs[SESSION_ID_ATTRIBUTE])
+                if any((getattr(span, "attributes", None) or {}).get("decimal.prompt.source")
+                       for span in group):
+                    # A agent_config() run: its prompt is saved in DecimalAI already, and the
+                    # text the model saw has placeholder values filled in (names only
+                    # leave the process, D8) and its skill list appended.
+                    seen_prompts = {}
                 agent_name = run_trace.agent_name or "otel-agent"
                 # Stamp the manifest onto the trace AFTER registration — the
                 # trace was assembled before it ran, and without an id the
@@ -2152,7 +2223,9 @@ def _extract_declared_tools(attrs: Dict[str, Any]) -> List[str]:
 # (gen_ai.prompt.{i}.role / .content, gen_ai.completion.{i}...).
 _MSG_KEY_RES = {
     "input": (
-        re.compile(r"^llm\.input_messages\.(\d+)\.message\.(role|content)$"),
+        # tool_call_id: a message answering a tool call. OpenInference's Anthropic
+        # instrumentor records a tool_result as role "user" with it set.
+        re.compile(r"^llm\.input_messages\.(\d+)\.message\.(role|content|tool_call_id)$"),
         re.compile(r"^gen_ai\.prompt\.(\d+)\.(role|content)$"),
     ),
     "output": (
@@ -2297,7 +2370,10 @@ def _messages_from_attrs(
         return _semconv_messages_from_attrs(attrs, direction)
     return [
         {
-            "role": found[idx].get("role") or _DEFAULT_ROLE[direction],
+            # A message carrying a tool_call_id is a tool's result, whatever role the
+            # instrumentor gave it (Anthropic's tool_result travels in a user turn).
+            "role": "tool" if found[idx].get("tool_call_id")
+            else (found[idx].get("role") or _DEFAULT_ROLE[direction]),
             "content": found[idx].get("content", ""),
         }
         for idx in sorted(found)

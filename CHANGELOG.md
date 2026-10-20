@@ -151,6 +151,92 @@ for the four below.
   skills on that run's list; when the list is cut to fit it still takes any name, so a skill
   the cap left off can be loaded.
 
+### Changed (breaking): Anthropic Messages API agents get their prompt and skills from `agent_config()`
+
+- **New:** `decimalai.anthropic.agent_config(name, fallback=..., on_unavailable="continue")`. Open
+  one run per user message, `with support.run(question, variables=values) as run:`, and hand the
+  SDK's Tool Runner `system=run.system` (the agent's saved prompt with its `{{variables}}`
+  filled from `variables`, then the skill list routed on the message) and
+  `tools=[*your_tools, *run.tools]` (`load_skill`). A hand-written `client.messages.create()` loop
+  takes `run.tool_params` instead and answers each `tool_use` block with `run.tool_result(block)`,
+  which returns `None` for your own tools. `async with` gives async tools for `AsyncAnthropic`,
+  and `await run.atool_result(block)`. `support.run()` itself calls no model. On Anthropic the
+  model can fetch a skill's text mid-turn for the first time.
+- Each run is one trace filed under the DecimalAI agent, with its prompt version and the skills
+  offered and loaded; `on_trace=fn` is called with each finished trace before it is sent.
+  `agent_config()` turns on Anthropic tracing (OpenInference's instrumentor) and sends only the calls
+  made inside its runs; `init(anthropic=True)` still sends every call. `decimalai.flush()` waits a
+  few seconds at most for a run that closed while its routing decision was still on its way.
+- **Chats:** `chat = support.conversation(variables=values)`, then `with chat.run(question) as run:`
+  for each message. A conversation keeps the system blocks and tool definition its first message
+  got, byte for byte: Anthropic answers HTTP 400 when either changes once a thinking block is in
+  the history. A prompt saved or a skill assigned later reaches the next conversation.
+  `chat.state` is the conversation as JSON-ready data, and `support.conversation(state=saved)`
+  resumes it in another process. Every message is still routed on its own text: for an agent whose
+  list is cut to fit, the skills a later message picks that the chat has not shown ride in that
+  message's user turn, `run.message`, which a chat sends instead of its own user dict.
+- `cache_control=` is the prompt-caching breakpoint DecimalAI puts on `run.system`, at its end
+  and, when later runs share the prompt but not the list, after the prompt (two of a request's
+  four): `{"type": "ephemeral"}` by default, `None` for none.
+- **New extra:** `pip install "decimalai[anthropic]"` installs `anthropic>=1.13.0` and
+  `openinference-instrumentation-anthropic>=3.0.3`. `[all]` includes it.
+- `decimalai init --framework anthropic` writes a project in this shape. Anthropic had no
+  template before.
+- **Removed:** `decimalai.anthropic.instrument(enable_skill_loader=True)` and the patches of
+  `Messages.create()`, `.stream()` and `.parse()` (sync and async) behind it, which put a skill menu
+  (and, when routing ranked one, the top skill's text) into the `system` of every request any
+  Anthropic client in the process made; `skill_system()`; and `get_current_routing_id()`.
+  `instrument()` is now a stub that raises `TypeError` naming `agent_config()`.
+
+Migration:
+
+```python
+# before
+from decimalai.anthropic import instrument
+instrument(enable_skill_loader=True, agent_name="support")
+response = client.messages.create(model=MODEL, max_tokens=1024, system=BASE, messages=messages)
+# or: system=skill_system(BASE, query=question)
+
+# after
+from decimalai.anthropic import agent_config
+support = agent_config("support", fallback=BASE)
+with support.run(question) as run:
+    response = client.beta.messages.tool_runner(
+        model=MODEL, max_tokens=1024, system=run.system, tools=[*my_tools, *run.tools],
+        messages=[{"role": "user", "content": question}],
+    ).until_done()
+```
+
+A chat that sent its history with every request keeps one `support.conversation()` beside that
+history and opens `chat.run(question)` for each message.
+
+### Fixed: `agent_config()` no longer switches DecimalAI back on after `init(enabled=False)`
+
+- After `decimalai.init(enabled=False)` there is no client, and every `agent_config()`
+  (`decimalai.agent_config()` and the OpenAI Agents, Pydantic AI, Google ADK and Anthropic ones) took
+  that to mean the SDK was never initialized and called `decimalai.init()` again from the
+  environment, which turned the kill switch off. They now initialize only a process that never
+  called `init()`.
+- Under the kill switch, `agent_config()` asks DecimalAI nothing: the agent runs on its `fallback=`
+  text, and with no fallback `agent_config()` raises `RuntimeError` saying to pass one.
+
+### Fixed: the OpenTelemetry exporter
+
+- A message that answers a tool call is recorded as a `tool` message. OpenInference's Anthropic
+  instrumentor records Anthropic's `tool_result` as a `user` message carrying a `tool_call_id`, so
+  a skill's text that the model loaded read as if the user had typed it. Any message with a
+  `tool_call_id` is now `tool`.
+- A `agent_config()` run no longer registers the system text the model saw as the agent's manifest
+  prompt. That text has the placeholder values filled in and the skill list appended, so the
+  manifest showed a changed prompt whenever a value or the skill list changed. The run's record
+  already names the saved prompt's version.
+- `init(otel=True)` beside a provider's tracing no longer sends each trace twice.
+  `init(anthropic=True)`, `init(openai=True)` and `init(google=True)`, and the tracing
+  `decimalai.anthropic.agent_config()` turns on, added a second DecimalAI exporter to a tracer
+  provider that `init(otel=True)` had already given one. They now use that one.
+- A run span's `decimal.session_id` becomes the trace's `session_id`. Anthropic runs set it to
+  their conversation's id, so a chat's messages group together.
+
 ## [0.21.0] — 2026-10-20
 
 ### Changed (breaking): `load_agent()` is now `agent_config()`, and each message is a `Run`

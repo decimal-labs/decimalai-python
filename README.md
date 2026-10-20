@@ -32,10 +32,11 @@ The core install is deliberately thin (tracing, CLI, manifests, skills). Framewo
 ```bash
 pip install "decimalai[langchain]"       # LangChain (add [langgraph] for LangGraph)
 pip install "decimalai[openai-agents]"   # OpenAI Agents SDK
+pip install "decimalai[anthropic]"       # Anthropic Messages API
 pip install "decimalai[all]"             # every framework adapter (not [evals]; see below)
 ```
 
-Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
+Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
 
 `[evals]` installs litellm, which pins `openai<3`, while `[openai]`, `[openai-agents]` and `[pydantic-ai]` need `openai>=3`. So `[evals]` is not part of `[all]`, and it cannot be installed in the same environment as those three. CrewAI has no extra for the same reason: install `crewai` yourself, beside the adapters that run on `openai<3`.
 
@@ -197,6 +198,65 @@ trace, filed under the DecimalAI agent with its prompt version and the skills of
 delivered; a runner built without it is not traced. Nothing in ADK is patched. An agent that carries
 ADK's own `SkillToolset` gets no DecimalAI skills.
 
+### Anthropic Messages API
+
+```python
+import anthropic
+from decimalai.anthropic import agent_config
+
+client = anthropic.Anthropic()
+support = agent_config("support", fallback=BASE_SYSTEM)   # reads DECIMAL_API_KEY
+
+question = "Where is ORD-1001?"
+with support.run(question, variables=customer) as run:
+    runner = client.beta.messages.tool_runner(
+        model="claude-haiku-5-5",
+        max_tokens=4096,
+        system=run.system,                  # the agent's saved prompt, then its skill list
+        tools=[lookup_order, *run.tools],   # + load_skill
+        messages=[{"role": "user", "content": question}],
+    )
+    answer = runner.until_done()
+```
+
+One run is one user message, from the question to the final answer. Opening it routes the skill
+list on that message, fills the prompt's variables (`{{name}}`) from `variables=` (a missing value stops the run before
+any model call) and starts the run's trace; closing it sends the trace, filed under the DecimalAI
+agent with its prompt version and the skills offered and loaded. `support.run()` calls no model:
+make the model calls inside the `with` block, and consume a Tool Runner there, since it sends nothing
+until it is iterated. A hand-written `client.messages.create()` loop takes `run.tool_params` (the same tool as a plain
+definition) and answers each `tool_use` block with `run.tool_result(block)`, which returns `None`
+for your own tools. `async with support.run(...)` gives async tools for `AsyncAnthropic`'s Tool Runner.
+
+A chat keeps one conversation, and a conversation's `system` and tools stay byte for byte what its
+first message got. Anthropic rejects a request whose system prompt or tool definitions changed once a
+thinking block is in the history (HTTP 400), so a prompt saved or a skill assigned later reaches the
+next conversation, and per-message facts belong in the user message. The user turn comes from the
+run too: `run.message` is the question, plus, for an agent whose skill list is cut to fit, the
+skills routed for this message that the chat has not shown yet:
+
+```python
+chat = support.conversation(variables=customer)   # one per chat
+history = []                                    # the chat's messages, kept with it
+
+with chat.run(question) as run:
+    history.append(run.message)                 # the question (+ skills new to this chat)
+    runner = client.beta.messages.tool_runner(
+        model="claude-haiku-5-5", max_tokens=4096,
+        system=run.system, tools=[lookup_order, *run.tools], messages=list(history),
+    )
+    for message in runner:                      # until_done() returns only the last message
+        history.append({"role": "assistant", "content": message.content})
+        if reply := runner.generate_tool_call_response():
+            history.append(reply)
+saved = chat.state                              # JSON: support.conversation(state=saved) resumes it
+```
+
+A server that keeps no chat in memory stores `chat.state` beside the history. Nothing in the
+Anthropic SDK is patched, and other clients get no skills. `agent_config()` turns on Anthropic tracing
+(OpenInference's instrumentor, installed by `decimalai[anthropic]`) and sends only the calls made
+inside its runs; `init(anthropic=True)` traces every call and changes no request.
+
 ### Your own model calls
 
 For code that calls a model itself (a provider SDK, your own tool loop), the top-level
@@ -216,7 +276,9 @@ text = run.load_skill(tool_input["name"])
 
 Each `support.run()` is one run, routed on its message the way an OpenAI Agents run is, with the
 prompt's variables (`{{name}}`) filled from `variables=`. A run serves its own `load_skill` calls,
-from any thread. `support.prompt` is the saved prompt as written, for code that wants only the text.
+from any thread. `support.prompt` is the saved prompt as written, for code that wants only the text. On the Anthropic Messages API use
+`decimalai.anthropic.agent_config()` ([above](#anthropic-messages-api)): Anthropic reads a tool's
+schema from `input_schema`, and `tool_spec` gives it as `parameters`.
 
 `init(langchain=True)` and `init(crewai=True)` install the same thing as that adapter's `instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both.
 
@@ -367,13 +429,13 @@ No adapter writes skills to disk on its own: `decimalai skills add` (or `router.
 
 ### Skill Delivery at Runtime (`enable_skill_loader`)
 
-Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, use the framework flag on `init()` (LangChain and CrewAI turn the loader on with it), or enable the skill loader on your adapter's `instrument()`. OpenAI Agents SDK, Pydantic AI and Google ADK agents use their framework's `agent_config()` instead ([above](#openai-agents-sdk)):
+Discovery and sync (above) get skills *into the platform*. To get them **into your agent's context at runtime**, use the framework flag on `init()` (LangChain and CrewAI turn the loader on with it), or enable the skill loader on your adapter's `instrument()`. OpenAI Agents SDK, Pydantic AI, Google ADK and Anthropic Messages API agents use their framework's `agent_config()` instead ([above](#openai-agents-sdk)):
 
 ```python
 import decimalai
 decimalai.init()
 
-from decimalai.langchain import instrument  # or .crewai / .anthropic
+from decimalai.langchain import instrument  # or .crewai
 instrument(enable_skill_loader=True)
 ```
 
@@ -397,11 +459,11 @@ You can read each run's trace as the LangChain adapter and ADK's `DecimalAIPlugi
 
 With the loader on, the router adds a ranked **skill list** to the prompt (one short row per skill: name + when to use it). A row alone is only an *offer* — the skill's actual content (its body) reaches the model through one of three delivery mechanisms:
 
-- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the skill list alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole skill list is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `anthropic`, `crewai` — none of them register a `load_skill` tool) and **off** for agents set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK), which fetch bodies with `load_skill` rather than double-deliver; switching that tool off makes injection take over there too. An explicit `True`/`False` always wins.
-- **`load_skill` tool** — an agent set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK) gets a `load_skill` tool beside its skill list, so the model can fetch an offered skill's body mid-run. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the list's cap left off this run's skill list), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself; a load from a router that has never routed (a hand-built list, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. An agent whose own skill loader serves its skills (an OpenAI `SandboxAgent` with `Skills`, ADK's `SkillToolset`, CrewAI's `skills=`, Deep Agents, the Pydantic AI harness) gets neither the tool nor the skill list. An `agent_config()` agent that has another tool named `load_skill` gets no DecimalAI skills on OpenAI Agents and Google ADK (with one warning); Pydantic AI refuses to run it, since two of its tools would share a name. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `agent_config()` parameter.
+- **Body injection** — `decimalai.init(inject_skill_body=...)` (or `DECIMALAI_INJECT_SKILL_BODY=0/1`) injects the top-routed skill's full body into the prompt. Bodies go in complete or not at all: one that does not fit the per-turn token budget is left out, never trimmed. A body is injected only when the platform says it ranked the result by this turn's message (`query_ranked`), so a "thanks!" gets the skill list alone. A degraded result still counts when it is ranked, such as lexical-only retrieval while embeddings are down. Two bodies go in ranked or not: the `priority_skills` the platform offered, and the agent's only skill when its whole skill list is one skill (which therefore reaches small talk too). The flag is **tri-state, not opt-in**: left unset it defaults **on** for the adapters where injection is the only body channel (`langchain`, `crewai` — neither registers a `load_skill` tool) and **off** for agents set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK, Anthropic), which fetch bodies with `load_skill` rather than double-deliver; switching that tool off makes injection take over there too. An explicit `True`/`False` always wins.
+- **`load_skill` tool** — an agent set up with a framework's `agent_config()` (OpenAI Agents, Pydantic AI, Google ADK, Anthropic) gets a `load_skill` tool beside its skill list, so the model can fetch an offered skill's body mid-run. Each load names the run's routing decision (`routing_id`), and the platform decides what to serve: any skill your org owns, has installed or has assigned to the agent (including one the list's cap left off this run's skill list), and a skill reachable only through the public registry just when the run was offered it, so a prompt injection can't load an arbitrary registry skill by name. The SDK refuses no name itself, apart from an Anthropic run whose whole skill list fits, which answers a name not on it with an error (the Anthropic SDK does not check a tool's input against its schema); a load from a router that has never routed (a hand-built list, a direct `SkillRouter.load_skill()` call) names no decision and is not confined. An agent whose own skill loader serves its skills (an OpenAI `SandboxAgent` with `Skills`, ADK's `SkillToolset`, CrewAI's `skills=`, Deep Agents, the Pydantic AI harness) gets neither the tool nor the skill list. An `agent_config()` agent that has another tool named `load_skill` gets no DecimalAI skills on OpenAI Agents and Google ADK (with one warning); Pydantic AI refuses to run it, since two of its tools would share a name. On by default; kill switch: `decimalai.init(load_skill_tool=False)` or `DECIMALAI_LOAD_SKILL_TOOL=0`. It is **not** an `agent_config()` parameter.
 - **Native loading from disk** — for runtimes that load SKILL.md folders themselves (Claude Code, Google ADK, ...), install skills with `decimalai skills add` and point the runtime at `decimalai.skills_dir()` (see [Skills on Disk](https://github.com/decimal-labs/decimalai-python#skills-on-disk)), and let the runtime deliver them; each framework's helper also records every load as an activation of the version delivered. No copy is taken and no fork is needed; you can install a skill you only linked.
 
-Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop the adapter controls):
+Delivery support differs per adapter — the asymmetry is structural (`load_skill` needs a tool loop that can send a tool result back):
 
 | Adapter | Skill list + body injection | `load_skill` tool | Notes |
 |---|---|---|---|
@@ -410,7 +472,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | `decimalai.langchain` | ✅ | ❌ injection-only | `enable_load_skill_tool` accepted but dormant (warns); on Python 3.10, async `create_agent` runs route their model calls without the run (warns once; see [Installation](https://github.com/decimal-labs/decimalai-python#installation)) |
 | `decimalai.adk` | ✅ | ✅ | from `agent_config()`: `instruction` carries the skill list, `tools` the `load_skill` tool; routed once per invocation on its message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
-| `decimalai.anthropic` | ✅ | ❌ injection-only | patches `messages.create()`, `.stream()` and `.parse()` (sync and async; not `client.beta`) — no loop to route a tool result back |
+| `decimalai.anthropic` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Tool Runner) or `run.tool_params` (`messages.create`) the `load_skill` tool; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
 
@@ -492,6 +554,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Google ADK | ✅ (native) | `agent_config(name)` + `DecimalAIPlugin()` in `App(plugins=[...])` |
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
 | Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
+| Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |

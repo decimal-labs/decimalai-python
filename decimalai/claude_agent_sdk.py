@@ -3,8 +3,9 @@
 First-class tracing for Anthropic's **Claude Agent SDK** (``claude-agent-sdk``,
 import ``claude_agent_sdk``) — the agentic framework whose ``query()`` runs a
 tool-use loop against the Claude Code engine. This is distinct from the raw
-Anthropic Messages API (traced via ``decimalai.trace`` / the OTEL exporter) and
-from ``decimalai.anthropic`` (which is the SkillRouter prompt-injection adapter).
+Anthropic Messages API (traced by ``init(anthropic=True)`` through the OTEL exporter)
+and from ``decimalai.anthropic`` (whose ``agent_config()`` gives Messages API calls an
+agent's prompt and skills, one run per user message).
 
 The Claude Agent SDK exposes no global callback/plugin system: ``query()`` is an
 async generator that yields ``SystemMessage`` (init) → ``AssistantMessage`` (model

@@ -1,10 +1,11 @@
 """Adapter registration tests for the native load_skill tool.
 
-  - openai_agents and pydantic_ai patch nothing: ``agent_config()`` hands the tool
-    to the developer, and tests/test_openai_agents_load_agent.py and
-    tests/test_pydantic_ai_load_agent.py drive it through the real frameworks.
-  - anthropic + langchain: instrument(enable_load_skill_tool=True) is
-    accepted but DORMANT — logs a warning, does not raise.
+  - openai_agents, pydantic_ai and anthropic patch nothing: ``agent_config()``
+    hands the tool to the developer, and tests/test_openai_agents_load_agent.py,
+    tests/test_pydantic_ai_load_agent.py and tests/test_anthropic_load_agent.py
+    drive it through the real frameworks.
+  - langchain: instrument(enable_load_skill_tool=True) is accepted but
+    DORMANT — logs a warning, does not raise.
 """
 
 from __future__ import annotations
@@ -18,21 +19,10 @@ import os
 os.environ.setdefault("DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING", "1")
 
 
-# ── anthropic + langchain: dormant param ─────────────────────────
+# ── langchain: dormant param ─────────────────────────────────────
 
 
 class TestDormantAdapters:
-    def test_anthropic_enable_load_skill_tool_warns_and_stays_dormant(self, caplog):
-        import decimalai.anthropic as an
-
-        with caplog.at_level(logging.WARNING, logger="decimalai.anthropic"):
-            an.instrument(enable_load_skill_tool=True)  # must not raise
-
-        assert any(
-            "enable_load_skill_tool is not supported" in rec.getMessage()
-            for rec in caplog.records
-        )
-
     def test_langchain_enable_load_skill_tool_warns_and_stays_dormant(
         self, caplog, monkeypatch,
     ):

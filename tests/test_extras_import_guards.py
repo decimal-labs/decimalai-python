@@ -114,6 +114,19 @@ class TestWarningGuards:
         with pytest.raises(ImportError, match=r'decimalai\[openai-agents\]'):
             oa.agent_config("support")
 
+    def test_anthropic_load_agent_names_the_extra_before_any_call(self, monkeypatch):
+        """Since 0.22 the Messages API's skills come from agent_config(), which needs the
+        Anthropic SDK outright: it raises, naming the extra, before init() or any
+        request. The module itself imports without the SDK (see below)."""
+        import decimalai._agent as agent_mod
+        import decimalai.anthropic as da
+
+        _block(monkeypatch, "anthropic")
+        monkeypatch.setattr(agent_mod, "_ensure_initialized",
+                            lambda: pytest.fail("set up before the import check"))
+        with pytest.raises(ImportError, match=r'decimalai\[anthropic\]'):
+            da.agent_config("support")
+
 
 class TestCoreImportSurvivesMissingFrameworks:
     """`import decimalai` and its lazy attrs work with ALL framework deps absent."""
@@ -128,6 +141,7 @@ class TestCoreImportSurvivesMissingFrameworks:
             "decimalai.pydantic_ai",
             "decimalai.claude_agent_sdk",
             "decimalai.adk",
+            "decimalai.anthropic",
             "decimalai.evals.llm_evaluators",
         ]
         # Pin the parent-package attributes to today's module objects so
@@ -144,6 +158,7 @@ class TestCoreImportSurvivesMissingFrameworks:
             "langchain_core",
             "agents",
             "openai",
+            "anthropic",
             "llama_index",
             "pydantic_ai",
             "claude_agent_sdk",

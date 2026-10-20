@@ -131,8 +131,9 @@ def _release_scoped_routing_rail(router: Any, scope: Optional[str]) -> None:
     """Give back the routing slot a scoped routing call filed under ``scope``.
 
     For the adapters that pass ``scope=`` to the router but read the decision
-    back from the per-call rails above, never from the router: ADK, Anthropic,
-    CrewAI, OpenAI Agents and Pydantic AI. The router still files every scoped
+    back from the per-call rails above, never from the router: every
+    ``agent_config()`` (ADK, Anthropic, OpenAI Agents, Pydantic AI and
+    ``decimalai.agent_config()``, through ``_agent_binding``) and CrewAI. The router still files every scoped
     decision a second time under the run's scope, for the adapter that does read
     it back from there (LangChain), and holds it until a scoped ``consume_*``
     drains it. Left in place, each run keeps one of the router's
@@ -223,10 +224,10 @@ def _body_is_known_partial(body: Any, record: Optional[Dict[str, Any]] = None) -
 
 # ── Progressive disclosure: the load_skill tool ────────────────────────
 # The description tier is always-on; bodies load on demand when the model
-# calls load_skill(name). Adapters that own their tool loop (openai_agents,
-# pydantic_ai) register this as a native tool; adapters that patch a
-# non-loop layer (anthropic, langchain) can't route a tool result and stay
-# on prompt injection until a loop wrapper exists.
+# calls load_skill(name). Every agent_config() (openai_agents, pydantic_ai, adk,
+# anthropic) hands the model this tool, for the framework's or the SDK's own
+# tool loop; adapters that patch a layer with no tool loop (langchain, crewai)
+# can't route a tool result and stay on prompt injection.
 
 LOAD_SKILL_TOOL_NAME = "load_skill"
 
@@ -1699,7 +1700,8 @@ class SkillRouter:
         # OpenAI Agents runner copies around the instructions callable), so
         # the contextvar rails above are invisible to the adapter's
         # trace-send path. The contextvars stay authoritative where they DO
-        # propagate (the generic tracer, the anthropic adapter); adapters
+        # propagate (the generic tracer; every agent_config(), which reads them
+        # right after its own routing call); adapters
         # union this rail in via `consume_routing_id()` /
         # `consume_offered_names()` / `consume_delivered_names()`.
         self._routing_id_rail: Optional[str] = None
@@ -2953,8 +2955,9 @@ class SkillRouter:
     ) -> tuple[str, Optional[str]]:
         """Return ``(prompt_fragment, routing_id)`` — the primitive every adapter calls.
 
-        This is the single entry point framework adapters (openai_agents,
-        langchain, pydantic_ai, anthropic) use to load skills into a prompt.
+        This is the single entry point framework adapters (every
+        ``agent_config()`` through :meth:`build_prompt_parts`, langchain, crewai)
+        use to load skills into a prompt.
         Returns a tuple instead of just the string so the adapter can
         thread ``routing_id`` into the resulting trace — without that, the
         ``routing_decision × trace_skill_activation`` join can't close,
@@ -3090,8 +3093,8 @@ class SkillRouter:
 
         # Reset both rails up front so a call that offers or
         # delivers nothing can't inherit a previous call's unconsumed
-        # names (producers without a consumer exist — e.g. the anthropic
-        # adapter and the generic quickstart never drain the rails).
+        # names (producers without a consumer exist — e.g. the generic
+        # quickstart never drains the rails).
         _last_offered_names_ctx.set(None)
         _last_delivered_names_ctx.set(None)
         _last_delivered_versions_ctx.set(None)
