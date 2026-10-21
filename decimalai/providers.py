@@ -123,13 +123,35 @@ _last_provider: Any = None
 
 # The tracer provider DecimalAI last bound each provider's OpenInference
 # instrumentor to. The instrumentor is a process-wide singleton, bound when it is
-# turned on; one another tool turned on first is not recorded.
+# turned on; one another tool turned on first is not recorded. With it, the
+# instrumentor's tracer at that moment: turned off and on again elsewhere, the
+# instrumentor holds a new one, and the record no longer holds.
 _openinference_provider: Dict[str, Any] = {}
+_openinference_tracer: Dict[str, Any] = {}
+
+
+def _note_binding(name: str, provider: Any, instrumentor: Any, already_on: bool) -> None:
+    """Record that DecimalAI bound ``name``'s instrumentor to ``provider``, unless it
+    was on before (``instrument()`` then left it bound where it was)."""
+    if already_on:
+        return
+    _openinference_provider[name] = provider
+    _openinference_tracer[name] = getattr(instrumentor, "_tracer", None)
 
 
 def _openinference_bound_to(name: str, provider: Any) -> bool:
-    """Whether DecimalAI bound ``name``'s instrumentor to ``provider`` (see otel)."""
-    return provider is not None and _openinference_provider.get(name) is provider
+    """Whether ``name``'s instrumentor is on and still bound where DecimalAI bound it,
+    to ``provider`` (see otel)."""
+    if provider is None or _openinference_provider.get(name) is not provider:
+        return False
+    instrumentor_cls = _load_instrumentor(_PROVIDERS[name])
+    if instrumentor_cls is None:
+        return False
+    instrumentor = instrumentor_cls()
+    if getattr(instrumentor, "is_instrumented_by_opentelemetry", None) is not True:
+        return False
+    recorded = _openinference_tracer.get(name)
+    return recorded is None or getattr(instrumentor, "_tracer", None) is recorded
 
 
 def _sdk_present(sdk_module: str) -> bool:
@@ -344,8 +366,7 @@ def instrument(
             continue
         if not explicit_provider:
             _instrumented.add(name)
-        if not already_on:
-            _openinference_provider[name] = provider
+        _note_binding(name, provider, instrumentor, already_on)
         logger.info("DecimalAI tracing enabled for direct %s SDK calls", name)
 
     return provider

@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock
 
+import sys
+
 import pytest
 
 import decimalai.providers as providers
@@ -39,10 +41,12 @@ def _reset_providers_state():
     providers._instrumented.clear()
     providers._pipeline_provider = None
     providers._openinference_provider.clear()
+    providers._openinference_tracer.clear()
     yield
     providers._instrumented.clear()
     providers._pipeline_provider = None
     providers._openinference_provider.clear()
+    providers._openinference_tracer.clear()
 
 
 @pytest.fixture
@@ -423,3 +427,34 @@ class TestOpenInferenceBinding:
         exporters = [getattr(p, "span_exporter", None)
                      for p in provider._active_span_processor._span_processors]
         assert [e._provider for e in exporters if e is not None] == [provider]
+
+    def test_a_binding_no_longer_holds_once_the_instrumentor_is_off_or_rebound(self, fake_pipeline, loaded):
+        instrumentor = loaded["anthropic"].return_value
+        self._turns_on(instrumentor)
+        instrument(anthropic=True)
+        assert providers._openinference_bound_to("anthropic", SENTINEL_PROVIDER)
+        instrumentor._tracer = object()  # turned off and on again, onto another provider
+        assert not providers._openinference_bound_to("anthropic", SENTINEL_PROVIDER)
+        instrumentor.is_instrumented_by_opentelemetry = False
+        assert not providers._openinference_bound_to("anthropic", SENTINEL_PROVIDER)
+
+    def test_init_crewai_does_not_claim_an_instrumentor_that_was_already_on(self, loaded, monkeypatch):
+        """CrewAI's init path called instrument() onto its provider, a no-op when the
+        instrumentor was on already, and recorded the binding anyway: its exporter then
+        dropped the only spans of CrewAI's Claude calls."""
+        import types
+
+        import decimalai
+
+        crewai_module = types.ModuleType("openinference.instrumentation.crewai")
+        crewai_module.CrewAIInstrumentor = MagicMock(name="CrewAIInstrumentor")
+        monkeypatch.setitem(sys.modules, "openinference.instrumentation.crewai", crewai_module)
+        monkeypatch.setattr(providers, "_sdk_present", lambda module: module == "anthropic")
+        import decimalai.crewai as dc
+
+        monkeypatch.setattr(dc, "_wire_tracer_provider", lambda provider: None)
+        self._turns_on(loaded["anthropic"].return_value, already_on=True)
+        crewai_provider = object()
+        decimalai._activate_crewai_instrumentation(crewai_provider)
+        assert not providers._openinference_bound_to("anthropic", crewai_provider)
+        assert "anthropic" not in providers._openinference_provider

@@ -1233,27 +1233,45 @@ class DecimalSpanExporter:
         """The Anthropic SDK's own call spans, dropped where OpenInference records the same calls.
 
         anthropic >= 1.14 traces each API call itself, by default without the
-        messages. On a provider where DecimalAI turned OpenInference's Anthropic
-        instrumentor on, every call is then recorded twice: inside OpenInference's
-        span for a plain request (which `content_from_wrapper` below would cover),
-        but beside it for `messages.stream()` (the request goes out after
-        OpenInference's span stops being current), and as a trace of its own when
-        no run wraps the stream. OpenInference's span has the content and the
-        tokens, so the SDK's call span is dropped there: the record anthropic 1.13
-        gave. On any other provider it is kept, as it may be the only record.
+        messages. With OpenInference's Anthropic instrumentor on, every call is
+        then recorded twice. For a plain request the SDK's span sits inside
+        OpenInference's, and `content_from_wrapper` below merges the two (the SDK's
+        model and max_tokens, OpenInference's content). For `messages.stream()` the
+        two are siblings, because the request goes out after OpenInference's span
+        stops being current, and with no run around the stream each is a trace of
+        its own. So the SDK's call spans that are not inside OpenInference's are
+        dropped, with whatever was recorded under them (an HTTP client's spans),
+        when this trace holds OpenInference's record of Anthropic calls, or when
+        DecimalAI bound the instrumentor to this exporter's provider. Anywhere else
+        the SDK's span is kept, as it may be the only record.
         """
-        try:
-            from .providers import _openinference_bound_to
-
-            if not _openinference_bound_to("anthropic", self._provider):
-                return otel_spans
-        except Exception:
+        calls = [span for span in otel_spans if _is_anthropic_sdk_call(span)]
+        if not calls:
             return otel_spans
-        return [
-            span for span in otel_spans
-            if not (_scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE)
-                    and (getattr(span, "attributes", None) or {}).get("gen_ai.operation.name") == "chat")
-        ]
+        recorded_here = {_get_span_id(span) for span in otel_spans
+                         if _scope_name(span).startswith(_OPENINFERENCE_ANTHROPIC_SCOPE)}
+        if not recorded_here:
+            try:
+                from .providers import _openinference_bound_to
+
+                if not _openinference_bound_to("anthropic", self._provider):
+                    return otel_spans
+            except Exception:
+                return otel_spans
+        dropped = {_get_span_id(span) for span in calls
+                   if _get_parent_span_id(span) not in recorded_here}
+        dropped.discard(None)
+        if not dropped:
+            return otel_spans
+        grew = True
+        while grew:  # and what was recorded under a dropped span
+            grew = False
+            for span in otel_spans:
+                span_id = _get_span_id(span)
+                if span_id not in dropped and _get_parent_span_id(span) in dropped:
+                    dropped.add(span_id)
+                    grew = True
+        return [span for span in otel_spans if _get_span_id(span) not in dropped]
 
     def _assemble_trace(self, otel_spans: List[Any]) -> Optional[tuple]:
         """Convert a group of OTEL spans (same trace_id) to a RunTrace.
@@ -2288,10 +2306,17 @@ def _messages_from_attrs(
 
 #: The instrumentation scope of the Anthropic SDK's own spans (anthropic >= 1.14).
 _ANTHROPIC_SDK_SCOPE = "com.anthropic.sdk"
+_OPENINFERENCE_ANTHROPIC_SCOPE = "openinference.instrumentation.anthropic"
 
 
 def _scope_name(span: Any) -> str:
     return getattr(getattr(span, "instrumentation_scope", None), "name", None) or ""
+
+
+def _is_anthropic_sdk_call(span: Any) -> bool:
+    """The Anthropic SDK's own span of a Messages call (not its Tool Runner's or tools')."""
+    return (_scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE)
+            and (getattr(span, "attributes", None) or {}).get("gen_ai.operation.name") == "chat")
 
 
 def _carries_content(attrs: Dict[str, Any]) -> bool:

@@ -669,6 +669,7 @@ def _activate_crewai_instrumentation(
             )
             continue
         provider_instrumentor = instrumentor_cls()
+        already_on = getattr(provider_instrumentor, "is_instrumented_by_opentelemetry", None) is True
         try:
             provider_instrumentor.instrument(tracer_provider=tracer_provider)
         except Exception:
@@ -689,7 +690,7 @@ def _activate_crewai_instrumentation(
         # Mark it globally instrumented so a later init(openai=True) doesn't
         # build a second exporter pipeline for a provider already captured.
         _providers._instrumented.add(pname)
-        _providers._openinference_provider[pname] = tracer_provider
+        _providers._note_binding(pname, tracer_provider, provider_instrumentor, already_on)
         logger.info("DecimalAI tracing enabled for %s SDK calls (via CrewAI)", pname)
 
 

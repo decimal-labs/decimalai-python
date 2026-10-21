@@ -4,6 +4,24 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed
+
+- **`init(crewai=True)` no longer drops CrewAI's Claude calls** (anthropic 1.14 and later, a
+  regression in 0.22.1). When OpenInference's Anthropic instrumentor was already on, for example
+  turned on onto another tracer provider, CrewAI's init path recorded it as bound to CrewAI's
+  provider anyway. That provider's exporter then dropped the SDK's own spans of every Claude call,
+  which were the only record it got.
+- **A plain Anthropic request keeps 0.22.0's record again** (anthropic 1.14 and later, under
+  `init(anthropic=True)`). 0.22.1 dropped the SDK's span of `messages.create()` along with the
+  duplicates of a streamed call, so each call lost the request's `max_tokens`, recorded the dated
+  response model, and the agent's manifest changed on upgrade. Only the SDK's spans outside
+  OpenInference's are dropped now. They take what was recorded under them with them (an HTTP
+  client's spans, which were left as a trace with no model call). The drop also applies where
+  OpenInference's record of the same calls is in the trace, as when another tool turned the
+  instrumentor on, and it stops once the instrumentor is turned off or bound elsewhere.
+
 ## [0.22.1] — 2026-10-21
 
 ### Fixed

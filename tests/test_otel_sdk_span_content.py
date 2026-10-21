@@ -211,7 +211,9 @@ def bound(monkeypatch):
     from decimalai.otel import DecimalSpanExporter
 
     provider = object()
-    monkeypatch.setattr(providers, "_openinference_provider", {"anthropic": provider})
+    # Bound and still on there (the binding record itself: tests/test_providers_instrument.py).
+    monkeypatch.setattr(providers, "_openinference_bound_to",
+                        lambda name, candidate: name == "anthropic" and candidate is provider)
     exporter = DecimalSpanExporter(agent_name="test-agent")
     exporter._provider = provider
     return exporter
@@ -256,3 +258,33 @@ def test_the_tool_runners_own_span_is_kept(bound):
     trace, *_ = bound._assemble_trace([*_stream_spans(parent=0xBBB1), runner])
     assert [s.name for s in trace.spans if s.name == "anthropic.messages.tool_runner"]
     assert len(trace.llm_calls) == 1
+
+
+def test_a_plain_request_inside_openinferences_span_keeps_the_merged_record(bound):
+    """0.22.0's record of messages.create(): the SDK's model and max_tokens, OpenInference's
+    content. Dropping the nested span instead changed every agent's manifest on upgrade."""
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    sdk = _scoped(_Span("anthropic.messages.create", SDK, OPENINFERENCE, SDK_ATTRS), SDK_SCOPE)
+    oi = _scoped(_Span("messages.create", OPENINFERENCE, ROOT, OPENINFERENCE_ATTRS), OPENINFERENCE_SCOPE)
+    trace, model, *_ = bound._assemble_trace([sdk, oi, run])
+    (call,) = trace.llm_calls
+    assert call.output == {"role": "assistant", "content": "pong-COMPLETION-SENTINEL"}
+    assert call.max_output_tokens == 16, "the request's max_tokens, from the SDK's span"
+
+
+def test_what_was_recorded_under_a_dropped_sdk_span_goes_with_it(bound):
+    # An HTTP client's span under the SDK's call span: alone it would be a trace of its own.
+    (sdk, _oi) = _stream_spans(parent=None)
+    http = _scoped(_Span("POST", 0xCCC1, SDK, {"http.request.method": "POST"}), "opentelemetry.instrumentation.httpx")
+    assert bound._assemble_trace([http, sdk]) is None
+
+
+def test_a_trace_with_openinferences_record_drops_the_sdks_sibling_wherever_it_is():
+    # Another tool bound the instrumentor (DecimalAI did not): within one trace the two
+    # records of a streamed call are still one call.
+    from decimalai.otel import DecimalSpanExporter
+
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace([*_stream_spans(), run])
+    (call,) = trace.llm_calls
+    assert call.output == {"role": "assistant", "content": "pong-COMPLETION-SENTINEL"}
