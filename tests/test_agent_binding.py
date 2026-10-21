@@ -456,3 +456,22 @@ def test_without_an_asyncio_loop_a_cancelled_run_does_not_wait_for_its_thread(pl
 
     asyncio.run(go())
     assert seen and all(kw.get("abandon_on_cancel") or kw.get("cancellable") for kw in seen)
+
+
+def test_without_an_asyncio_loop_a_call_that_raises_typeerror_runs_once(monkeypatch):
+    """The anyio hop once retried with anyio < 4.1's keyword on any TypeError, including
+    one the routed call raised itself: a second routing request for that run."""
+    calls = []
+
+    def route():
+        calls.append(1)
+        raise TypeError("'int' object is not iterable")
+
+    monkeypatch.setattr(binding, "_running_asyncio_loop", lambda: None)
+
+    async def go():
+        with pytest.raises(TypeError):
+            await binding._in_thread(route)
+
+    asyncio.run(go())
+    assert calls == [1]

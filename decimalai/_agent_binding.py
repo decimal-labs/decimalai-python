@@ -84,11 +84,19 @@ async def _in_thread(func: Any, *args: Any) -> Any:
     import anyio.to_thread
 
     call = functools.partial(contextvars.copy_context().run, func, *args)
-    try:
-        # A cancelled run returns at once, as under asyncio; the thread finishes alone.
-        return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
-    except TypeError:  # anyio < 4.1
-        return await anyio.to_thread.run_sync(call, cancellable=True)
+    # A cancelled run returns at once, as under asyncio; the thread finishes alone.
+    return await anyio.to_thread.run_sync(call, **{_anyio_abandon_keyword(): True})
+
+
+@functools.lru_cache(maxsize=None)
+def _anyio_abandon_keyword() -> str:
+    """``abandon_on_cancel`` (anyio >= 4.1), or its older name ``cancellable``."""
+    import inspect
+
+    import anyio.to_thread
+
+    parameters = inspect.signature(anyio.to_thread.run_sync).parameters
+    return "abandon_on_cancel" if "abandon_on_cancel" in parameters else "cancellable"
 
 
 async def _wait_without_cancelling(pending: Any, timeout: float) -> None:

@@ -21,6 +21,9 @@ and patch releases are fixes.
   client's spans, which were left as a trace with no model call). The drop also applies where
   OpenInference's record of the same calls is in the trace, as when another tool turned the
   instrumentor on, and it stops once the instrumentor is turned off or bound elsewhere.
+- **Under trio, a routing call that raises `TypeError` is made once.** The fallback for
+  anyio < 4.1 caught any `TypeError`, including one the call itself raised, and made the call
+  again with anyio's older keyword.
 
 ## [0.22.1] — 2026-10-21
 
