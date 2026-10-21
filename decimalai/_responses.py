@@ -103,6 +103,9 @@ class TraceListItem(TypedDict, total=False):
     eval_verdict: Optional[str]
     eval_score: Optional[float]
     created_at: Optional[str]
+    # The prompt agent_config() recorded for the run: {agent, source, version,
+    # content_hash, variables, skills_unavailable}. None: no record.
+    prompt: Optional[Dict[str, Any]]
 
 
 class TraceListResponse(TypedDict):
@@ -132,6 +135,9 @@ class TraceDetailResponse(TraceListItem, total=False):
     eval_breakdown: Optional[Dict[str, Any]]
     eval_details_json: Optional[Dict[str, Any]]
     error_message: Optional[str]
+    # The whole final answer (bounded). None on traces stored before the
+    # platform kept it; those only have final_output_preview.
+    final_output: Optional[str]
 
 
 # ── Agents ──────────────────────────────────────────────────

@@ -374,8 +374,43 @@ class TestResponseSpanFinalOutputPreview:
         run_trace = _run_response_spans(processor, trace_id, spans)
 
         assert run_trace.final_output_preview == "done"
+        assert run_trace.final_output == "done"
         # Both turns still count as LLM calls
         assert len(run_trace.llm_calls) == 2
+
+    def test_the_whole_answer_rides_along_with_the_preview(self):
+        """The 200-character preview is all evals and the platform's judges
+        used to see of an answer. The trace now carries the whole of it,
+        bounded, and the preview is its start (the platform reads a preview
+        that is not the start of the answer as a redaction)."""
+        from decimalai.openai_agents import DecimalTracingProcessor
+
+        answer = "Order 1042 shipped on October 18. " + "It is with the carrier. " * 40
+        processor = DecimalTracingProcessor(agent_name="test-agent")
+        trace_id = f"trace_{uuid4().hex[:16]}"
+        span = _MockSpan(trace_id=trace_id, span_data=_MockSpanData(
+            "response", response=_SyntheticResponse(output=[_OutputMessage(_OutputText(answer))]),
+            input="Where is order 1042?", usage=None))
+
+        run_trace = _run_response_spans(processor, trace_id, [span])
+
+        assert len(answer) > 200
+        assert run_trace.final_output == answer
+        assert run_trace.final_output_preview == answer[:200]
+        assert run_trace.final_output.startswith(run_trace.final_output_preview)
+        assert run_trace.model_dump(mode="json")["final_output"] == answer
+
+    def test_a_runaway_answer_is_bounded(self):
+        from decimalai.openai_agents import DecimalTracingProcessor
+        from decimalai.schema.trace import FINAL_OUTPUT_MAX_CHARS
+
+        runaway = "x" * (FINAL_OUTPUT_MAX_CHARS + 100)
+        processor = DecimalTracingProcessor(agent_name="test-agent")
+        trace_id = f"trace_{uuid4().hex[:16]}"
+        span = _MockSpan(trace_id=trace_id, span_data=_MockSpanData(
+            "response", response=_SyntheticResponse(output=[_OutputMessage(_OutputText(runaway))]),
+            input="q", usage=None))
+        assert len(_run_response_spans(processor, trace_id, [span]).final_output) == FINAL_OUTPUT_MAX_CHARS
 
 
 class TestResponseOutputTextHelper:

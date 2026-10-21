@@ -643,7 +643,9 @@ def trace_to_trace_data(trace: Any) -> TraceData:
     return TraceData(
         id=str(d.get("id", "")),
         input=d.get("user_input_preview") or d.get("user_input") or "",
-        output=d.get("final_output_preview") or d.get("final_output") or "",
+        # The whole answer when the trace carries it; the 200-character preview
+        # is all older traces (and other adapters) have.
+        output=d.get("final_output") or d.get("final_output_preview") or "",
         status=d.get("status", "success"),
         tool_calls=tool_calls,
         llm_calls=llm_calls,

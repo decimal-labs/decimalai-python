@@ -9,9 +9,11 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import queue
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
@@ -264,8 +266,8 @@ class DecimalConfig:
     # flush, and there never was one.
     #
     # There is no periodic flush because there is nothing for it to drain.
-    # `BackgroundSender.submit` hands each trace straight to a
-    # ThreadPoolExecutor, which starts the send immediately — the send path
+    # `BackgroundSender.submit` hands each trace straight to the sender's
+    # worker thread, which starts the send immediately — the send path
     # holds no queue that time could bound. The ONE buffer in the SDK is
     # `DecimalAIClient._trace_buffer`, and it is bounded by COUNT
     # (`_AUTO_FLUSH_THRESHOLD` in _client.py) plus the explicit
@@ -461,11 +463,65 @@ ExportErrorCallback = Callable[[BaseException, Optional[str]], None]
 
 # ── Background Sender ─────────────────────────────────────────
 
+#: How long process exit waits on a send that has stopped making progress.
+#: Exit waits for every queued send while sends keep completing, and gives up
+#: once one has run this long: a platform that is down or not answering holds
+#: the process this long, not for the 31-62 s re-registration ladder of a
+#: held trace (`_MANIFEST_RETRY_BACKOFFS_S`) or the client's own retries.
+_EXIT_STALL_TIMEOUT_S = 5.0
+
+
+class _SenderThread:
+    """Runs submitted work in order on one DAEMON thread.
+
+    What the sender used from ``ThreadPoolExecutor(max_workers=1)``, minus the
+    exit behaviour. Since Python 3.9 that pool's worker is a non-daemon thread
+    the interpreter joins at shutdown, after it has run every queued item and
+    before any ``atexit`` handler, so nothing could bound the wait: with
+    DecimalAI unreachable a process that had printed its answer stayed open
+    for 31-62 s per held trace. A daemon thread is not joined; the sender's
+    own exit drain (``BackgroundSender.shutdown``) decides how long to wait.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._work: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn: Callable[[], Any]) -> "Future[Any]":
+        future: "Future[Any]" = Future()
+        self._work.put((future, fn))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is None:
+                return
+            future, fn = item
+            if not future.set_running_or_notify_cancel():
+                continue  # cancelled while queued: the exit drain gave up on it
+            try:
+                result = fn()
+            except BaseException as exc:  # noqa: BLE001 — same contract as ThreadPoolExecutor
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait: bool = False) -> None:
+        self._work.put(None)
+        if wait:
+            self._thread.join()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+
 class BackgroundSender:
     """Non-blocking trace sender using a single daemon thread.
 
-    Traces are submitted to a ThreadPoolExecutor so the calling thread
-    (the user's agent) is never blocked on HTTP I/O.
+    Traces are submitted to a worker thread so the calling thread (the
+    user's agent) is never blocked on HTTP I/O.
 
     Tracks send-side observability (sent/failed/streaks/timestamps) so
     callers can introspect via ``decimalai.export_status()`` or react
@@ -476,7 +532,7 @@ class BackgroundSender:
     """
 
     def __init__(self) -> None:
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor: Optional[_SenderThread] = None
         self._pending: list[Any] = []  # Futures for flush()
         # submit() runs on arbitrary caller
         # threads; without a lock the read-modify-write on self._pending (append
@@ -516,13 +572,18 @@ class BackgroundSender:
         # backend goes down and 50 traces all fail with the same error.
         self._escalation_fired: bool = False
 
+        # Set when the exit drain gave up on a stalled send. The worker thread
+        # is a daemon and may still finish that send while the interpreter
+        # shuts down; it must not write to the logs or call user code then.
+        self._abandoned: bool = False
+
     # ---- executor lifecycle ----
 
-    def _ensure_executor(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="decimal-sender"
-            )
+    def _ensure_executor(self) -> _SenderThread:
+        # A child made by os.fork() inherits this object but not its thread:
+        # without the liveness check its sends would queue and never run.
+        if self._executor is None or not self._executor.is_alive():
+            self._executor = _SenderThread("decimal-sender")
         return self._executor
 
     # ---- public observability ----
@@ -607,6 +668,8 @@ class BackgroundSender:
                 escalate = True
             else:
                 escalate = False
+            if self._abandoned:
+                return  # the process is exiting; the exit summary already spoke
 
         # Per-failure log (current behavior) — kept WARNING so the line
         # remains greppable. Escalation banner only fires once per streak.
@@ -674,7 +737,7 @@ class BackgroundSender:
             # Prune completed futures to avoid unbounded growth.
             self._pending = [f for f in self._pending if not f.done()]
 
-    def flush(self, timeout: float = 5.0) -> None:
+    def flush(self, timeout: float = 5.0, *, give_up_on_stall: bool = False) -> int:
         """Wait for all pending work to complete.
 
         Counters and last_send_error are normally updated inside the
@@ -682,32 +745,59 @@ class BackgroundSender:
         injected into ``_pending`` directly (test fixtures, advanced
         callers wiring their own queues), flush() records the outcome
         here as a safety net.
+
+        Work runs one item at a time, in order, so ``timeout`` bounds how long
+        any one item may run once the one before it is done. With
+        ``give_up_on_stall`` the first item to exceed it ends the wait: it and
+        everything queued behind it are abandoned (queued items never start),
+        and the count of them is returned. Without it, every item still gets
+        its own ``timeout`` and 0 is returned.
         """
         # Snapshot-and-clear under the lock, then await OUTSIDE it so submit()
         # and status() never block on the (potentially multi-second) drain.
         with self._pending_lock:
             pending = self._pending
             self._pending = []
-        for future in pending:
+        for index, future in enumerate(pending):
             try:
                 future.result(timeout=timeout)
                 # Future succeeded — only record if it wasn't already
                 # counted by _runner.
                 if not getattr(future, "_dai_recorded_in_runner", False):
                     self._record_success()
+            except FutureTimeoutError as exc:
+                # On 3.11+ this is the builtin TimeoutError, which a send can
+                # raise itself (a socket timeout). Only a future still running
+                # timed out HERE.
+                if not future.done() and give_up_on_stall:
+                    left = [f for f in pending[index:] if not f.done()]
+                    for f in left:
+                        f.cancel()  # a no-op on the one already running
+                    return len(left)
+                if not getattr(future, "_dai_recorded_in_runner", False):
+                    self._record_failure(exc)
             except Exception as exc:
                 # Recorded by _runner unless the future was injected
                 # directly into _pending (tests do this); record here
                 # in that case so observability stays accurate.
                 if not getattr(future, "_dai_recorded_in_runner", False):
                     self._record_failure(exc)
+        return 0
 
-    def shutdown(self) -> None:
-        """Flush pending work and shut down the executor."""
-        self.flush()
+    def shutdown(self) -> int:
+        """Drain pending work for process exit and stop the worker.
+
+        Waits while sends keep completing; gives up on one that runs longer
+        than ``_EXIT_STALL_TIMEOUT_S``. Returns how many were left unsent.
+        """
+        unsent = self.flush(_EXIT_STALL_TIMEOUT_S, give_up_on_stall=True)
+        if unsent:
+            with self._state_lock:
+                self._abandoned = True
         if self._executor is not None:
             self._executor.shutdown(wait=False)
             self._executor = None
+        return unsent
 
 
 def _extract_trace_id(args: tuple) -> Optional[str]:
@@ -815,16 +905,28 @@ def _ingest_when_manifest_lands(
 
 # ---- atexit summary ----------------------------------------------------
 
-def _emit_shutdown_summary() -> None:
+def _emit_shutdown_summary(unsent: int = 0) -> None:
     """Print a one-line stderr summary on process exit IF anything failed.
 
     Silent on the happy path (sent_count > 0 and failed_count == 0).
     Loud at the right moment — users notice startup banners more than
     mid-session warnings, so flushing the diagnostic at shutdown catches
     "wait, where were my traces?" cases without spamming healthy runs.
+
+    ``unsent`` is how many sends the exit drain gave up on; when there are
+    any, that is the one line.
     """
     try:
-        st = _sender.status()
+        st = _sender.status(queue_depth_hint=0)
+        if unsent:
+            err = st.last_error or st.last_manifest_error
+            sys.stderr.write(
+                f"decimalai: {unsent} trace{'' if unsent == 1 else 's'} not sent: "
+                f"DecimalAI did not respond within {_EXIT_STALL_TIMEOUT_S:g} s of exit"
+                + (f" (last error: {err})" if err else "")
+                + ".\n"
+            )
+            return
         if st.failed == 0 and st.sent > 0:
             return  # happy path — stay silent
         if st.failed == 0 and st.sent == 0:
@@ -845,15 +947,18 @@ def _emit_shutdown_summary() -> None:
 def _shutdown() -> None:
     """Flush pending traces, emit summary, clean up. Called via atexit."""
     global _client
+    unsent = 0
     try:
-        _sender.shutdown()
+        unsent = _sender.shutdown()
     except Exception:
         pass
     try:
-        _emit_shutdown_summary()
+        _emit_shutdown_summary(unsent)
     except Exception:
         pass
-    if _client is not None:
+    # A send the drain gave up on may still be using the client on the
+    # sender's thread; closing it under that send gains nothing at exit.
+    if _client is not None and not unsent:
         try:
             if hasattr(_client, "close"):
                 _client.close()

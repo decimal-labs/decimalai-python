@@ -130,3 +130,30 @@ def test_a_trace_from_the_openai_agents_adapter_lists_its_tool_call(sdk):
         assert [(tc.name, tc.args, tc.result) for tc in data.tool_calls] == [
             ("lookup_order", {"order": "A-1"}, "order A-1: refunded"),
         ]
+
+
+class TestEvalsReadTheWholeAnswer:
+    """`TraceData.output` is what every eval grades. It was the 200-character
+    preview even when the trace carried the whole answer."""
+
+    ANSWER = "Order 1042 shipped on October 18. " + "It is with the carrier now. " * 20
+
+    def test_a_trace_with_the_whole_answer(self):
+        from decimalai.evals import trace_to_trace_data
+
+        data = trace_to_trace_data({
+            "id": "t", "final_output_preview": self.ANSWER[:200], "final_output": self.ANSWER,
+        })
+        assert data.output == self.ANSWER
+
+    def test_an_older_trace_with_only_the_preview(self):
+        from decimalai.evals import trace_to_trace_data
+
+        assert trace_to_trace_data({"id": "t", "final_output_preview": "short"}).output == "short"
+
+    def test_a_run_trace_model(self):
+        from decimalai.evals import trace_to_trace_data
+        from decimalai.schema.trace import RunTrace
+
+        trace = RunTrace(final_output_preview=self.ANSWER[:200], final_output=self.ANSWER)
+        assert trace_to_trace_data(trace).output == self.ANSWER

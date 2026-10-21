@@ -77,7 +77,13 @@ def _coerce_span_id(raw: Any) -> Optional[UUID]:
 
 from .schema.common import FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
-from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
+from .schema.trace import (
+    FINAL_OUTPUT_MAX_CHARS,
+    LlmCallRecord,
+    RunTrace,
+    ToolCallRecord,
+    TraceSpan,
+)
 
 logger = logging.getLogger("decimalai.openai_agents")
 
@@ -1796,7 +1802,14 @@ def _register_snapshot(agent_name: str, snapshot: Any) -> Optional[str]:
             # Leave the per-agent hash unset so the next trace retries; a
             # transient blip must not permanently stop this agent from ever
             # declaring a manifest.
-            logger.warning("Failed to register manifest for %s", agent_name, exc_info=True)
+            # One line: DecimalAI being unreachable is handled, not a crash.
+            # The traceback is at DEBUG for whoever needs it.
+            logger.warning(
+                "decimalai: could not register %s's manifest (%s: %s); its traces "
+                "are held and retried in the background.",
+                agent_name, type(exc).__name__, str(exc)[:200],
+            )
+            logger.debug("Manifest registration for %s failed", agent_name, exc_info=True)
             # Hand the send side something to retry WITH. Returning None here ships the
             # trace with no manifest_id, which a strict backend answers 400
             # "manifest_id is required" — the trace is lost. The attempt above runs on
@@ -1878,6 +1891,7 @@ class _TraceAccumulator:
         self.agent_name: Optional[str] = None
         self.user_input_preview: Optional[str] = None
         self.final_output_preview: Optional[str] = None
+        self.final_output: Optional[str] = None
         self.status = Status.SUCCESS
         self.error_message: Optional[str] = None
         # Manifest auto-detection accumulators
@@ -2535,9 +2549,12 @@ class DecimalTracingProcessor:
 
         # Capture final output from the response — the extracted text, not the
         # ResponseOutputMessage repr. Text-less turns (pure tool calls) don't
-        # overwrite a preview captured from an earlier turn.
+        # overwrite a preview captured from an earlier turn. The whole answer
+        # goes with it: the 200-character preview is all evals and the
+        # platform's judges used to see.
         if output_text:
             acc.final_output_preview = _preview(output_text)
+            acc.final_output = _preview(output_text, FINAL_OUTPUT_MAX_CHARS)
 
     def _handle_handoff(
         self, span: Any, span_data: Any, acc: _TraceAccumulator
@@ -2810,6 +2827,7 @@ class DecimalTracingProcessor:
             ended_at=ended_at,
             user_input_preview=acc.user_input_preview or _preview(run_rail.get("user_input")),
             final_output_preview=acc.final_output_preview,
+            final_output=acc.final_output,
             error_message=acc.error_message,
             spans=acc.spans,
             llm_calls=acc.llm_calls,

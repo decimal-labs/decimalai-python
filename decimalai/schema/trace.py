@@ -113,6 +113,12 @@ class TraceSpan(BaseModel):
     attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
+#: How much of a run's final answer a trace carries (`RunTrace.final_output`).
+#: The platform keeps the same amount; a runaway generation does not get to put
+#: megabytes into every trace.
+FINAL_OUTPUT_MAX_CHARS = 20_000
+
+
 class RunTrace(BaseModel):
     """Top-level execution record. One per agent invocation.
 
@@ -130,6 +136,12 @@ class RunTrace(BaseModel):
     ended_at: Optional[datetime] = None
     user_input_preview: Optional[str] = None
     final_output_preview: Optional[str] = None
+    # The whole final answer, up to FINAL_OUTPUT_MAX_CHARS. The preview above is
+    # its first 200 characters and stays for lists; evals and the platform's
+    # judges read this one. Set it to text the preview starts with: the
+    # platform treats a preview that is not the start of it as a redaction and
+    # stores the preview instead.
+    final_output: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     # Multi-agent: link this trace to a parent orchestrator trace.
