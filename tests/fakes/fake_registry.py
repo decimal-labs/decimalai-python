@@ -17,10 +17,12 @@ codes and the same per-item error codes, and renders every byte with
 ``skillevaluation.skillfmt``, the module the platform renders with. A test therefore sees
 the folder the platform would serve, not an invented one.
 
-It answers the anonymous search, ``GET /api/v1/registry/skills?q=``, with browse cards (keyless
-``agent_config()`` reads it): the public skills, or :attr:`FakeRegistry.search_results` in its
-order, each ``skill_safety`` from its band (``passed`` when clean) and a ``benchmark_summary``
-unless ``benchmarked=False``.
+It answers the anonymous search, ``POST /api/v1/registry/skills/search`` (the query in the
+body) and ``GET /api/v1/registry/skills?q=``, with browse cards (keyless ``agent_config()``
+reads them): the public skills, or :attr:`FakeRegistry.search_results` in its order, each
+``skill_safety`` from its band (``passed`` when clean) and a ``benchmark_summary`` unless
+``benchmarked=False``. ``search_post=False`` makes it a registry from before the POST route,
+which answers that one the framework's 405.
 
 It also answers ``GET /api/v1/skills/{name}/body``, the delivery route older clients used
 for disk exports, so a test can prove the engine never falls back to it. ``old=True`` makes
@@ -110,6 +112,7 @@ ANON_RESOLVE = "/api/v1/registry/install/resolve"
 ANON_BUNDLES = "/api/v1/registry/install/bundles/"
 REGISTRY_SKILLS = "/api/v1/registry/skills/"
 SEARCH = "/api/v1/registry/skills"
+SEARCH_POST = "/api/v1/registry/skills/search"
 SKILLS = "/api/v1/skills/"
 
 #: Route names, for :meth:`FakeRegistry.fault` and :meth:`FakeRegistry.calls`.
@@ -254,6 +257,8 @@ class FakeRegistry:
         self._lock = threading.Lock()
         #: What the search answers, in order; None: every public skill, in the order added.
         self.search_results: Optional[List[FakeSkill]] = None
+        #: False: a registry from before ``POST /api/v1/registry/skills/search``.
+        self.search_post = True
 
     # ── building the registry ─────────────────────────────────────────
 
@@ -512,6 +517,10 @@ class FakeRegistry:
             return self._body(match.group("name"))
         if path == SEARCH and method == "GET":
             return self._search(query)
+        if path == SEARCH_POST and method == "POST":
+            if not self.search_post:
+                return _framework(405, accepted=["GET"])  # the GET /skills/{id} route's
+            return self._search({k: str(v) for k, v in (body or {}).items()})
         return _framework(404)
 
     def _next_fault(self, route: str) -> Optional[FaultAction]:
@@ -935,7 +944,7 @@ def _route_of(path: str) -> str:
         return "registry_bundle"
     if _BODY_RE.match(path):
         return "body"
-    if path == SEARCH:
+    if path in (SEARCH, SEARCH_POST):
         return "search"
     return "other"
 

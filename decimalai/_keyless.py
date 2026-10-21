@@ -47,7 +47,11 @@ LINK_FILE = "link.toml"
 DEFAULT_BASE_URL = "https://api.decimal.ai"
 
 #: The anonymous registry search a keyless run makes, and the only route besides the
-#: install routes (resolve, bundle) a keyless process calls.
+#: install routes (resolve, bundle) a keyless process calls. The message goes in the
+#: request body: a URL is written to access logs and keyed into caches at every hop.
+SEARCH_POST_PATH = "/api/v1/registry/skills/search"
+#: The same search with the message in the URL (``?q=``), for a registry that predates
+#: the POST route (it answers that one 404 or 405).
 SEARCH_PATH = "/api/v1/registry/skills"
 
 #: How long a run waits for the search before it lists the project's skills alone.
@@ -59,8 +63,11 @@ _SEARCH_CONNECT_S = 2.0
 #: the page is a little larger because the server sizes its semantic pool from it.
 _SEARCH_LIMIT = 10
 #: The longest message sent as the query. The search ranks on meaning, and the first
-#: few sentences carry it; a pasted log or email would only make the URL long.
+#: few sentences carry it; a pasted log or email would only make the request long.
 _QUERY_MAX_CHARS = 500
+#: Registries (base URLs) that answered the POST search 404 or 405: this process asks
+#: them with the GET from then on.
+_POST_UNSUPPORTED: Set[str] = set()
 
 #: The relevance cutoff (see `relevant_matches`).
 _SEARCH_WINDOW = 5
@@ -236,19 +243,30 @@ def relevant_matches(query: Optional[str], items: Sequence[Mapping[str, Any]],
 def search_registry(query: str, *, url: Optional[str] = None, transport: Any = None) -> List[Dict[str, Any]]:
     """The anonymous registry search for one message: its result items, in order.
 
-    Raises on any failure; the caller lists the project's skills alone.
+    ``POST /api/v1/registry/skills/search`` with the message in the body. A registry
+    that answers it 404 or 405 predates the route, and gets ``GET ?q=`` from then on.
+    Raises on any other failure; the caller lists the project's skills alone.
     """
     import httpx
 
     from ._config import sdk_user_agent
 
+    root = (url or base_url()).rstrip("/")
+    ask = {"q": query[:_QUERY_MAX_CHARS], "limit": _SEARCH_LIMIT}
     with httpx.Client(
-        base_url=url or base_url(),
+        base_url=root,
         timeout=httpx.Timeout(_SEARCH_TIMEOUT_S, connect=_SEARCH_CONNECT_S),
         headers={"User-Agent": sdk_user_agent("keyless")},
         transport=transport,
     ) as client:
-        resp = client.get(SEARCH_PATH, params={"q": query[:_QUERY_MAX_CHARS], "limit": _SEARCH_LIMIT})
+        resp = None
+        if root not in _POST_UNSUPPORTED:
+            resp = client.post(SEARCH_POST_PATH, json=ask)
+            if resp.status_code in (404, 405):
+                _POST_UNSUPPORTED.add(root)
+                resp = None
+        if resp is None:
+            resp = client.get(SEARCH_PATH, params=ask)
         resp.raise_for_status()
         items = resp.json().get("items")
     if not isinstance(items, list):
@@ -625,6 +643,7 @@ def _reset() -> None:
     with _router_lock:
         _router = None
     _announced.clear()
+    _POST_UNSUPPORTED.clear()
 
 
 # ── starting keyless, and the guard ──────────────────────────────────────────

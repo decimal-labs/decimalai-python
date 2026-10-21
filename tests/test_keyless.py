@@ -36,7 +36,7 @@ import decimalai._keyless as keyless
 from decimalai._client import AgentNotFoundError
 from decimalai._config import DecimalConfig, DecimalConfigError
 from decimalai.skill_router import LOAD_SKILL_PROMPT_HINT, SkillRouter
-from tests.fakes.fake_registry import ANON_BUNDLES, ANON_RESOLVE, SEARCH, FakeRegistry
+from tests.fakes.fake_registry import ANON_BUNDLES, ANON_RESOLVE, SEARCH, SEARCH_POST, FakeRegistry
 
 MESSAGE = "My package arrived damaged, can I get a refund?"
 FALLBACK = "You help customers with their orders."
@@ -106,7 +106,7 @@ def only_registry_reads(world) -> None:
     """Nothing but the registry was reached, by nothing but its anonymous routes."""
     assert world.attempts and all(a[:2] == ("127.0.0.1", world.port) for a in world.attempts), world.attempts
     for request in world.registry.requests:
-        assert request.path == SEARCH or request.path == ANON_RESOLVE \
+        assert request.path in (SEARCH_POST, ANON_RESOLVE) \
             or request.path.startswith(ANON_BUNDLES), request.path
         assert "authorization" not in request.headers
     assert cfg._config is None and cfg._client is None, "nothing initialized the SDK"
@@ -144,7 +144,8 @@ def test_a_run_lists_safe_benchmarked_matches_that_share_a_word_with_its_message
     assert offered(run.system) == ["acme/refund-policy", "big/refund-manual"]
     assert "enum" not in run.tool_spec["parameters"]["properties"]["name"], "any listed name loads"
     [search] = world.registry.calls("search")
-    assert search.query["q"] == MESSAGE
+    assert (search.method, search.path, search.json["q"]) == ("POST", SEARCH_POST, MESSAGE)
+    assert search.query == {}, "the message is in the body, never the URL"
     assert world.project.joinpath(".decimal").exists() is False, "listing writes nothing"
     only_registry_reads(world)
 
@@ -194,6 +195,16 @@ def test_a_skill_too_long_to_serve_is_not_added_or_listed_again(world):
     assert "over the 24000-character limit for one skill" in text
     assert manifest(world) == "" and not (world.project / ".agents").exists()
     assert "big/refund-manual" not in offered(support.run(MESSAGE).system)
+
+
+def test_a_registry_without_the_post_route_is_asked_with_the_get_from_then_on(world):
+    world.registry.search_post = False
+    support = decimalai.agent_config("order-support")
+    assert offered(support.run(MESSAGE).system) == ["acme/refund-policy", "big/refund-manual"]
+    support.run("My refund never arrived.")
+    asked = [(r.method, r.path) for r in world.registry.calls("search")]
+    assert asked == [("POST", SEARCH_POST), ("GET", SEARCH), ("GET", SEARCH)], "the POST is tried once"
+    assert world.registry.calls("search")[1].query["q"] == MESSAGE
 
 
 def test_a_failed_search_lists_the_projects_skills_alone(world, caplog):
