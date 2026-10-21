@@ -129,6 +129,14 @@ def test_direct_provider_sdk_call_traced(provider, model):
         resource=Resource.create({SERVICE_NAME: "decimal-agent"})
     )
 
+    # Start from an unpatched SDK, as the finally block below leaves it. An earlier
+    # cell can leave the instrumentor on: decimalai.anthropic.agent_config() turns it
+    # on onto the global provider (0.23+), and OpenInference instruments once per
+    # process, so instrument() here would bind nothing and the trace would never come.
+    instrumentor_cls = _load_instrumentor(spec)
+    if instrumentor_cls is not None and instrumentor_cls().is_instrumented_by_opentelemetry:
+        instrumentor_cls().uninstrument()
+
     # THE product call: one line enables direct-SDK tracing for this provider.
     instrument(
         **{provider: True},
