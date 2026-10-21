@@ -4,6 +4,41 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.24.0] — 2026-10-21
+
+### New: `agent_config()` runs without a DecimalAI key
+
+- With no `DECIMAL_API_KEY` / `DECIMALAI_API_KEY` set and `decimalai.init()` never called, every
+  `agent_config()` (`decimalai`, `openai_agents`, `pydantic_ai`, `adk`, `anthropic`) runs keyless
+  instead of raising `DecimalConfigError`. Its prompt is `fallback=`, which is now optional (without
+  one, the instructions are the skill list alone), and `prompt_source` is the new
+  `"fallback (no key)"`.
+- Each run's skill list is the skills in `.decimal/skills.toml` plus at most two public registry
+  skills for the run's message, from the registry's anonymous search: among its first five
+  results, ones whose safety review passed, that have a benchmark, and that share a word with the
+  message. A search slower than five seconds is dropped and the run lists the project's skills.
+- When the model loads a listed registry skill it is added to the project, through the same engine
+  as `decimalai skills add` and anonymously, pinned to the version served in `.decimal/skills.toml`
+  and `.decimal/skills.lock`; one stderr line names it, and later runs read it from disk. A skill
+  whose safety review is no longer clean, or whose text is longer than the 24,000 characters one
+  load may return, is not added and not listed again by that process.
+- Nothing else is sent: no traces, routing decisions or prompt reads. Only the registry search and
+  its public install routes are called.
+
+### New: adding a key connects the project
+
+- With a key, the first `agent_config()` of an agent in a git checkout with something to connect
+  (skills in `.decimal/skills.toml`, or an agent the call created) assigns those skills to the agent
+  at the versions the lock pins and writes `.decimal/link.toml` (the key's organization and
+  workspace). Commit it: in a project that has it, `agent_config()` with no key raises
+  `DecimalConfigError` naming the organization, so a deploy that lost its key fails at startup.
+  The prompt in your code is never saved to DecimalAI.
+
+### Changed: an agent name the workspace has not seen is created
+
+- `agent_config()` no longer raises `AgentNotFoundError` for an unknown name: it creates the agent
+  (`POST /api/v1/agents`, no prompt) and says so on stderr. A misspelled name now makes a new agent.
+
 ## [0.23.0] — 2026-10-21
 
 ### Changed (breaking): Anthropic Messages API agents get their prompt and skills from `agent_config()`
