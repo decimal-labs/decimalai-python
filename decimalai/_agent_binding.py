@@ -335,6 +335,9 @@ class AgentBinding:
         self._menu_truncated = False
         self._runs: "OrderedDict[Tuple[Any, Any], Dict[str, Any]]" = OrderedDict()
         self._warned: Set[Tuple[str, str]] = set()
+        #: No API key and no ``init()``: the project's skills and the registry's,
+        #: served by `decimalai._keyless`, and nothing recorded (no run is sent).
+        self._keyless = bool(getattr(prompt, "keyless", False))
 
     # ── the seams a framework supplies ───────────────────────
     def _router(self) -> Any:
@@ -410,6 +413,25 @@ class AgentBinding:
         """
         return None
 
+    # ── keyed or keyless ────────────────────────────────────
+    def _skill_router(self) -> Any:
+        """The router this binding routes and serves through: the framework's, or keyless."""
+        if self._keyless:
+            from ._keyless import keyless_router
+
+            return keyless_router()
+        return self._router()
+
+    def _serve(self, name: str) -> str:
+        """One load: the framework's `_serve_load`, or the keyless router's (nothing recorded)."""
+        if self._keyless:
+            return self._skill_router().load_skill(name, scope=self._run_key(), agent_name=self.name)
+        return self._serve_load(name)
+
+    def _record_run(self, **fields: Any) -> bool:
+        """`_record`, except keyless: a keyless run is sent nowhere, so nothing is kept for it."""
+        return False if self._keyless else self._record(**fields)
+
     # ── what the agent currently gets ────────────────────────
     @property
     def prompt_version(self) -> Optional[int]:
@@ -428,8 +450,11 @@ class AgentBinding:
         ``"decimalai"`` (read from DecimalAI), ``"decimalai (cached copy)"`` (DecimalAI
         was unreachable at the last read, so the copy read before it),
         ``"fallback (unreachable)"`` (DecimalAI unreachable and nothing cached: the
-        ``fallback=`` text), or ``"fallback (none saved)"`` (the agent has no saved
-        prompt: the ``fallback=`` text).
+        ``fallback=`` text), ``"fallback (none saved)"`` (the agent has no saved
+        prompt: the ``fallback=`` text), or ``"fallback (no key)"`` (no API key is
+        set, so DecimalAI was not asked: the ``fallback=`` text). Each fallback value
+        applies with or without a ``fallback=``; without one there is no prompt
+        text, and the instructions are the skill list alone.
         """
         with self._lock:
             prompt = self._prompt
@@ -437,6 +462,8 @@ class AgentBinding:
 
     @staticmethod
     def _source_of(prompt: Any) -> str:
+        if getattr(prompt, "keyless", False):
+            return "fallback (no key)"
         if getattr(prompt, "system_prompt", None) is None:
             return "fallback (none saved)"
         if getattr(prompt, "is_fallback", False) and getattr(prompt, "version_number", None) is None:
@@ -608,7 +635,7 @@ class AgentBinding:
             text = f"{text}\n\n{menu}" if text else menu
         self._on_compose(agent)
         prompt_record = self._prompt_record(prompt, template, state["unavailable"], agent)
-        self._record(
+        self._record_run(
             agent=agent, system_prompt=text, offered=state["names"],
             routing_id=state["routing_id"], user_input=state["query"],
             prompt=prompt_record,
@@ -631,7 +658,8 @@ class AgentBinding:
             # run's own decision, ranked on its message, is recorded in the
             # background so the run never waits on it.
             pending = _in_background(self._route_run, run_key, state["names"], state["query"])
-            self._note_pending(run_key, pending)
+            if not self._keyless:
+                self._note_pending(run_key, pending)
             state["pending"] = pending
         return text
 
@@ -672,7 +700,7 @@ class AgentBinding:
                 "conversation keeps its first message's text (Claude rejects a changed system "
                 "prompt), so later messages get no new skill text."))
         self._on_compose(agent)
-        self._record(
+        self._record_run(
             agent=agent, system_prompt=record.text, offered=list(record.names), routing_id=routing_id,
             user_input=query, prompt=copy.deepcopy(record.prompt), delivered=[], delivered_versions=[],
         )
@@ -683,13 +711,14 @@ class AgentBinding:
             # this run's loads, and the framework records it.
             state["routed"] = routed
         elif record.cut:
-            router = self._router()
+            router = self._skill_router()
             remember = getattr(router, "_remember_run_routing", None)
             if run_key is not None and routing_id and callable(remember):
                 remember(run_key, routing_id)
         else:
             pending = _in_background(self._route_run, run_key, list(record.names), query)
-            self._note_pending(run_key, pending)
+            if not self._keyless:
+                self._note_pending(run_key, pending)
             state["pending"] = pending
         return state
 
@@ -711,7 +740,7 @@ class AgentBinding:
         """One routing decision: (menu text, offered names, routing id, menu was
         cut, skills whose text it pasted in, and their versions). Text is pasted
         in only with ``inject``."""
-        router = self._router()
+        router = self._skill_router()
         if router is None:
             return "", [], None, False, [], []
         from ._skill_witness import copy_delivered_versions
@@ -773,13 +802,13 @@ class AgentBinding:
         self._store_menu(prefix, offered, routing_id, truncated)
         # Stamp the run only when the decision offered exactly what it was shown;
         # otherwise the offer/activation join would describe another list.
-        if routing_id and sorted(offered) == sorted(shown):
+        if routing_id and not self._keyless and sorted(offered) == sorted(shown):
             self._stamp_routing(run_key, routing_id)
 
     def _refresh_prompt_if_stale(self) -> None:
         from ._config import _disabled_by_init
 
-        if _disabled_by_init():
+        if _disabled_by_init() or self._keyless:
             return
         with self._lock:
             due = (
@@ -861,7 +890,7 @@ class AgentBinding:
         if repeat is not None:
             return repeat
         await self._name_this_runs_decision(run_key, state)
-        result = await _in_thread(self._serve_load, name)
+        result = await _in_thread(self._serve, name)
         self._mark_loaded(name, state, result)
         return result
 
@@ -880,7 +909,7 @@ class AgentBinding:
             except Exception:
                 self._log.debug("this run's routing decision is not in yet", exc_info=True)
         self._name_latest_decision(run_key)
-        result = self._serve_load(name)
+        result = self._serve(name)
         self._mark_loaded(name, state, result)
         return result
 
@@ -909,7 +938,7 @@ class AgentBinding:
         """Without a decision of its own, a run's loads name this agent's latest."""
         if run_key is None:
             return
-        router = self._router()
+        router = self._skill_router()
         known = getattr(router, "_run_routing_ids", None)
         remember = getattr(router, "_remember_run_routing", None)
         if not isinstance(known, Mapping) or not callable(remember):

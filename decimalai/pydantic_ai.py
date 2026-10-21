@@ -473,7 +473,7 @@ def agent_config(
                       tools=[lookup_order], capabilities=[support])
         result = await agent.run(question, deps=customer)
 
-    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps
+    Reads the agent's saved prompt here and keeps
     a local copy, re-read in the background at most once a minute. Each run is
     routed on its own prompt: the first run before its first model request, later
     runs from a local copy while their decision is recorded in the background, and
@@ -485,27 +485,33 @@ def agent_config(
     ``init(load_skill_tool=False)``), every run is routed and the text of the skills
     picked for it goes into the instructions instead (``inject_skill_body``).
 
+    With no API key and no ``init()``, the agent runs keyless, as
+    :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each
+    run lists the project's skills and public registry matches, and nothing is
+    traced. With a key, an agent the workspace has no agent by is created.
+
     Args:
         agent_name: The agent's name in DecimalAI.
-        fallback: Instructions to use when the agent has no saved prompt, or when
-            DecimalAI cannot be reached at startup. Without one, an unreachable
-            DecimalAI raises here rather than starting an agent with no instructions.
+        fallback: Instructions to use when the agent has no saved prompt, when no API
+            key is set, or when DecimalAI cannot be reached at startup. With a key and
+            without one, an unreachable DecimalAI raises here rather than starting an
+            agent with no instructions.
         on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
             never returned them, and the run's record says so; ``"fail"`` raises
             before the model request instead.
 
     Raises:
         ImportError: Pydantic AI is not installed.
-        AgentNotFoundError: DecimalAI has no agent by this name.
+        DecimalConfigError: no API key is set in a project ``.decimal/link.toml``
+            connects to a workspace.
         ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
     if on_unavailable not in ("continue", "fail"):
         raise ValueError("on_unavailable must be 'continue' or 'fail'")
     _require_pydantic_ai()
-    from ._agent import _ensure_initialized, read_prompt
+    from ._agent import _open_prompt
 
-    _ensure_initialized()
-    prompt = read_prompt(agent_name, fallback=fallback)
+    prompt = _open_prompt(agent_name, fallback)
     return _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)
 
 

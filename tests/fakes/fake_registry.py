@@ -17,6 +17,11 @@ codes and the same per-item error codes, and renders every byte with
 ``skillevaluation.skillfmt``, the module the platform renders with. A test therefore sees
 the folder the platform would serve, not an invented one.
 
+It answers the anonymous search, ``GET /api/v1/registry/skills?q=``, with browse cards (keyless
+``agent_config()`` reads it): the public skills, or :attr:`FakeRegistry.search_results` in its
+order, each ``skill_safety`` from its band (``passed`` when clean) and a ``benchmark_summary``
+unless ``benchmarked=False``.
+
 It also answers ``GET /api/v1/skills/{name}/body``, the delivery route older clients used
 for disk exports, so a test can prove the engine never falls back to it. ``old=True`` makes
 it a registry that predates the install routes: those answer the framework's own 404 while
@@ -104,10 +109,11 @@ AUTH_BUNDLES = "/api/v1/install/bundles/"
 ANON_RESOLVE = "/api/v1/registry/install/resolve"
 ANON_BUNDLES = "/api/v1/registry/install/bundles/"
 REGISTRY_SKILLS = "/api/v1/registry/skills/"
+SEARCH = "/api/v1/registry/skills"
 SKILLS = "/api/v1/skills/"
 
 #: Route names, for :meth:`FakeRegistry.fault` and :meth:`FakeRegistry.calls`.
-ROUTES = ("resolve", "bundle", "registry_bundle", "body", "other")
+ROUTES = ("resolve", "bundle", "registry_bundle", "body", "search", "other")
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _REGISTRY_BUNDLE_RE = re.compile(r"^/api/v1/registry/skills/(?P<ref>.+)/bundle$")
@@ -160,6 +166,8 @@ class FakeSkill:
     users: Set[str] = field(default_factory=set)   # orgs with a Use link
     #: The version others get for "latest"; None means the newest.
     public_number: Optional[int] = None
+    #: Whether the search card carries a ``benchmark_summary``.
+    benchmarked: bool = True
 
     def version(self, number: int) -> FakeVersion:
         for v in self.versions:
@@ -244,6 +252,8 @@ class FakeRegistry:
         self._renders: Dict[str, Dict[str, skillfmt.RenderFields]] = {}
         self._next_id = 1
         self._lock = threading.Lock()
+        #: What the search answers, in order; None: every public skill, in the order added.
+        self.search_results: Optional[List[FakeSkill]] = None
 
     # ── building the registry ─────────────────────────────────────────
 
@@ -500,6 +510,8 @@ class FakeRegistry:
         match = _BODY_RE.match(path)
         if match and method == "GET":
             return self._body(match.group("name"))
+        if path == SEARCH and method == "GET":
+            return self._search(query)
         return _framework(404)
 
     def _next_fault(self, route: str) -> Optional[FaultAction]:
@@ -830,6 +842,21 @@ class FakeRegistry:
         self.fetches.append(Fetch(skill.skill_id, "", query.get("channel"), query.get("purpose")))
         return _json(200, data, cache="public, max-age=300")
 
+    def _search(self, query: Mapping[str, str]) -> httpx.Response:
+        """The browse card of each public skill, as ``GET /api/v1/registry/skills`` lists it."""
+        found = self.search_results if self.search_results is not None else [
+            s for s in self.skills if s.public]
+        limit = int(query.get("limit") or 20)
+        items = [{
+            "id": s.skill_id, "name": s.name, "url_slug": s.url_slug,
+            "description": s.description,
+            "skill_safety": "passed" if s.band == "clean" else s.band,
+            "benchmark_summary": {"verdict": "lift", "pass_rate_delta_pts": 12.0} if s.benchmarked else None,
+            "latest_version_number": None,
+        } for s in found[:limit]]
+        return _json(200, {"items": items, "next_cursor": None, "has_next": False, "total_hint": None},
+                     cache="public, max-age=60")
+
     def _body(self, name: str) -> httpx.Response:
         skill = next((s for s in self.skills if s.name == name), None)
         if skill is None:
@@ -908,6 +935,8 @@ def _route_of(path: str) -> str:
         return "registry_bundle"
     if _BODY_RE.match(path):
         return "body"
+    if path == SEARCH:
+        return "search"
     return "other"
 
 

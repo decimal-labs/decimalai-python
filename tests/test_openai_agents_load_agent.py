@@ -72,9 +72,22 @@ class FakeDecimal:
         self.requests: list = []
         self.queries: dict = {}  # routing id -> the message it was minted for
         self._next = 0
+        #: Names the workspace has no agent by, and the agents created since.
+        self.missing = {"missing-agent"}
+        self.created: list = []
+
+    def created_names(self):
+        return {name for name, _ in self.created}
+
+    def create_agent(self, agent_name, **fields):
+        self.created.append((agent_name, fields))
+        self.missing.discard(agent_name)
 
     def prompt_payload(self, agent_name, version=None):
-        if agent_name == "missing-agent":
+        if agent_name in self.created_names():
+            return {"agent_name": agent_name, "system_prompt": None, "version_number": None,
+                    "content_hash": None}
+        if agent_name in self.missing:
             import httpx
 
             raise AgentNotFoundError(
@@ -187,6 +200,7 @@ def decimal(monkeypatch):
         api_key="dai_sk_test", base_url="http://127.0.0.1:9", enabled=True))
     client = MagicMock()
     client.get_agent_prompt.side_effect = fake.prompt_payload
+    client.create_agent.side_effect = fake.create_agent
     client.register_manifest.return_value = {"manifest_id": "m-1", "status": "active"}
     monkeypatch.setattr(cfg, "_client", client)
     router = SkillRouter(api_key="dai_sk_test", base_url="http://127.0.0.1:9", inject_body=False)
@@ -323,9 +337,16 @@ def test_no_saved_prompt_uses_the_fallback_and_says_so(decimal):
     assert span.attributes["decimal.prompt.source"] == "fallback (none saved)"
 
 
-def test_an_unknown_agent_fails_at_load_agent(decimal):
-    with pytest.raises(AgentNotFoundError):
-        oa.agent_config("missing-agent", fallback=BASE)
+def test_an_unknown_agent_is_created_without_the_codes_prompt(decimal, monkeypatch, tmp_path, capsys):
+    """A name the workspace has not seen is a new agent (owner decision 2026-10-21): it is
+    created, with no prompt (the code's is never saved), and runs on its fallback."""
+    monkeypatch.chdir(tmp_path)
+    support = oa.agent_config("missing-agent", fallback=BASE)
+    assert decimal.created == [("missing-agent", {})]
+    assert (support.name, support.prompt_source) == ("missing-agent", "fallback (none saved)")
+    assert "created agent 'missing-agent'" in capsys.readouterr().err
+    oa.agent_config("missing-agent", fallback=BASE)
+    assert len(decimal.created) == 1, "created once; the next process finds it"
 
 
 def test_skills_unavailable_continue_or_fail(decimal):

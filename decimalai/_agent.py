@@ -36,6 +36,14 @@ That is why `_from_payload` checks for the KEY and never reaches for
 `payload.get("system_prompt")`: `.get()` turns every wrong-shaped 200 — an
 older backend, a captive-portal login page, a proxy's error envelope — into a
 plausible-looking empty prompt.
+
+KEYLESS
+-------
+With no API key and no ``init()`` there is no workspace to read, which is a
+mode, not an error (`decimalai._keyless`): the fallback is the prompt
+(``keyless=True``, ``prompt_source == "fallback (no key)"``) and the project
+and the public registry supply the skills. Fail-closed still holds where it
+matters: in a project ``.decimal/link.toml`` says is connected, no key raises.
 """
 
 from __future__ import annotations
@@ -102,6 +110,9 @@ class SavedPrompt:
     #: Set only when `is_fallback` — how old the served value is, in seconds,
     #: or None for a caller-supplied fallback that was never fetched.
     stale_age_seconds: Optional[float] = None
+    #: True when no API key is set and ``init()`` was never called: the agent runs
+    #: keyless (`decimalai._keyless`) on its fallback, and DecimalAI was not asked.
+    keyless: bool = False
 
     def __repr__(self) -> str:
         """Never dumps the prompt body — a prompt is up to 100,000 characters.
@@ -273,8 +284,10 @@ def read_prompt(
             Default 0. Regardless of it, the last good value IS served when the
             platform is unreachable: stale beats down.
 
+    With no API key set and ``decimalai.init()`` never called, DecimalAI is not
+    asked: the result is the fallback (or no prompt), with ``keyless=True``.
+
     Raises:
-        DecimalConfigError: `decimalai.init()` has not been called.
         AgentNotFoundError: no such agent in this workspace.
         ValueError: `agent_name` is empty, or the response was not a prompt
             payload this SDK can read.
@@ -286,7 +299,7 @@ def read_prompt(
             'decimalai.agent_config("refund-bot").'
         )
 
-    from ._config import _disabled_by_init, _get_client
+    from ._config import _disabled_by_init, _get_client, _keyless
 
     if _disabled_by_init():
         # The kill switch: DecimalAI is not asked, and the agent runs on its
@@ -297,6 +310,11 @@ def read_prompt(
                 f"{agent_name!r} cannot be read; pass agent_config(..., fallback=...) to run without it."
             )
         return SavedPrompt(agent_name=agent_name, system_prompt=fallback, is_fallback=True)
+    if _keyless():
+        # No key anywhere: there is no workspace to read from. The fallback is the
+        # prompt, and no fallback means the instructions are the skill list alone.
+        return SavedPrompt(agent_name=str(agent_name), system_prompt=fallback,
+                           is_fallback=True, keyless=True)
 
     key = f"{agent_name}\x00{version if version is not None else ''}"
 
@@ -405,15 +423,50 @@ def _get_skill_router() -> Any:
 
 
 def _ensure_initialized() -> None:
-    """`decimalai.init()` from the environment when nothing initialized the SDK yet."""
+    """`decimalai.init()` from the environment when nothing initialized the SDK yet.
+
+    Not without a key: that is keyless mode (`decimalai._keyless`), not an error.
+    """
     from . import _config
 
     # Not `_client is None`: `init(enabled=False)` leaves no client too, and
     # initializing again from the environment would turn the kill switch back off.
-    if _config._config is None and _config._client is None:
+    if _config._config is None and _config._client is None and not _config._keyless():
         import decimalai
 
         decimalai.init()
+
+
+def _open_prompt(agent_name: str, fallback: Optional[str]) -> SavedPrompt:
+    """What every ``agent_config()`` starts with: the prompt it runs on, keyed or keyless.
+
+    Keyless (no key, no ``init()``): refuses in a project ``.decimal/link.toml``
+    says is connected, else says once that the agent runs keyless. With a key: an
+    agent the workspace does not have is created rather than refused, and the
+    project is connected for it on its first keyed run (`decimalai._keyless.connect`).
+    """
+    from . import _keyless as keyless
+    from ._client import AgentNotFoundError
+    from ._config import _disabled_by_init, _keyless
+
+    if _keyless():
+        prompt = read_prompt(agent_name, fallback=fallback)
+        keyless.check_link(prompt.agent_name)
+        keyless.announce(prompt.agent_name)
+        return prompt
+    _ensure_initialized()
+    created = False
+    try:
+        prompt = read_prompt(agent_name, fallback=fallback)
+    except AgentNotFoundError:
+        # An agent exists once it is used (traces or manifests make one on the
+        # platform), so a name the workspace has not seen is a new agent, not a typo
+        # to refuse. Created without a prompt: the code's own prompt is not saved.
+        created = keyless.create_agent(str(agent_name))
+        prompt = read_prompt(agent_name, fallback=fallback)
+    if not _disabled_by_init() and not prompt.is_fallback:
+        keyless.connect(prompt.agent_name, router=_get_skill_router, created=created)
+    return prompt
 
 
 #: The span attributes a prompt record becomes (see `_prompt_attributes`).
@@ -787,12 +840,20 @@ def agent_config(
         # system=run.system, tools=[*my_tools, run.tool_spec]
         # ... when the model calls load_skill(name): run.load_skill(name)
 
-    Reads the agent's saved prompt here (so a misspelled name fails now) and
-    keeps a local copy, re-read in the background at most once a minute. Each
-    `AgentConfig.run()` routes its message: the first run before it returns,
-    later ones in the background, and every run of an agent with more skills
-    than fit the list. Initializes the SDK from ``DECIMAL_API_KEY`` when
-    ``decimalai.init()`` has not been called.
+    Reads the agent's saved prompt here and keeps a local copy, re-read in the
+    background at most once a minute. Each `AgentConfig.run()` routes its
+    message: the first run before it returns, later ones in the background, and
+    every run of an agent with more skills than fit the list. Initializes the SDK
+    from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called; an
+    agent the workspace has no agent by is created (without a prompt). The first
+    keyed run in a git checkout assigns the project's skills
+    (``.decimal/skills.toml``) to the agent and writes ``.decimal/link.toml``.
+
+    With no key and no ``init()``, the agent runs keyless: the ``fallback`` is its
+    prompt, each run lists the project's skills and the best public registry
+    matches for its message, and a registry skill the model loads is added to
+    the project. Nothing but the anonymous registry search and install is sent.
+    In a project with ``.decimal/link.toml``, no key raises instead.
 
     A framework with its own adapter has its own ``agent_config()``, which hands
     the same prompt and skills over in that framework's shape:
@@ -801,21 +862,22 @@ def agent_config(
 
     Args:
         agent_name: The agent's name in DecimalAI.
-        fallback: The prompt to use when the agent has no saved prompt, or when
-            DecimalAI cannot be reached now. Without one, an unreachable
-            DecimalAI raises here rather than starting an agent with no prompt.
+        fallback: The prompt to use when the agent has no saved prompt, when
+            DecimalAI cannot be reached now, or when no key is set. With a key
+            and without one, an unreachable DecimalAI raises here rather than
+            starting an agent with no prompt.
         on_unavailable: ``"continue"`` (default) composes runs without skills
             when DecimalAI never returned them, and the record says so;
             ``"fail"`` raises from `AgentConfig.run()` instead.
 
     Raises:
-        AgentNotFoundError: DecimalAI has no agent by this name.
+        DecimalConfigError: no key is set in a project ``.decimal/link.toml``
+            connects to a workspace.
         ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
     if on_unavailable not in ("continue", "fail"):
         raise ValueError("on_unavailable must be 'continue' or 'fail'")
-    _ensure_initialized()
-    prompt = read_prompt(agent_name, fallback=fallback)
+    prompt = _open_prompt(agent_name, fallback)
     return AgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
 
 

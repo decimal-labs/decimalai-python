@@ -75,8 +75,8 @@ class TestWarningGuards:
 
         _block(monkeypatch, "google.adk")
         monkeypatch.setattr(adk, "_PluginClass", None)
-        monkeypatch.setattr(agent_mod, "_ensure_initialized",
-                            lambda: pytest.fail("set up before the import check"))
+        monkeypatch.setattr(agent_mod, "_open_prompt",
+                            lambda *a: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
             adk.agent_config("support")
         with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
@@ -89,8 +89,8 @@ class TestWarningGuards:
         import decimalai.pydantic_ai as pai
 
         _block(monkeypatch, "pydantic_ai")
-        monkeypatch.setattr(agent_mod, "_ensure_initialized",
-                            lambda: pytest.fail("set up before the import check"))
+        monkeypatch.setattr(agent_mod, "_open_prompt",
+                            lambda *a: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[pydantic-ai\]'):
             pai.agent_config("support")
 
@@ -106,11 +106,12 @@ class TestWarningGuards:
     def test_openai_agents_load_agent_names_the_extra_before_any_call(self, monkeypatch):
         """Since 0.18 the skills come from agent_config(), which needs the SDK
         outright: it raises, naming the extra, before init() or any request."""
+        import decimalai._agent as agent_mod
         import decimalai.openai_agents as oa
 
         _block(monkeypatch, "agents")
-        monkeypatch.setattr(oa, "_ensure_initialized",
-                            lambda: pytest.fail("set up before the import check"))
+        monkeypatch.setattr(agent_mod, "_open_prompt",
+                            lambda *a: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[openai-agents\]'):
             oa.agent_config("support")
 
@@ -122,8 +123,8 @@ class TestWarningGuards:
         import decimalai.anthropic as da
 
         _block(monkeypatch, "anthropic")
-        monkeypatch.setattr(agent_mod, "_ensure_initialized",
-                            lambda: pytest.fail("set up before the import check"))
+        monkeypatch.setattr(agent_mod, "_open_prompt",
+                            lambda *a: pytest.fail("set up before the import check"))
         with pytest.raises(ImportError, match=r'decimalai\[anthropic\]'):
             da.agent_config("support")
 

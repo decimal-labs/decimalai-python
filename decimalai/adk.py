@@ -1926,7 +1926,7 @@ def agent_config(
         agent = LlmAgent(name="support", model="gemini-3.5-flash",
                          instruction=support.instruction, tools=[lookup_order, *support.tools])
 
-    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps a
+    Reads the agent's saved prompt here and keeps a
     local copy, re-read in the background at most once a minute. Each invocation is
     routed on its own user message: the first before its first model request, later
     ones from the local copy while their decision is recorded in the background, and
@@ -1940,18 +1940,25 @@ def agent_config(
     ``init(load_skill_tool=False)``), every invocation is routed and the text of the
     skills picked for it goes into the instruction instead (``inject_skill_body``).
 
+    With no API key and no ``init()``, the agent runs keyless, as
+    :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each
+    run lists the project's skills and public registry matches, and nothing is
+    traced. With a key, an agent the workspace has no agent by is created.
+
     Args:
         agent_name: The agent's name in DecimalAI.
-        fallback: The instruction to use when the agent has no saved prompt, or when
-            DecimalAI cannot be reached at startup. Without one, an unreachable
-            DecimalAI raises here rather than starting an agent with no instruction.
+        fallback: The instruction to use when the agent has no saved prompt, when no
+            API key is set, or when DecimalAI cannot be reached at startup. With a key
+            and without one, an unreachable DecimalAI raises here rather than starting
+            an agent with no instruction.
         on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
             never returned them, and the trace says so; ``"fail"`` raises before the
             model request instead.
 
     Raises:
         ImportError: Google ADK is not installed.
-        AgentNotFoundError: DecimalAI has no agent by this name.
+        DecimalConfigError: no API key is set in a project ``.decimal/link.toml``
+            connects to a workspace.
         ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
     if on_unavailable not in ("continue", "fail"):
@@ -1960,10 +1967,9 @@ def agent_config(
         import google.adk  # noqa: F401 — before any setup or network call
     except ImportError:
         raise ImportError('agent_config() needs Google ADK: pip install "decimalai[adk]"') from None
-    from ._agent import _ensure_initialized, read_prompt
+    from ._agent import _open_prompt
 
-    _ensure_initialized()
-    prompt = read_prompt(agent_name, fallback=fallback)
+    prompt = _open_prompt(agent_name, fallback)
     return ADKAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
 
 

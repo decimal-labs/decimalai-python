@@ -1364,17 +1364,6 @@ def _require_agents_sdk() -> None:
         ) from None
 
 
-def _ensure_initialized() -> None:
-    """`decimalai.init()` from the environment when nothing initialized the SDK yet.
-
-    The shared rule (`decimalai._agent._ensure_initialized`): `init(enabled=False)`
-    leaves no client, and initializing again would turn the kill switch back off.
-    """
-    from ._agent import _ensure_initialized as ensure
-
-    ensure()
-
-
 def _ensure_tracing() -> None:
     """Register this process's trace processor; no Agents SDK class is touched."""
     try:
@@ -1616,7 +1605,7 @@ def agent_config(
         )
         result = await Runner.run(agent, question, context=Customer(...))
 
-    Reads the agent's saved prompt here (so a misspelled name fails now) and
+    Reads the agent's saved prompt here and
     keeps a local copy, re-read in the background at most once a minute. The
     skill list is routed on each run's message: an agent whose skills all fit
     the list shows a local copy and records each run's decision in the
@@ -1632,29 +1621,35 @@ def agent_config(
     text of the skills picked for it goes into the instructions instead
     (``inject_skill_body``, on by default once the tool is off).
 
+    With no API key and no ``init()``, the agent runs keyless, as
+    :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each
+    run lists the project's skills and public registry matches, and nothing is
+    traced. With a key, an agent the workspace has no agent by is created.
+
     Args:
         agent_name: The agent's name in DecimalAI.
-        fallback: Instructions to use when the agent has no saved prompt, or
-            when DecimalAI cannot be reached at startup. Without one, an
-            unreachable DecimalAI raises here rather than starting an agent
-            with no instructions.
+        fallback: Instructions to use when the agent has no saved prompt, when no
+            API key is set, or when DecimalAI cannot be reached at startup. With a
+            key and without one, an unreachable DecimalAI raises here rather than
+            starting an agent with no instructions.
         on_unavailable: ``"continue"`` (default) runs without skills when
             DecimalAI never returned them, and the run's record says so;
             ``"fail"`` raises before the model call instead.
 
     Raises:
-        AgentNotFoundError: DecimalAI has no agent by this name.
+        DecimalConfigError: no API key is set in a project ``.decimal/link.toml``
+            connects to a workspace.
         ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
     """
     if on_unavailable not in ("continue", "fail"):
         raise ValueError("on_unavailable must be 'continue' or 'fail'")
     _require_agents_sdk()
-    _ensure_initialized()
-    from ._agent import read_prompt as _load_prompt
+    from ._agent import _open_prompt
 
-    prompt = _load_prompt(agent_name, fallback=fallback)
+    prompt = _open_prompt(agent_name, fallback)
     config = OpenAIAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
-    _ensure_tracing()
+    if not prompt.keyless:  # keyless runs are traced nowhere
+        _ensure_tracing()
     return config
 
 

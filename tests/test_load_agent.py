@@ -241,11 +241,23 @@ class TestFailsClosed:
         with pytest.raises(httpx.ReadTimeout):
             read_prompt(AGENT)
 
-    def test_an_uninitialized_sdk_raises(self, monkeypatch):
+    def test_an_uninitialized_sdk_with_a_key_raises(self, monkeypatch):
         monkeypatch.setattr("decimalai._config._client", None)
+        monkeypatch.setattr("decimalai._config._config", None)
+        monkeypatch.setenv("DECIMAL_API_KEY", "dai_sk_test")
         with pytest.raises(DecimalConfigError) as exc:
             read_prompt(AGENT)
         assert "init" in str(exc.value)
+
+    def test_no_key_and_no_init_asks_nothing_and_serves_the_fallback(self, monkeypatch):
+        """Keyless: there is no workspace to read from, so this is not an error."""
+        monkeypatch.setattr("decimalai._config._client", None)
+        monkeypatch.setattr("decimalai._config._config", None)
+        monkeypatch.delenv("DECIMAL_API_KEY", raising=False)
+        monkeypatch.delenv("DECIMALAI_API_KEY", raising=False)
+        config = read_prompt(AGENT, fallback="Be brief.")
+        assert (config.system_prompt, config.is_fallback, config.keyless) == ("Be brief.", True, True)
+        assert read_prompt(AGENT).system_prompt is None
 
     def test_an_empty_name_is_refused_before_any_request(self, monkeypatch):
         seen = []

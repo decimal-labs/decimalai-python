@@ -1064,7 +1064,7 @@ def agent_config(
                 messages=[{"role": "user", "content": question}])
             answer = runner.until_done()
 
-    Reads the agent's saved prompt here (so a misspelled name fails now) and keeps
+    Reads the agent's saved prompt here and keeps
     a local copy, re-read in the background at most once a minute. Each run is
     routed on its own message: the agent's first run before it opens, later runs
     from the local copy while their own decision is recorded in the background,
@@ -1076,11 +1076,17 @@ def agent_config(
     ``init(load_skill_tool=False)``), each run is routed and the text of the
     skills picked for it goes into ``run.system`` instead.
 
+    With no API key and no ``init()``, the agent runs keyless, as
+    :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each
+    run lists the project's skills and public registry matches, and nothing is
+    traced. With a key, an agent the workspace has no agent by is created.
+
     Args:
         agent_name: The agent's name in DecimalAI.
-        fallback: The system prompt to use when the agent has no saved prompt, or
-            when DecimalAI cannot be reached now. Without one, an unreachable
-            DecimalAI raises here rather than starting an agent with no prompt.
+        fallback: The system prompt to use when the agent has no saved prompt, when
+            no API key is set, or when DecimalAI cannot be reached now. With a key and
+            without one, an unreachable DecimalAI raises here rather than starting an
+            agent with no prompt.
         on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
             never returned them, and the run's record says so; ``"fail"`` raises
             when the run opens instead.
@@ -1094,7 +1100,8 @@ def agent_config(
 
     Raises:
         ImportError: the Anthropic SDK is not installed.
-        AgentNotFoundError: DecimalAI has no agent by this name.
+        DecimalConfigError: no API key is set in a project ``.decimal/link.toml``
+            connects to a workspace.
         ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``,
             or ``cache_control`` is not a dict or None.
     """
@@ -1105,11 +1112,11 @@ def agent_config(
     if cache_control is not None and not isinstance(cache_control, dict):
         raise ValueError('cache_control must be a dict such as {"type": "ephemeral"}, or None')
     _require_anthropic()
-    from ._agent import _ensure_initialized, read_prompt
+    from ._agent import _open_prompt
 
-    _ensure_initialized()
-    prompt = read_prompt(agent_name, fallback=fallback)
-    _turn_on_tracing()
+    prompt = _open_prompt(agent_name, fallback)
+    if not prompt.keyless:  # keyless runs are traced nowhere
+        _turn_on_tracing()
     return AnthropicAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable,
                                 cache_control=cache_control, on_trace=on_trace)
 
