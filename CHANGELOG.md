@@ -4,6 +4,16 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [0.24.1] — 2026-10-21
+
+### Changed: a keyless run's message travels in the request body
+
+- A keyless `agent_config()` run searched the registry with `GET /api/v1/registry/skills?q=<message>`,
+  which put each user message in a URL, where access logs and caches keep it. It now sends the
+  message in the body of `POST /api/v1/registry/skills/search`, which answers the same results. A
+  registry that does not have that route yet (it answers 404 or 405) is asked with the `GET` from then
+  on, so self-hosted and older platforms keep working.
+
 ## [0.24.0] — 2026-10-21
 
 ### New: `agent_config()` runs without a DecimalAI key
