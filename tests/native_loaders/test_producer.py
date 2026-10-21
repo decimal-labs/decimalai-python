@@ -72,6 +72,38 @@ def test_p1_the_commands_ran_through_this_checkouts_console_script(made):
             command.explain())
 
 
+def _launcher(interpreter: str) -> str:
+    """A console script's head as uv and pip write it when ``#!`` cannot hold the path."""
+    return f"#!/bin/sh\n'''exec' {interpreter} \"$0\" \"$@\"\n' '''\n"
+
+
+@pytest.mark.parametrize("head, interpreter", [
+    ("#!/opt/venv/bin/python\n# -*- coding: utf-8 -*-\n", "/opt/venv/bin/python"),
+    (_launcher("'/a/very/long/venv/bin/python'"), "/a/very/long/venv/bin/python"),
+    (_launcher("'/tmp/it'\"'\"'s a dir/bin/python'"), "/tmp/it's a dir/bin/python"),
+    (_launcher('"/tmp/my venv/bin/python"'), "/tmp/my venv/bin/python"),
+    (_launcher("/a/very/long/venv/bin/python"), "/a/very/long/venv/bin/python"),
+], ids=["plain", "uv-long-path", "uv-quote-in-path", "pip-space-in-path", "pip-linux-long-path"])
+def test_p1_the_scripts_interpreter_is_read_from_its_shebang_or_its_launcher(tmp_path, head,
+                                                                              interpreter):
+    """When the ``#!`` line would pass 127 bytes, or the path has a space, uv and pip write
+    ``#!/bin/sh`` and exec the interpreter from the next line instead. Read as a ``#!``
+    line, the check ran ``/bin/sh -c "import decimalai"`` and every test here failed in a
+    venv at a long path."""
+    script = tmp_path / producer.SCRIPT_NAME
+    script.write_text(head + "import sys\nfrom decimalai.cli.main import cli\n")
+    assert producer.script_interpreter(script) == interpreter
+
+
+def test_p1_a_launcher_that_names_no_interpreter_is_refused(tmp_path):
+    """uv's ``--relocatable`` launcher works out the path when it runs; refused by name, not
+    read as ``/bin/sh``."""
+    script = tmp_path / producer.SCRIPT_NAME
+    script.write_text(_launcher('"$(dirname -- "$(realpath -- "$0")")"/\'python\''))
+    with pytest.raises(producer.ProducerError, match="cannot tell which interpreter"):
+        producer.script_interpreter(script)
+
+
 def test_p1_install_frozen_wrote_exactly_what_add_wrote(made):
     """From a checkout of the manifest and the lock alone, ``--frozen`` rebuilt every
     folder byte for byte and mode for mode, and wrote neither the manifest nor the lock."""

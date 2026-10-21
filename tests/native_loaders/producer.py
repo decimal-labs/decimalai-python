@@ -34,6 +34,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -165,11 +166,32 @@ def console_script() -> Path:
 
 
 def script_interpreter(script: Path) -> str:
-    """The interpreter the script's ``#!`` line names."""
-    first = script.read_bytes().split(b"\n", 1)[0].decode()
+    """The interpreter the script's ``#!`` line names.
+
+    Or, when that line would pass 127 bytes (uv everywhere, pip on Linux) or the path
+    holds a space, the one on the ``exec`` line below ``#!/bin/sh``, quoted for the
+    shell. That is how uv and pip write the script then::
+
+        #!/bin/sh
+        '''exec' '/a/very/long/venv/bin/python' "$0" "$@"
+        ' '''
+    """
+    lines = script.read_bytes().split(b"\n", 2)
+    first = lines[0].decode()
     if not first.startswith("#!"):
         raise ProducerError(f"{script} has no #! line")
-    return first[2:].strip().split()[0]
+    if first.rstrip() != "#!/bin/sh" or len(lines) < 2 or not lines[1].startswith(b"'''exec' "):
+        return first[2:].strip().split()[0]
+    launcher = lines[1].decode()
+    try:
+        words = shlex.split(launcher)
+    except ValueError:
+        words = []
+    # exec <interpreter> [its options] "$0" "$@"
+    if (len(words) < 4 or words[0] != "exec" or words[-2:] != ["$0", "$@"]
+            or not os.path.isabs(words[1])):
+        raise ProducerError(f"cannot tell which interpreter {script} runs: {launcher!r}")
+    return words[1]
 
 
 def tree(project: Path) -> Tree:
