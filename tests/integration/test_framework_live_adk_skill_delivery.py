@@ -157,6 +157,8 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
         }],
         author=f"live-adk/{agent_name}",
         conflict_policy="local_wins",
+        # On this agent only: new skills are opt-in on the platform since 2026-10-22.
+        agent_name=agent_name,
     )
     # agent_config() reads the agent's saved prompt, so the agent has to exist.
     h.create_agent(agent_name, _INSTRUCTION)

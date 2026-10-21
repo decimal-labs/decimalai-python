@@ -787,18 +787,19 @@ class TestSkillsAreNamed:
 
     # The list comes from GET /agents/{name}/skills, which returns subscription
     # rows only. An agent is ALSO offered, with no row at all, every skill its
-    # workspace owns unless that skill is set to "Only agents it's assigned
-    # to" -- so a skill created a moment ago was missing from a header that
-    # called the list "Skills this agent will use", and an agent with no rows
-    # was told it "will run as a plain model call".
+    # workspace owns that is set to "Offered to: All agents" -- so the header
+    # says so, or an agent with no rows is told it "will run as a plain model
+    # call". Since the platform made new skills opt-in (2026-10-22) a skill
+    # created a moment ago is NOT one of them, and the header must not claim it.
 
     @pytest.mark.parametrize("skills", [SKILLS, []], ids=["attached", "none-attached"])
     def test_the_workspace_skills_offered_without_a_row_are_mentioned(self, skills):
         header = _header_text(render_agent_file(AGENT, "langchain", skills))
         assert "also offered the skills this workspace owns" in header \
             or "still offered the skills this workspace owns" in header
-        assert "including one created a moment ago" in header
-        assert "Only agents it's assigned to" in header
+        assert "Offered to: All agents" in header
+        assert "A new skill is not one of them" in header
+        assert "including one created a moment ago" not in header
 
     def test_the_list_is_not_called_what_the_agent_will_use(self):
         header = _header_text(render_agent_file(AGENT, "langchain", SKILLS))

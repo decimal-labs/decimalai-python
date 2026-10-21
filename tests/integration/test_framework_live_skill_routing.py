@@ -69,6 +69,9 @@ def _create_skill(name: str, description: str, body_markdown: str, category: str
         "description": description,
         "body_markdown": body_markdown,
         "category": category,
+        # Routed to the test's agent without an assignment: every agent, explicitly
+        # (new skills are opt-in on the platform since 2026-10-22).
+        "offer_scope": "workspace",
     })
     skill_id = resp.get("skill_id") or resp.get("id") or ""
     assert skill_id, f"skill create returned no id: {resp}"

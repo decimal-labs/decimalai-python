@@ -245,6 +245,48 @@ class TestSkillRouterCRUD:
         assert mock.call_args_list[1][1]["json"] == {"offer_scope": "restricted"}
         assert result["offer_scope"] == "restricted"
 
+    def test_create_skill_for_an_agent(self):
+        """`agent_name` rides in the create payload: the platform makes the skill opt-in and
+        puts it on that agent in the same call (new skills are opt-in since 2026-10-22)."""
+        router = self._router()
+        reply = {"status": "ok", "skill_id": "x", "name": "s", "version": 1, "offer_scope": "restricted",
+                 "added_to_agent": "support"}
+        with patch.object(router, "_request", return_value=reply) as mock:
+            result = router.create_skill("s", "d", "# Body", agent_name="support")
+            mock.assert_called_once()
+            assert mock.call_args[1]["json"]["agent_name"] == "support"
+            assert "offer_scope" not in mock.call_args[1]["json"]
+            assert result == reply
+
+    def test_create_skill_for_an_agent_on_an_older_backend(self):
+        """An older backend ignores `agent_name`: the SDK restricts the skill and assigns it,
+        the calls callers used to make themselves."""
+        router = self._router()
+        replies = [{"status": "ok", "skill_id": "x", "name": "s", "version": 1, "offer_scope": "workspace"},
+                   {"status": "ok"}, {"status": "ok", "action": "assigned"}]
+        with patch.object(router, "_request", side_effect=replies) as mock:
+            result = router.create_skill("s", "d", "# Body", agent_name="support")
+        assert [c[0][:2] for c in mock.call_args_list] == [
+            ("POST", "/api/v1/skills"), ("PUT", "/api/v1/skills/x"), ("POST", "/api/v1/agents/support/skills/x"),
+        ]
+        assert mock.call_args_list[1][1]["json"] == {"offer_scope": "restricted"}
+        assert result["offer_scope"] == "restricted" and result["added_to_agent"] == "support"
+
+    def test_sync_skills_says_who_gets_new_skills_only_when_asked(self):
+        router = self._router()
+        with patch.object(router, "_request", return_value={"status": "ok"}) as mock:
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}])
+            body = mock.call_args[1]["json"]
+            assert "offer_scope" not in body and "agent_name" not in body and "add_to_agent" not in body
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}], offer_scope="workspace")
+            assert mock.call_args[1]["json"]["offer_scope"] == "workspace"
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}], agent_name="support", add_to_agent="created")
+            body = mock.call_args[1]["json"]
+            assert (body["agent_name"], body["add_to_agent"]) == ("support", "created")
+            # add_to_agent means nothing without an agent, so it isn't sent alone.
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}], add_to_agent="created")
+            assert "add_to_agent" not in mock.call_args[1]["json"]
+
     def test_assign_skill(self):
         router = self._router()
         reply = {"status": "ok", "action": "assigned", "subscription_id": "sub-1", "pinned_version_id": None}

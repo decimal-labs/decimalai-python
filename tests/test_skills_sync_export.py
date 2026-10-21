@@ -119,6 +119,23 @@ class TestSkillRouterForkAndUse:
         mock_export.assert_not_called()
         assert out["skill"]["name"] == "pdf"
 
+    def test_fork_says_which_agents_get_the_copy_only_when_asked(self):
+        """`offer_scope` rides as a query param (new skills are opt-in since 2026-10-22)."""
+        router = self._router()
+        seen = []
+
+        def mock_request(method, path, **kwargs):
+            if method == "GET":
+                return {"items": [{"id": "cat-1", "name": "pdf"}]}
+            seen.append(kwargs.get("params"))
+            return {"status": "installed", "skill": {"id": "fork-1", "name": "pdf"}}
+
+        with patch.object(router, "_request", side_effect=mock_request):
+            router.fork("pdf")
+            router.fork("pdf", offer_scope="restricted")
+            router.fork("pdf", new_name="my-pdf", offer_scope="workspace")
+        assert seen == [None, {"offer_scope": "restricted"}, {"new_name": "my-pdf", "offer_scope": "workspace"}]
+
     def test_use_posts_to_use_endpoint_not_fork(self):
         """use() resolves the registry skill then POSTs /use (a linked pointer, no fork)."""
         router = self._router()

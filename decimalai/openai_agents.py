@@ -1291,6 +1291,11 @@ def instrument(
                         conflict_policy="newer_wins",
                         install_id=_ident.get("install_id"),
                         install_label=_ident.get("install_label"),
+                        # A skill written for this agent goes on this agent (new
+                        # skills are opt-in). Only ones this boot created: one
+                        # removed on the dashboard is not added back.
+                        agent_name=fallback_name or process_name,
+                        add_to_agent="created",
                     )
                     synced = result.get("synced", 0)
                     created = result.get("created", 0)

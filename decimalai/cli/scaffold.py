@@ -375,10 +375,10 @@ def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
     if not skills:
         return [
             "# No skills are attached to this agent itself. It is still offered the",
-            "# skills this workspace owns: by default every one of them, including",
-            "# one created a moment ago, unless its \"Offered to\" setting is \"Only",
-            "# agents it's assigned to\". The file loads its skills at run time, so",
-            "# attaching more in the dashboard needs no regenerating.",
+            "# skills this workspace owns that are set to \"Offered to: All agents\".",
+            "# A new skill is not one of them: it reaches only the agents it is added",
+            "# to. The file loads its skills at run time, so attaching more in the",
+            "# dashboard needs no regenerating.",
         ]
 
     lines = [f"# Skills attached to this agent ({len(skills)}):"]
@@ -392,10 +392,9 @@ def _skill_comment_lines(skills: Sequence[Mapping[str, Any]]) -> List[str]:
         lines.append(f"#   - {name}" + (f" — {desc}" if desc else "") + suffix)
     lines += [
         "#",
-        "# It is also offered the skills this workspace owns: by default every one",
-        "# of them, including one created a moment ago, unless its \"Offered to\"",
-        "# setting is \"Only agents it's assigned to\". Only attached skills are",
-        "# listed above.",
+        "# It is also offered the skills this workspace owns that are set to",
+        "# \"Offered to: All agents\". A new skill is not one of them: it reaches",
+        "# only the agents it is added to. Only attached skills are listed above.",
     ]
     return lines
 

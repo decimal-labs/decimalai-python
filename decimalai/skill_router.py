@@ -3437,6 +3437,10 @@ class SkillRouter:
         response_mode: str = "summary",
         install_id: Optional[str] = None,
         install_label: Optional[str] = None,
+        *,
+        offer_scope: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        add_to_agent: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Push local skills to the platform (bulk upsert).
 
@@ -3457,6 +3461,18 @@ class SkillRouter:
             response_mode: ``"summary"`` (default; returns counts) or
                 ``"diff"`` (returns a per-skill ``actions`` array with
                 bodies for any ``pulled`` entries).
+            offer_scope: Which agents get the skills this sync CREATES
+                (existing skills keep theirs): ``"restricted"``, only the agents
+                you add them to; ``"workspace"``, every agent in the org. Leave
+                it out and they reach every agent for now; the platform is
+                making new skills opt-in, so pass it to keep a behavior.
+            agent_name: Add the synced skills to this agent. New ones are then
+                created ``"restricted"`` (only this agent) unless
+                ``offer_scope`` says otherwise.
+            add_to_agent: With ``agent_name``: ``"all"`` (the server's default)
+                adds every synced skill; ``"created"`` adds only the ones this
+                sync created, so a skill removed from the agent on the dashboard
+                is not added back. The adapters' boot sync uses ``"created"``.
 
         Returns:
             Dict with ``created`` / ``updated`` / ``unchanged`` / ``pulled`` /
@@ -3476,6 +3492,13 @@ class SkillRouter:
             payload["install_id"] = install_id
             if install_label:
                 payload["install_label"] = install_label
+        # A backend that predates these fields ignores them (the skills still sync).
+        if offer_scope is not None:
+            payload["offer_scope"] = offer_scope
+        if agent_name:
+            payload["agent_name"] = agent_name
+            if add_to_agent:
+                payload["add_to_agent"] = add_to_agent
 
         return self._request("POST", "/api/v1/skills/sync", json=payload)
 
@@ -3523,6 +3546,7 @@ class SkillRouter:
         stability: str = "stable",
         trigger_phrases: Optional[List[str]] = None,
         offer_scope: Optional[str] = None,
+        agent_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new skill on the platform.
 
@@ -3535,15 +3559,19 @@ class SkillRouter:
             category: Optional category grouping.
             stability: One of 'stable', 'experimental', 'deprecated'.
             trigger_phrases: Optional list of trigger phrases.
-            offer_scope: Who the trigger router offers the skill to.
-                ``"workspace"`` (the default) is every agent in the org;
-                ``"restricted"`` is only the agents you assign it to with
-                :meth:`assign_skill`. Set here, the skill is never offered
+            offer_scope: Which agents get the skill. ``"restricted"``: only
+                the agents you add it to (:meth:`assign_skill`, or
+                ``agent_name`` here). ``"workspace"``: every agent in the org.
+                Leave it out and an API key still gets ``"workspace"`` today;
+                the platform is making new skills opt-in (``"restricted"``), so
+                pass it to keep a behavior. Set here, the skill is never offered
                 org-wide, not even until a later :meth:`update_skill`.
+            agent_name: Also add the new skill to this agent. Implies
+                ``offer_scope="restricted"`` unless you say otherwise.
 
         Returns:
-            Created skill descriptor: ``skill_id``, ``name``, ``version`` and
-            ``offer_scope``.
+            Created skill descriptor: ``skill_id``, ``name``, ``version``,
+            ``offer_scope`` and, with ``agent_name``, ``added_to_agent``.
         """
         payload: Dict[str, Any] = {
             "name": name,
@@ -3559,12 +3587,19 @@ class SkillRouter:
             payload["trigger_phrases"] = trigger_phrases
         if offer_scope is not None:
             payload["offer_scope"] = offer_scope
+        if agent_name:
+            payload["agent_name"] = agent_name
         result = self._request("POST", "/api/v1/skills", json=payload)
-        if offer_scope is not None and result.get("offer_scope") != offer_scope:
+        wanted = offer_scope if offer_scope is not None else ("restricted" if agent_name else None)
+        if wanted is not None and result.get("offer_scope") != wanted:
             # An older backend ignores the field and does not echo it: set it
             # the way callers had to before.
-            self.update_skill(result["skill_id"], offer_scope=offer_scope)
-            result = {**result, "offer_scope": offer_scope}
+            self.update_skill(result["skill_id"], offer_scope=wanted)
+            result = {**result, "offer_scope": wanted}
+        if agent_name and not result.get("added_to_agent"):
+            # An older backend ignores `agent_name` too: add it the same way.
+            self.assign_skill(agent_name, result["skill_id"])
+            result = {**result, "added_to_agent": agent_name}
         return result
 
     def update_skill(
@@ -3592,11 +3627,11 @@ class SkillRouter:
             stability: New stability level.
             trigger_phrases: New trigger phrases.
             is_active: Set active/inactive.
-            offer_scope: Who the trigger router offers the skill to.
-                ``"workspace"`` (the default) is every agent in the org;
-                ``"restricted"`` is only the agents it has been assigned to
-                (:meth:`assign_skill`). Metadata only: it does not create a
-                new version.
+            offer_scope: Which agents get the skill. ``"workspace"`` is every
+                agent in the org; ``"restricted"`` is only the agents it has
+                been assigned to (:meth:`assign_skill`). Metadata only: it does
+                not create a new version, but each agent whose list changes
+                gets a new setup version on the platform.
             change_summary: Description of body changes (for version history).
             author: Author of the change.
 
@@ -4128,6 +4163,7 @@ class SkillRouter:
         name: str,
         *,
         new_name: Optional[str] = None,
+        offer_scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fork a registry skill into your workspace — DB only, no disk write.
 
@@ -4140,6 +4176,10 @@ class SkillRouter:
         Args:
             name: Registry skill name to fork.
             new_name: Optional custom name for the fork in your workspace.
+            offer_scope: Which agents get the copy: ``"restricted"``, only the
+                agents you add it to; ``"workspace"``, every agent. Leave it out
+                and it reaches every agent for now; the platform is making new
+                skills opt-in, so pass it to keep a behavior.
 
         Returns:
             The platform's fork response (``status``, ``skill`` with id/name,
@@ -4174,7 +4214,10 @@ class SkillRouter:
         except Exception as e:
             raise RuntimeError(f"Failed to search registry: {e}")
 
-        params = {"new_name": new_name} if new_name else None
+        params: Optional[Dict[str, Any]] = {
+            **({"new_name": new_name} if new_name else {}),
+            **({"offer_scope": offer_scope} if offer_scope is not None else {}),
+        } or None
         # Step 2: fork. ``/fork`` is the only route now — the ``/install`` alias
         # was RETIRED server-side on 2026-08-11 and answers 410, because
         # "install" came to mean a LINK everywhere else and a route that
