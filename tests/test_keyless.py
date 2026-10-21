@@ -36,7 +36,7 @@ import decimalai._keyless as keyless
 from decimalai._client import AgentNotFoundError
 from decimalai._config import DecimalConfig, DecimalConfigError
 from decimalai.skill_router import LOAD_SKILL_PROMPT_HINT, SkillRouter
-from tests.fakes.fake_registry import ANON_BUNDLES, ANON_RESOLVE, SEARCH, SEARCH_POST, FakeRegistry
+from tests.fakes.fake_registry import ANON_BUNDLES, ANON_RESOLVE, SEARCH_POST, FakeRegistry
 
 MESSAGE = "My package arrived damaged, can I get a refund?"
 FALLBACK = "You help customers with their orders."
@@ -197,14 +197,38 @@ def test_a_skill_too_long_to_serve_is_not_added_or_listed_again(world):
     assert "big/refund-manual" not in offered(support.run(MESSAGE).system)
 
 
-def test_a_registry_without_the_post_route_is_asked_with_the_get_from_then_on(world):
+def test_a_registry_without_the_post_route_is_not_searched(world, caplog):
+    """Its GET search would carry each message in a URL. The registry that happens to
+    is api.decimal.ai itself, rolled back to before the POST route."""
     world.registry.search_post = False
     support = decimalai.agent_config("order-support")
-    assert offered(support.run(MESSAGE).system) == ["acme/refund-policy", "big/refund-manual"]
-    support.run("My refund never arrived.")
+    with caplog.at_level("WARNING", logger="decimalai"):
+        assert offered(support.run(MESSAGE).system) == []
+        assert offered(support.run("My refund never arrived.").system) == []
     asked = [(r.method, r.path) for r in world.registry.calls("search")]
-    assert asked == [("POST", SEARCH_POST), ("GET", SEARCH), ("GET", SEARCH)], "the POST is tried once"
-    assert world.registry.calls("search")[1].query["q"] == MESSAGE
+    assert asked == [("POST", SEARCH_POST)], "asked once, and never with the GET"
+    assert sum("has no POST /api/v1/registry/skills/search" in r.getMessage()
+               for r in caplog.records) == 1
+
+
+def test_the_message_is_in_no_url_a_keyless_run_requests(world):
+    """Not the search's, and not the install routes' a load makes after it. Read off
+    each request as it travelled, percent-encoding intact, and decoded."""
+    marker = "Zanzibar-4417"
+    message = f"My package {marker} arrived damaged, can I get a refund?"
+    support = decimalai.agent_config("order-support")
+    run = support.run(message)
+    assert run.load_skill("acme/refund-policy").startswith("## Skill:")
+    support.run(message)
+    requests = world.registry.requests
+    assert {r.route for r in requests} >= {"search", "resolve", "bundle"}, [r.route for r in requests]
+    for r in requests:
+        travelled = r.raw_path + "?" + urllib.parse.urlencode(r.query)
+        for text in (travelled, urllib.parse.unquote_plus(travelled)):
+            assert marker not in text and "damaged" not in text, (r.method, travelled)
+    searched = world.registry.calls("search")
+    assert searched and all(r.method == "POST" and marker in r.json["q"] for r in searched), \
+        "the message reached the registry, in the body"
 
 
 def test_a_failed_search_lists_the_projects_skills_alone(world, caplog):

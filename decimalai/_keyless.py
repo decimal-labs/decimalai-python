@@ -49,10 +49,10 @@ DEFAULT_BASE_URL = "https://api.decimal.ai"
 #: The anonymous registry search a keyless run makes, and the only route besides the
 #: install routes (resolve, bundle) a keyless process calls. The message goes in the
 #: request body: a URL is written to access logs and keyed into caches at every hop.
+#: A registry from before this route (it answers 404 or 405) is not searched at all:
+#: its ``GET /api/v1/registry/skills?q=`` would put each message in a URL, and the
+#: registry whose logs that fills is api.decimal.ai itself, rolled back past 2026-10-21.
 SEARCH_POST_PATH = "/api/v1/registry/skills/search"
-#: The same search with the message in the URL (``?q=``), for a registry that predates
-#: the POST route (it answers that one 404 or 405).
-SEARCH_PATH = "/api/v1/registry/skills"
 
 #: How long a run waits for the search before it lists the project's skills alone.
 #: Measured 2026-10-21 from a laptop: 1.1-3.5 s for a new message, one cold outlier
@@ -65,8 +65,8 @@ _SEARCH_LIMIT = 10
 #: The longest message sent as the query. The search ranks on meaning, and the first
 #: few sentences carry it; a pasted log or email would only make the request long.
 _QUERY_MAX_CHARS = 500
-#: Registries (base URLs) that answered the POST search 404 or 405: this process asks
-#: them with the GET from then on.
+#: Registries (base URLs) that answered the POST search 404 or 405: this process does not
+#: search them again.
 _POST_UNSUPPORTED: Set[str] = set()
 
 #: The relevance cutoff (see `relevant_matches`).
@@ -244,7 +244,8 @@ def search_registry(query: str, *, url: Optional[str] = None, transport: Any = N
     """The anonymous registry search for one message: its result items, in order.
 
     ``POST /api/v1/registry/skills/search`` with the message in the body. A registry
-    that answers it 404 or 405 predates the route, and gets ``GET ?q=`` from then on.
+    that answers it 404 or 405 predates the route: it is not searched (nothing found,
+    said once), and never asked with the ``GET``, which carries the message in its URL.
     Raises on any other failure; the caller lists the project's skills alone.
     """
     import httpx
@@ -252,6 +253,8 @@ def search_registry(query: str, *, url: Optional[str] = None, transport: Any = N
     from ._config import sdk_user_agent
 
     root = (url or base_url()).rstrip("/")
+    if root in _POST_UNSUPPORTED:
+        return []
     ask = {"q": query[:_QUERY_MAX_CHARS], "limit": _SEARCH_LIMIT}
     with httpx.Client(
         base_url=root,
@@ -259,14 +262,14 @@ def search_registry(query: str, *, url: Optional[str] = None, transport: Any = N
         headers={"User-Agent": sdk_user_agent("keyless")},
         transport=transport,
     ) as client:
-        resp = None
-        if root not in _POST_UNSUPPORTED:
-            resp = client.post(SEARCH_POST_PATH, json=ask)
-            if resp.status_code in (404, 405):
-                _POST_UNSUPPORTED.add(root)
-                resp = None
-        if resp is None:
-            resp = client.get(SEARCH_PATH, params=ask)
+        resp = client.post(SEARCH_POST_PATH, json=ask)
+        if resp.status_code in (404, 405):
+            _POST_UNSUPPORTED.add(root)
+            logger.warning(
+                "decimalai: the registry at %s has no POST %s (it predates 2026-10-21), so "
+                "keyless runs list the project's own skills only: its GET search would put "
+                "each message in a URL.", root, SEARCH_POST_PATH)
+            return []
         resp.raise_for_status()
         items = resp.json().get("items")
     if not isinstance(items, list):
