@@ -325,11 +325,6 @@ contract is wrong — fix contract.py so every framework gets the fix.
 # ── the guards ───────────────────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "0.23 adds the Anthropic Messages API row (anthropic-messages-api) to the capability "
-    "table; the docs describe what PyPI serves, so decimalai-docs regenerates its tables "
-    "with the 0.23 release. Remove this mark then: strict, so the regenerated page turns "
-    "it red. Same mark as tests/test_frameworks_registry.py's docs-tables test."))
 def test_advertised_snapshot_matches_docs() -> None:
     """The vendored advertised list is what the docs actually advertise.
 

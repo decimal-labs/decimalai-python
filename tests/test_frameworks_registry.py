@@ -259,10 +259,6 @@ def test_replace_block_round_trips_on_a_page():
         reg.extract_block(page.replace(reg.end_marker("capability-table"), ""), "capability-table")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "0.23 adds the Anthropic Messages API row (agent_config(...)) to the registry tables; the "
-    "docs describe what PyPI serves, so decimalai-docs regenerates its tables with the 0.23 "
-    "release. Remove this mark then: strict, so the regenerated page turns it red."))
 def test_docs_generated_blocks_are_the_registrys():
     """The docs page carries exactly what the renderers produce. Skips without the docs
     checkout; decimalai-docs' scripts/check_generated_framework_tables.py makes the same
