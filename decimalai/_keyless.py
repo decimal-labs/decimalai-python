@@ -18,7 +18,9 @@ never called, every ``agent_config()`` runs keyless:
 Adding a key connects the project (:func:`connect`, on the first keyed
 ``agent_config()`` of each agent): the agent is created when the workspace has none
 by that name, the project's skills are assigned to it at their pinned versions, and
-``.decimal/link.toml`` records the workspace. From then on a run with no key in that
+``.decimal/link.toml`` records the workspace and what was assigned. Each later keyed
+start assigns the skills ``skills.toml`` gained since (from the record, so an unchanged
+project makes no request). From then on a run with no key in that
 project raises (:func:`check_link`) rather than quietly running keyless: that file,
 committed, is what protects a production deploy that lost its key. The prompt in the
 code is never saved to DecimalAI: a saved prompt overrides the code's, which is
@@ -725,8 +727,19 @@ def _link_label(link: Mapping[str, Any]) -> str:
     return f"at {link.get('base_url') or DEFAULT_BASE_URL}"
 
 
+def _assigned(link: Optional[Mapping[str, Any]], agent_name: str) -> Dict[str, str]:
+    """The skills ``link.toml`` records as assigned to ``agent_name``: registry name to the
+    ``.decimal/skills.toml`` spec it was assigned at (``"3"`` or ``"latest"``). Empty for
+    a link written before the record existed (0.24), so its skills are assigned again."""
+    table = (link or {}).get("assigned")
+    given = table.get(agent_name) if isinstance(table, dict) else None
+    if not isinstance(given, dict):
+        return {}
+    return {k: v for k, v in given.items() if isinstance(k, str) and isinstance(v, str)}
+
+
 def _write_link(project: Any, *, url: str, identity: Mapping[str, Optional[str]],
-                agents: Sequence[str]) -> bool:
+                agents: Sequence[str], assigned: Mapping[str, Mapping[str, str]]) -> bool:
     """Write ``.decimal/link.toml``; True when its bytes changed."""
     from .skillpkg.manifest import _quote
 
@@ -739,7 +752,18 @@ def _write_link(project: Any, *, url: str, identity: Mapping[str, Optional[str]]
     for key in ("org_id", "org_slug", "workspace_id"):
         if identity.get(key):
             lines.append(f"{key} = {_quote(str(identity[key]))}")
-    lines.append("agents = [" + ", ".join(_quote(a) for a in sorted(set(agents))) + "]")
+    names = sorted(set(agents))
+    lines.append("agents = [" + ", ".join(_quote(a) for a in names) + "]")
+    lines += [
+        "",
+        "# The .decimal/skills.toml skills assigned to each agent, at the version assigned.",
+        "# A keyed run assigns only what is new here, so a skill removed from an agent in",
+        "# the dashboard stays removed. Delete an agent's table to assign them all again.",
+    ]
+    for agent in names:
+        lines.append(f"[assigned.{_quote(agent)}]")
+        for name, spec in sorted((assigned.get(agent) or {}).items()):
+            lines.append(f"{_quote(name)} = {_quote(spec)}")
     data = ("\n".join(lines) + "\n").encode("utf-8")
     path = link_path(project)
     if path.is_file() and path.read_bytes() == data:
@@ -790,19 +814,23 @@ def _identity(client: Any) -> Optional[Dict[str, Optional[str]]]:
 
 
 def connect(agent_name: str, *, router: Any, created: bool = False) -> None:
-    """Connect this project to the key's workspace for ``agent_name``, once.
+    """Connect this project to the key's workspace for ``agent_name``, and keep it in step.
 
     Runs for a project with something to connect: one that lists skills in
     ``.decimal/skills.toml`` (a keyless run adds them there), or whose agent this run
-    just created. Assigns each of those skills to the agent at the version the lock
-    pins (``assign_skill`` with the lock's version id; a ``"latest"`` entry follows the
-    latest), then records the agent, the key's organization and its workspace in
-    ``.decimal/link.toml``. ``router`` is the SkillRouter to assign with, or a callable
-    returning it, called only when there is something to assign. Only in a git checkout,
-    the one place the file can be committed (a container built from the repository
-    carries the committed file). Never raises: a project that cannot be connected now
-    (the platform did not answer) is connected by a later run, and the agent runs
-    either way.
+    just created. The first time, it assigns each of those skills to the agent at the
+    version the lock pins (``assign_skill`` with the lock's version id; a ``"latest"``
+    entry follows the latest), then records the agent, the key's organization and
+    workspace, and the skills it assigned in ``.decimal/link.toml``. On every later
+    keyed start it compares ``skills.toml`` with that record and assigns only what is
+    new or was re-pinned: a skill added with ``decimalai skills add`` (with a key or
+    without one) reaches the agent on its next start, and when nothing changed no
+    request is made. ``router`` is the SkillRouter to assign with, or a callable
+    returning it, called only when there is something to assign. Only in a git
+    checkout, the one place the file can be committed (a container built from the
+    repository carries the committed file). Never raises: what cannot be assigned now
+    (the platform did not answer, or refused) is tried again by the next start, and the
+    agent runs either way.
     """
     from .skillpkg.project import Project
 
@@ -816,60 +844,165 @@ def connect(agent_name: str, *, router: Any, created: bool = False) -> None:
         link = read_link(project)
         linked = link.get("agents") if isinstance(link, dict) else None
         if isinstance(linked, list) and agent_name in linked:
-            return
-        _connect(project, agent_name, link if isinstance(link, dict) else None, router)
+            _sync(project, agent_name, link, router)
+        else:
+            _connect(project, agent_name, link if isinstance(link, dict) else None, router)
     except Exception:
         logger.warning("decimalai: could not connect this project for agent %r (continuing); "
                        "the next run tries again.", agent_name, exc_info=True)
 
 
-def _connect(project: Any, agent_name: str, link: Optional[Dict[str, Any]], router: Any) -> None:
-    from ._config import _get_client, _get_config
+@dataclass(frozen=True)
+class _Wanted:
+    """One ``.decimal/skills.toml`` skill as an assignment: what to send, and what to record."""
+
+    skill_id: str
+    pin_version_id: Optional[str]    # None follows the latest
+    spec: str                        # the manifest's spec, "3" or "latest"
+    label: str                       # how a message names it
+
+
+def _wanted(project: Any) -> Dict[str, _Wanted]:
+    """The project's skills by registry name: each manifest entry the lock has resolved."""
     from .skillpkg import lock as _lock
     from .skillpkg import manifest as _manifest
+
+    if not project.manifest_path.is_file():
+        return {}
+    wanted = _manifest.load(project, missing_ok=True)
+    out: Dict[str, _Wanted] = {}
+    for entry in (_lock.locked_entries(project) or {}).values():
+        name = entry.get("name")
+        if not isinstance(name, str) or name not in wanted:
+            continue
+        spec = wanted[name].spec
+        pinned = not wanted[name].latest
+        out[name] = _Wanted(
+            skill_id=str(entry["skill_id"]),
+            pin_version_id=str(entry["version_id"]) if pinned else None,
+            spec=spec,
+            label=f"{name} v{entry.get('version')}" if pinned else f"{name} (latest)",
+        )
+    return out
+
+
+def _elsewhere(link: Mapping[str, Any], url: str, identity: Mapping[str, Optional[str]]) -> bool:
+    """Whether ``link`` names another platform, organization or workspace than this key's."""
+    return link.get("base_url") not in (None, url) or any(
+        link.get(key) and identity.get(key) and link.get(key) != identity.get(key)
+        for key in ("org_id", "workspace_id"))
+
+
+def _leave_elsewhere(project: Any, link: Mapping[str, Any], url: str,
+                     identity: Mapping[str, Optional[str]]) -> None:
+    logger.warning(
+        "decimalai: %s connects this project to %s at %s; this key is %s at %s. Left "
+        "as it is: delete the file to connect the project to this one.",
+        link_path(project), _link_label(link), link.get("base_url") or "?",
+        _link_label(identity), url)
+
+
+def _assign(router: Any, agent_name: str, todo: Mapping[str, _Wanted]
+            ) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Assign each of ``todo`` to the agent: ``(assigned name -> spec, labels, failures)``.
+
+    A failure is not recorded, so the next keyed start tries it again."""
+    done: Dict[str, str] = {}
+    labels: List[str] = []
+    failed: List[str] = []
+    for name, want in sorted(todo.items()):
+        try:
+            router.assign_skill(agent_name, want.skill_id, pin_version_id=want.pin_version_id)
+        except Exception as exc:
+            logger.debug("assign_skill failed", exc_info=True)
+            failed.append(f"{name} ({str(exc)[:120]})")
+            continue
+        done[name] = want.spec
+        labels.append(want.label)
+    return done, labels, failed
+
+
+def _say_failed(agent_name: str, failed: Sequence[str]) -> None:
+    if failed:
+        _say(f"agent {agent_name!r}: could not assign {'; '.join(failed)}. The next run "
+             "tries again; or assign it from the agent's Skills tab in the dashboard.")
+
+
+def _connect(project: Any, agent_name: str, link: Optional[Dict[str, Any]], router: Any) -> None:
+    from ._config import _get_client, _get_config
 
     url = _get_config().base_url.rstrip("/")
     identity = _identity(_get_client())
     if identity is None:
         return
-    if link and not link.get("damaged"):
-        elsewhere = link.get("base_url") not in (None, url) or any(
-            link.get(key) and identity.get(key) and link.get(key) != identity.get(key)
-            for key in ("org_id", "workspace_id"))
-        if elsewhere:
-            logger.warning(
-                "decimalai: %s connects this project to %s at %s; this key is %s at %s. Left "
-                "as it is: delete the file to connect the project to this one.",
-                link_path(project), _link_label(link), link.get("base_url") or "?",
-                _link_label(identity), url)
-            return
-    assigned: List[str] = []
-    failed: List[str] = []
-    router = router() if callable(router) else router
-    if project.manifest_path.is_file() and router is not None:
-        wanted = _manifest.load(project, missing_ok=True)
-        entries = _lock.locked_entries(project) or {}
-        for entry in entries.values():
-            name = entry.get("name")
-            if not isinstance(name, str) or name not in wanted:
-                continue
-            pinned = not wanted[name].latest
-            try:
-                router.assign_skill(agent_name, str(entry["skill_id"]),
-                                    pin_version_id=str(entry["version_id"]) if pinned else None)
-                assigned.append(f"{name} v{entry.get('version')}" if pinned else f"{name} (latest)")
-            except Exception as exc:
-                logger.debug("assign_skill failed", exc_info=True)
-                failed.append(f"{name} ({str(exc)[:120]})")
-    agents = list(link.get("agents") or []) if link and isinstance(link.get("agents"), list) else []
-    kept = {key: identity.get(key) or (link or {}).get(key) for key in ("org_id", "org_slug", "workspace_id")}
-    changed = _write_link(project, url=url, identity=kept, agents=[*agents, agent_name])
-    if not changed:
+    if link and not link.get("damaged") and _elsewhere(link, url, identity):
+        _leave_elsewhere(project, link, url, identity)
         return
-    done = f"assigned {', '.join(assigned)}; " if assigned else ""
-    _say(f"connected agent {agent_name!r} to your workspace: {done}wrote "
-         f"{project.rel(link_path(project))}. Commit it.")
-    if failed:
-        # Said once: the link is written, so no later run tries again on its own.
-        _say(f"agent {agent_name!r}: could not assign {'; '.join(failed)}. Assign them from "
-             "the agent's Skills tab in the dashboard.")
+    wanted = _wanted(project)
+    done: Dict[str, str] = {}
+    labels: List[str] = []
+    failed: List[str] = []
+    if wanted:
+        router = router() if callable(router) else router
+        if router is not None:
+            done, labels, failed = _assign(router, agent_name, wanted)
+    usable = link if link and not link.get("damaged") else {}
+    agents = list(usable.get("agents") or []) if isinstance(usable.get("agents"), list) else []
+    agents = [a for a in agents if isinstance(a, str)]
+    assigned = {a: _assigned(usable, a) for a in agents}
+    assigned[agent_name] = done
+    kept = {key: identity.get(key) or usable.get(key) for key in ("org_id", "org_slug", "workspace_id")}
+    changed = _write_link(project, url=url, identity=kept, agents=[*agents, agent_name],
+                          assigned=assigned)
+    if changed:
+        did = f"assigned {', '.join(labels)}; " if labels else ""
+        _say(f"connected agent {agent_name!r} to your workspace: {did}wrote "
+             f"{project.rel(link_path(project))}. Commit it.")
+    _say_failed(agent_name, failed)
+
+
+def _sync(project: Any, agent_name: str, link: Dict[str, Any], router: Any) -> None:
+    """A connected agent's later keyed start: assign what ``skills.toml`` has and the
+    record does not. Reads only local files when the two agree."""
+    from ._config import _get_client, _get_config
+
+    given = _assigned(link, agent_name)
+    wanted = _wanted(project)
+    todo = {name: want for name, want in wanted.items() if given.get(name) != want.spec}
+    gone = sorted(name for name in given if name not in wanted)
+    if not todo and not gone:
+        return
+    url = _get_config().base_url.rstrip("/")
+    identity: Mapping[str, Optional[str]] = {key: link.get(key) for key in ("org_id", "org_slug", "workspace_id")}
+    done: Dict[str, str] = {}
+    labels: List[str] = []
+    failed: List[str] = []
+    if todo:
+        # Assign only in the workspace the link names: a key of another organization (a
+        # teammate's personal one) must not give its workspace this project's skills.
+        verified = _identity(_get_client())
+        if verified is None:
+            return
+        if _elsewhere(link, url, verified):
+            _leave_elsewhere(project, link, url, verified)
+            return
+        router = router() if callable(router) else router
+        if router is None:
+            return
+        done, labels, failed = _assign(router, agent_name, todo)
+    record = {name: spec for name, spec in given.items() if name in wanted}
+    record.update(done)
+    agents = [a for a in link.get("agents") or [] if isinstance(a, str)]
+    assigned = {a: _assigned(link, a) for a in agents}
+    assigned[agent_name] = record
+    changed = _write_link(project, url=link.get("base_url") or url, identity=identity,
+                          agents=agents, assigned=assigned)
+    where = project.rel(link_path(project))
+    if labels and changed:
+        _say(f"agent {agent_name!r}: assigned {', '.join(labels)} from "
+             f"{project.rel(project.manifest_path)}; updated {where}. Commit it.")
+    if gone and changed:
+        _say(f"agent {agent_name!r}: {', '.join(gone)} left {project.rel(project.manifest_path)} "
+             "and stays assigned in your workspace; remove it from the agent's Skills tab in "
+             f"the dashboard if it should go. Updated {where}.")
+    _say_failed(agent_name, failed)

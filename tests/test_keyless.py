@@ -13,7 +13,9 @@ and adds a registry skill to the project when the model loads it. Pinned here:
   after that;
 - ``.decimal/link.toml`` makes a keyless run in a connected project raise;
 - the first keyed run creates the agent (with no prompt), assigns the project's skills at
-  their pinned versions, and writes the link file, once.
+  their pinned versions, and writes the link file with what it assigned; each later keyed
+  start assigns only what ``skills.toml`` gained since, and an unchanged project makes no
+  request.
 
 The registry is ``tests/fakes/fake_registry.py`` on a real socket, so the search and the
 install engine go through the same HTTP clients they use against the platform.
@@ -572,7 +574,8 @@ def test_a_link_to_another_workspace_is_left_as_it_is(world, monkeypatch, caplog
     assert workspace.assigned == [] and "org-other" in link.read_text()
 
 
-def test_a_skill_that_cannot_be_assigned_is_reported_once(world, monkeypatch, capsys):
+def test_a_skill_that_cannot_be_assigned_is_said_and_tried_again_on_the_next_start(
+        world, monkeypatch, capsys):
     keyless_phase(world)
     capsys.readouterr()
     workspace = Workspace("order-support")
@@ -581,6 +584,170 @@ def test_a_skill_that_cannot_be_assigned_is_reported_once(world, monkeypatch, ca
     decimalai.agent_config("order-support")
     err = capsys.readouterr().err
     assert "could not assign acme/refund-policy (402 linked-skill cap reached)" in err
-    assert (world.project / ".decimal/link.toml").exists()
+    link = world.project / ".decimal/link.toml"
+    assert link.exists() and '"acme/refund-policy"' not in link.read_text(), "only what was assigned"
     decimalai.agent_config("order-support")
-    assert capsys.readouterr().err == "", "said once"
+    assert "could not assign acme/refund-policy" in capsys.readouterr().err
+    workspace.assign_error = None
+    decimalai.agent_config("order-support")
+    assert "assigned acme/refund-policy v2" in capsys.readouterr().err
+    assert '"acme/refund-policy" = "2"' in link.read_text()
+    decimalai.agent_config("order-support")
+    assert capsys.readouterr().err == "" and len(workspace.assigned) == 1
+
+
+# ── after connecting: .decimal/skills.toml and the workspace converge ─────────
+
+
+def connected(world, monkeypatch, capsys, *agents):
+    """The tutorial's project after its first keyed runs: refund-policy v2 assigned to each
+    of ``agents``, ``link.toml`` written. Returns the workspace, its requests forgotten."""
+    keyless_phase(world)
+    workspace = Workspace()
+    with_key(monkeypatch, workspace)
+    for agent in agents or ("order-support",):
+        decimalai.agent_config(agent, fallback=FALLBACK)
+    workspace.assigned.clear()
+    workspace.verified = 0
+    capsys.readouterr()
+    return workspace
+
+
+def add_without_a_key(monkeypatch, ref):
+    """`decimalai skills add <ref>` run with no key in the environment."""
+    from decimalai import skillpkg
+
+    with monkeypatch.context() as m:
+        m.delenv("DECIMAL_API_KEY", raising=False)
+        result = skillpkg.add(ref, interactive=False)
+    assert result.ok, result
+
+
+def lock_entry(world, name):
+    import json
+
+    skills = json.loads((world.project / ".decimal/skills.lock").read_text())["skills"]
+    return next(e for e in skills.values() if e["name"] == name)
+
+
+def test_the_link_file_records_what_was_assigned_and_reads_back(world, monkeypatch, capsys):
+    connected(world, monkeypatch, capsys)
+    link = keyless.read_link(None)
+    assert link["agents"] == ["order-support"]
+    assert link["assigned"] == {"order-support": {"acme/refund-policy": "2"}}
+
+
+def test_a_skill_added_after_connecting_reaches_the_agent_on_its_next_keyed_start(
+        world, monkeypatch, capsys):
+    """`decimalai skills add` only writes the project: without a key it cannot reach the
+    workspace, and with one the install routes resolve and fetch but link nothing (checked
+    against the platform live). So the next keyed start assigns it."""
+    workspace = connected(world, monkeypatch, capsys)
+    add_without_a_key(monkeypatch, "acme/order-tracking")
+    assert workspace.assigned == [], "adding a skill makes no workspace request"
+
+    decimalai.agent_config("order-support", fallback=FALLBACK)
+    tracking = lock_entry(world, "acme/order-tracking")
+    assert workspace.assigned == [(f"/api/v1/agents/order-support/skills/{tracking['skill_id']}",
+                                   {"pin_version_id": None})], "only the new skill"
+    assert workspace.verified == 1, "the key is checked against the link before assigning"
+    err = capsys.readouterr().err
+    assert ("agent 'order-support': assigned acme/order-tracking (latest) from .decimal/skills.toml; "
+            "updated .decimal/link.toml. Commit it.") in err
+    assert keyless.read_link(None)["assigned"]["order-support"] == {
+        "acme/order-tracking": "latest", "acme/refund-policy": "2"}
+
+    decimalai.agent_config("order-support", fallback=FALLBACK)
+    assert (len(workspace.assigned), workspace.verified, capsys.readouterr().err) == (1, 1, ""), \
+        "an unchanged project makes no request"
+
+
+def test_a_skill_moved_to_another_version_is_assigned_at_it(world, monkeypatch, capsys):
+
+    workspace = connected(world, monkeypatch, capsys)
+    add_without_a_key(monkeypatch, "acme/refund-policy@1")
+    decimalai.agent_config("order-support")
+    entry = lock_entry(world, "acme/refund-policy")
+    assert entry["version"] == 1
+    assert workspace.assigned == [(f"/api/v1/agents/order-support/skills/{entry['skill_id']}",
+                                   {"pin_version_id": entry["version_id"]})]
+    assert "assigned acme/refund-policy v1" in capsys.readouterr().err
+    assert keyless.read_link(None)["assigned"]["order-support"] == {"acme/refund-policy": "1"}
+
+
+def test_a_removed_skill_is_dropped_from_the_record_and_left_assigned(world, monkeypatch, capsys):
+    """Unassigning needs an admin key, and a skill may be on the agent for other reasons:
+    a run never unassigns. It says so once, and makes no request."""
+    from decimalai import skillpkg
+
+    workspace = connected(world, monkeypatch, capsys)
+    assert skillpkg.remove("acme/refund-policy").ok
+    decimalai.agent_config("order-support")
+    assert (workspace.assigned, workspace.verified) == ([], 0)
+    err = capsys.readouterr().err
+    assert "acme/refund-policy left .decimal/skills.toml and stays assigned in your workspace" in err
+    assert keyless.read_link(None)["assigned"]["order-support"] == {}
+    decimalai.agent_config("order-support")
+    assert capsys.readouterr().err == ""
+
+
+def test_a_skill_removed_from_the_agent_in_the_dashboard_stays_removed(world, monkeypatch, capsys):
+    """The record, not the workspace, says what was assigned: a keyed start never asks the
+    workspace, so it cannot put back what someone took off the agent there."""
+    workspace = connected(world, monkeypatch, capsys)
+    workspace.assign_error = AssertionError("nothing may be assigned")
+    for _ in range(3):
+        decimalai.agent_config("order-support")
+    assert (workspace.assigned, workspace.verified, capsys.readouterr().err) == ([], 0, "")
+
+
+def test_a_link_written_before_the_record_assigns_the_projects_skills_once(world, monkeypatch, capsys):
+    """A 0.24 link file lists the agent and records no skills."""
+    workspace = connected(world, monkeypatch, capsys)
+    link = world.project / ".decimal/link.toml"
+    link.write_text('base_url = "https://ws.test"\norg_id = "org-1"\norg_slug = "acme"\n'
+                    'workspace_id = "ws-1"\nagents = ["order-support"]\n')
+    decimalai.agent_config("order-support")
+    assert len(workspace.assigned) == 1
+    assert keyless.read_link(None)["assigned"]["order-support"] == {"acme/refund-policy": "2"}
+    decimalai.agent_config("order-support")
+    assert len(workspace.assigned) == 1
+
+
+def test_each_connected_agent_gets_the_new_skill_on_its_own_start(world, monkeypatch, capsys):
+
+    workspace = connected(world, monkeypatch, capsys, "order-support", "billing")
+    assert keyless.read_link(None)["agents"] == ["billing", "order-support"]
+    add_without_a_key(monkeypatch, "acme/order-tracking")
+    decimalai.agent_config("billing")
+    assert [path.split("/")[4] for path, _ in workspace.assigned] == ["billing"]
+    assigned = keyless.read_link(None)["assigned"]
+    assert assigned["billing"] == {"acme/order-tracking": "latest", "acme/refund-policy": "2"}
+    assert assigned["order-support"] == {"acme/refund-policy": "2"}, "not assigned for it yet"
+    decimalai.agent_config("order-support")
+    assert [path.split("/")[4] for path, _ in workspace.assigned] == ["billing", "order-support"]
+
+
+def test_a_key_of_another_organization_assigns_nothing_to_its_workspace(world, monkeypatch, capsys, caplog):
+
+    connected(world, monkeypatch, capsys)
+    add_without_a_key(monkeypatch, "acme/order-tracking")
+    other = Workspace("order-support", org_id="org-2", workspace_id="ws-9")
+    with_key(monkeypatch, other)
+    with caplog.at_level("WARNING", logger="decimalai"):
+        decimalai.agent_config("order-support")
+    assert other.assigned == [] and "delete the file" in caplog.text
+    assert "acme/order-tracking" not in keyless.read_link(None)["assigned"]["order-support"]
+
+
+def test_a_platform_that_does_not_answer_assigns_the_new_skill_on_a_later_start(world, monkeypatch, capsys):
+
+    workspace = connected(world, monkeypatch, capsys)
+    add_without_a_key(monkeypatch, "acme/order-tracking")
+    workspace.verify_error = httpx.ConnectError("refused")
+    decimalai.agent_config("order-support")
+    assert workspace.assigned == []
+    assert "acme/order-tracking" not in keyless.read_link(None)["assigned"]["order-support"]
+    workspace.verify_error = None
+    decimalai.agent_config("order-support")
+    assert len(workspace.assigned) == 1

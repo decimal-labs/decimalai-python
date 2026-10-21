@@ -847,7 +847,8 @@ def agent_config(
     from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called; an
     agent the workspace has no agent by is created (without a prompt). The first
     keyed run in a git checkout assigns the project's skills
-    (``.decimal/skills.toml``) to the agent and writes ``.decimal/link.toml``.
+    (``.decimal/skills.toml``) to the agent and writes ``.decimal/link.toml``; each
+    later keyed run assigns the skills added to it since.
 
     With no key and no ``init()``, the agent runs keyless: the ``fallback`` is its
     prompt, each run lists the project's skills and the best public registry
