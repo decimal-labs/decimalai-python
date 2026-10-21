@@ -280,11 +280,11 @@ class TestSkillRouterCRUD:
             assert "offer_scope" not in body and "agent_name" not in body and "add_to_agent" not in body
             router.sync_skills([{"name": "a", "body_markdown": "# A"}], offer_scope="workspace")
             assert mock.call_args[1]["json"]["offer_scope"] == "workspace"
-            router.sync_skills([{"name": "a", "body_markdown": "# A"}], agent_name="support", add_to_agent="created")
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}], agent_name="support", add_to_agent="unless_removed")
             body = mock.call_args[1]["json"]
-            assert (body["agent_name"], body["add_to_agent"]) == ("support", "created")
+            assert (body["agent_name"], body["add_to_agent"]) == ("support", "unless_removed")
             # add_to_agent means nothing without an agent, so it isn't sent alone.
-            router.sync_skills([{"name": "a", "body_markdown": "# A"}], add_to_agent="created")
+            router.sync_skills([{"name": "a", "body_markdown": "# A"}], add_to_agent="unless_removed")
             assert "add_to_agent" not in mock.call_args[1]["json"]
 
     def test_assign_skill(self):

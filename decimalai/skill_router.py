@@ -3466,17 +3466,23 @@ class SkillRouter:
                 you add them to; ``"workspace"``, every agent in the org. Leave
                 it out and they reach every agent for now; the platform is
                 making new skills opt-in, so pass it to keep a behavior.
-            agent_name: Add the synced skills to this agent. New ones are then
-                created ``"restricted"`` (only this agent) unless
-                ``offer_scope`` says otherwise.
+            agent_name: Add the synced skills to this agent, made if it doesn't
+                exist yet (it must be a slug: lowercase letters, digits, ``-`` and
+                ``_``). New ones are then created ``"restricted"`` (only this
+                agent) unless ``offer_scope`` says otherwise.
             add_to_agent: With ``agent_name``: ``"all"`` (the server's default)
-                adds every synced skill; ``"created"`` adds only the ones this
-                sync created, so a skill removed from the agent on the dashboard
-                is not added back. The adapters' boot sync uses ``"created"``.
+                adds every synced skill, including one a person removed from the
+                agent; ``"unless_removed"`` adds every synced skill except those,
+                so a skill removed on the dashboard stays off. The adapters' boot
+                sync uses ``"unless_removed"``.
 
         Returns:
             Dict with ``created`` / ``updated`` / ``unchanged`` / ``pulled`` /
             ``failures`` counts, plus ``actions`` if ``response_mode="diff"``.
+            With ``agent_name``: ``added_to_agent`` and ``added``, and
+            ``kept_off`` (skills a person removed from the agent), or
+            ``agent_not_found`` with ``agent_problem`` when no agent could be
+            made under that name.
         """
         payload: Dict[str, Any] = {
             "skills": skills,

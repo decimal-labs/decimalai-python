@@ -1256,13 +1256,14 @@ def instrument(
     # skills reach disk only when a `decimalai skills` command runs. Folders that
     # command installed are never uploaded (that would copy a registry skill into
     # your org).
+    sync_job = None
     if disk_sync and resolved_skills:
         try:
-            from ._config import _get_config, _sender
+            from ._config import _get_config
 
             config = _get_config()
 
-            def _sync_skills_background():
+            def _sync_skills_background(sync_name: Optional[str]):
                 try:
                     from .skill_router import SkillRouter, _sync_up_items
                     from .skills import _with_local_timestamps
@@ -1292,10 +1293,11 @@ def instrument(
                         install_id=_ident.get("install_id"),
                         install_label=_ident.get("install_label"),
                         # A skill written for this agent goes on this agent (new
-                        # skills are opt-in). Only ones this boot created: one
-                        # removed on the dashboard is not added back.
-                        agent_name=fallback_name or process_name,
-                        add_to_agent="created",
+                        # skills are opt-in), under the name its traces carry. One
+                        # a person removed from the agent on the dashboard is not
+                        # added back on the next boot.
+                        agent_name=sync_name,
+                        add_to_agent="unless_removed",
                     )
                     synced = result.get("synced", 0)
                     created = result.get("created", 0)
@@ -1307,7 +1309,7 @@ def instrument(
                 except Exception:
                     logger.debug("Background skill sync failed", exc_info=True)
 
-            _sender.submit(_sync_skills_background)
+            sync_job = _sync_skills_background
         except Exception:
             logger.debug("Skill sync setup failed (non-fatal)", exc_info=True)
 
@@ -1321,6 +1323,19 @@ def instrument(
         fallback_agent_name=fallback_name,
     )
     agent_name = processor.decimal_name_for(own_name)
+
+    if sync_job is not None:
+        # Submitted only now, under the name this Agent's runs are filed under: its DecimalAI name
+        # (instrument(agent_name=...) or init's), and the Agent's own name= only when there is no
+        # other. Syncing under name= ("Assistant") made a phantom agent that got the skills while
+        # the agent its traces named got none.
+        sync_name = agent_name or own_name
+        try:
+            from ._config import _sender
+
+            _sender.submit(lambda: sync_job(sync_name))
+        except Exception:
+            logger.debug("Skill sync setup failed (non-fatal)", exc_info=True)
 
     # If an Agent object was provided, introspect it for manifest — under the
     # name its traces will carry.

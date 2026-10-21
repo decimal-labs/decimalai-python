@@ -1867,10 +1867,10 @@ def instrument(
                         install_id=_ident.get("install_id"),
                         install_label=_ident.get("install_label"),
                         # A skill written for this agent goes on this agent (new
-                        # skills are opt-in). Only ones this boot created: one
-                        # removed on the dashboard is not added back.
+                        # skills are opt-in). One a person removed from the agent on
+                        # the dashboard is not added back on the next boot.
                         agent_name=agent_name,
-                        add_to_agent="created",
+                        add_to_agent="unless_removed",
                     )
                     synced = result.get("synced", 0)
                     created = result.get("created", 0)
