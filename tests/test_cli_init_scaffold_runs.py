@@ -30,6 +30,7 @@ runs on every commit; `langchain` is not, and runs wherever it is installed.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -623,6 +624,76 @@ def test_generated_file_executes(framework, prompt, tmp_path):
         # pasting it too would deliver it twice.
         assert "TURNS: 2" in out, out
         assert "BODY_IN_TOOL_RESULT: True" in out, out
+
+
+# ── the agent_config() templates run without a DecimalAI key ──────────
+#
+# `decimalai init` needs a key, but the file it writes is run by people who may
+# not have one: a teammate's clone, a CI job, a shell that never loaded .env.
+# Until 2026-10-21 every template opened with `decimalai.init(...)`, which
+# raises without a key, so the file died on that line where `agent_config()`
+# would have run keyless (SDK 0.24). Here the file runs with no key and nothing
+# DecimalAI stubbed: the public registry is the fake one on a real socket, it
+# offers the canary skill for the template's own question, the model loads it,
+# and the body comes back as load_skill's result. The search went by POST.
+
+KEYLESS_DRIVER = """\
+import contextlib, json, runpy
+from unittest.mock import patch
+
+from tests.fakes.fake_registry import FakeRegistry
+
+_stack = contextlib.ExitStack()
+{stub}
+_registry = FakeRegistry()
+_skill = _registry.add_skill(
+    {skill!r}, body="# Restocking\\n\\n" + {canary!r},
+    description="What I can help with when a customer returns an opened box.")
+_registry.search_results = [_skill]
+import os
+os.environ["DECIMAL_BASE_URL"] = _stack.enter_context(_registry.serve())
+
+import decimalai._config as _cfg
+with _stack:
+    _mod = runpy.run_path({path!r}, run_name="__main__")
+    print("INITIALIZED:", _cfg._config is not None or _cfg._client is not None)
+    print("SEARCHES:", json.dumps([[r.method, r.raw_path, r.query] for r in _registry.calls("search")]))
+{probe}
+"""
+
+
+@pytest.mark.parametrize("framework", sorted(f for f in RUNTIMES if f != "langchain"))
+def test_generated_file_runs_without_a_decimalai_key(framework, tmp_path):
+    spec = RUNTIMES[framework]
+    if not _have(spec["requires"]):
+        pytest.skip(f"{spec['requires']} not installed")
+    agent_py = tmp_path / "agent.py"
+    agent_py.write_text(render_agent_file(AGENT, framework, SKILLS))
+    driver = tmp_path / "driver.py"
+    driver.write_text(KEYLESS_DRIVER.format(
+        stub=spec["stub"], probe=spec["probe"], path=str(agent_py),
+        skill=CANARY_SKILL, canary=CANARY,
+    ))
+    env = {k: v for k, v in _ENV.items() if k not in ("DECIMAL_API_KEY", "DECIMAL_BASE_URL")}
+    proc = subprocess.run(
+        [sys.executable, str(driver)], capture_output=True, text=True,
+        cwd=tmp_path, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, (
+        f"generated {framework} file failed to run without a key:\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )
+    out = proc.stdout
+    assert "stubbed answer" in out, out
+    assert "INITIALIZED: False" in out, out
+    assert f"agent {AGENT!r} runs keyless" in proc.stderr, proc.stderr
+    assert "PROMPT_SEEN: <none>" in out, out
+    assert "SKILL_OFFERED: True" in out, out
+    assert "SKILL_BODY_DELIVERED: True" in out, out
+    searches = json.loads(out.split("SEARCHES: ", 1)[1].splitlines()[0])
+    assert searches and all(m == "POST" and q == {} for m, _path, q in searches), searches
+    assert f'"{CANARY_SKILL}" = "1"' in (tmp_path / ".decimal/skills.toml").read_text(), \
+        "the skill the model loaded was added to the project"
 
 
 # ── the langchain template must be an AGENT, not a chat completion ───

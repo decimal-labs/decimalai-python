@@ -297,6 +297,9 @@ class TestTemplateIsCode:
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
 #: anthropic's Tool Runner since 0.23).
 LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk", "anthropic")
+#: How many init() calls each template makes. The agent_config() templates make none
+#: (scaffold.py point 5), except pydantic-ai's exporter, made only with a key.
+INIT_CALLS = {"langchain": 1, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0}
 
 #: The templates whose skills arrive through instrument()'s loader.
 LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAMEWORKS]
@@ -354,10 +357,10 @@ class TestSkillLoaderIsOn:
     ):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         init_calls = calls(tree, "init")
-        assert len(init_calls) == 1
+        assert len(init_calls) == INIT_CALLS[framework]
         allowed = self.ALLOWED_TRACING_FLAG[framework]
         carried = [f for f in self.TRACING_FLAGS
-                   if kwarg(init_calls[0], f) is not None]
+                   for c in init_calls if kwarg(c, f) is not None]
         assert carried == ([allowed] if allowed else []), (
             f"{framework}: init() carries {carried}, expected "
             f"{[allowed] if allowed else []} — see scaffold.py. Two span "
@@ -538,11 +541,19 @@ class TestAgentNameBinding:
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_name_is_bound_on_init_and_not_repeated_on_instrument(self, framework):
         """`init(agent_name=AGENT_NAME)` is the default every adapter's
-        `instrument()` falls back to, so the name rides on init() and the
-        instrument() line carries none of its own."""
+        `instrument()` falls back to, so on langchain the name rides on init() and
+        the instrument() line carries none of its own. An agent_config() template
+        binds it on `agent_config(AGENT_NAME)`, which files the runs' traces, and an
+        init() it makes (pydantic-ai's exporter) names the same constant."""
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         assert assigned(tree, "AGENT_NAME") == AGENT
-        assert kwarg_reads(calls(tree, "init")[0], "agent_name", "AGENT_NAME")
+        for init in calls(tree, "init"):
+            assert kwarg_reads(init, "agent_name", "AGENT_NAME")
+        if framework in LOAD_AGENT_FRAMEWORKS:
+            (load,) = calls(tree, "agent_config")
+            assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
+        else:
+            assert len(calls(tree, "init")) == 1
         assert not any(has_kwarg(c, "agent_name") for c in calls(tree, "instrument"))
 
     #: Each name below makes a different second copy visible. `refund_bot` is
@@ -659,7 +670,7 @@ class TestNoKeyInFile:
         tree = parse(source)
         # init() takes no api_key at all — it reads the env itself, which is
         # both fewer characters and impossible to leak.
-        assert kwarg(calls(tree, "init")[0], "api_key") is None
+        assert all(kwarg(c, "api_key") is None for c in calls(tree, "init"))
         for literal in string_literals(tree):
             assert "dai_sk_" not in literal
 
@@ -691,6 +702,65 @@ class TestNoKeyInFile:
                                    base_url="http://localhost:8000")
         assert kwarg(calls(parse(source), "init")[0],
                      "base_url") == "http://localhost:8000"
+
+    @pytest.mark.parametrize("framework", LOAD_AGENT_FRAMEWORKS)
+    def test_an_agent_config_template_sets_a_local_base_url_before_importing_decimalai(
+            self, framework):
+        """These files call no init() to carry it (scaffold.py point 5), so the URL goes
+        into DECIMAL_BASE_URL, which agent_config() reads with a key and without one. It
+        has to come first: importing decimalai with a key set initializes from it."""
+        tree = parse(render_agent_file(AGENT, framework, SKILLS, base_url="http://localhost:8000"))
+        setdefaults = [i for i, node in enumerate(tree.body)
+                       if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                       and ast.unparse(node.value.func) == "os.environ.setdefault"]
+        assert len(setdefaults) == 1
+        (where,) = setdefaults
+        assert [ast.literal_eval(a) for a in tree.body[where].value.args] == [
+            "DECIMAL_BASE_URL", "http://localhost:8000"]
+        first_decimalai = min(
+            i for i, node in enumerate(tree.body)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and any((getattr(node, "module", None) or alias.name).startswith("decimalai")
+                    for alias in node.names))
+        assert where < first_decimalai
+        assert "DECIMAL_BASE_URL" not in render_agent_file(AGENT, framework, SKILLS, base_url=None)
+
+
+# ── 4b. it runs without a DecimalAI key ──────────────────────────────
+
+
+class TestRunsWithoutAKey:
+    """`init()` raises without a key, and agent_config() runs keyless without one
+    (SDK 0.24): a template that opens with init() dies on that line for anyone who
+    runs it without the key. `test_cli_init_scaffold_runs.py` runs them keyless."""
+
+    @staticmethod
+    def _guarded_by_a_key_check(tree: ast.Module, call: ast.Call) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and any(c is call for n in node.body for c in ast.walk(n)):
+                test = ast.unparse(node.test)
+                return "DECIMAL_API_KEY" in test and "DECIMALAI_API_KEY" in test
+        return False
+
+    @pytest.mark.parametrize("framework", LOAD_AGENT_FRAMEWORKS)
+    def test_an_agent_config_template_calls_init_only_when_a_key_is_set(self, framework):
+        tree = parse(render_agent_file(AGENT, framework, SKILLS))
+        inits = calls(tree, "init")
+        assert all(self._guarded_by_a_key_check(tree, c) for c in inits), ast.unparse(tree)
+        if framework == "pydantic-ai":
+            (init,) = inits
+            assert kwarg(init, "otel") is True, "its exporter is the one agent_config() leaves out"
+
+    def test_the_openai_agents_template_has_an_example_tool_beside_load_skill(self):
+        """The docs' keyless example's shape: one of your tools, then load_skill."""
+        tree = parse(render_agent_file(AGENT, "openai-agents", SKILLS))
+        (tool,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
+        assert tool.name == "lookup_order"
+        assert [ast.unparse(d) for d in tool.decorator_list] == ["function_tool"]
+        assert [ast.unparse(e) for e in assigned_node(tree, "TOOLS").elts] == ["lookup_order"]
+        (agent,) = calls(tree, "Agent")
+        tools = {kw.arg: kw.value for kw in agent.keywords}["tools"]
+        assert [ast.unparse(e) for e in tools.elts] == ["*TOOLS", "*support.tools"]
 
 
 # ── 5. the skills are NAMED in the file ──────────────────────────────
@@ -1404,8 +1474,8 @@ class TestConsistencyWithFrontendSnippets:
         # the agent on instrument(), the templates on init(), which is the same
         # binding — init()'s name is the one every instrument() falls back to.
         init_calls = calls(tree, "init")
-        assert len(init_calls) == 1
-        assert kwarg_reads(init_calls[0], "agent_name", "AGENT_NAME")
+        assert len(init_calls) == INIT_CALLS[framework]
+        assert all(kwarg_reads(c, "agent_name", "AGENT_NAME") for c in init_calls)
         inst = calls(tree, "instrument")
         if framework in LOAD_AGENT_FRAMEWORKS:
             # The agent_config() shape (openai-agents 0.18, pydantic-ai 0.19), which
