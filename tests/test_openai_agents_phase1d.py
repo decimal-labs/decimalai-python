@@ -278,15 +278,28 @@ class TestUntracedRunsDoNotShareARunScope:
         recorded for one: it would be held until evicted, and read by nobody."""
         oa._skill_router_singleton = _Router()
         support = oa.agent_config("support")
+        # `Runner.run_sync` runs on this thread's event loop and leaves it open, so
+        # the test supplies that loop, to be able to join its worker threads.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            for i in range(5):
+                Runner.run_sync(_agent(support, _ScriptedModel([_call("load_skill", {"name": SKILL}),
+                                                                _text("ok")])),
+                                f"question {i}", run_config=untraced)
 
-        for i in range(5):
-            Runner.run_sync(_agent(support, _ScriptedModel([_call("load_skill", {"name": SKILL}),
-                                                            _text("ok")])),
-                            f"question {i}", run_config=untraced)
-
-        assert dict(oa._run_rails) == {}
-        gc.collect()
-        assert len(oa._untraced_run_keys) == 0, "a finished run's key outlived its trace"
+            assert dict(oa._run_rails) == {}
+            # A load's fetch runs on one of the loop's worker threads, carrying a
+            # copy of its run's context, and so the run's trace. A worker marks the
+            # call done before it lets go of it, so a run can return while a worker
+            # still holds its trace (CI, py3.10 floors: one key left). Waiting on the
+            # call is not enough; joining the workers is.
+            loop.run_until_complete(loop.shutdown_default_executor())
+            gc.collect()
+            assert len(oa._untraced_run_keys) == 0, "a finished run's key outlived its trace"
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
     def test_an_agents_memory_of_finished_runs_is_bounded(self, sdk, untraced, monkeypatch):
         monkeypatch.setattr(binding, "_MAX_CONFIG_RUNS", 3)
