@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.23.0] — 2026-10-21
 
 ### Changed (breaking): Anthropic Messages API agents get their prompt and skills from `agent_config()`
 
