@@ -931,7 +931,7 @@ def agent_config(
 
     With no API key and no ``init()``, the agent runs keyless, as
     :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, its
-    skills come from the project and the public registry, and nothing is traced.
+    skills are the ones the project lists in ``.decimal/skills.toml``, and nothing is sent.
     With a key, an agent the workspace has no agent by is created.
 
     Args:
