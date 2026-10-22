@@ -34,6 +34,20 @@ and patch releases are fixes.
   boot sync uses `"unless_removed"`: every synced skill goes on the agent except one a person
   removed on the dashboard. The OpenAI adapter's boot sync uses the name its traces carry.
 
+### Fixed: Pydantic AI traces show the skill text the model was given
+
+- A `load_skill` result in a Pydantic AI run is recorded as a `tool` message carrying the skill's
+  text. Pydantic AI 2.x sends a tool's result as a `tool_call_response` part with a `result` field
+  (the GenAI semantic conventions call it `response`), inside a `user` message, and the exporter
+  read only `response`: every Pydantic AI trace recorded an empty user message where the skill
+  text was. The model always got the text; the trace could not show it, so nothing downstream
+  that reads a model call's input (the platform's delivery signals among them) saw the delivery.
+- The instructions Pydantic AI keeps in `gen_ai.system_instructions` (a JSON array of parts)
+  become the call's system message, and the prompt a trace records is their text, not that JSON.
+- Found by a new live test that runs every `agent_config()` binding against a real backend and a
+  real model (`tests/integration/test_framework_live_binding_skill_loading.py`); the release gate
+  runs it in its provider lanes, and ADK on an OpenAI model in its openai2 leg.
+
 ## [0.24.1] — 2026-10-21
 
 ### Changed: a keyless run's message travels in the request body

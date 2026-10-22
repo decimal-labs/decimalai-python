@@ -2386,7 +2386,10 @@ def _text_from_parts(parts: Any) -> str:
                 args = json.dumps(args, default=str) if args else ""
             chunks.append(f"{part.get('name', 'tool')}({args})")
         elif ptype == "tool_call_response":
-            chunks.append(str(part.get("response", "")))
+            # The semconv field is `response`; Pydantic AI (2.x) writes `result`.
+            response = part.get("response", part.get("result", ""))
+            chunks.append(response if isinstance(response, str)
+                          else json.dumps(response, default=str))
         else:
             content = part.get("content") or part.get("text")
             if content is not None:
@@ -2394,10 +2397,46 @@ def _text_from_parts(parts: Any) -> str:
     return "\n".join(c for c in chunks if c)
 
 
+def _system_instructions_text(value: Any) -> Optional[str]:
+    """``gen_ai.system_instructions`` as text.
+
+    A plain string (AG2, hand-built spans), or a JSON array of parts (Pydantic AI:
+    ``[{"type": "text", "content": "..."}]``), which used to land as that JSON text.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return value or None
+    if isinstance(value, dict):
+        value = [value]
+    if isinstance(value, (list, tuple)):
+        return _text_from_parts(value) or None
+    return str(value) if value else None
+
+
+def _semconv_role(entry: Dict[str, Any], direction: str) -> str:
+    """A semconv message's role, with a turn that only answers tool calls as ``tool``.
+
+    Pydantic AI sends tool results as a ``user`` message inside its next model
+    request; the other adapters record them as ``tool`` messages, which is what the
+    delivery signals read for a ``load_skill`` result.
+    """
+    parts = entry.get("parts")
+    if (isinstance(parts, (list, tuple)) and parts
+            and all(isinstance(p, dict) and p.get("type") == "tool_call_response" for p in parts)):
+        return "tool"
+    return str(entry.get("role") or _DEFAULT_ROLE[direction])
+
+
 def _semconv_messages_from_attrs(
     attrs: Dict[str, Any], direction: str
 ) -> Optional[List[Dict[str, Any]]]:
-    """Rebuild one direction's messages from the GenAI-semconv JSON attribute."""
+    """Rebuild one direction's messages from the GenAI-semconv JSON attribute.
+
+    On input, ``gen_ai.system_instructions`` becomes the leading system message when
+    the messages carry none (Pydantic AI keeps its instructions in that attribute).
+    """
     for key in _SEMCONV_MSG_KEYS[direction]:
         raw = attrs.get(key)
         if raw is None:
@@ -2417,11 +2456,16 @@ def _semconv_messages_from_attrs(
                 messages.append({"role": _DEFAULT_ROLE[direction], "content": entry})
             elif isinstance(entry, dict):
                 messages.append({
-                    "role": str(entry.get("role") or _DEFAULT_ROLE[direction]),
+                    "role": _semconv_role(entry, direction),
                     "content": _text_from_parts(
                         entry.get("parts", entry.get("content", ""))
                     ),
                 })
+        if messages and direction == "input" and not any(
+                m["role"].lower() in ("system", "developer") for m in messages):
+            system = _system_instructions_text(attrs.get("gen_ai.system_instructions"))
+            if system:
+                messages.insert(0, {"role": "system", "content": system})
         if messages:
             return messages
     return None
@@ -2622,10 +2666,12 @@ def _extract_system_prompt(attrs: Dict[str, Any]) -> Optional[str]:
         if message["role"].lower() in ("system", "developer") and message["content"]:
             return message["content"]
     # GenAI-semconv fallback.
-    for key in ("gen_ai.system_instructions", "gen_ai.prompt"):
-        val = attrs.get(key)
-        if val:
-            return str(val)
+    system = _system_instructions_text(attrs.get("gen_ai.system_instructions"))
+    if system:
+        return system
+    val = attrs.get("gen_ai.prompt")
+    if val:
+        return str(val)
     return None
 
 
