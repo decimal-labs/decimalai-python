@@ -5,26 +5,27 @@ never called, every ``agent_config()`` runs keyless:
 
 - the prompt is the ``fallback=`` text, or none (the instructions are then the skill
   list alone); ``prompt_source`` is ``"fallback (no key)"``;
-- each run's skill list is the project's own skills (``.decimal/skills.toml``) plus at
-  most two matches from the public registry, found by searching it anonymously with
-  the run's message (:func:`relevant_matches` is the cutoff). Only a skill that passed
-  its safety review and has a benchmark is offered;
-- when the model loads a registry skill, it is added to the project through the
-  engine behind ``decimalai skills add`` (anonymous, refused unless its safety review
-  is clean), pinned to the version offered in ``.decimal/skills.toml`` and
-  ``skills.lock``. One line on stderr names it. Later runs read it from disk;
-- nothing else is sent: no traces, no routing decisions, no prompt reads.
+- the skill list is the project's: the registry skills ``.decimal/skills.toml`` lists
+  under ``[skills]`` (installed in ``.agents/skills``) and the skills you wrote that it
+  lists under ``[authored]`` (`decimalai._authored`). ``decimalai skills add`` puts a
+  skill on it. Nothing is searched and nothing is added on the agent's behalf: a folder
+  in ``.agents/skills`` that is not listed (a Codex or Cursor skill, say) is left out;
+- every skill's text is read from disk, so nothing is sent: no traces, no routing
+  decisions, no prompt reads, no registry requests.
 
 Adding a key connects the project (:func:`connect`, on the first keyed
 ``agent_config()`` of each agent): the agent is created when the workspace has none
-by that name, the project's skills are assigned to it at their pinned versions, and
-``.decimal/link.toml`` records the workspace and what was assigned. Each later keyed
-start assigns the skills ``skills.toml`` gained since (from the record, so an unchanged
-project makes no request). From then on a run with no key in that
-project raises (:func:`check_link`) rather than quietly running keyless: that file,
-committed, is what protects a production deploy that lost its key. The prompt in the
-code is never saved to DecimalAI: a saved prompt overrides the code's, which is
-exactly what the code's author did not ask for.
+by that name, and the project's list is copied onto it once: registry skills are
+assigned at their pinned versions, and skills you wrote are uploaded to the
+organization (not published) and added to it. ``.decimal/link.toml`` records the
+workspace and what was copied. From then on the agent's list lives on DecimalAI: the
+dashboard and ``decimalai skills add`` change it, and a run never does. A later keyed
+start reads only local files and says when the project disagrees with what was copied
+(an entry added to ``skills.toml`` by hand, a skill you wrote edited since its upload).
+A run with no key in that project raises (:func:`check_link`) rather than quietly running
+keyless: that file, committed, is what protects a production deploy that lost its key.
+The prompt in the code is never saved to DecimalAI: a saved prompt overrides the
+code's, which is exactly what the code's author did not ask for.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from uuid import uuid4
 
-from .skillpkg.client import RegistryClient
+from . import _authored
 
 logger = logging.getLogger("decimalai")
 
@@ -48,34 +49,7 @@ LINK_FILE = "link.toml"
 
 DEFAULT_BASE_URL = "https://api.decimal.ai"
 
-#: The anonymous registry search a keyless run makes, and the only route besides the
-#: install routes (resolve, bundle) a keyless process calls. The message goes in the
-#: request body: a URL is written to access logs and keyed into caches at every hop.
-#: A registry from before this route (it answers 404 or 405) is not searched at all:
-#: its ``GET /api/v1/registry/skills?q=`` would put each message in a URL, and the
-#: registry whose logs that fills is api.decimal.ai itself, rolled back past 2026-10-21.
-SEARCH_POST_PATH = "/api/v1/registry/skills/search"
-
-#: How long a run waits for the search before it lists the project's skills alone.
-#: Measured 2026-10-21 from a laptop: 1.1-3.5 s for a new message, one cold outlier
-#: at 36 s. A run must not wait on that outlier.
-_SEARCH_TIMEOUT_S = 5.0
-_SEARCH_CONNECT_S = 2.0
-#: The search's page size. The cutoff reads only the first `_SEARCH_WINDOW` results;
-#: the page is a little larger because the server sizes its semantic pool from it.
-_SEARCH_LIMIT = 10
-#: The longest message sent as the query. The search ranks on meaning, and the first
-#: few sentences carry it; a pasted log or email would only make the request long.
-_QUERY_MAX_CHARS = 500
-#: Registries (base URLs) that answered the POST search 404 or 405: this process does not
-#: search them again.
-_POST_UNSUPPORTED: Set[str] = set()
-
-#: The relevance cutoff (see `relevant_matches`).
-_SEARCH_WINDOW = 5
-_MAX_REGISTRY_OFFERS = 2
-
-#: The project's own skills listed on a run, the platform's menu cap.
+#: The project's skills listed on a run, the platform's menu cap.
 _MAX_PROJECT_SKILLS = 20
 _MAX_DESCRIPTION_CHARS = 200
 #: Routing decisions kept for loads to name (one per run).
@@ -115,7 +89,8 @@ def _say(line: str) -> None:
 #
 # A port of `_query_terms` / `_lexical_relevance` in the backend's skill_service.py,
 # which the platform's own menus use as their word-overlap floor. Ported rather than
-# invented so the two agree on what "shares a word" means.
+# invented so the two agree on what "shares a word" means. With load_skill off, it
+# picks the project skill whose text goes into the run's instructions.
 
 _STOPWORDS = frozenset({
     "a", "about", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do",
@@ -190,106 +165,18 @@ def word_overlap(terms: Sequence[str], name: Optional[str], description: Optiona
     return score
 
 
-def _slug(name: str) -> str:
-    return name.rsplit("/", 1)[-1].strip().lower()
-
-
-def eligible(item: Mapping[str, Any]) -> bool:
-    """A registry skill keyless mode may offer: it passed its safety review and has a benchmark.
-
-    The public listing deliberately includes skills not yet reviewed (it hides only
-    negative verdicts), so the filter has to be explicit here.
-    """
-    return item.get("skill_safety") == "passed" and bool(item.get("benchmark_summary"))
-
-
-def relevant_matches(query: Optional[str], items: Sequence[Mapping[str, Any]],
-                     *, exclude: Sequence[str] = ()) -> List[Mapping[str, Any]]:
-    """The registry skills a run offers, from the search's answer for its message.
-
-    The search answers with no relevance score, so the cutoff is built from what the
-    answer does carry. Within the first `_SEARCH_WINDOW` results (the server puts its
-    meaning matches first), keep a skill that is `eligible` and shares at least one
-    content word with the message (`word_overlap`, the platform's own floor), one per
-    slug (an import and its copy are one skill to the model), at most
-    `_MAX_REGISTRY_OFFERS`, and none the project already has.
-
-    Measured 2026-10-21 on 12 support messages, hand-labeled, twice (the search's
-    order shifts between identical calls): 16-17 of 21 offers were on the message's
-    topic (76-81%) and 8-10 of 21 would help answer it (38-48%; many on-topic skills
-    are written for the store operator, such as "write a refund policy page"). Small
-    talk ("Hi, thanks for your help!") offered nothing. Wider windows and a third
-    offer each lowered both numbers; one offer halved the useful ones.
-    """
-    terms = query_terms(query)
-    if not terms:
-        return []
-    taken = {_slug(n) for n in exclude}
-    picked: List[Mapping[str, Any]] = []
-    for item in list(items)[:_SEARCH_WINDOW]:
-        name = item.get("name")
-        if not isinstance(name, str) or not name.strip() or not eligible(item):
-            continue
-        if word_overlap(terms, name, item.get("description")) < 1:
-            continue
-        slug = _slug(name)
-        if slug in taken:
-            continue
-        taken.add(slug)
-        picked.append(item)
-        if len(picked) >= _MAX_REGISTRY_OFFERS:
-            break
-    return picked
-
-
-def search_registry(query: str, *, url: Optional[str] = None, transport: Any = None) -> List[Dict[str, Any]]:
-    """The anonymous registry search for one message: its result items, in order.
-
-    ``POST /api/v1/registry/skills/search`` with the message in the body. A registry
-    that answers it 404 or 405 predates the route: it is not searched (nothing found,
-    said once), and never asked with the ``GET``, which carries the message in its URL.
-    Raises on any other failure; the caller lists the project's skills alone.
-    """
-    import httpx
-
-    from ._config import sdk_user_agent
-
-    root = (url or base_url()).rstrip("/")
-    if root in _POST_UNSUPPORTED:
-        return []
-    ask = {"q": query[:_QUERY_MAX_CHARS], "limit": _SEARCH_LIMIT}
-    with httpx.Client(
-        base_url=root,
-        timeout=httpx.Timeout(_SEARCH_TIMEOUT_S, connect=_SEARCH_CONNECT_S),
-        headers={"User-Agent": sdk_user_agent("keyless")},
-        transport=transport,
-    ) as client:
-        resp = client.post(SEARCH_POST_PATH, json=ask)
-        if resp.status_code in (404, 405):
-            _POST_UNSUPPORTED.add(root)
-            logger.warning(
-                "decimalai: the registry at %s has no POST %s (it predates 2026-10-21), so "
-                "keyless runs list the project's own skills only: its GET search would put "
-                "each message in a URL.", root, SEARCH_POST_PATH)
-            return []
-        resp.raise_for_status()
-        items = resp.json().get("items")
-    if not isinstance(items, list):
-        raise ValueError("the registry search answered without an items list")
-    return [i for i in items if isinstance(i, dict)]
-
-
-# ── the project's own skills ─────────────────────────────────────────────────
+# ── the project's skills ─────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class Offer:
-    """One skill a run lists: the project's own (``path`` set) or a registry match."""
+    """One skill a run lists: a registry skill installed in the project, or one you wrote."""
 
     name: str
     description: str
-    path: Optional[Path] = None          # the installed SKILL.md
-    version: Optional[int] = None        # the registry version offered or installed
+    path: Optional[Path] = None          # its SKILL.md on disk
+    version: Optional[int] = None        # the installed registry version; None for one you wrote
+    authored: bool = False               # listed under [authored]: a skill you wrote
 
 
 def _one_line(text: Any) -> str:
@@ -300,11 +187,14 @@ def _one_line(text: Any) -> str:
 
 
 def project_skills(project: Any = None) -> Dict[str, Offer]:
-    """The project's own skills: each entry of ``.decimal/skills.toml`` installed on disk.
+    """The project's skills, as ``.decimal/skills.toml`` lists them, each read from disk.
 
-    Keyed by registry name, the name the manifest and the menu use. A skill listed in
-    the manifest but not installed (``decimalai skills install`` not run yet) is left
-    out: there is no text to serve.
+    Registry skills: each ``[skills]`` entry the lock has installed, keyed by registry
+    name, the name the manifest and the menu use. A skill listed but not installed
+    (``decimalai skills install`` not run yet) is left out: there is no text to serve.
+    Skills you wrote: each ``[authored]`` name whose ``.agents/skills/<name>/SKILL.md``
+    exists and was not installed from the registry, keyed by folder name. Nothing else
+    in ``.agents/skills`` is listed.
     """
     from .skillpkg import lock as _lock
     from .skillpkg import manifest as _manifest
@@ -320,20 +210,35 @@ def project_skills(project: Any = None) -> Dict[str, Offer]:
     except Exception:
         logger.debug("keyless: could not read the project's skills", exc_info=True)
         return {}
+
+    def read(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            return parse_skill_md(str(path)) if path.is_file() else None
+        except Exception:
+            return None
+
     out: Dict[str, Offer] = {}
     for install_name, entry in sorted(entries.items()):
         name = entry.get("name")
         if not isinstance(name, str) or name not in wanted:
             continue
         path = project.skill_dir(install_name) / "SKILL.md"
-        try:
-            parsed = parse_skill_md(str(path)) if path.is_file() else None
-        except Exception:
-            parsed = None
+        parsed = read(path)
         if not parsed:
             continue
         out[name] = Offer(name=name, description=_one_line(parsed.get("description")), path=path,
                           version=entry.get("version") if isinstance(entry.get("version"), int) else None)
+        if len(out) >= _MAX_PROJECT_SKILLS:
+            return out
+    for name in _authored.listed(project):
+        if name in out or name in entries:
+            continue  # a registry install of that folder name: the lock's entry is the skill
+        path = _authored.skill_md(project, name)
+        parsed = read(path)
+        if not parsed:
+            continue
+        out[name] = Offer(name=name, description=_one_line(parsed.get("description")), path=path,
+                          authored=True)
         if len(out) >= _MAX_PROJECT_SKILLS:
             break
     return out
@@ -363,59 +268,26 @@ def render_menu(offers: Sequence[Offer]) -> str:
 # ── the router a keyless binding uses ────────────────────────────────────────
 
 
-def _split_frontmatter(text: str) -> Optional[Tuple[str, str]]:
-    from skillevaluation import skillfmt
-
-    return skillfmt.split_frontmatter(text)
-
-
-class _FetchOnce(RegistryClient):
-    """A registry client that fetches each rendering once, so the bundle a load checked
-    is the bundle the install engine writes (and the registry counts one fetch)."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._bundles: Dict[Tuple[str, str, str], Any] = {}
-
-    def fetch_resolved(self, resolved: Any, *, purpose: str) -> Any:
-        key = (resolved.version_id, resolved.install_name, resolved.render.hash)
-        if key not in self._bundles:
-            self._bundles[key] = super().fetch_resolved(resolved, purpose=purpose)
-        return self._bundles[key]
-
-
-
 class KeylessSkillRouter:
-    """Lists and serves a keyless agent's skills: the project's, and the registry's on use.
+    """Lists and serves a keyless agent's skills: the project's, read from disk.
 
     It stands where an agent's ``SkillRouter`` stands (`AgentBinding` reads the same few
-    methods and attributes), and records nothing: a keyless run is sent nowhere.
-
-    A registry skill is served only to a load whose run listed it, as the platform
-    serves one only to a load whose routing decision offered it: a message that talks
-    the model into loading some other public skill gets "no skill named", and nothing
-    is added to the project. The project's own skills are served to any load.
+    methods and attributes), and records nothing: a keyless run is sent nowhere. The
+    list is read again on every run, so a skill ``decimalai skills add`` lists while the
+    process runs is offered from the next run on.
     """
 
-    def __init__(self, *, url: Optional[str] = None, transport: Any = None,
-                 project_dir: Optional[str] = None) -> None:
-        self.base_url = (url or base_url()).rstrip("/")
-        self._transport = transport
+    def __init__(self, *, project_dir: Optional[str] = None) -> None:
+        self.base_url = base_url()
         self._project_dir = project_dir
         self._rail_lock = threading.Lock()
-        #: run key -> the routing decision its loads name.
+        #: run key -> the routing id its run was given.
         self._run_routing_ids: "OrderedDict[str, str]" = OrderedDict()
-        #: routing decision -> the registry skills it offered, by name.
-        self._decisions: "OrderedDict[str, Dict[str, Offer]]" = OrderedDict()
         #: run key -> names whose text that run was served.
         self._loads: "OrderedDict[str, Set[str]]" = OrderedDict()
-        self._add_lock = threading.Lock()
-        #: Registry skills refused at their first load (unsafe, or too long): not listed again.
-        self._unusable: Set[str] = set()
-        self._search_warned = False
 
     def __repr__(self) -> str:
-        return f"<KeylessSkillRouter {self.base_url}>"
+        return "<KeylessSkillRouter (the project's skills)>"
 
     def _project(self) -> Any:
         from .skillpkg.project import Project
@@ -429,9 +301,9 @@ class KeylessSkillRouter:
     ) -> Tuple[str, str, Optional[str]]:
         """``(menu, "", routing id)`` for one run, as `SkillRouter.build_prompt_parts`.
 
-        The list depends on the message, so it reports itself cut: the binding then
-        lists every run's own matches before its model call, and its ``load_skill``
-        takes any name rather than an enum of one run's list.
+        It reports the list as cut, so the binding asks for it on every run (it is a read
+        of local files) and its ``load_skill`` takes any name rather than an enum of one
+        run's list: a skill listed while the process runs is served on its next run.
         """
         from .skill_router import (
             _last_delivered_names_ctx,
@@ -440,21 +312,7 @@ class KeylessSkillRouter:
         )
 
         local = project_skills(self._project())
-        found: List[Mapping[str, Any]] = []
-        if query and not inject_body:
-            # With load_skill off nothing could ever add a registry skill to the
-            # project, so it is not listed.
-            with self._rail_lock:
-                skip = [*local, *self._unusable]
-            found = relevant_matches(query, self._search(query), exclude=skip)
-        registry = {
-            str(item["name"]): Offer(
-                name=str(item["name"]), description=_one_line(item.get("description")),
-                version=item.get("latest_version_number")
-                if isinstance(item.get("latest_version_number"), int) else None)
-            for item in found
-        }
-        offers = list(local.values()) + list(registry.values())
+        offers = list(local.values())
         menu = render_menu(offers)
         delivered: List[str] = []
         if inject_body and query:
@@ -468,28 +326,11 @@ class KeylessSkillRouter:
                 menu = f"{menu}\n\n## Skill: {best.name}\n\n{text}"
                 delivered = [best.name]
         routing_id = f"keyless_{uuid4().hex}"
-        with self._rail_lock:
-            self._decisions[routing_id] = registry
-            while len(self._decisions) > _MAX_DECISIONS:
-                self._decisions.popitem(last=False)
         self._remember_run_routing(scope, routing_id)
         _last_offered_names_ctx.set([o.name for o in offers])
         _last_menu_truncated_ctx.set(True)
         _last_delivered_names_ctx.set(delivered or None)
         return menu, "", routing_id
-
-    def _search(self, query: str) -> List[Dict[str, Any]]:
-        try:
-            return search_registry(query, url=self.base_url, transport=self._transport)
-        except Exception as exc:
-            if not self._search_warned:
-                self._search_warned = True
-                logger.warning(
-                    "decimalai: the public registry search failed (%s); keyless runs list "
-                    "the project's own skills until it answers.", exc)
-            else:
-                logger.debug("keyless: registry search failed", exc_info=True)
-            return []
 
     # ── the rails a binding reads and releases ─────────────
     def _remember_run_routing(self, scope: Optional[str], routing_id: Optional[str]) -> None:
@@ -522,9 +363,10 @@ class KeylessSkillRouter:
     # ── load_skill ──────────────────────────────────────────
     def load_skill(self, name: str, *, agent_name: Optional[str] = None,
                    scope: Optional[str] = None) -> str:
-        """One skill's text for the model, adding a registry skill to the project first.
+        """One listed skill's text for the model, read from disk.
 
-        Always a string the model can act on, as `SkillRouter.load_skill`.
+        Always a string the model can act on, as `SkillRouter.load_skill`. A name the
+        project does not list gets "no skill named", whatever sits in ``.agents/skills``.
         """
         name = (name or "").strip()
         if not name:
@@ -538,15 +380,7 @@ class KeylessSkillRouter:
                 if name not in loaded and len(loaded) >= _MAX_LOADED_BODIES:
                     return (f"load_skill budget exhausted: at most {_MAX_LOADED_BODIES} skills "
                             "load per turn. Proceed with what is already loaded.")
-        project = self._project()
-        offer = project_skills(project).get(name)
-        if offer is None:
-            listed = self._listed(scope, name)
-            if listed is not None:
-                added = self._add(project, listed, agent_name)
-                if isinstance(added, str):
-                    return added
-                offer = added
+        offer = project_skills(self._project()).get(name)
         if offer is None:
             return f"load_skill: no skill named {name!r} is available. Use the exact name from the skills menu."
         body = _body(offer)
@@ -560,73 +394,6 @@ class KeylessSkillRouter:
             with self._rail_lock:
                 self._loads.setdefault(scope, set()).add(name)
         return f"## Skill: {name}\n\n{body}"
-
-    def _listed(self, scope: Optional[str], name: str) -> Optional[Offer]:
-        """The registry skill ``name`` as this run's list offered it, or None."""
-        with self._rail_lock:
-            routing_id = self._run_routing_ids.get(scope) if scope is not None else None
-            decision = self._decisions.get(routing_id) if routing_id else None
-            return (decision or {}).get(name)
-
-    def _add(self, project: Any, offer: Offer, agent_name: Optional[str]) -> Any:
-        """Add a listed registry skill to the project, pinned to its current version: its
-        `Offer` on disk, or the sentence the model gets instead.
-
-        Checked before anything is written: the version's safety review must be clean
-        (the install engine's own gate, without its question: a run has no one to ask)
-        and its text must fit the per-skill limit a keyed run's router enforces too. A
-        skill that fails either is left out of the project, and of this process's
-        later lists. The bundle fetched for the check is the one installed.
-        """
-        from .skillpkg import ops
-        from .skillpkg.client import ResolveRequest, trust_verdict
-        from .skillpkg.errors import SkillpkgError
-
-        with self._add_lock:
-            # Another run may have added it while this one waited.
-            done = project_skills(project).get(offer.name)
-            if done is not None:
-                return done
-            client = _FetchOnce(api_key=None, base_url=self.base_url, channel="sdk",
-                                transport=self._transport)
-            try:
-                resolved = client.resolve_one(ResolveRequest(ref=offer.name), purpose="add")
-                refusal, caution = trust_verdict(resolved)
-                if refusal or caution:
-                    return self._refuse(offer.name, f"its safety review is {refusal or caution}")
-                text = client.fetch_resolved(resolved, purpose="add").skill_md.decode("utf-8")
-                split = _split_frontmatter(text)
-                body = (split[1] if split else text).strip()
-                if len(body) > _BODY_CHAR_LIMIT:
-                    return self._refuse(offer.name, (
-                        f"its instructions are {len(body)} characters, over the {_BODY_CHAR_LIMIT}-"
-                        "character limit for one skill"))
-                result = ops.add(offer.name, version=resolved.version, yes=False, interactive=False,
-                                 directory=str(project.directory), client=client)
-            except SkillpkgError as exc:
-                result, why = None, str(exc)
-            finally:
-                client.close()
-            if result is not None and int(result.exit_code) != 0:
-                why = "; ".join(str(p) for p in result.problems if isinstance(p, SkillpkgError))
-                why = why or f"exit code {int(result.exit_code)}"
-            if result is None or int(result.exit_code) != 0:
-                logger.warning("decimalai: could not add %s to this project: %s", offer.name, why)
-                return (f"load_skill: {offer.name!r} could not be added to this project ({why}). "
-                        "Proceed without it.")
-            added = project_skills(project).get(offer.name)
-            if added is None:
-                return f"load_skill: {offer.name!r} was added but cannot be read. Proceed without it."
-            who = f" (first loaded by agent {agent_name!r})" if agent_name else ""
-            _say(f"added skill {offer.name} v{resolved.version} to .decimal/skills.toml{who}.")
-            return added
-
-    def _refuse(self, name: str, why: str) -> str:
-        """Leave a registry skill out of the project and out of this process's lists."""
-        with self._rail_lock:
-            self._unusable.add(name)
-        logger.warning("decimalai: did not add %s to this project: %s.", name, why)
-        return f"load_skill: {name!r} cannot be used here ({why}). Proceed without it."
 
 
 _router: Optional[KeylessSkillRouter] = None
@@ -648,21 +415,54 @@ def _reset() -> None:
     with _router_lock:
         _router = None
     _announced.clear()
-    _POST_UNSUPPORTED.clear()
+    _told.clear()
 
 
 # ── starting keyless, and the guard ──────────────────────────────────────────
 
 _announced: Set[str] = set()
+#: Notices given once per process: (kind, ...) keys.
+_told: Set[Tuple[str, ...]] = set()
+
+
+def _once(*key: str) -> bool:
+    """True the first time ``key`` is asked for in this process."""
+    if key in _told:
+        return False
+    _told.add(key)
+    return True
 
 
 def announce(agent_name: str) -> None:
-    """Say once per agent that it runs keyless, and how to connect it."""
+    """Say once per agent that it runs keyless, what it uses, and how to connect it."""
     if agent_name in _announced:
         return
     _announced.add(agent_name)
     _say(f"no DECIMAL_API_KEY, so agent {agent_name!r} runs keyless: no traces, and its skills "
-         "come from this project and the public registry. Add DECIMAL_API_KEY to connect it.")
+         "are the ones .decimal/skills.toml lists (`decimalai skills add <name>` adds one). "
+         "Add DECIMAL_API_KEY to connect it.")
+    _tell_unlisted(agent_name)
+
+
+def _tell_unlisted(agent_name: str, project: Any = None) -> None:
+    """Say once per project which skill folders in ``.agents/skills`` its agents leave out.
+
+    The folder is shared with coding tools (Codex, Cursor and others read it), so a
+    folder there is not on an agent's list until ``decimalai skills add`` puts it there.
+    One line, so a folder that is there for another tool costs one line per process.
+    """
+    try:
+        from .skillpkg.project import Project
+
+        project = project or Project.find()
+        names = _authored.unlisted(project)
+        if not names or not _once("unlisted", str(project.directory)):
+            return
+        shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+        _say(f"{project.rel(project.skills_root)} has skills this project's agents do not use: "
+             f"{shown}. To give one to agent {agent_name!r}: decimalai skills add <name>")
+    except Exception:
+        logger.debug("keyless: could not list the unlisted skill folders", exc_info=True)
 
 
 def link_path(project: Any = None) -> Path:
@@ -727,10 +527,15 @@ def _link_label(link: Mapping[str, Any]) -> str:
     return f"at {link.get('base_url') or DEFAULT_BASE_URL}"
 
 
+#: What `link.toml` records for a skill you wrote that is on an agent (a registry skill
+#: records the spec it was assigned at).
+AUTHORED = "authored"
+
+
 def _assigned(link: Optional[Mapping[str, Any]], agent_name: str) -> Dict[str, str]:
-    """The skills ``link.toml`` records as assigned to ``agent_name``: registry name to the
-    ``.decimal/skills.toml`` spec it was assigned at (``"3"`` or ``"latest"``). Empty for
-    a link written before the record existed (0.24), so its skills are assigned again."""
+    """What ``link.toml`` records as given to ``agent_name`` from this project: a registry
+    name -> the ``.decimal/skills.toml`` spec it was assigned at (``"3"`` or ``"latest"``),
+    and a skill you wrote -> ``"authored"``. Empty when there is no record."""
     table = (link or {}).get("assigned")
     given = table.get(agent_name) if isinstance(table, dict) else None
     if not isinstance(given, dict):
@@ -738,8 +543,34 @@ def _assigned(link: Optional[Mapping[str, Any]], agent_name: str) -> Dict[str, s
     return {k: v for k, v in given.items() if isinstance(k, str) and isinstance(v, str)}
 
 
+def _has_record(link: Optional[Mapping[str, Any]], agent_name: str) -> bool:
+    """False for a link written by 0.24, which connected with no record of what it assigned."""
+    table = (link or {}).get("assigned")
+    return isinstance(table, dict) and isinstance(table.get(agent_name), dict)
+
+
+def _uploaded(link: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    """The ``[uploaded]`` table: a skill you wrote -> the SHA-256 of its instructions as this
+    project last uploaded them."""
+    table = (link or {}).get("uploaded")
+    if not isinstance(table, dict):
+        return {}
+    return {k: v for k, v in table.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _record_of(project: Any, link: Mapping[str, Any], agent_name: str) -> Dict[str, str]:
+    """An agent's record, or for a 0.24 link (none kept) what the project lists now: that
+    link assigned everything its file listed, so nothing in it is news."""
+    if _has_record(link, agent_name):
+        return _assigned(link, agent_name)
+    record = {name: want.spec for name, want in _wanted(project).items()}
+    record.update({name: AUTHORED for name in _authored.listed(project)})
+    return record
+
+
 def _write_link(project: Any, *, url: str, identity: Mapping[str, Optional[str]],
-                agents: Sequence[str], assigned: Mapping[str, Mapping[str, str]]) -> bool:
+                agents: Sequence[str], assigned: Mapping[str, Mapping[str, str]],
+                uploaded: Optional[Mapping[str, str]] = None) -> bool:
     """Write ``.decimal/link.toml``; True when its bytes changed."""
     from .skillpkg.manifest import _quote
 
@@ -756,14 +587,24 @@ def _write_link(project: Any, *, url: str, identity: Mapping[str, Optional[str]]
     lines.append("agents = [" + ", ".join(_quote(a) for a in names) + "]")
     lines += [
         "",
-        "# The .decimal/skills.toml skills assigned to each agent, at the version assigned.",
-        "# A keyed run assigns only what is new here, so a skill removed from an agent in",
-        "# the dashboard stays removed. Delete an agent's table to assign them all again.",
+        "# What each agent got from this project: the .decimal/skills.toml skills copied onto",
+        "# it when it connected, and what `decimalai skills add` has given it since. Its skills",
+        "# live on DecimalAI now: the dashboard and `decimalai skills add` change them, and",
+        "# editing skills.toml does not.",
     ]
     for agent in names:
         lines.append(f"[assigned.{_quote(agent)}]")
         for name, spec in sorted((assigned.get(agent) or {}).items()):
             lines.append(f"{_quote(name)} = {_quote(spec)}")
+    if uploaded:
+        lines += [
+            "",
+            "# The instructions of each skill you wrote, as this project last uploaded them",
+            "# (SHA-256). A run says when the file has changed since: `decimalai skills sync`.",
+            "[uploaded]",
+        ]
+        for name, digest in sorted(uploaded.items()):
+            lines.append(f"{_quote(name)} = {_quote(digest)}")
     data = ("\n".join(lines) + "\n").encode("utf-8")
     path = link_path(project)
     if path.is_file() and path.read_bytes() == data:
@@ -771,6 +612,26 @@ def _write_link(project: Any, *, url: str, identity: Mapping[str, Optional[str]]
     project.makedirs(project.state_dir)
     project.write_file(path, data)
     return True
+
+
+def record(project: Any, *, agent_name: Optional[str] = None,
+           assigned: Optional[Mapping[str, str]] = None,
+           uploaded: Optional[Mapping[str, str]] = None) -> bool:
+    """Add to a connected project's link file what a ``decimalai skills`` command just did:
+    skills it gave ``agent_name``, and the instructions it uploaded. False (nothing written)
+    when the project is not connected or its link file cannot be read."""
+    link = read_link(project)
+    if not link or link.get("damaged"):
+        return False
+    agents = [a for a in link.get("agents") or [] if isinstance(a, str)]
+    if agent_name and agent_name not in agents:
+        agents.append(agent_name)
+    table = {a: _record_of(project, link, a) for a in agents}
+    if agent_name and assigned:
+        table[agent_name] = {**table.get(agent_name, {}), **assigned}
+    identity = {key: link.get(key) for key in ("org_id", "org_slug", "workspace_id")}
+    return _write_link(project, url=link.get("base_url") or base_url(), identity=identity,
+                       agents=agents, assigned=table, uploaded={**_uploaded(link), **(uploaded or {})})
 
 
 # ── the first keyed run ──────────────────────────────────────────────────────
@@ -814,23 +675,23 @@ def _identity(client: Any) -> Optional[Dict[str, Optional[str]]]:
 
 
 def connect(agent_name: str, *, router: Any, created: bool = False) -> None:
-    """Connect this project to the key's workspace for ``agent_name``, and keep it in step.
+    """Connect this project to the key's workspace for ``agent_name`` once, then watch it.
 
-    Runs for a project with something to connect: one that lists skills in
-    ``.decimal/skills.toml`` (a keyless run adds them there), or whose agent this run
-    just created. The first time, it assigns each of those skills to the agent at the
-    version the lock pins (``assign_skill`` with the lock's version id; a ``"latest"``
-    entry follows the latest), then records the agent, the key's organization and
-    workspace, and the skills it assigned in ``.decimal/link.toml``. On every later
-    keyed start it compares ``skills.toml`` with that record and assigns only what is
-    new or was re-pinned: a skill added with ``decimalai skills add`` (with a key or
-    without one) reaches the agent on its next start, and when nothing changed no
-    request is made. ``router`` is the SkillRouter to assign with, or a callable
-    returning it, called only when there is something to assign. Only in a git
+    Runs for a project with something to connect: one with a ``.decimal/skills.toml``
+    (it lists the project's skills), or whose agent this run just created. The first
+    time (the agent is not in ``.decimal/link.toml`` yet) it copies the project's list
+    onto the agent: each registry skill is assigned at the version the lock pins (a
+    ``"latest"`` entry follows the latest), and each skill you wrote (``[authored]``) is
+    uploaded to the organization, not published, and added to the agent. It then records
+    the agent, the key's organization and workspace, and what it copied in
+    ``.decimal/link.toml``. From then on the agent's skills live on DecimalAI: every later
+    keyed start reads local files only, makes no request, changes nothing, and says once
+    per process when the project lists a skill the agent was not given or a skill you
+    wrote has changed since its upload. ``router`` is the SkillRouter to copy with, or a
+    callable returning it, called only when there is something to copy. Only in a git
     checkout, the one place the file can be committed (a container built from the
-    repository carries the committed file). Never raises: what cannot be assigned now
-    (the platform did not answer, or refused) is tried again by the next start, and the
-    agent runs either way.
+    repository carries the committed file). Never raises: a copy that fails is said, and
+    the agent runs either way.
     """
     from .skillpkg.project import Project
 
@@ -844,7 +705,7 @@ def connect(agent_name: str, *, router: Any, created: bool = False) -> None:
         link = read_link(project)
         linked = link.get("agents") if isinstance(link, dict) else None
         if isinstance(linked, list) and agent_name in linked:
-            _sync(project, agent_name, link, router)
+            _check(project, agent_name, link)
         else:
             _connect(project, agent_name, link if isinstance(link, dict) else None, router)
     except Exception:
@@ -928,6 +789,124 @@ def _say_failed(agent_name: str, failed: Sequence[str]) -> None:
              "tries again; or assign it from the agent's Skills tab in the dashboard.")
 
 
+def _own(project: Any) -> Dict[str, Dict[str, Any]]:
+    """The skills you wrote that the project lists, by folder name: each parsed SKILL.md."""
+    from .skills import parse_skill_md
+
+    managed = _authored.managed(project)
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in _authored.listed(project):
+        if name in managed:
+            continue
+        path = _authored.skill_md(project, name)
+        try:
+            descriptor = parse_skill_md(str(path)) if path.is_file() else None
+        except Exception:
+            descriptor = None
+        if descriptor:
+            out[name] = descriptor
+    return out
+
+
+def sync_authored(router: Any, items: List[Dict[str, Any]], **kwargs: Any) -> Dict[str, Any]:
+    """``POST /skills/sync`` the skills you wrote, the platform's copy winning a conflict.
+
+    ``conflict_policy="remote_wins_on_conflict"`` (with the checkout's ``install_id``):
+    a body only this checkout changed is uploaded; one the platform changed is not
+    overwritten. A platform from before that policy answers 422, and is asked again with
+    ``newer_wins``, which it has always taken.
+    """
+    from .skill_router import SkillRouterError
+
+    try:
+        return router.sync_skills(items, conflict_policy="remote_wins_on_conflict",
+                                  response_mode="diff", **kwargs)
+    except SkillRouterError as exc:
+        if getattr(exc, "status_code", None) != 422 or "conflict_policy" not in str(
+                getattr(exc, "detail", "") or exc):
+            raise
+    return router.sync_skills(items, conflict_policy="newer_wins", response_mode="diff", **kwargs)
+
+
+def _upload(project: Any, router: Any, agent_name: str, own: Mapping[str, Dict[str, Any]]
+            ) -> Tuple[Dict[str, str], List[str], List[str], Dict[str, str]]:
+    """Upload the skills you wrote and add them to the agent, in one sync:
+    ``(record, labels, failures, uploaded hashes)``."""
+    from skillevaluation import skillfmt
+
+    from ._install import get_install_identity
+    from .skill_router import _sync_up_items
+    from .skills import _with_local_timestamps
+
+    items, _managed = _sync_up_items(_with_local_timestamps(list(own.values())))
+    if not items:
+        return {}, [], [], {}
+    folder_of = {d.get("name"): folder for folder, d in own.items()}
+    try:
+        ident = get_install_identity(str(project.directory))
+    except Exception:
+        ident = {}
+    try:
+        result = sync_authored(router, items, install_id=ident.get("install_id"),
+                               install_label=ident.get("install_label"),
+                               agent_name=agent_name, add_to_agent="all")
+    except Exception as exc:
+        logger.debug("sync_skills failed", exc_info=True)
+        return {}, [], [f"{', '.join(sorted(own))} ({str(exc)[:120]})"], {}
+    if result.get("agent_not_found"):
+        why = result.get("agent_problem") or "the agent could not be found"
+        return {}, [], [f"{', '.join(sorted(own))} ({why})"], {}
+    failed_names = {f.get("name") for f in result.get("failures") or [] if isinstance(f, dict)}
+    actions = {a.get("name"): a for a in result.get("actions") or [] if isinstance(a, dict)}
+    done: Dict[str, str] = {}
+    labels: List[str] = []
+    failed: List[str] = []
+    uploaded: Dict[str, str] = {}
+    for item in items:
+        name = item["name"]
+        folder = folder_of.get(name, name)
+        action = actions.get(name) or {}
+        if name in failed_names or action.get("action") == "failed":
+            failed.append(f"{folder} (upload failed)")
+            continue
+        done[folder] = AUTHORED
+        if action.get("action") == "pulled":
+            # The organization's copy was changed on DecimalAI: it stays, and the agent
+            # uses it. Recording its text makes the next start say the file differs.
+            uploaded[folder] = skillfmt.body_sha256(action.get("body_markdown") or "")
+            labels.append(f"{folder} (DecimalAI's copy, which differs from yours)")
+        else:
+            uploaded[folder] = skillfmt.body_sha256(item["body_markdown"])
+            labels.append(f"{folder} (uploaded)")
+    return done, labels, failed, uploaded
+
+
+def _say_edited(project: Any, agent_name: str, wanted: Mapping[str, _Wanted]) -> None:
+    """Name each registry skill whose folder was edited: the agent gets the registry's text."""
+    from .skillpkg import fs
+    from .skillpkg import lock as _lock
+
+    try:
+        entries = _lock.locked_entries(project) or {}
+    except Exception:
+        return
+    for folder, entry in sorted(entries.items()):
+        name = entry.get("name")
+        if name not in wanted:
+            continue
+        try:
+            state = fs.check_folder(project.skill_dir(folder), entry, name=folder)
+        except Exception:
+            continue
+        if state.state is fs.State.MODIFIED:
+            version = entry.get("version")
+            text = f"v{version}" if isinstance(version, int) else "version"
+            _say(f"{name} was edited in {project.rel(project.skill_dir(folder))}, but agent "
+                 f"{agent_name!r} uses the registry's {text}: the edit does not carry over. To "
+                 "keep it, fork the skill on DecimalAI (Fork a copy, on its page) and give the "
+                 "fork to the agent.")
+
+
 def _connect(project: Any, agent_name: str, link: Optional[Dict[str, Any]], router: Any) -> None:
     from ._config import _get_client, _get_config
 
@@ -939,70 +918,73 @@ def _connect(project: Any, agent_name: str, link: Optional[Dict[str, Any]], rout
         _leave_elsewhere(project, link, url, identity)
         return
     wanted = _wanted(project)
+    own = _own(project)
     done: Dict[str, str] = {}
     labels: List[str] = []
     failed: List[str] = []
-    if wanted:
+    uploaded: Dict[str, str] = {}
+    if wanted or own:
         router = router() if callable(router) else router
         if router is not None:
-            done, labels, failed = _assign(router, agent_name, wanted)
+            if wanted:
+                assigned, said, refused = _assign(router, agent_name, wanted)
+                done.update(assigned)
+                labels += said
+                failed += refused
+            if own:
+                assigned, said, refused, uploaded = _upload(project, router, agent_name, own)
+                done.update(assigned)
+                labels += said
+                failed += refused
     usable = link if link and not link.get("damaged") else {}
     agents = list(usable.get("agents") or []) if isinstance(usable.get("agents"), list) else []
     agents = [a for a in agents if isinstance(a, str)]
-    assigned = {a: _assigned(usable, a) for a in agents}
-    assigned[agent_name] = done
+    assigned_all = {a: _record_of(project, usable, a) for a in agents}
+    assigned_all[agent_name] = done
     kept = {key: identity.get(key) or usable.get(key) for key in ("org_id", "org_slug", "workspace_id")}
     changed = _write_link(project, url=url, identity=kept, agents=[*agents, agent_name],
-                          assigned=assigned)
+                          assigned=assigned_all, uploaded={**_uploaded(usable), **uploaded})
     if changed:
-        did = f"assigned {', '.join(labels)}; " if labels else ""
-        _say(f"connected agent {agent_name!r} to your workspace: {did}wrote "
-             f"{project.rel(link_path(project))}. Commit it.")
+        copied = f"copied {', '.join(labels)} onto it. " if labels else ""
+        _say(f"connected agent {agent_name!r} to your DecimalAI workspace: {copied}From now on "
+             "its skills live on DecimalAI: change them in the dashboard or with `decimalai "
+             f"skills add`; editing {project.rel(project.manifest_path)} no longer changes them. "
+             f"Wrote {project.rel(link_path(project))}: commit it.")
+    _say_edited(project, agent_name, wanted)
     _say_failed(agent_name, failed)
 
 
-def _sync(project: Any, agent_name: str, link: Dict[str, Any], router: Any) -> None:
-    """A connected agent's later keyed start: assign what ``skills.toml`` has and the
-    record does not. Reads only local files when the two agree."""
-    from ._config import _get_client, _get_config
-
-    given = _assigned(link, agent_name)
+def _check(project: Any, agent_name: str, link: Dict[str, Any]) -> None:
+    """A connected agent's later keyed start: reads local files only, writes nothing,
+    asks nothing. Says once per process what the project lists that the agent was not
+    given, and which skills you wrote changed since this project uploaded them."""
+    if not _has_record(link, agent_name):
+        given = _record_of(project, link, agent_name)  # a 0.24 link: the file is the record
+    else:
+        given = _assigned(link, agent_name)
     wanted = _wanted(project)
-    todo = {name: want for name, want in wanted.items() if given.get(name) != want.spec}
-    gone = sorted(name for name in given if name not in wanted)
-    if not todo and not gone:
-        return
-    url = _get_config().base_url.rstrip("/")
-    identity: Mapping[str, Optional[str]] = {key: link.get(key) for key in ("org_id", "org_slug", "workspace_id")}
-    done: Dict[str, str] = {}
-    labels: List[str] = []
-    failed: List[str] = []
-    if todo:
-        # Assign only in the workspace the link names: a key of another organization (a
-        # teammate's personal one) must not give its workspace this project's skills.
-        verified = _identity(_get_client())
-        if verified is None:
-            return
-        if _elsewhere(link, url, verified):
-            _leave_elsewhere(project, link, url, verified)
-            return
-        router = router() if callable(router) else router
-        if router is None:
-            return
-        done, labels, failed = _assign(router, agent_name, todo)
-    record = {name: spec for name, spec in given.items() if name in wanted}
-    record.update(done)
-    agents = [a for a in link.get("agents") or [] if isinstance(a, str)]
-    assigned = {a: _assigned(link, a) for a in agents}
-    assigned[agent_name] = record
-    changed = _write_link(project, url=link.get("base_url") or url, identity=identity,
-                          agents=agents, assigned=assigned)
-    where = project.rel(link_path(project))
-    if labels and changed:
-        _say(f"agent {agent_name!r}: assigned {', '.join(labels)} from "
-             f"{project.rel(project.manifest_path)}; updated {where}. Commit it.")
-    if gone and changed:
-        _say(f"agent {agent_name!r}: {', '.join(gone)} left {project.rel(project.manifest_path)} "
-             "and stays assigned in your workspace; remove it from the agent's Skills tab in "
-             f"the dashboard if it should go. Updated {where}.")
-    _say_failed(agent_name, failed)
+    listed = [n for n in _authored.listed(project) if _authored.is_own_folder(project, n)]
+    manifest = project.rel(project.manifest_path)
+    missing = sorted([n for n in wanted if n not in given] + [n for n in listed if n not in given])
+    if missing and _once("missing", agent_name, *missing):
+        _say(f"agent {agent_name!r} gets its skills from DecimalAI, and {manifest} lists "
+             f"{', '.join(missing)}, which it was not given. Add one with `decimalai skills add "
+             "<name>` or in the dashboard; editing the file does not.")
+    repinned = sorted(n for n, w in wanted.items()
+                      if n in given and given[n] not in (w.spec, AUTHORED))
+    for name in repinned:
+        spec = wanted[name].spec
+        if _once("repinned", agent_name, name, spec):
+            pin = "the latest version" if spec == "latest" else f"v{spec}"
+            _say(f"{manifest} asks for {name} at {pin}; agent {agent_name!r}'s version of it is "
+                 f"set on DecimalAI: `decimalai skills add {name}@{spec}` or the dashboard.")
+    uploaded = _uploaded(link)
+    edited = sorted(n for n in listed if n in uploaded
+                    and _authored.body_hash(project, n) not in (None, uploaded[n]))
+    if edited and _once("edited", agent_name, *edited):
+        one = len(edited) == 1
+        _say(f"{', '.join(edited)} in {project.rel(project.skills_root)} "
+             f"{'does' if one else 'do'} not match DecimalAI's copy, which agent {agent_name!r} "
+             f"uses: run `decimalai skills sync` to sync {'it' if one else 'them'} (a change "
+             "made on DecimalAI wins).")
+    _tell_unlisted(agent_name, project)

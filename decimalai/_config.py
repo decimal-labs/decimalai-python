@@ -403,8 +403,8 @@ def _keyless() -> bool:
     """True when nothing gives the SDK a key: no ``init()`` and no key in the environment.
 
     Every ``agent_config()`` then runs keyless (``decimalai._keyless``): the
-    ``fallback=`` prompt, the project's own skills and the public registry's, and
-    nothing sent but the anonymous registry reads. Read at each ``agent_config()``
+    ``fallback=`` prompt and the skills the project lists, read from disk, and
+    nothing sent. Read at each ``agent_config()``
     call, after the import-time ``.env`` load, so a key added to ``.env`` switches
     the next process over.
     """

@@ -304,7 +304,9 @@ class TestSkillsSyncInstallWiring:
         # per-install synced baseline) plus the always-on reconcile knobs.
         assert body["install_id"] == ident["install_id"]
         assert body["install_label"] == "ci-box"
-        assert body["conflict_policy"] == "newer_wins"
+        # The platform's copy wins a conflict (2026-10-22); tests/test_skills_sync_platform_wins.py
+        # pins the rule and the fallback for a platform from before it.
+        assert body["conflict_policy"] == "remote_wins_on_conflict"
         assert body["response_mode"] == "diff"
 
         # …and the discovered skill, hashed on the frontmatter-stripped body

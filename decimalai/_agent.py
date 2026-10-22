@@ -41,8 +41,8 @@ KEYLESS
 -------
 With no API key and no ``init()`` there is no workspace to read, which is a
 mode, not an error (`decimalai._keyless`): the fallback is the prompt
-(``keyless=True``, ``prompt_source == "fallback (no key)"``) and the project
-and the public registry supply the skills. Fail-closed still holds where it
+(``keyless=True``, ``prompt_source == "fallback (no key)"``) and the skills are
+the ones the project lists in ``.decimal/skills.toml``. Fail-closed still holds where it
 matters: in a project ``.decimal/link.toml`` says is connected, no key raises.
 """
 
@@ -846,15 +846,14 @@ def agent_config(
     every run of an agent with more skills than fit the list. Initializes the SDK
     from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called; an
     agent the workspace has no agent by is created (without a prompt). The first
-    keyed run in a git checkout assigns the project's skills
-    (``.decimal/skills.toml``) to the agent and writes ``.decimal/link.toml``; each
-    later keyed run assigns the skills added to it since.
+    keyed run in a git checkout copies the project's skills (``.decimal/skills.toml``)
+    onto the agent once and writes ``.decimal/link.toml``. From then on the agent's
+    skills live on DecimalAI: the dashboard and ``decimalai skills add`` change them.
 
     With no key and no ``init()``, the agent runs keyless: the ``fallback`` is its
-    prompt, each run lists the project's skills and the best public registry
-    matches for its message, and a registry skill the model loads is added to
-    the project. Nothing but the anonymous registry search and install is sent.
-    In a project with ``.decimal/link.toml``, no key raises instead.
+    prompt and each run lists the skills ``.decimal/skills.toml`` lists (registry
+    skills ``decimalai skills add`` installed, and skills you wrote), read from disk.
+    Nothing is sent. In a project with ``.decimal/link.toml``, no key raises instead.
 
     A framework with its own adapter has its own ``agent_config()``, which hands
     the same prompt and skills over in that framework's shape:

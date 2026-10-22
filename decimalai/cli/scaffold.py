@@ -127,7 +127,7 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 
 5. The file RUNS WITHOUT A DECIMALAI KEY (SDK 0.24+). With no key, every
    `agent_config()` runs keyless (`decimalai/_keyless.py`): its `fallback=`
-   prompt, the project's skills plus public registry matches, nothing traced.
+   prompt, the skills `.decimal/skills.toml` lists, nothing traced.
    `init()` refuses to start without a key, so until 2026-10-21 every template
    that opened with `decimalai.init(agent_name=AGENT_NAME)` died on that line
    for anyone who ran it without the key: a teammate's clone, a CI job, a

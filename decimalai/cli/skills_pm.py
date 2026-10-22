@@ -174,16 +174,31 @@ def _next_steps() -> None:
 @click.option("--no-install", is_flag=True, default=False,
               help="Only record the skill in .decimal/skills.toml; "
                    "`decimalai skills install` fetches it.")
+@click.option("--to-agent", "agent_name", default=None, metavar="NAME",
+              help="Add the skill to this agent on DecimalAI (needs an API key). In a project "
+                   "connected to DecimalAI (.decimal/link.toml) with one agent, that agent is "
+                   "the default.")
 @_directory_option
 @_registry_options
-def skills_add(ref, yes, force, no_install, directory, api_key, base_url):
-    """Add a registry skill to the project and install it.
+def skills_add(ref, yes, force, no_install, agent_name, directory, api_key, base_url):
+    """Add a skill: one from the registry, or one you wrote in .agents/skills.
 
     REF is a registry name, url_slug, install name or skill id, optionally with @N to pin
-    version N or @latest to follow the newest. The skill is recorded in
-    .decimal/skills.toml, written to .agents/skills/<install-name>/, and its exact bytes
-    are recorded in .decimal/skills.lock. Adding a skill again with another version
-    changes the version.
+    version N or @latest to follow the newest; or the folder name of a skill you wrote,
+    .agents/skills/<REF>/SKILL.md.
+
+    Before the project is connected to DecimalAI, the skill goes on the project's list,
+    .decimal/skills.toml, which agent_config() agents use. A registry skill is recorded
+    there, written to .agents/skills/<install-name>/ and its exact bytes recorded in
+    .decimal/skills.lock; adding it again with another version changes the version. A
+    skill you wrote is listed under [authored]. A folder in .agents/skills that is not
+    listed is not used by the agents (Codex, Cursor and other tools read that folder too).
+
+    Once the project is connected (its first agent_config() run with an API key wrote
+    .decimal/link.toml), an agent's skills live on DecimalAI, and this adds REF to the
+    agent there: a registry skill is assigned to it, and a skill you wrote is uploaded to
+    your organization (not published) and added. .decimal/skills.toml does not change.
+    --to-agent does the same in any project.
 
     A skill whose safety review has not cleared it (caution, unreviewed) is asked about
     on a terminal and refused without one, unless --yes. Blocked skills are refused.
@@ -192,16 +207,48 @@ def skills_add(ref, yes, force, no_install, directory, api_key, base_url):
     Examples:
         $ decimalai skills add acme/refund-policy
         $ decimalai skills add acme/refund-policy@3
-        $ decimalai skills add pdf --yes
+        $ decimalai skills add refund-policy          # a skill you wrote
+        $ decimalai skills add pdf --yes --to-agent support
     """
-    _add(ref, yes=yes, force=force, no_install=no_install, directory=directory,
-         api_key=api_key, base_url=base_url)
+    _add(ref, yes=yes, force=force, no_install=no_install, agent_name=agent_name,
+         directory=directory, api_key=api_key, base_url=base_url)
 
 
-def _add(ref: str, *, yes: bool, force: bool, no_install: bool, directory: Optional[str],
-         api_key: Optional[str], base_url: str) -> None:
-    from .. import skillpkg
+def _add(ref: str, *, yes: bool, force: bool, no_install: bool, agent_name: Optional[str],
+         directory: Optional[str], api_key: Optional[str], base_url: str) -> None:
+    from .. import _authored, _keyless, skillpkg
+    from ..skillpkg.project import Project
 
+    project = Project.at(directory) if directory else Project.find()
+    link = _keyless.read_link(project)
+    target = agent_name
+    if target is None and link:
+        agents = [a for a in link.get("agents") or [] if isinstance(a, str)]
+        if len(agents) > 1:
+            raise click.UsageError(
+                f"this project is connected to DecimalAI for agents {', '.join(sorted(agents))} "
+                f"({project.rel(_keyless.link_path(project))}): pass --to-agent <name>")
+        if agents:
+            target = agents[0]
+    if target is not None:
+        _add_to_agent(project, ref, target, yes=yes, api_key=api_key, base_url=base_url,
+                      connected=bool(link) and agent_name is None)
+        return
+    if not force and _authored.is_own_folder(project, ref.strip()):
+        name = ref.strip()
+        try:
+            added = _authored.add(project, name)
+        except (ValueError, SkillpkgError) as exc:
+            click.echo(f"  ✗ {exc}", err=True)
+            raise SystemExit(int(ExitCode.USAGE))
+        where = project.rel(project.manifest_path)
+        if added:
+            click.echo(f"  ✓ listed {name} (a skill you wrote) under [authored] in {where}: "
+                       "agent_config() agents in this project use it from "
+                       f"{project.rel(_authored.skill_md(project, name))}")
+        else:
+            click.echo(f"  • {name} is already listed in {where}")
+        return
     result = skillpkg.add(ref, yes=yes, force=force, no_install=no_install,
                           directory=directory, api_key=api_key or None, base_url=base_url,
                           **_gate())
@@ -209,6 +256,123 @@ def _add(ref: str, *, yes: bool, force: bool, no_install: bool, directory: Optio
     if result.ok and any(getattr(c, "action", None) == "add" for c in result.changes):
         _next_steps()
     _exit(result)
+
+
+def _add_to_agent(project: Any, ref: str, agent: str, *, yes: bool, api_key: Optional[str],
+                  base_url: str, connected: bool) -> None:
+    """``decimalai skills add`` once the agent's skills live on DecimalAI: add REF there."""
+    from .. import _authored, _keyless
+    from ..skill_router import SkillRouter
+
+    why = (f"agent {agent!r} gets its skills from DecimalAI (this project is connected: "
+           f"{project.rel(_keyless.link_path(project))})" if connected
+           else f"--to-agent adds the skill to agent {agent!r} on DecimalAI")
+    if not api_key:
+        raise click.UsageError(f"{why}; set DECIMAL_API_KEY to add a skill to it")
+    router = SkillRouter(api_key=api_key, base_url=base_url)
+    try:
+        name = ref.strip()
+        if _authored.is_own_folder(project, name):
+            _upload_to_agent(project, router, name, agent)
+        else:
+            _assign_to_agent(project, router, ref, agent, yes=yes, api_key=api_key,
+                             base_url=base_url)
+    finally:
+        close = getattr(router, "close", None)
+        if callable(close):
+            close()
+    if connected:
+        click.echo(f"  • {project.rel(project.manifest_path)} is unchanged: {why}.")
+
+
+def _upload_to_agent(project: Any, router: Any, name: str, agent: str) -> None:
+    from skillevaluation import skillfmt
+
+    from .. import _authored, _keyless
+    from .._install import get_install_identity
+    from ..skill_router import _sync_up_items
+    from ..skills import _with_local_timestamps, parse_skill_md
+
+    descriptor = parse_skill_md(str(_authored.skill_md(project, name)))
+    items, _managed = _sync_up_items(_with_local_timestamps([descriptor] if descriptor else []))
+    if not items:
+        click.echo(f"  ✗ {project.rel(_authored.skill_md(project, name))} is not a skill this "
+                   "SDK can read (it needs frontmatter with a name and description, and "
+                   "instructions)", err=True)
+        raise SystemExit(int(ExitCode.USAGE))
+    ident = get_install_identity(str(project.directory))
+    try:
+        result = _keyless.sync_authored(router, items, install_id=ident.get("install_id"),
+                                        install_label=ident.get("install_label"),
+                                        agent_name=agent, add_to_agent="all")
+    except Exception as exc:
+        click.echo(f"  ✗ could not upload {name}: {exc}", err=True)
+        raise SystemExit(int(ExitCode.NETWORK))
+    if result.get("agent_not_found"):
+        click.echo(f"  ✗ {name} was uploaded, but not added to agent {agent!r}: "
+                   f"{result.get('agent_problem') or 'no such agent'}", err=True)
+        raise SystemExit(int(ExitCode.PROBLEMS))
+    (action,) = [a for a in result.get("actions") or [{}] if isinstance(a, dict)] or [{}]
+    if action.get("action") == "failed" or result.get("failures"):
+        click.echo(f"  ✗ could not upload {name}: "
+                   f"{action.get('error') or result.get('failures')}", err=True)
+        raise SystemExit(int(ExitCode.PROBLEMS))
+    if action.get("action") == "pulled":
+        body_hash = skillfmt.body_sha256(action.get("body_markdown") or "")
+        click.echo(f"  ✓ added {name} to agent {agent!r} on DecimalAI, with DecimalAI's copy: "
+                   "it was changed there, so your file was not uploaded. `decimalai skills "
+                   "sync` brings that copy into the file.")
+    else:
+        body_hash = skillfmt.body_sha256(items[0]["body_markdown"])
+        click.echo(f"  ✓ uploaded {name} to your organization (not published) and added it to "
+                   f"agent {agent!r} on DecimalAI")
+    _keyless.record(project, agent_name=agent, assigned={name: _keyless.AUTHORED},
+                    uploaded={name: body_hash})
+
+
+def _assign_to_agent(project: Any, router: Any, ref: str, agent: str, *, yes: bool,
+                     api_key: str, base_url: str) -> None:
+    from .. import _keyless
+    from ..skillpkg.client import RegistryClient, ResolveRequest, trust_verdict
+    from ..skillpkg.ops import _parse_ref
+
+    try:
+        base, spec = _parse_ref(ref, None)
+    except SkillpkgError as exc:
+        click.echo(f"  ✗ {exc}", err=True)
+        raise SystemExit(int(ExitCode.USAGE))
+    client = RegistryClient(api_key=api_key, base_url=base_url, channel="cli")
+    try:
+        resolved = client.resolve_one(ResolveRequest(ref=base, version=spec or "latest"),
+                                      purpose="add")
+    except SkillpkgError as exc:
+        click.echo(f"  ✗ {exc}", err=True)
+        raise SystemExit(int(exc.exit_code) if hasattr(exc, "exit_code") else 1)
+    finally:
+        client.close()
+    refusal, caution = trust_verdict(resolved)
+    if refusal:
+        click.echo(f"  ✗ {resolved.registry_name} is {refusal}: it cannot be added", err=True)
+        raise SystemExit(int(ExitCode.UNAVAILABLE))
+    if caution and not yes:
+        question = (f"{resolved.registry_name} v{resolved.version}: its safety review is "
+                    f"{caution}. Add it to agent {agent!r} anyway?")
+        if not (_stdin_is_tty() and _confirm(question)):
+            click.echo(f"  ✗ {resolved.registry_name} was not added: its safety review is "
+                       f"{caution} (pass --yes to add it anyway)", err=True)
+            raise SystemExit(int(ExitCode.UNAVAILABLE))
+    pinned = spec not in (None, "latest")
+    try:
+        router.assign_skill(agent, resolved.skill_id,
+                            pin_version_id=resolved.version_id if pinned else None)
+    except Exception as exc:
+        click.echo(f"  ✗ could not add {resolved.registry_name} to agent {agent!r}: {exc}",
+                   err=True)
+        raise SystemExit(int(ExitCode.NETWORK))
+    how = f"pinned to v{resolved.version}" if pinned else f"v{resolved.version}, following the latest"
+    click.echo(f"  ✓ added {resolved.registry_name} to agent {agent!r} on DecimalAI ({how})")
+    _keyless.record(project, agent_name=agent,
+                    assigned={resolved.registry_name: spec or "latest"})
 
 
 # ── install ─────────────────────────────────────────────────────────────────
@@ -303,19 +467,42 @@ def skills_update(name, force, dry_run, yes, as_json, directory, api_key, base_u
                    "first.")
 @_directory_option
 def skills_remove(name, force, directory):
-    """Remove a skill's folder and its manifest and lock entries.
+    """Take a skill off the project's list.
 
-    NAME is the folder name or the registry name. Nothing changes on the registry: Use
-    links and forks stay.
+    NAME is the folder name or the registry name. A registry skill's folder goes too,
+    with its manifest and lock entries; nothing changes on the registry (Use links and
+    forks stay). A skill you wrote is taken off the [authored] list; its folder stays.
+
+    In a project connected to DecimalAI its agents keep the skill: remove it from an
+    agent in the dashboard.
 
     \b
     Example:
         $ decimalai skills remove acme-refund-policy
     """
-    from .. import skillpkg
+    from .. import _authored, _keyless, skillpkg
+    from ..skillpkg.project import Project
 
+    project = Project.at(directory) if directory else Project.find()
+    agents = [a for a in (_keyless.read_link(project) or {}).get("agents") or []
+              if isinstance(a, str)]
+    still = (f"  • agent{'s' if len(agents) > 1 else ''} {', '.join(sorted(agents))} keep it on "
+             "DecimalAI: remove it from an agent in the dashboard." if agents else None)
+    if name in _authored.listed(project) and name not in _authored.managed(project):
+        try:
+            _authored.remove(project, name)
+        except (ValueError, SkillpkgError) as exc:
+            click.echo(f"  ✗ {exc}", err=True)
+            raise SystemExit(int(ExitCode.USAGE))
+        click.echo(f"  ✓ took {name} off the list in {project.rel(project.manifest_path)}; its "
+                   f"folder {project.rel(project.skill_dir(name))} stays")
+        if still:
+            click.echo(still)
+        return
     result = skillpkg.remove(name, force=force, directory=directory)
     _print_result(result)
+    if still and result.ok and result.changes:
+        click.echo(still)
     _exit(result)
 
 

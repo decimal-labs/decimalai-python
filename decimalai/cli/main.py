@@ -3,6 +3,8 @@
 import logging
 import os
 import urllib.parse
+from pathlib import Path
+from typing import Optional, Tuple
 
 import click
 
@@ -1181,8 +1183,167 @@ def _registry_stamped(frontmatter) -> bool:
     return isinstance(skill_id, str) and bool(skill_id.strip())
 
 
+def _sync_entry(skill_md: Path, installed: list) -> Optional[dict]:
+    """The ``POST /skills/sync`` item for one SKILL.md, or None (said why, or a registry
+    install, whose folder name goes in ``installed``)."""
+    import hashlib
+
+    from ..skills import _split_frontmatter, _title_from_skill_md
+
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except OSError as e:
+        click.echo(f"  ⚠ skipping {skill_md} ({e})", err=True)
+        return None
+
+    frontmatter, body = _split_frontmatter(content, path=str(skill_md))
+    # A folder `decimalai skills` installed is someone's registry skill: syncing it
+    # would create a private copy of it in your organization.
+    if _registry_stamped(frontmatter):
+        installed.append(skill_md.parent.name)
+        return None
+    if not body or not body.strip():
+        click.echo(f"  ⚠ skipping {skill_md} (empty body)", err=True)
+        return None
+
+    name = (
+        (frontmatter.get("name") or "").strip()
+        or skill_md.parent.name
+    )
+    if not name:
+        click.echo(f"  ⚠ skipping {skill_md} (no name)", err=True)
+        return None
+
+    # Hash is on the body specifically, not the whole file — that
+    # way changing only frontmatter (e.g. tweaking description) does
+    # not look like a content change to the backend.
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    # git-aware timestamp: prefer the commit time so a fresh checkout
+    # (every file's mtime reset to "now") doesn't make the local copy always
+    # "win" under newer_wins and clobber a more-recent dashboard edit.
+    from ..skills import _local_updated_at_iso
+    local_updated_at = _local_updated_at_iso(str(skill_md))
+
+    # The endpoint takes one category string and rejects the whole batch for a
+    # list, which YAML reads `category: [a, b]` as; the frontmatter keeps the list.
+    category = frontmatter.get("category")
+    entry = {
+        "name": name,
+        "display_name": _title_from_skill_md(frontmatter, body),
+        "content_hash": content_hash,
+        "body_markdown": body,
+        "description": frontmatter.get("description") or "",
+        "category": category if isinstance(category, str) else None,
+        "trigger_phrases": frontmatter.get("trigger_phrases"),
+        "frontmatter": frontmatter or None,
+        "local_updated_at": local_updated_at,
+    }
+
+    # An eval.yaml beside SKILL.md is part of the skill — sync it too,
+    # so authored cases exist on the platform and a later
+    # `skills push` can attach per-case results. Previously only
+    # `skills benchmark` (metered) uploaded the suite, which
+    # dead-ended the free local→push funnel: push skipped every case
+    # and the hint said "run skills sync" — which didn't help.
+    eval_yaml_path = skill_md.parent / "eval.yaml"
+    if eval_yaml_path.is_file():
+        try:
+            eval_text = eval_yaml_path.read_text(encoding="utf-8")
+            try:
+                from skillevaluation.parser import (
+                    EvalYamlParseError,
+                    parse_eval_yaml,
+                )
+            except ImportError:
+                # Installs predating the skillevaluation dependency hit a
+                # bare ModuleNotFoundError here the moment an eval.yaml
+                # exists. Name the actual fix instead.
+                raise SystemExit(
+                    "skills sync needs the `skillevaluation` package to validate "
+                    f"{eval_yaml_path} — your decimalai install predates it. "
+                    "Fix: pip install -U decimalai"
+                )
+            try:
+                parse_eval_yaml(eval_text)
+                entry["eval_yaml_text"] = eval_text
+                entry["eval_yaml_hash"] = hashlib.sha256(
+                    eval_text.encode("utf-8")
+                ).hexdigest()
+            except EvalYamlParseError as exc:
+                click.echo(
+                    f"  ⚠ {eval_yaml_path}: invalid eval.yaml not synced ({exc})",
+                    err=True,
+                )
+        except OSError as exc:
+            click.echo(f"  ⚠ could not read {eval_yaml_path}: {exc}", err=True)
+
+    # Bundle files (references/, scripts/, templates/, assets/) travel with the
+    # skill: the sync endpoint mirrors them onto the version (text-only,
+    # server-capped), so a later `skills pull` returns what was pushed.
+    from ..skills import collect_bundle_attachments
+    bundle = collect_bundle_attachments(str(skill_md.parent))
+    if bundle:
+        entry["attachments"] = bundle
+    return entry
+
+
+def _sync_sources(skills_dir: Optional[str]) -> Tuple[list, list]:
+    """``(SKILL.md paths, places)`` to sync: every one under SKILLS_DIR when given; else
+    every one under ./skills, and each skill you wrote that .decimal/skills.toml lists
+    under [authored] (its folder in .agents/skills)."""
+    from pathlib import Path
+
+    from .. import _authored
+    from ..skillpkg.project import Project
+
+    if skills_dir is not None:
+        base = Path(skills_dir).resolve()
+        return sorted(base.rglob("SKILL.md")), [str(base)]
+    paths: list = []
+    places: list = []
+    default = Path("./skills")
+    if default.is_dir():
+        base = default.resolve()
+        paths += sorted(base.rglob("SKILL.md"))
+        places.append(str(base))
+    project = Project.find()
+    listed = [n for n in _authored.listed(project) if _authored.is_own_folder(project, n)]
+    for name in listed:
+        path = _authored.skill_md(project, name).resolve()
+        if path not in paths:
+            paths.append(path)
+    if listed:
+        places.append(f"{project.rel(project.skills_root)} ({', '.join(listed)})")
+    return paths, places
+
+
+def _backup_before_pull(target: Path, name: str) -> Optional[Path]:
+    """Copy a SKILL.md about to be overwritten by DecimalAI's copy to
+    ``.decimal/backup/sync-<time>/<name>/SKILL.md`` (git-ignored). None if it could not."""
+    import shutil
+
+    from ..skillpkg import fs
+    from ..skillpkg.ops import _ensure_gitignore
+    from ..skillpkg.project import Project
+
+    try:
+        project = Project.find(target.parent)
+        dest = project.backup_dir / f"sync-{fs.new_txid()}" / target.parent.name / target.name
+        project.makedirs(dest.parent)
+        shutil.copy2(target, dest)
+        try:
+            _ensure_gitignore(project)
+        except Exception:
+            pass
+        return dest
+    except Exception as exc:
+        click.echo(f"    ⚠ could not keep a copy of {target} ({exc})", err=True)
+        return None
+
+
 @skills.command("sync")
-@click.argument("skills_dir", type=click.Path(exists=True, file_okay=False), default="./skills")
+@click.argument("skills_dir", type=click.Path(exists=True, file_okay=False), required=False)
 @click.option(
     "--apply-pulls/--no-apply-pulls",
     default=True,
@@ -1196,140 +1357,39 @@ def _registry_stamped(frontmatter) -> bool:
 )
 @common_options
 def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
-    """Sync local SKILL.md files at SKILLS_DIR with the platform registry.
+    """Sync the SKILL.md files you wrote with your organization on DecimalAI.
 
-    Walks SKILLS_DIR (default ./skills) for SKILL.md files, hashes each
-    one (SHA-256 of body_markdown), and POSTs to /api/v1/skills/sync
-    with ``response_mode="diff"`` so the backend returns a per-skill
-    ``actions`` array:
+    Without SKILLS_DIR: every SKILL.md under ./skills, and each skill you wrote that
+    .decimal/skills.toml lists under [authored] (`decimalai skills add <name>`), in its
+    folder in .agents/skills. With SKILLS_DIR: every SKILL.md under it. A folder
+    `decimalai skills add` installed from the registry is never sent.
+
+    Each skill's instructions are compared with DecimalAI's copy and with what this
+    checkout last synced:
 
       \b
-      created      — skill did not exist on backend, now does
-      no_change    — local hash matches backend; nothing to do
-      pushed       — local was newer; backend version bumped
-      pulled       — backend was newer; CLI overwrites local file
-      failed       — per-skill error (rest of the batch still processed)
+      created      — new on DecimalAI
+      no_change    — the same on both sides
+      pushed       — only your file changed: uploaded as a new version
+      pulled       — DecimalAI's copy changed: written into your file
+      failed       — per-skill error (the rest of the batch still syncs)
 
-    Conflict policy: ``newer_wins`` via ``local_updated_at``. Equal hashes
-    are always ``no_change``.
-
-    \b
-    Examples:
-        $ decimalai skills sync                # uses ./skills
-        $ decimalai skills sync ./agents/skills
-        $ decimalai skills sync --dry-run
+    When both changed, DecimalAI's copy wins: your file is copied to
+    .decimal/backup/ first, and the line for it says where. To upload your version
+    instead, copy it back and sync again.
     """
-    import hashlib
     from pathlib import Path
 
-    from ..skills import _split_frontmatter, _title_from_skill_md
-
-    base = Path(skills_dir).resolve()
-
-    # Walk for SKILL.md (one per skill directory). We tolerate both
-    # layouts: <root>/<name>/SKILL.md and <root>/<name>.md (rare).
+    paths, places = _sync_sources(skills_dir)
     skills_payload: list[dict] = []
     discovered_paths: dict[str, Path] = {}
     installed: list[str] = []
-
-    for skill_md in base.rglob("SKILL.md"):
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-        except OSError as e:
-            click.echo(f"  ⚠ skipping {skill_md} ({e})", err=True)
-            continue
-
-        frontmatter, body = _split_frontmatter(content, path=str(skill_md))
-        # A folder `decimalai skills` installed is someone's registry skill: syncing it
-        # would create a private copy of it in your organization.
-        if _registry_stamped(frontmatter):
-            installed.append(skill_md.parent.name)
-            continue
-        if not body or not body.strip():
-            click.echo(f"  ⚠ skipping {skill_md} (empty body)", err=True)
-            continue
-
-        name = (
-            (frontmatter.get("name") or "").strip()
-            or skill_md.parent.name
-        )
-        if not name:
-            click.echo(f"  ⚠ skipping {skill_md} (no name)", err=True)
-            continue
-
-        # Hash is on the body specifically, not the whole file — that
-        # way changing only frontmatter (e.g. tweaking description) does
-        # not look like a content change to the backend.
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-        # git-aware timestamp: prefer the commit time so a fresh checkout
-        # (every file's mtime reset to "now") doesn't make the local copy always
-        # "win" under newer_wins and clobber a more-recent dashboard edit.
-        from ..skills import _local_updated_at_iso
-        local_updated_at = _local_updated_at_iso(str(skill_md))
-
-        # The endpoint takes one category string and rejects the whole batch for a
-        # list, which YAML reads `category: [a, b]` as; the frontmatter keeps the list.
-        category = frontmatter.get("category")
-        entry = {
-            "name": name,
-            "display_name": _title_from_skill_md(frontmatter, body),
-            "content_hash": content_hash,
-            "body_markdown": body,
-            "description": frontmatter.get("description") or "",
-            "category": category if isinstance(category, str) else None,
-            "trigger_phrases": frontmatter.get("trigger_phrases"),
-            "frontmatter": frontmatter or None,
-            "local_updated_at": local_updated_at,
-        }
-
-        # An eval.yaml beside SKILL.md is part of the skill — sync it too,
-        # so authored cases exist on the platform and a later
-        # `skills push` can attach per-case results. Previously only
-        # `skills benchmark` (metered) uploaded the suite, which
-        # dead-ended the free local→push funnel: push skipped every case
-        # and the hint said "run skills sync" — which didn't help.
-        eval_yaml_path = skill_md.parent / "eval.yaml"
-        if eval_yaml_path.is_file():
-            try:
-                eval_text = eval_yaml_path.read_text(encoding="utf-8")
-                try:
-                    from skillevaluation.parser import (
-                        EvalYamlParseError,
-                        parse_eval_yaml,
-                    )
-                except ImportError:
-                    # Installs predating the skillevaluation dependency hit a
-                    # bare ModuleNotFoundError here the moment an eval.yaml
-                    # exists. Name the actual fix instead.
-                    raise SystemExit(
-                        "skills sync needs the `skillevaluation` package to validate "
-                        f"{eval_yaml_path} — your decimalai install predates it. "
-                        "Fix: pip install -U decimalai"
-                    )
-                try:
-                    parse_eval_yaml(eval_text)
-                    entry["eval_yaml_text"] = eval_text
-                    entry["eval_yaml_hash"] = hashlib.sha256(
-                        eval_text.encode("utf-8")
-                    ).hexdigest()
-                except EvalYamlParseError as exc:
-                    click.echo(
-                        f"  ⚠ {eval_yaml_path}: invalid eval.yaml not synced ({exc})",
-                        err=True,
-                    )
-            except OSError as exc:
-                click.echo(f"  ⚠ could not read {eval_yaml_path}: {exc}", err=True)
-
-        # Bundle files (references/, scripts/, templates/, assets/) travel with the
-        # skill: the sync endpoint mirrors them onto the version (text-only,
-        # server-capped), so a later `skills pull` returns what was pushed.
-        from ..skills import collect_bundle_attachments
-        bundle = collect_bundle_attachments(str(skill_md.parent))
-        if bundle:
-            entry["attachments"] = bundle
-        skills_payload.append(entry)
-        discovered_paths[name] = skill_md
+    for skill_md in paths:
+        entry = _sync_entry(skill_md, installed)
+        if entry is not None:
+            skills_payload.append(entry)
+            discovered_paths[entry["name"]] = skill_md
+    where = ", ".join(places) if places else "./skills"
 
     if installed:
         click.echo(
@@ -1337,13 +1397,16 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
             f"(`decimalai skills` manages them): {', '.join(sorted(installed))}"
         )
     if not skills_payload:
-        if installed:
-            click.echo(f"  No skills of your own under {base}; nothing to sync")
+        if not places:
+            click.echo("  Nothing to sync: there is no ./skills folder, and .decimal/skills.toml "
+                       "lists no skills you wrote (`decimalai skills add <name>` lists one)")
+        elif installed:
+            click.echo(f"  No skills of your own under {where}; nothing to sync")
         else:
-            click.echo(f"  No SKILL.md files found under {base}")
+            click.echo(f"  No SKILL.md files found under {where}")
         return
 
-    click.echo(f"  Discovered {len(skills_payload)} skill(s) under {base}")
+    click.echo(f"  Discovered {len(skills_payload)} skill(s) under {where}")
 
     if dry_run:
         click.echo("  --dry-run: skipping POST")
@@ -1351,8 +1414,9 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
             click.echo(f"    • {entry['name']:<40s}  hash={entry['content_hash'][:12]}")
         return
 
-    # Stamp this checkout's install identity so the backend records a
-    # per-install synced baseline and `decimalai skills status` can show drift.
+    # Stamp this checkout's install identity so the backend records a per-install
+    # synced baseline: the conflict rule below reads it, and `decimalai skills status`
+    # shows drift from it.
     from .._install import get_install_identity
 
     identity = get_install_identity()
@@ -1360,18 +1424,28 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
     if install_id:
         click.echo(f"  Install: {identity.get('install_label') or install_id[:8]}")
 
+    # The platform's copy wins a conflict: a body only this checkout changed is pushed,
+    # and anything DecimalAI changed is pulled. A platform from before that rule answers
+    # 422 and gets newer_wins, which it has always taken; every pull then keeps a copy.
+    policy = "remote_wins_on_conflict"
     client = _make_client(api_key, base_url)
     try:
-        sync_body = {
-            "skills": skills_payload,
-            "conflict_policy": "newer_wins",
-            "response_mode": "diff",
-        }
-        if install_id:
-            sync_body["install_id"] = install_id
-            if identity.get("install_label"):
-                sync_body["install_label"] = identity["install_label"]
-        resp = client._http.post("/api/v1/skills/sync", json=sync_body)
+        while True:
+            sync_body = {
+                "skills": skills_payload,
+                "conflict_policy": policy,
+                "response_mode": "diff",
+            }
+            if install_id:
+                sync_body["install_id"] = install_id
+                if identity.get("install_label"):
+                    sync_body["install_label"] = identity["install_label"]
+            resp = client._http.post("/api/v1/skills/sync", json=sync_body)
+            if (resp.status_code == 422 and policy != "newer_wins"
+                    and "conflict_policy" in resp.text):
+                policy = "newer_wins"
+                continue
+            break
         if resp.status_code == 422:
             # Surface the backend's per-field validation errors — "422" alone
             # hides exactly the message that tells the user what to rename
@@ -1431,6 +1505,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
     if pulled and apply_pulls:
         click.echo("")
         click.echo("  Writing pulled results to disk…")
+        base = Path(skills_dir).resolve() if skills_dir is not None else Path("./skills").resolve()
         for item in pulled:
             name = item.get("name")
             body = item.get("body_markdown") or ""
@@ -1459,6 +1534,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
                 target.parent.mkdir(parents=True, exist_ok=True)
             # Preserve existing frontmatter if any; otherwise write body only.
             existing_fm = ""
+            existing = None
             if target.exists():
                 try:
                     existing = target.read_text(encoding="utf-8")
@@ -1468,12 +1544,57 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
                             existing_fm = existing[: end + 3] + "\n\n"
                 except OSError:
                     existing_fm = ""
+            # The file is about to lose edits DecimalAI never stored: the platform says so
+            # (`conflict`), or, on a platform from before that, its body is not the one
+            # being written.
+            kept = None
+            if existing is not None and (item.get("conflict") is True or (
+                    item.get("conflict") is None and policy == "newer_wins"
+                    and existing[len(existing_fm.rstrip()):].strip() != body.strip())):
+                kept = _backup_before_pull(target, str(name))
             target.write_text(existing_fm + body, encoding="utf-8")
-            click.echo(f"    ↓ {name} → {target} (v{item.get('version_number')})")
+            if kept is not None:
+                click.echo(f"    ↓ {name} → {target} (v{item.get('version_number')}): DecimalAI's "
+                           f"copy replaced your edits, which are saved at {kept}. To upload "
+                           "yours instead, copy it back and sync again.")
+            else:
+                click.echo(f"    ↓ {name} → {target} (v{item.get('version_number')})")
     elif pulled:
         click.echo("  (--no-apply-pulls set; skipping disk writes)")
         for item in pulled:
             click.echo(f"    ↓ {item.get('name')} (v{item.get('version_number')})")
+
+    _record_synced(discovered_paths, actions, apply_pulls)
+
+
+def _record_synced(discovered_paths: dict, actions: list, applied_pulls: bool) -> None:
+    """In a project connected to DecimalAI, remember the instructions of each listed skill
+    you wrote as they now stand on both sides, so its agents' runs stop saying it changed."""
+    from .. import _authored, _keyless
+    from ..skillpkg.project import Project
+
+    try:
+        project = Project.find()
+        if not _keyless.read_link(project):
+            return
+        listed = set(_authored.listed(project))
+        synced = {"created", "pushed", "no_change", "reconciled_metadata"}
+        if applied_pulls:
+            synced.add("pulled")
+        uploaded = {}
+        for action in actions:
+            path = discovered_paths.get(action.get("name"))
+            if path is None or action.get("action") not in synced:
+                continue
+            folder = path.parent.name
+            if folder in listed and path.resolve() == _authored.skill_md(project, folder).resolve():
+                digest = _authored.body_hash(project, folder)
+                if digest:
+                    uploaded[folder] = digest
+        if uploaded:
+            _keyless.record(project, uploaded=uploaded)
+    except Exception as exc:  # the sync itself succeeded; the note is a convenience
+        click.echo(f"  ⚠ could not update .decimal/link.toml ({exc})", err=True)
 
 
 # Drift status → display glyph and a stable display order (drift first so it
