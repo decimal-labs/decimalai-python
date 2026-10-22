@@ -265,6 +265,18 @@ def test_no_skill_list_means_no_tool(platform):
         assert run.tools == [] and run.tool_params == []
 
 
+def test_always_include_text_ends_the_cached_skill_block(platform):
+    """D-C: an always-include skill's full text is part of the skill block, so the one cache
+    breakpoint covers it and a conversation keeps it with the list."""
+    platform.always = {"order-support": 1}
+    with da.agent_config("support").run("Where is my order?", variables=SAM) as run:
+        prompt, menu = run.system
+        assert prompt == {"type": "text", "text": "Hello Sam."}
+        assert menu["text"].startswith("\n\n## Available Skills")
+        assert menu["text"].endswith("## Skill: order-support\n\n# Order support\n\nUse lookup_order for order facts.")
+        assert menu["cache_control"] == {"type": "ephemeral"}
+
+
 def test_cache_control_none_sends_no_breakpoint_and_a_ttl_is_kept(platform):
     platform.saved = SavedPrompt(agent_name="support", system_prompt="You help.", version_number=4,
                                  content_hash="c" * 64)

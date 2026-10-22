@@ -22,6 +22,10 @@ Per invocation of the agent (one user message):
   that the thread has not shown go into the conversation as one tagged human message after the
   user's (``additional_kwargs["lc_source"] == "decimalai_skills"``), the way Deep Agents adds a
   pinned skill, so earlier messages never change.
+- The agent's always-include skills (set on the agent in DecimalAI) go into the conversation in
+  full as one tagged human message at the thread's first message
+  (``lc_source == "decimalai_always_include"``), and one more when the agent gains another
+  mid-thread. ``load_skill`` answers for them that they are already loaded.
 - Every model call gets that system text and ``load_skill``, whose definition is fixed for the
   thread. The model reads a listed skill's full text with ``load_skill``; it arrives as the tool
   result.
@@ -70,6 +74,8 @@ RUN_KEY = "decimalai_run"
 CONVERSATION_KEY = "decimalai_conversation"
 #: ``additional_kwargs["lc_source"]`` of the human message carrying a later message's new skills.
 SKILLS_SOURCE = "decimalai_skills"
+#: ``additional_kwargs["lc_source"]`` of the human message carrying the always-include skills' text.
+ALWAYS_SOURCE = "decimalai_always_include"
 
 #: Background routing decisions the CallbackHandler waits for when it builds a run's trace.
 _MAX_LATE_DECISIONS = 1024
@@ -120,6 +126,17 @@ def _warn_async_before_311(config: "LangChainAgentConfig") -> None:
         "the model. Use Python 3.11+, or run the agent with .invoke(). Logged once.")
 
 
+def _always_message(texts: List[Tuple[str, str]]) -> HumanMessage:
+    """The always-include skills' full text, as the tagged human message a thread carries."""
+    names = [name for name, _section in texts]
+    return HumanMessage(
+        content=("The full text of skills this agent always uses (already loaded; follow them "
+                 "where they apply):\n\n" + "\n\n".join(section for _name, section in texts)),
+        additional_kwargs={"lc_source": ALWAYS_SOURCE, "decimalai_injected": True,
+                           "decimalai_skills": names},
+    )
+
+
 def _is_ours(message: Any) -> bool:
     kwargs = getattr(message, "additional_kwargs", None)
     return isinstance(kwargs, dict) and bool(kwargs.get("decimalai_injected"))
@@ -161,6 +178,10 @@ class LangChainAgentConfig(AgentBinding):
 
     _VALUES_HINT = ("Pass them as the run's context=... (create_agent(context_schema=...)), "
                     "as attributes or dict keys.")
+
+    #: The always-include skills' text goes into the conversation as a tagged message, so the
+    #: system text a thread keeps stays the prompt and the list.
+    _ALWAYS_IN_SYSTEM = False
 
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
@@ -321,6 +342,20 @@ class LangChainAgentConfig(AgentBinding):
                                        "decimalai_skills": list(new)},
                 )]
                 changed = True
+        from ._config import _disabled_by_init
+
+        always = state.get("always_now")
+        if always is None and not _disabled_by_init():
+            # A later message: always-include skills the agent gained since the thread began.
+            always, versions = self._always_now(skip=record.delivered)
+            if always:
+                names = [name for name, _section in always]
+                record.delivered = [*record.delivered, *names]
+                state["loaded"] = set(state.get("loaded") or ()) | set(names)
+                self._record(delivered=names, delivered_versions=versions)
+                changed = True
+        if always:
+            update["messages"] = [*update.get("messages", []), _always_message(always)]
         if changed:
             update[CONVERSATION_KEY] = record.to_state(self.name)
         return update
@@ -504,8 +539,13 @@ class LangChainAgentConfig(AgentBinding):
     def _handed_over(self, run_key: str, record: Optional[ConversationRecord]) -> SystemMessage:
         # The rails stay set: a node's context ends with the node, after its model call.
         self._open_rails(run_key, record)
-        return SystemMessage(content=record.text if record is not None else "",
-                             additional_kwargs={"decimalai_injected": True})
+        text = record.text if record is not None else ""
+        # No thread state to carry a message in: the always-include skills' text ends the system text.
+        always = (self._run_state(run_key) or {}).get("always_now") or []
+        if always:
+            block = "\n\n".join(section for _name, section in always)
+            text = f"{text}\n\n{block}" if text else block
+        return SystemMessage(content=text, additional_kwargs={"decimalai_injected": True})
 
 
 def _context(state: Any, runtime: Any) -> Dict[str, Any]:

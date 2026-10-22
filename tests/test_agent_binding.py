@@ -46,6 +46,9 @@ class FakePlatform:
         self.requests: list = []
         self.queries: dict = {}
         self._next = 0
+        #: The agent's always-include skills (D-C), name -> version; sent only when set, as an
+        #: older platform sends none.
+        self.always: dict = {}
 
     def request(self, method, path, json=None, params=None, **kwargs):
         self.requests.append((method, path, dict(params or {})))
@@ -60,13 +63,16 @@ class FakePlatform:
             self._next += 1
             routing_id = f"rt_{self._next:024x}"
             self.queries[routing_id] = query
-            return {
+            answer = {
                 "skills": [{"name": n, "description": n} for n in shown],
                 "stable_menu": menu(shown), "menu_instruction": MENU_INSTRUCTION if shown else "",
                 "routing_hint": "", "stable_menu_skills": shown, "routing_id": routing_id,
                 "strategy": "full_menu" if not query else "semantic", "query_ranked": bool(query),
                 "truncated": self.truncated, "rows_total": len(self.skills), "skill_count": len(shown),
             }
+            if self.always:
+                answer["always_include"] = [{"name": n, "version": v} for n, v in self.always.items()]
+            return answer
         if path.startswith("/api/v1/skills/") and path.endswith("/body"):
             name = path.split("/")[-2]
             body = BODIES[name]
@@ -78,6 +84,9 @@ class FakePlatform:
 
     def menu_calls(self):
         return [r for r in self.requests if r[1] in ("/api/v1/skills/menu", "/api/v1/skills/route")]
+
+    def body_calls(self, name):
+        return [r for r in self.requests if r[1] == f"/api/v1/skills/{name}/body"]
 
 
 _RUN: contextvars.ContextVar = contextvars.ContextVar("test_agent_binding_run", default=None)

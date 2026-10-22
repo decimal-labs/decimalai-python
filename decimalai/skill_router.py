@@ -153,6 +153,33 @@ def consume_last_delivered_versions() -> List[Dict[str, str]]:
     return [dict(version) for version in versions or []]
 
 
+#: The agent's always-include skills, from the menu or route answer that this call read:
+#: ``{"name", "version"}`` rows (D-C). Every ``agent_config()`` binding puts their full text into
+#: each run (`SkillRouter.always_include_texts`). An older platform sends none.
+_last_always_include_ctx: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar(
+    "decimalai_skill_router_last_always_include", default=None,
+)
+
+
+def consume_last_always_include() -> List[Dict[str, Any]]:
+    """Read + clear the always-include rows of the most recent `build_prompt_fragment`."""
+    rows = _last_always_include_ctx.get()
+    _last_always_include_ctx.set(None)
+    return [dict(row) for row in rows or []]
+
+
+def _always_include_of(result: Any) -> List[Dict[str, Any]]:
+    """The ``always_include`` rows of a menu or route answer, well-formed ones only."""
+    rows = result.get("always_include") if isinstance(result, dict) else None
+    out: List[Dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        name = row.get("name") if isinstance(row, dict) else None
+        if isinstance(name, str) and name.strip() and name not in [r["name"] for r in out]:
+            version = row.get("version")
+            out.append({"name": name.strip(), "version": version if isinstance(version, int) else None})
+    return out
+
+
 def _release_scoped_routing_rail(router: Any, scope: Optional[str]) -> None:
     """Give back the routing slot a scoped routing call filed under ``scope``.
 
@@ -3108,8 +3135,9 @@ class SkillRouter:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, menu_truncated, experiment, run_prompt) = cached
+                 delivered_versions, menu_truncated, experiment, run_prompt, always) = cached
                 _last_experiment_ctx.set(dict(experiment) if experiment else None)
+                _last_always_include_ctx.set([dict(row) for row in always] or None)
                 _last_run_prompt_ctx.set(dict(run_prompt) if run_prompt else None)
                 # The hit re-offers the same decision, so this run's loads name
                 # it — the cache key carries the scope, so the miss filed it
@@ -3155,6 +3183,7 @@ class SkillRouter:
         _last_menu_truncated_ctx.set(None)
         _last_experiment_ctx.set(None)
         _last_run_prompt_ctx.set(None)
+        _last_always_include_ctx.set(None)
 
         # How long the routing call took: a failure is cached only when
         # retrying it would cost the turn that time again (see below).
@@ -3211,6 +3240,8 @@ class SkillRouter:
         run_prompt = result.get("prompt") if isinstance(result.get("prompt"), dict) else None
         _last_experiment_ctx.set(dict(experiment) if experiment else None)
         _last_run_prompt_ctx.set(dict(run_prompt) if run_prompt else None)
+        always = _always_include_of(result)
+        _last_always_include_ctx.set([dict(row) for row in always] or None)
         # Expose the offered skill names via a contextvar so
         # framework adapters can stamp them onto RunTrace.skills_offered_in_prompt
         # without having to extend this method's return signature.
@@ -3408,7 +3439,7 @@ class SkillRouter:
             self._fragment_cache.set(
                 cache_key,
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, menu_truncated, experiment, run_prompt),
+                 delivered_versions, menu_truncated, experiment, run_prompt, always),
                 ttl_seconds=_UNSCOPED_FAILURE_TTL_S if failure_only and not scope else None,
             )
         return fragment, routing_id
@@ -3484,6 +3515,66 @@ class SkillRouter:
             return fragment, "", routing_id
         prefix, tail = parts
         return prefix, tail, routing_id
+
+    def always_include_texts(
+        self, rows: List[Dict[str, Any]], *, agent_name: Optional[str] = None,
+    ) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
+        """The full text of an agent's always-include skills, for its runs.
+
+        ``rows`` are a menu or route answer's ``always_include`` rows
+        (`consume_last_always_include`). Returns ``(texts, versions)``: ``(name, section)`` per
+        skill whose complete text came back, in the platform's order, each section a
+        ``## Skill: <name>`` heading and the text; and their version witnesses (delivery, never a
+        load). A text that
+        comes back partial, empty or over the per-body limit is left out, and so is one that no
+        longer fits the body token budget. Each is logged: the agent asked for that skill in
+        every run, and this run does not get it.
+        """
+        texts: List[Tuple[str, str]] = []
+        names: List[str] = []
+        versions: List[Dict[str, str]] = []
+        tokens_used = 0
+        effective_agent = agent_name or self.agent_name
+        for row in rows:
+            name = row.get("name") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not name or name in names:
+                continue
+            options: Dict[str, Any] = {"max_chars": self.per_body_char_limit}
+            if effective_agent is not None:
+                options["agent_name"] = effective_agent
+            # As the injection path does: never inherit a previous fetch's hash.
+            _body_hash_tls.value = None
+            _body_hash_tls.partial = None
+            _body_hash_tls.identity = None
+            try:
+                body = self.get_skill_body(name, **options)
+            except Exception:  # noqa: BLE001 - one skill's text must never cost the run
+                logger.warning("DecimalAI: always-include skill %r could not be fetched; this run does "
+                               "not get its text.", name, exc_info=True)
+                continue
+            content_hash = getattr(_body_hash_tls, "value", None)
+            partial = getattr(_body_hash_tls, "partial", None)
+            if (partial is True or (partial is None and _body_is_known_partial(body))
+                    or not (body and body.strip())):
+                logger.warning("DecimalAI: always-include skill %r came back without its complete "
+                               "text; this run does not get it.", name)
+                continue
+            body = body.strip()
+            tokens = estimate_tokens(body)
+            if len(body) > self.per_body_char_limit or tokens_used + tokens > self.body_token_budget:
+                logger.warning(
+                    "DecimalAI: always-include skill %r (~%d tokens) does not fit the %d-token budget "
+                    "for skill text (or the %d-character limit for one skill), so runs do not get it.",
+                    name, tokens, self.body_token_budget, self.per_body_char_limit)
+                continue
+            tokens_used += tokens
+            texts.append((name, f"## Skill: {name}\n\n{body}"))
+            names.append(name)
+            if isinstance(content_hash, str) and content_hash:
+                witness = {"name": name, "hash": content_hash}
+                witness.update(getattr(_body_hash_tls, "identity", None) or {})
+                versions.append(witness)
+        return texts, versions
 
     def sync_skills(
         self,
@@ -3782,6 +3873,31 @@ class SkillRouter:
             # answers "noop", which leaves the same state.
             "DELETE", _agent_skill_path(agent_name, skill_id), replay_safe=True,
         )
+
+    def set_always_include(
+        self, agent_name: str, skill: str, always_include: bool = True,
+    ) -> Dict[str, Any]:
+        """Put a skill's full text into every run of one agent, or stop.
+
+        Every ``agent_config()`` binding then gives the agent's runs the skill's text instead of
+        leaving the model to load it: for a skill nearly every answer needs, like a reply format.
+        The skill must be assigned to the agent first (``assign_skill``, or
+        ``sync_skills(agent_name=...)``); the platform answers 404 otherwise. The dashboard's
+        "Always include" on the agent's skill does the same.
+
+        Args:
+            agent_name: The agent's name in DecimalAI.
+            skill: The skill's name or id. A registry skill whose name has a ``/``
+                (``owner/name``) by its id: the route takes one path segment.
+            always_include: ``False`` turns it off again.
+
+        Returns:
+            ``{"status": "ok", "agent_name", "skill_id", "skill_name", "always_include",
+            "changed"}``; ``changed`` is False when it already was so.
+        """
+        path = _agent_skill_path(agent_name, skill) + "/always-include"
+        # Idempotent: a repeat answers changed=False and leaves the same state.
+        return self._request("PUT", path, json={"always_include": bool(always_include)}, replay_safe=True)
 
     # ── Versions ─────────────────────────────────────────
 

@@ -320,6 +320,60 @@ def test_a_hand_built_graph_uses_system_message_and_tools(platform):
     assert trace.agent_name == "support" and trace.skills_loaded_by_agent == ["damaged-item"]
 
 
+# ── always-include skills (D-C): a tagged message, never the system text ─────────────────
+def always_messages(seen) -> List[HumanMessage]:
+    return [m for m in seen["messages"] if isinstance(m, HumanMessage)
+            and m.additional_kwargs.get("lc_source") == lcc.ALWAYS_SOURCE]
+
+
+def test_the_always_include_text_is_one_tagged_message_at_the_threads_first_message(platform):
+    platform.always = {"order-support": 1}
+    support = lcc.LangChainAgentConfig(saved_prompt(), fallback=None, on_unavailable="continue")
+    agent = make_agent(support)
+    handler = lc.CallbackHandler(auto_send=False)
+    ask(agent, "My keyboard arrived cracked.", thread="chat", handler=handler)
+
+    first = SEEN[0]
+    (tagged,) = always_messages(first)
+    assert "## Skill: order-support" in tagged.content and "Use lookup_order" in tagged.content
+    assert tagged.additional_kwargs["decimalai_skills"] == ["order-support"]
+    assert "## Skill:" not in first["system"], "the system text a thread keeps is the prompt and the list"
+    humans = [m for m in first["messages"] if isinstance(m, HumanMessage)]
+    assert humans[0].content == "My keyboard arrived cracked." and humans[1] is not None
+    trace = handler.get_trace()
+    # Delivered: the always-included skill, and the one the model loaded (a load delivers too).
+    assert trace.skills_delivered == ["damaged-item", "order-support"]
+    assert trace.skills_loaded_by_agent == ["damaged-item"]
+    assert "order-support" in [v["name"] for v in trace.skills_delivered_versions]
+
+    SEEN.clear()
+    ask(agent, "Where is my order?", thread="chat")
+    assert len(always_messages(SEEN[0])) == 1, "the thread already has it: not sent again"
+    assert SEEN[0]["system"] == first["system"]
+
+
+def test_an_always_include_skill_gained_mid_thread_arrives_on_the_next_message(platform):
+    support = lcc.LangChainAgentConfig(saved_prompt(), fallback=None, on_unavailable="continue")
+    agent = make_agent(support)
+    ask(agent, "My keyboard arrived cracked.", thread="chat")
+    assert always_messages(SEEN[-1]) == []
+
+    platform.always = {"order-support": 1}
+    support._route_run(None, [], "the agent's list changed")   # the copy follows
+    SEEN.clear()
+    WANT["skill"] = None
+    ask(agent, "Where is my order?", thread="chat")
+    (tagged,) = always_messages(SEEN[0])
+    assert tagged.additional_kwargs["decimalai_skills"] == ["order-support"]
+
+
+def test_a_hand_built_graph_gets_the_always_include_text_in_its_system_message(platform):
+    platform.always = {"order-support": 1}
+    support = lcc.LangChainAgentConfig(saved_prompt(), fallback=None, on_unavailable="continue")
+    system = support.system_message([HumanMessage("Where is my order?")], context=SAM)
+    assert system.content.startswith("Hello Sam") and system.content.endswith("Use lookup_order for order facts.")
+
+
 # ── what a run leaves behind, and the switches ──────────────────────────────────────────
 def test_an_untraced_run_leaves_nothing_on_the_router(platform):
     support = lcc.LangChainAgentConfig(saved_prompt(), fallback=None, on_unavailable="continue")

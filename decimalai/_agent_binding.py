@@ -342,6 +342,10 @@ class AgentBinding:
     #: How a caller passes variables' values, said in `MissingPromptVariable`.
     _VALUES_HINT = "Pass them as variables=..., as attributes or dict keys."
 
+    #: Where the agent's always-include skills' text goes: after the skill list in the system
+    #: text (True), or somewhere the framework module puts it itself (LangChain: a tagged message).
+    _ALWAYS_IN_SYSTEM = True
+
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         self.name: str = prompt.agent_name
         self._fallback = fallback
@@ -367,6 +371,9 @@ class AgentBinding:
         #: The agent's running experiment, as the last routing answer named it (skills-first
         #: Phase 3), or None. While one runs, every run routes first, so its arm is its own.
         self._experiment: Optional[Dict[str, Any]] = None
+        #: The agent's always-include skills (D-C), as the last routing answer listed them, with
+        #: their text: fetched again only when the list or a version changes.
+        self._always: Dict[str, Any] = {"key": None, "texts": [], "versions": []}
 
     # ── the seams a framework supplies ───────────────────────
     def _router(self) -> Any:
@@ -607,6 +614,9 @@ class AgentBinding:
                 # A skill whose text is already in the instructions is not sent again.
                 "loaded": set(delivered) if tool else set(),
                 "delivered": delivered, "delivered_versions": versions,
+                # Gets the agent's always-include skills' text (D-C); the kill switch and a
+                # blocked agent's early answer in `_begin_run` do not.
+                "always_on": True,
             }
             if run_key is not None:
                 self._runs[plan["key"]] = state
@@ -678,6 +688,22 @@ class AgentBinding:
 
             # The usage sentence names the load_skill tool, so only beside it.
             menu = f"{state['prefix']}\n{LOAD_SKILL_PROMPT_HINT}" if state["tool"] else state["prefix"]
+        # The always-include skills (D-C): their full text in every run, but one this run's own
+        # text already pasted. Part of the skill section, so a conversation keeps it with the list.
+        always, always_versions = (
+            self._always_now(skip=state["delivered"]) if state.get("always_on") else ([], []))
+        state["always_now"] = always
+        if always:
+            if self._ALWAYS_IN_SYSTEM:
+                block = "\n\n".join(section for _name, section in always)
+                menu = f"{menu}\n\n{block}" if menu else block
+            names = [name for name, _section in always]
+            state["delivered"] = [*state["delivered"], *names]
+            state["delivered_versions"] = [*state["delivered_versions"], *always_versions]
+            if state["tool"]:
+                # Its text is already in the run: load_skill answers so instead of sending it again.
+                state["loaded"] = set(state["loaded"]) | set(names)
+        if menu:
             text = f"{text}\n\n{menu}" if text else menu
         self._on_compose(agent)
         prompt_record = self._prompt_record(prompt, template, state["unavailable"], agent)
@@ -810,10 +836,15 @@ class AgentBinding:
         # A version witness an earlier, failed build left in this context must not
         # be read as this build's (on the synchronous path the context is the caller's).
         consume_last_delivered_versions()
-        from .skill_router import consume_last_experiment, consume_last_run_prompt
+        from .skill_router import (
+            consume_last_always_include,
+            consume_last_experiment,
+            consume_last_run_prompt,
+        )
 
         consume_last_experiment()
         consume_last_run_prompt()
+        consume_last_always_include()
         try:
             if self._keyless or mark is None:
                 prefix, _tail, routing_id = router.build_prompt_parts(
@@ -835,6 +866,10 @@ class AgentBinding:
         versions = copy_delivered_versions(consume_last_delivered_versions())
         experiment = consume_last_experiment()
         run_prompt = consume_last_run_prompt()
+        always = consume_last_always_include()
+        if prefix or routing_id:
+            # An answer: the agent's always-include list is as it says, none included.
+            self._store_always(always)
         if mark is not None and not self._keyless and (prefix or routing_id):
             # A marked answer says whether the agent runs an experiment: named, or not.
             with self._lock:
@@ -842,6 +877,32 @@ class AgentBinding:
         if not inject:
             delivered, versions = [], []
         return prefix or "", offered, routing_id, truncated, delivered, versions, run_prompt
+
+    def _store_always(self, rows: List[Dict[str, Any]]) -> None:
+        """Keep the always-include skills' text, fetched again only when the list changes."""
+        key = tuple((row.get("name"), row.get("version")) for row in rows)
+        with self._lock:
+            if key == self._always["key"]:
+                return
+        texts: List[Tuple[str, str]] = []
+        versions: List[Dict[str, str]] = []
+        router = self._skill_router()
+        if rows and router is not None and callable(getattr(router, "always_include_texts", None)):
+            try:
+                texts, versions = router.always_include_texts(rows, agent_name=self.name)
+            except Exception:  # noqa: BLE001 - the next answer tries again
+                self._log.debug("could not fetch the always-include skills' text", exc_info=True)
+                return
+        with self._lock:
+            self._always = {"key": key, "texts": list(texts), "versions": [dict(v) for v in versions]}
+
+    def _always_now(self, skip: Any = ()) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
+        """The always-include texts and their versions now, but those named in ``skip``."""
+        with self._lock:
+            texts = [(name, text) for name, text in self._always["texts"] if name not in skip]
+            names = {name for name, _text in texts}
+            versions = [dict(v) for v in self._always["versions"] if v.get("name") in names]
+        return texts, versions
 
     def _store_menu(
         self, prefix: str, offered: List[str], routing_id: Optional[str], truncated: bool,
