@@ -37,9 +37,20 @@ don't have to:
    per-call handler is traced TWICE — it asserts one trace and gets two.
    The ``_clear_langchain_global_handler`` autouse fixture below is that
    missing teardown.
+
+4. **The SDK's ContextVars are put back after each test.** pytest runs every
+   test in one thread and one Context, so a ContextVar a test sets outside a
+   runnable stays set for every test after it — and the SDK sets them there
+   by design: a bare ``llm.invoke()`` routes in its caller's Context, which is
+   where that turn's skill-load budget lives. One kill-switch test that left
+   its budget behind made every later unscoped ``load_skill`` in the session
+   charge that same three-body budget, until loads in unrelated tests came
+   back "budget exhausted" and recorded nothing. The
+   ``_restore_sdk_context_vars`` autouse fixture below restores each one.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import sys
 import weakref
@@ -316,6 +327,43 @@ def _restore_sdk_config():
         if pkg is not None:
             pkg._global_client = saved[2]
 
+
+
+@pytest.fixture(autouse=True)
+def _restore_sdk_context_vars():
+    """Put every module-level ``decimalai*`` ContextVar back after each test.
+
+    See concern 4 in the module docstring. Resetting a token restores the
+    exact earlier state, "never set" included, so a test still sees the value
+    it inherited. A var with no default that was never set gets no token (one
+    would have to change it), and a module first imported during the test is
+    not covered: neither was there to snapshot.
+    """
+    tokens = []
+    seen = set()
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not (name == "decimalai" or name.startswith("decimalai.")):
+            continue
+        for value in list(vars(mod).values()):
+            if not isinstance(value, contextvars.ContextVar) or id(value) in seen:
+                continue
+            seen.add(id(value))
+            try:
+                # The var's own default when it was never set: setting that
+                # changes nothing the test can see, and the reset below puts
+                # "never set" back.
+                current = value.get()
+            except LookupError:
+                continue
+            tokens.append((value, value.set(current), current))
+    try:
+        yield
+    finally:
+        for var, token, current in reversed(tokens):
+            try:
+                var.reset(token)
+            except (RuntimeError, ValueError):
+                var.set(current)
 
 @pytest.fixture(autouse=True)
 def _clear_langchain_global_handler():
