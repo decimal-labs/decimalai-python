@@ -21,6 +21,10 @@ Each cell builds the agent the way ``decimalai init`` and the docs build it:
                                   because litellm pins openai<3 (skips elsewhere)
     langchain-openai              create_agent("openai:...", middleware=[support.middleware])
     langchain-anthropic           the same, on Claude
+    langgraph_stategraph-openai   a hand-built LangGraph StateGraph: the model node takes
+                                  support.system_message(...), the graph binds support.tools
+                                  and runs them in a ToolNode (the LangChain page's "A
+                                  hand-built graph"), the most common LangGraph shape on GitHub
 
 ADK on Gemini has its own file, ``test_framework_live_adk_skill_delivery.py``, which this one
 generalizes.
@@ -103,6 +107,7 @@ _CELLS = [
     pytest.param("adk", "openai", id="adk-openai"),
     pytest.param("langchain", "openai", id="langchain-openai"),
     pytest.param("langchain", "anthropic", id="langchain-anthropic"),
+    pytest.param("langgraph_stategraph", "openai", id="langgraph_stategraph-openai"),
     pytest.param("pydantic_ai", "anthropic", id="pydantic_ai-anthropic"),
     pytest.param("anthropic_messages", "anthropic", id="anthropic_messages-anthropic"),
 ]
@@ -382,8 +387,52 @@ def _langchain(provider: str, model: str, agent_name: str, *, skills: bool) -> s
     return final_text(agent.invoke(ask))
 
 
+def _langgraph_stategraph(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
+    pytest.importorskip("langgraph.graph")
+    pytest.importorskip(f"langchain_{provider}")
+    from langchain.chat_models import init_chat_model
+    from langchain_core.messages import SystemMessage
+    from langgraph.graph import START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode, tools_condition
+
+    def final_text(result) -> str:
+        return str(result["messages"][-1].text or "")   # a property in langchain-core 1.x
+
+    ask = {"messages": [{"role": "user", "content": _QUERY}]}
+    llm = init_chat_model(f"{provider}:{model}")
+    if not skills:
+        def plain(state: MessagesState):
+            return {"messages": [llm.invoke([SystemMessage(_INSTRUCTION), *state["messages"]])]}
+
+        graph = StateGraph(MessagesState)
+        graph.add_node("model", plain)
+        graph.add_edge(START, "model")
+        return final_text(graph.compile().invoke(ask))
+
+    from decimalai.langchain import agent_config
+
+    # As the LangChain page's "A hand-built graph" writes it: the model node takes the run's
+    # system message, and the graph binds the config's tools (load_skill) and runs them.
+    support = agent_config(agent_name)
+    tools = [*support.tools]
+    bound = llm.bind_tools(tools)
+
+    def call_model(state: MessagesState, runtime):
+        system = support.system_message(state["messages"], context=runtime.context)
+        return {"messages": [bound.invoke([system, *state["messages"]])]}
+
+    builder = StateGraph(MessagesState, context_schema=dict)
+    builder.add_node("model", call_model)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_edge(START, "model")
+    builder.add_conditional_edges("model", tools_condition)
+    builder.add_edge("tools", "model")
+    return final_text(builder.compile().invoke(ask, context={}))
+
+
 _RUNNERS = {
     "langchain": _langchain,
+    "langgraph_stategraph": _langgraph_stategraph,
     "openai_agents": _openai_agents,
     "pydantic_ai": _pydantic_ai,
     "anthropic_messages": _anthropic_messages,

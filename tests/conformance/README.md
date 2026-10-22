@@ -472,7 +472,12 @@ after the global install), `openai-agents:sandbox_agent`,
 loop inside `agent_config(name).run(message)`, taking `run.tool_params` and
 answering `load_skill` with `run.tool_result(block)`, over `messages.create()` and over
 `messages.stream()`) and `anthropic:async_tool_runner` (`async with` around the
-async Tool Runner).
+async Tool Runner); the raw OpenAI SDK's two, `openai:responses_api_loop` (the same
+run on the Responses API, `run.response_tools`) and `openai:async_chat_loop` (`async
+with` around an `AsyncOpenAI` loop answering with `await run.atool_result(call)`); and
+`langchain:hand_built_graph` (a `StateGraph` whose model node takes
+`support.system_message(...)` and binds `support.tools`, the most common LangGraph
+shape, which has no middleware to take).
 
 ### The delivery axis (D1)
 

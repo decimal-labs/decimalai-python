@@ -34,6 +34,7 @@ from . import (
     Ctx,
     Driver,
     DriverError,
+    Shape,
     StubTurn,
     fanout_threads,
     stub_script,
@@ -289,6 +290,33 @@ def run_conversation(ctxs: Sequence[Ctx]) -> Any:
     return agent.invoke(_ask(second), thread)
 
 
+def _hand_built_graph(ctxs: Sequence[Ctx]) -> Any:
+    """The page's "A hand-built graph": a StateGraph whose model node takes
+    ``support.system_message(state["messages"], context=runtime.context)`` and binds
+    ``support.tools`` beside its own, run in a ToolNode. It has no middleware to take."""
+    from langgraph.graph import START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode, tools_condition
+
+    out = []
+    for ctx in ctxs:
+        support = _config(ctx, {})
+        tools = [_tool(ctx), *support.tools]
+        bound = _stub_model(ctx, script=_skill_script(ctx)).bind_tools(tools)
+
+        def call_model(state: MessagesState, runtime: Any, bound: Any = bound, support: Any = support) -> Any:
+            system = support.system_message(state["messages"], context=runtime.context)
+            return {"messages": [bound.invoke([system, *state["messages"]])]}
+
+        builder = StateGraph(MessagesState, context_schema=dict)
+        builder.add_node("model", call_model)
+        builder.add_node("tools", ToolNode(tools))
+        builder.add_edge(START, "model")
+        builder.add_conditional_edges("model", tools_condition)
+        builder.add_edge("tools", "model")
+        out.append(builder.compile().invoke(_ask(ctx), context={}))
+    return out
+
+
 DRIVER = Driver(
     name="langchain",
     covers=frozenset({"langchain", "langgraph"}),
@@ -304,6 +332,17 @@ DRIVER = Driver(
     run_unnamed=run_unnamed,
     run_conversation=run_conversation,
     loads_agent_from_platform=True,
+    shapes=(
+        Shape(
+            name="hand_built_graph",
+            doc=(
+                "a hand-built StateGraph whose model node takes support.system_message(...) "
+                "and binds support.tools, run in a ToolNode"
+            ),
+            run=_hand_built_graph,
+            routed=True,
+        ),
+    ),
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,
