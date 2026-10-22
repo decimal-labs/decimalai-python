@@ -411,6 +411,16 @@ def test_instructions_keep_the_developers_order_of_capabilities(platform):
     assert text.startswith("CALLER RULES.\n\nFIRST.\n\nHello Sam.") and text.endswith("LAST.")
 
 
+def test_the_config_reads_as_a_capability_with_load_skill(platform):
+    """What a caller (the fleet's preflight) reads off the config: its toolset holds load_skill,
+    and it is a Pydantic AI capability."""
+    from pydantic_ai.capabilities import AbstractCapability
+
+    support = pai.agent_config("support")
+    assert isinstance(support, AbstractCapability) and callable(support.get_instructions)
+    assert list(support.get_toolset().tools) == ["load_skill"]
+
+
 def test_two_configs_never_compare_equal(platform):
     first, second = pai.agent_config("support"), pai.agent_config("support")
     assert first != second and first == first

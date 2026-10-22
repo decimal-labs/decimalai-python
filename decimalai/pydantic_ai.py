@@ -645,6 +645,14 @@ def _config_class() -> Any:
                     CombinedCapability.__init__(self, capabilities=[
                         _RunSpan(self, part_id + "-run"), _Skills(self, part_id)])
 
+                def get_toolset(self) -> Any:
+                    """``load_skill``'s toolset, the parts' only one (what this read before 0.25).
+
+                    The fleet's preflight proves the binding by its ``tools``. Instructions are
+                    not overridden: Pydantic AI places each part's by the part's own position.
+                    """
+                    return self._toolset
+
                 # One config is one object: Pydantic AI's base is a dataclass, whose
                 # generated equality would make two agents' configs compare equal.
                 __eq__ = object.__eq__
