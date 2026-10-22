@@ -208,7 +208,7 @@ def _result_message(api: str, call_id: Any, text: str) -> Dict[str, Any]:
 class Conversation:
     """Messages that share one ``system`` and one ``load_skill`` definition.
 
-    Made by :meth:`OpenAIAgentConfig.conversation`. Its first run composes the
+    Made by :meth:`OpenAISDKAgentConfig.conversation`. Its first run composes the
     system text (the prompt filled from ``variables``, then the skill list) and the
     tool; every later run reuses both, byte for byte, and is still routed on its
     own message. Keep one per chat, beside the chat's message history; a server
@@ -223,7 +223,7 @@ class Conversation:
         id: This conversation's id; its runs' traces carry it as ``session_id``.
     """
 
-    def __init__(self, config: "OpenAIAgentConfig", variables: Any,
+    def __init__(self, config: "OpenAISDKAgentConfig", variables: Any,
                  record: Optional[ConversationRecord] = None,
                  conversation_id: Optional[str] = None) -> None:
         self._config = config
@@ -288,7 +288,7 @@ class Run:
         response_tools: ``load_skill`` for the Responses API's ``tools=``.
     """
 
-    def __init__(self, config: "OpenAIAgentConfig", conversation: Conversation,
+    def __init__(self, config: "OpenAISDKAgentConfig", conversation: Conversation,
                  message: Optional[str]) -> None:
         self._config = config
         self._conversation = conversation
@@ -705,7 +705,7 @@ class Run:
 # ── the config ───────────────────────────────────────────────
 
 
-class OpenAIAgentConfig(AgentBinding):
+class OpenAISDKAgentConfig(AgentBinding):
     """One agent's prompt and skills in DecimalAI, for the OpenAI SDK.
 
     Made by :func:`agent_config`. Open one run per user message::
@@ -730,7 +730,7 @@ class OpenAIAgentConfig(AgentBinding):
 
     def __repr__(self) -> str:
         return (
-            f"OpenAIAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
+            f"OpenAISDKAgentConfig(name={self.name!r}, prompt_version={self.prompt_version!r}, "
             f"skills={self.skill_names!r})"
         )
 
@@ -902,7 +902,7 @@ def agent_config(
     fallback: Optional[str] = None,
     on_unavailable: str = "continue",
     on_trace: Any = None,
-) -> OpenAIAgentConfig:
+) -> OpenAISDKAgentConfig:
     """Pull an agent's prompt and skills from DecimalAI, for the OpenAI SDK.
 
     ::
@@ -959,8 +959,8 @@ def agent_config(
     prompt = _open_prompt(agent_name, fallback)
     if not prompt.keyless:  # keyless runs are traced nowhere
         _turn_on_tracing()
-    return OpenAIAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable,
+    return OpenAISDKAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable,
                              on_trace=on_trace)
 
 
-__all__ = ["Conversation", "OpenAIAgentConfig", "Run", "agent_config"]
+__all__ = ["Conversation", "OpenAISDKAgentConfig", "Run", "agent_config"]

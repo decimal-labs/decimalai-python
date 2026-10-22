@@ -477,7 +477,12 @@ run on the Responses API, `run.response_tools`) and `openai:async_chat_loop` (`a
 with` around an `AsyncOpenAI` loop answering with `await run.atool_result(call)`); and
 `langchain:hand_built_graph` (a `StateGraph` whose model node takes
 `support.system_message(...)` and binds `support.tools`, the most common LangGraph
-shape, which has no middleware to take).
+shape, which has no middleware to take); and the Gemini API's two,
+`google-genai:hand_written_loop` (a `generate_content` loop taking `run.tool_params` and
+answering with `run.tool_result(call)`) and `google-genai:async_chat` (`async with`
+around a `client.aio` chat with automatic function calling). The Gemini driver's stub is
+`drivers/_gemini_wire.py`, reached through `HttpOptions(base_url=...)`; its tracing half
+is `init(google=True)`, which had no driver until 0.25.
 
 ### The delivery axis (D1)
 
@@ -570,8 +575,9 @@ artifact in the one cell that exists to be channel-agnostic.
 
 **Which frameworks get a cell** is read off `decimalai/cli/scaffold.py`
 directly — `SUPPORTED_FRAMEWORKS` today is langchain, openai-agents, pydantic-ai, adk,
-anthropic and openai (it was two until 2026-09-03; anthropic joined with its 0.23
-template, openai with its 0.25 one; a doc test keeps this sentence honest). The other four drivers are a
+anthropic, openai and google-genai (it was two until 2026-09-03; anthropic joined with its
+0.23 template, openai and google-genai with their 0.25 ones; a doc test keeps this
+sentence honest). The other four drivers are a
 declared N/A whose reason is the SDK's own
 `UNSCAFFOLDED_WITH_SEAM` / `NO_PROMPT_SEAM` classification, recomputed and
 compared by `test_coverage.test_every_journey_na_is_declared_and_counted`. Write
@@ -771,11 +777,6 @@ never opts out of having a driver.
 
 Stated so nobody mistakes a green cell for a guarantee.
 
-- **`init(google=True)`.** The raw-Google provider rail has no driver: the
-  hermetic tier needs a stub that speaks the provider's wire format, and
-  `google.genai`'s client has no `base_url` seam to point at one the way `openai`
-  and `anthropic` do. Recorded in `PROVIDER_FLAG_DRIVERS` and printed by
-  `test_recorded_provider_gaps_are_visible` on every run, rather than hidden.
 - **The `disk_sync` path.** `instrument()` resolves `disk_sync=False` when the
   skill loader is on, so the `skills` phase never exercises the disk mirror.
   C11 therefore grades the per-call-handler and rail paths but not
@@ -818,7 +819,7 @@ Stated so nobody mistakes a green cell for a guarantee.
   differently for having it. That question needs a real model and belongs to
   the live end-to-end tier that runs against a real backend and a real model.
 - **The journey on a framework with no scaffold.** J1 only exists where
-  `decimalai init` writes a file — six frameworks today. The other four are a
+  `decimalai init` writes a file — seven frameworks today. The other four are a
   declared N/A, and the exemption is only as good as the day somebody writes
   their template.
 - **The journey's own install set.** J1's langchain cell needs `langchain` and

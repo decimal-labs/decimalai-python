@@ -224,6 +224,7 @@ SCAFFOLD_KEYS: Dict[str, Set[str]] = {
     "openai-agents": {"openai-agents"},
     "anthropic": {"anthropic"},
     "openai": {"openai"},
+    "google-genai": {"google-genai"},
     "pydantic-ai": {"pydantic-ai"},
     "llamaindex": {"llamaindex"},
     "claude-agent-sdk": {"claude-agent-sdk"},

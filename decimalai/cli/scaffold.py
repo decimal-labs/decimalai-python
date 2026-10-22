@@ -1150,6 +1150,133 @@ def _render_openai(
     ]
 
 
+def _render_google_genai(
+    agent_name: str, model: str, base_url: Optional[str]
+) -> List[str]:
+    # The run's handle is `turn`, not `run`: inside `def run(...)`, `as run:`
+    # would rebind the function's own name.
+    return [
+        *_import_lines(
+            ["import os"],
+            ["import decimalai",
+             "from decimalai.google_genai import agent_config",
+             "from google import genai",
+             "from google.genai import types"],
+            base_url),
+        "",
+        "# Any Gemini model your Google API key can reach.",
+        f"MODEL = {_py(model)}",
+        *_agent_name_lines(agent_name, load_agent_routes=True),
+        "# The loop's cap on model calls for one question. Loading a skill takes one",
+        "# call of its own; raise it if your agent chains many functions.",
+        "MAX_TURNS = 20",
+        "",
+        "# genai.Client() reads GOOGLE_API_KEY (or GEMINI_API_KEY) when it is made, and",
+        "# fails at the first model call without one. Fail here, before anything runs.",
+        "if not (os.environ.get(\"GOOGLE_API_KEY\") or os.environ.get(\"GEMINI_API_KEY\")",
+        "        or os.environ.get(\"GOOGLE_GENAI_USE_VERTEXAI\", \"\").lower() in (\"1\", \"true\")):",
+        "    raise SystemExit(",
+        "        \"GOOGLE_API_KEY is not set. Run: export GOOGLE_API_KEY=...  (a Gemini API key; \"",
+        "        \"or GOOGLE_GENAI_USE_VERTEXAI=1 with Google Cloud credentials). The `Set:` \"",
+        "        \"block `decimalai init` printed lists every variable this file needs.\"",
+        "    )",
+        "",
+        *_agent_config_lines([
+            "# This agent's prompt and skills, one run per question. Nothing is injected",
+            "# behind your back: run() below passes both to the model.",
+            "#   turn.system  the prompt saved in the dashboard, then the list of this",
+            "#                agent's skills. Re-read at most once a minute, so a prompt",
+            "#                saved in the dashboard reaches a run within a minute, with",
+            "#                no redeploy. {{placeholders}} in it are filled from",
+            "#                support.run(..., variables=...).",
+            "#   turn.tool_params  load_skill, the function the model reads a skill with,",
+            "#                which turn.tool_result(call) answers.",
+            "# Each run is one trace, filed under AGENT_NAME: agent_config() traces the",
+            "# Gemini calls made inside it. With no prompt saved, the agent gets only the",
+            "# skill list: nothing this file made up. Pass agent_config(AGENT_NAME,",
+            "# fallback=...) to supply one.",
+        ]),
+        "",
+        "client = genai.Client()",
+        "",
+        "",
+        "def lookup_order(order_id: str) -> str:",
+        "    \"\"\"Look up an order's status by its id.\"\"\"",
+        "    # An example. Replace it with a call to your own system.",
+        "    return f\"Order {order_id}: shipped, arriving in two days.\"",
+        "",
+        "",
+        "# Your functions: what the model is shown, and the function that answers each.",
+        "# DecimalAI adds load_skill.",
+        "TOOLS: list = [{\"function_declarations\": [{",
+        "    \"name\": \"lookup_order\",",
+        "    \"description\": \"Look up an order's status by its id.\",",
+        "    \"parameters_json_schema\": {",
+        "        \"type\": \"object\",",
+        "        \"properties\": {\"order_id\": {\"type\": \"string\",",
+        "                                     \"description\": \"The order id, for example A1001.\"}},",
+        "        \"required\": [\"order_id\"],",
+        "    },",
+        "}]}]",
+        "FUNCTIONS = {\"lookup_order\": lookup_order}",
+        "",
+        "",
+        "def run(question: str) -> str:",
+        "    \"\"\"One question: call the model and its functions until it answers.",
+        "",
+        "    The question is sent with no earlier messages. For a chat, keep one",
+        "    support.conversation() per chat instead: its system instruction and",
+        "    load_skill stay the same for every message.",
+        "    \"\"\"",
+        "    # Make the model calls inside the `with` block: the run's trace closes with it.",
+        "    with support.run(question) as turn:",
+        "        config = types.GenerateContentConfig(",
+        "            system_instruction=turn.system,",
+        "            # Your own functions go first; DecimalAI adds load_skill.",
+        "            tools=[*TOOLS, *turn.tool_params],",
+        "        )",
+        "        contents = [{\"role\": \"user\", \"parts\": [{\"text\": turn.message}]}]",
+        "        for _ in range(MAX_TURNS):",
+        "            response = client.models.generate_content(model=MODEL, contents=contents, config=config)",
+        "            if not response.function_calls:",
+        "                return response.text or \"\"",
+        "            contents.append(response.candidates[0].content)",
+        "            parts = []",
+        "            for call in response.function_calls:",
+        "                # turn.tool_result() answers load_skill, and returns None for your",
+        "                # own functions, which FUNCTIONS answers.",
+        "                part = turn.tool_result(call)",
+        "                if part is None:",
+        "                    function = FUNCTIONS.get(call.name)",
+        "                    try:",
+        "                        # The model can ask for a function the prompt names but this",
+        "                        # file does not define; saying so lets it carry on.",
+        "                        output = (str(function(**(call.args or {}))) if function",
+        "                                  else f\"There is no function named {call.name!r}.\")",
+        "                    except Exception as exc:  # the model sees the error and can try again",
+        "                        output = f\"Error: {exc}\"",
+        "                    part = {\"function_response\": {\"name\": call.name, \"id\": call.id,",
+        "                                                   \"response\": {\"result\": output}}}",
+        "                parts.append(part)",
+        "            contents.append({\"role\": \"user\", \"parts\": parts})",
+        "    # The model kept calling functions without answering. Usually it is chasing a",
+        "    # function the prompt names but this file does not define: check the Tools line",
+        "    # in your system prompt against TOOLS above.",
+        "    return (",
+        "        f\"[{AGENT_NAME}] stopped after {MAX_TURNS} model calls without an \"",
+        "        \"answer. See the comment in run().\"",
+        "    )",
+        "",
+        "",
+        'if __name__ == "__main__":',
+        '    print(run("What can you help me with?"))',
+        "    # Short-lived scripts exit before the background sender drains. With a key,",
+        "    # agent_config() registers an atexit flush; this makes it explicit. Without",
+        "    # one there is nothing to send, and this does nothing.",
+        "    decimalai.flush()",
+    ]
+
+
 _RENDERERS = {
     "langchain": _render_langchain,
     "openai-agents": _render_openai_agents,
@@ -1157,6 +1284,7 @@ _RENDERERS = {
     "adk": _render_adk,
     "anthropic": _render_anthropic,
     "openai": _render_openai,
+    "google-genai": _render_google_genai,
 }
 
 #: What the user has to install and export for the generated file to run.
@@ -1296,6 +1424,16 @@ def normalize_model(framework: str, model: Optional[str]) -> str:
             f"the first model call.\nTry --model gemini-3.5-flash, or wrap another "
             f"provider in the file: model=LiteLlm(\"openai/{model}\")."
         )
+    if framework == "google-genai":
+        # google-genai calls Gemini and nothing else: another provider's name is a file
+        # that dies on its first model call while `decimalai init` reports success.
+        if re.fullmatch(r"(gemini-.*|gemma-.*|models/.+|projects/.+)", model):
+            return model
+        raise UnusableModel(
+            f"The Gemini API serves Gemini models, and {model!r} is not one — the file "
+            f"would die on its first model call.\nTry --model gemini-3.5-flash, or "
+            f"--framework openai for an OpenAI model."
+        )
     if framework != "pydantic-ai" or model == "test" or ":" in model:
         return model
     raise UnusableModel(
@@ -1372,7 +1510,7 @@ def provider_key(framework: str, model: Optional[str] = None) -> Optional[str]:
         "langchain": _PROVIDER_REQUIREMENTS,
         "pydantic-ai": _PYDANTIC_AI_PROVIDERS,
     }.get(framework)
-    if table is None:  # openai-agents, anthropic: the provider's own key; adk: its own guard
+    if table is None:  # openai-agents, anthropic, openai: the provider's own key; adk, google-genai: their own guard
         vars_ = ENV_VARS[framework]
         return vars_[1] if len(vars_) > 1 else None
     if framework == "pydantic-ai" and model == "test":

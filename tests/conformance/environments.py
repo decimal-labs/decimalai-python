@@ -107,6 +107,9 @@ DRIVER_ENVS: Dict[str, FrozenSet[str]] = {
     # openai 2 (what LiteLLM and CrewAI pin) in the other, where it proves the module
     # works for the code that is stuck on openai<3.
     "openai": _BOTH,
+    # The OpenInference google-genai instrumentor is in the openai 3 environment's
+    # extras (providers-tests) only.
+    "google-genai": _OPENAI3,
     "claude-agent-sdk": _OPENAI3,
     "crewai": _OPENAI2,             # crewai pins openai<3
     # google-adk itself installs in either environment, but the driver's stub

@@ -6,6 +6,29 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: `decimalai.google_genai.agent_config()`, for your own Gemini calls (`google-genai`)
+
+- The same run for the Gemini API's SDK: `with support.run(question, variables=customer) as run:`
+  gives `run.system` (for `system_instruction`), `run.message` (the user turn, as text) and
+  `load_skill` twice: `run.tools` as a Python function, which the SDK's automatic function
+  calling runs (in a chat, as google-genai recommends), and `run.tool_params` as a function
+  declaration for a loop of your own, whose calls `run.tool_result(call)` answers with a
+  `function_response` part (`None` for your own functions). `async with` gives an async
+  function for `client.aio`; `support.conversation()` keeps a chat's instruction and tool.
+- Each run is one trace, filed under the agent, with no other setup (`agent_config()` turns
+  OpenInference's google-genai instrumentor on for its runs only).
+- `decimalai init --framework google-genai` writes a hand-written `generate_content` loop:
+  automatic function calling raises `KeyError` when the model asks for a function you did not
+  pass (a saved prompt can name one), and the file must answer such a call, not crash.
+- The new `[google-genai]` extra installs `google-genai` and the instrumentor. The conformance
+  matrix grades it (and `init(google=True)`, which had no driver) against a stub of
+  `generateContent`.
+
+### Changed: `decimalai.openai`'s config is `OpenAISDKAgentConfig`
+
+- It was `OpenAIAgentConfig`, the name the OpenAI Agents SDK module's config already had, so
+  `print(support)` could not tell the two apart. Unreleased, so nothing else moves.
+
 ### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
 
 - For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an

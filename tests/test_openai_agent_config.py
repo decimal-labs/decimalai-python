@@ -166,7 +166,7 @@ def responses_loop(client, run, *, tools=(LOOKUP_ORDER_RESPONSES,)):
 
 def test_a_chat_completions_loop_gets_the_prompt_the_skill_list_and_load_skill(platform):
     support = do.agent_config("support")
-    assert type(support).__name__ == "OpenAIAgentConfig" and support.name == "support"
+    assert type(support).__name__ == "OpenAISDKAgentConfig" and support.name == "support"
     api = OpenAIStub(("call", "damaged-item"), "answer")
     with support.run("My keyboard arrived cracked.", variables=SAM) as run:
         assert chat_loop(api.client(), run) == "done"

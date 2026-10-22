@@ -161,12 +161,10 @@ PROVIDER_FLAG_DRIVERS: Dict[str, str] = {
     # Pydantic AI driver's documented setup pairs init(openai=True) with its
     # capability, so it exercises the flag too.)
     "openai": "openai",
-    # init(google=True) has no driver: the hermetic tier needs a stub that
-    # speaks the provider's wire format, and google.genai's client has no
-    # base_url seam to point at one the way `openai` and `anthropic` do. This is
-    # a real gap, recorded rather than hidden — see README, "what v1 does not
-    # cover".
-    "google": "",
+    # init(google=True) is the same rail for `google-genai`: the Gemini API
+    # driver's tracing half is that flag around a function-calling loop, against a
+    # stub reached through HttpOptions(base_url=...).
+    "google": "google-genai",
 }
 
 
@@ -201,6 +199,10 @@ EXTRA_SLUGS: Dict[str, Set[str]] = {
     # The Anthropic SDK and its instrumentor, for decimalai.anthropic.agent_config()
     # (0.23+), whose row the capability table gained with it.
     "anthropic": {"anthropic-messages-api"},
+    # The same for the OpenAI SDK and Gemini's (decimalai.openai and
+    # decimalai.google_genai, 0.25+).
+    "openai": {"openai-sdk"},
+    "google-genai": {"gemini-api"},
 }
 
 #: Extras that install no framework adapter, each with the reason. Anything
@@ -209,8 +211,6 @@ EXTRA_SLUGS: Dict[str, Set[str]] = {
 #: automatically (it pulls the same frameworks for a live lane or a test
 #: environment, so requiring a separate driver for it would double-count).
 NON_FRAMEWORK_EXTRAS: Dict[str, str] = {
-    "openai": "the provider SDK for the init(openai=True) rail, not a framework "
-              "— see PROVIDER_FLAG_DRIVERS",
     "evals": "litellm, for the eval runner; instruments nothing",
     "all": "an alias for every runtime extra above; adds no framework of its own",
     "dev": "the unit-test toolchain plus the openai 3 frameworks its tests import",
@@ -1052,6 +1052,7 @@ OBSERVER_SURFACES: Dict[str, str] = {
     # The raw OpenAI SDK module has no instrument(): a run, and its on_trace, come from
     # agent_config(), as on Anthropic.
     "openai": "decimalai.openai:agent_config",
+    "google-genai": "decimalai.google_genai:agent_config",
 }
 
 

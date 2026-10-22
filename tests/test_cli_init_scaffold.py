@@ -194,6 +194,7 @@ class TestTemplateIsCode:
             "adk": "decimalai.adk",
             "anthropic": "decimalai.anthropic",
             "openai": "decimalai.openai",
+            "google-genai": "decimalai.google_genai",
         }[framework]
         assert expected in mods, f"{framework} must import {expected}"
 
@@ -238,6 +239,7 @@ class TestTemplateIsCode:
         "adk": "gemini-2.5-pro",
         "anthropic": "claude-sonnet-5-5",
         "openai": "gpt-5-mini",
+        "google-genai": "gemini-2.5-pro",
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -311,11 +313,12 @@ class TestTemplateIsCode:
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
 #: anthropic's Tool Runner since 0.23, langchain's create_agent middleware since 0.25).
 #: Every template is one now.
-LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic", "openai")
+LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic", "openai",
+                         "google-genai")
 #: How many init() calls each template makes. The agent_config() templates make none
 #: (scaffold.py point 5), except pydantic-ai's exporter, made only with a key.
 INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0,
-              "openai": 0}
+              "openai": 0, "google-genai": 0}
 
 
 def _support_attr(node: ast.AST, attr: str) -> bool:
@@ -362,8 +365,9 @@ class TestSkillLoaderIsOn:
         # agent_config() traces its own runs; anthropic=True would widen that to every
         # Anthropic call in the process, which a one-agent file has no use for.
         "anthropic": None,
-        # The same for openai=True and the OpenAI calls.
+        # The same for openai=True and the OpenAI calls, and google=True and Gemini's.
         "openai": None,
+        "google-genai": None,
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -465,6 +469,36 @@ class TestSkillLoaderIsOn:
         assert f"{{'role': 'system', 'content': {handle}.system}}, {handle}.message" in source
         (answered,) = calls(inside, "tool_result")
         assert ast.unparse(answered.func) == f"{handle}.tool_result"
+
+    def test_google_genai_hands_each_run_to_its_function_calling_loop(self):
+        """A hand-written generate_content loop, not automatic function calling: the SDK's
+        automatic calling raises KeyError when the model asks for a function the file did
+        not pass (a saved prompt can name one), and run() must answer, never raise. Each
+        run opens `support.run(question)`, sends `turn.system` and `turn.message`, offers
+        `*turn.tool_params` after the file's own, and answers with `turn.tool_result(call)`
+        first, all inside the `with` block."""
+        tree = parse(render_agent_file(AGENT, "google-genai", SKILLS))
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "agent_config")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (run_fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"]
+        (block,) = [n for n in ast.walk(run_fn) if isinstance(n, ast.With)]
+        (item,) = block.items
+        assert _support_attr(item.context_expr.func, "run")
+        handle = item.optional_vars.id
+        assert handle != "run", "`as run:` inside def run() rebinds the function's own name"
+        inside = ast.Module(body=block.body, type_ignores=[])
+        (generate,) = calls(inside, "generate_content")
+        assert ast.unparse(generate.func) == "client.models.generate_content"
+        (config,) = calls(inside, "GenerateContentConfig")
+        keywords = {kw.arg: kw.value for kw in config.keywords}
+        assert ast.unparse(keywords["system_instruction"]) == f"{handle}.system"
+        assert [ast.unparse(e) for e in keywords["tools"].elts] == ["*TOOLS", f"*{handle}.tool_params"]
+        assert f"{handle}.message" in ast.unparse(inside)
+        (answered,) = calls(inside, "tool_result")
+        assert ast.unparse(answered.func) == f"{handle}.tool_result"
+        assert calls(inside, "send_message") == [], "no automatic function calling"
 
     def test_anthropic_hands_each_run_to_the_tool_runner(self):
         """Nothing patches the Anthropic SDK since 0.21: the prompt, the skill list and
@@ -1081,6 +1115,24 @@ class TestCliWritesTheFile:
         assert 'pip install "decimalai[anthropic]"' in result.output
         assert 'export ANTHROPIC_API_KEY="..."' in result.output
         assert "OPENAI_API_KEY" not in result.output
+
+    def test_google_genai_next_steps_name_the_extra_and_the_google_key(self, tmp_path, monkeypatch):
+        """`decimalai[google-genai]` carries the SDK and the tracing agent_config() turns on."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--framework", "google-genai"])
+        assert result.exit_code == 0, result.output
+        assert 'pip install "decimalai[google-genai]"' in result.output
+        assert 'export GOOGLE_API_KEY="..."' in result.output
+        assert "OPENAI_API_KEY" not in result.output
+
+    def test_google_genai_refuses_a_model_gemini_does_not_serve(self):
+        from decimalai.cli.scaffold import UnusableModel, normalize_model
+
+        assert normalize_model("google-genai", None) == "gemini-3.5-flash"
+        assert normalize_model("google-genai", "gemini-2.5-pro") == "gemini-2.5-pro"
+        with pytest.raises(UnusableModel, match="--framework openai"):
+            normalize_model("google-genai", "gpt-4o-mini")
 
     def test_openai_next_steps_name_the_extra_and_the_openai_key(self, tmp_path, monkeypatch):
         """`decimalai[openai]` carries the OpenAI SDK and the tracing agent_config() turns on;

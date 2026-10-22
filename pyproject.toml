@@ -124,6 +124,10 @@ dependencies = [
 # AgentMiddleware, before_agent / wrap_model_call, PrivateStateAttr), from 1.4.5. It
 # brings langgraph into a tracing-only install too.
 langchain = ["langchain>=1.4.5", "langchain-core>=1.6.10"]
+# Runtime extra for the Gemini API's SDK (decimalai.google_genai.agent_config()): google-genai,
+# and the OpenInference instrumentor that agent_config() turns on to trace its runs and that
+# init(google=True) uses to trace every call. Floored at the releases the suite runs.
+google-genai = ["google-genai>=2.30.1", "openinference-instrumentation-google-genai>=1.4.13"]
 # Runtime extra for the OpenAI SDK (decimalai.openai.agent_config()): the SDK, and the
 # OpenInference instrumentor that agent_config() turns on to trace its runs and that
 # init(openai=True) uses to trace every call. Floored at the releases the suite runs.
@@ -165,7 +169,7 @@ evals = ["litellm>=1.105.0"]
 # install it in a separate environment. Self-referential, so floors stay defined
 # once in their own extras.
 all = [
-    "decimalai[langchain,openai,openai-agents,claude-agent-sdk,pydantic-ai,adk,anthropic,langgraph,llamaindex]",
+    "decimalai[langchain,openai,openai-agents,claude-agent-sdk,pydantic-ai,adk,anthropic,langgraph,llamaindex,google-genai]",
 ]
 # The unit-test toolchain and nothing else, so the openai 2 environment can have
 # it without `dev`'s openai 3 frameworks.

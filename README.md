@@ -33,11 +33,12 @@ The core install is deliberately thin (tracing, CLI, manifests, skills). Framewo
 pip install "decimalai[langchain]"       # LangChain (add [langgraph] for LangGraph)
 pip install "decimalai[openai-agents]"   # OpenAI Agents SDK
 pip install "decimalai[openai]"          # OpenAI SDK: your own Chat Completions / Responses loop
+pip install "decimalai[google-genai]"    # Gemini API (google-genai): your own Gemini calls
 pip install "decimalai[anthropic]"       # Anthropic Messages API
 pip install "decimalai[all]"             # every framework adapter (not [evals]; see below)
 ```
 
-Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
+Available extras: `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[google-genai]`, `[llamaindex]`, `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
 
 `[evals]` installs litellm, which pins `openai<3`, while `[openai]`, `[openai-agents]` and `[pydantic-ai]` need `openai>=3`. So `[evals]` is not part of `[all]`, and it cannot be installed in the same environment as those three. CrewAI has no extra for the same reason: install `crewai` yourself, beside the adapters that run on `openai<3`.
 
@@ -240,6 +241,33 @@ or LiteLLM's `completion()` takes the same run; only calls made through an `open
 a chat's system text and tool fixed, as on Anthropic. `agent_config()` turns on OpenAI tracing
 (OpenInference's instrumentor, installed by `decimalai[openai]`) for its runs only;
 `init(openai=True)` traces every OpenAI call.
+
+### Gemini API (`google-genai`)
+
+```python
+from google import genai
+from google.genai import types
+from decimalai.google_genai import agent_config
+
+client = genai.Client()
+support = agent_config("support", fallback=BASE_PROMPT)   # reads DECIMAL_API_KEY
+
+with support.run(question, variables=customer) as run:
+    chat = client.chats.create(model="gemini-3.5-flash", config=types.GenerateContentConfig(
+        system_instruction=run.system,          # the agent's saved prompt, then its skill list
+        tools=[lookup_order, *run.tools],       # your functions, then load_skill
+    ))
+    answer = chat.send_message(run.message).text
+```
+
+The same run as the OpenAI and Anthropic modules: one trace per user message, filed under the
+DecimalAI agent. `run.tools` is `load_skill` as a Python function for the SDK's automatic
+function calling; a loop of your own takes `run.tool_params` (a function declaration) and answers
+each of `response.function_calls` with `run.tool_result(call)` (`None` for your own functions).
+Automatic function calling raises `KeyError` when the model asks for a function you did not pass,
+so `decimalai init --framework google-genai` writes the loop instead. `agent_config()` turns on
+Gemini tracing (`decimalai[google-genai]` installs the instrumentor) for its runs only;
+`init(google=True)` traces every Gemini call.
 
 ### Anthropic Messages API
 
@@ -522,6 +550,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | `decimalai.adk` | ✅ | ✅ | from `agent_config()`: `instruction` carries the skill list, `tools` the `load_skill` tool; routed once per invocation on its message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Tool Runner) or `run.tool_params` (`messages.create`) the `load_skill` tool; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
+| `decimalai.google_genai` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (automatic function calling) or `run.tool_params` (your own loop) the `load_skill` tool, answered by `run.tool_result(call)`; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.openai` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Chat Completions) or `run.response_tools` (Responses API) the `load_skill` tool, answered by `run.tool_result(call)`; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
@@ -606,6 +635,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
 | Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
 | OpenAI SDK (Chat Completions / Responses API) | ✅ | `agent_config(name)` from `decimalai.openai`, one `support.run(message)` per user message; traces its own runs |
+| Gemini API (`google-genai`) | ✅ | `agent_config(name)` from `decimalai.google_genai`, one `support.run(message)` per user message; traces its own runs |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |

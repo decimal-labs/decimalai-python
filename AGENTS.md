@@ -26,7 +26,7 @@ pip install "decimalai[all]"   # all framework/provider adapters
 ```
 
 Adapter extras (core stays thin; install the one matching the user's stack):
-`[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[llamaindex]`,
+`[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[google-genai]`, `[llamaindex]`,
 `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
 
 ## Demo / smoke test
@@ -52,8 +52,9 @@ task calls and two semantic judge calls. It is separate from authenticated `init
 import decimalai
 decimalai.init(langchain=True)        # or openai_agents / llamaindex / claude_agent_sdk / crewai / ...
 support = agent_config("support")       # an agent's prompt and skills, from decimalai.openai_agents,
-                                      # .pydantic_ai, .adk, .langchain, .anthropic or .openai (your own
-                                      # OpenAI loop); decimalai.agent_config for any other loop
+                                      # .pydantic_ai, .adk, .langchain, .anthropic, .openai or
+                                      # .google_genai (your own OpenAI / Gemini calls);
+                                      # decimalai.agent_config for any other loop
 @decimalai.trace(agent_name="...")    # manual tracing for any framework
 decimalai.export_manifest(snapshot)   # → an agentversion manifest dict (works offline)
 ```

@@ -16,6 +16,9 @@ Each cell builds the agent the way ``decimalai init`` and the docs build it:
                                   --framework openai` writes it
     openai_responses-openai       the same run on the Responses API: instructions=run.system,
                                   run.response_tools, previous_response_id
+    google_genai-google           decimalai.google_genai.agent_config(): a chat with automatic
+                                  function calling, system_instruction=run.system and
+                                  tools=[*run.tools]; needs a Gemini key (GEMINI_API_KEY)
     adk-openai                    LlmAgent(model=LiteLlm("openai/..."), instruction=support.instruction,
                                   tools=[*support.tools]); runs only in the openai2 environment,
                                   because litellm pins openai<3 (skips elsewhere)
@@ -104,6 +107,7 @@ _CELLS = [
     pytest.param("neutral", "openai", id="neutral-openai"),
     pytest.param("openai_chat", "openai", id="openai_chat-openai"),
     pytest.param("openai_responses", "openai", id="openai_responses-openai"),
+    pytest.param("google_genai", "google", id="google_genai-google"),
     pytest.param("adk", "openai", id="adk-openai"),
     pytest.param("langchain", "openai", id="langchain-openai"),
     pytest.param("langchain", "anthropic", id="langchain-anthropic"),
@@ -119,7 +123,8 @@ _CELLS = [
 def _openinference_instrumentors() -> list:
     found = []
     for module, cls in (("openinference.instrumentation.openai", "OpenAIInstrumentor"),
-                        ("openinference.instrumentation.anthropic", "AnthropicInstrumentor")):
+                        ("openinference.instrumentation.anthropic", "AnthropicInstrumentor"),
+                        ("openinference.instrumentation.google_genai", "GoogleGenAIInstrumentor")):
         try:
             found.append(getattr(__import__(module, fromlist=[cls]), cls))
         except ImportError:
@@ -138,7 +143,7 @@ def _unpatch() -> None:
     for cls in _openinference_instrumentors():
         if cls().is_instrumented_by_opentelemetry:
             cls().uninstrument()
-    for name in ("decimalai.anthropic", "decimalai.openai"):
+    for name in ("decimalai.anthropic", "decimalai.openai", "decimalai.google_genai"):
         try:
             # So the next agent_config() turns its provider's tracing on again.
             __import__(name, fromlist=["_tracing_turned_on"])._tracing_turned_on = False
@@ -323,6 +328,31 @@ def _openai_responses(provider: str, model: str, agent_name: str, *, skills: boo
     return response.output_text or ""
 
 
+def _google_genai(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
+    pytest.importorskip("google.genai")
+    import os
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    if not skills:
+        # A call outside a run: nothing traces it (the instrumentors are off).
+        return client.models.generate_content(
+            model=model, contents=_QUERY,
+            config=types.GenerateContentConfig(system_instruction=_INSTRUCTION)).text or ""
+
+    from decimalai.google_genai import agent_config
+
+    # The module's documented shape: a chat with automatic function calling, no init() line,
+    # since agent_config() traces its own runs.
+    support = agent_config(agent_name)
+    with support.run(_QUERY) as run:
+        chat = client.chats.create(model=model, config=types.GenerateContentConfig(
+            system_instruction=run.system, tools=[*run.tools]))
+        return chat.send_message(run.message).text or ""
+
+
 def _adk(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
     pytest.importorskip("google.adk")
     pytest.importorskip(
@@ -439,6 +469,7 @@ _RUNNERS = {
     "neutral": _neutral,
     "openai_chat": _openai_chat,
     "openai_responses": _openai_responses,
+    "google_genai": _google_genai,
     "adk": _adk,
 }
 

@@ -22,7 +22,7 @@ _WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
           6: "six", 7: "seven", 8: "eight", 9: "nine"}
 
 #: Drivers the matrix runs. The N/A count is this minus the scaffolded ones.
-_DRIVER_COUNT = 10
+_DRIVER_COUNT = 11
 
 
 def test_the_readme_names_every_scaffolded_framework():

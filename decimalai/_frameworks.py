@@ -415,6 +415,41 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "nothing patched (0.25+)",
     ),
     Framework(
+        key="google-genai",
+        title="Gemini API (with `agent_config(...)`)",
+        cli_label="The Gemini API (google-genai)",
+        module="decimalai.google_genai",
+        entry_point="`agent_config(name)`",
+        # `init(google=True)` traces every Gemini call in the process; agent_config()
+        # turns the same tracing on for the calls made inside its runs, so it needs no flag.
+        init_flag=None,
+        init_flag_note="— (no flag; `agent_config()` traces its runs, `google=True` every call)",
+        extra="google-genai",
+        # The template is a chat with automatic function calling: the SDK runs the loop
+        # with the file's own functions and load_skill (`run.tools`).
+        scaffold=TEMPLATE,
+        install='pip install "decimalai[google-genai]"',
+        # google-genai reads GOOGLE_API_KEY ahead of GEMINI_API_KEY; name the one that
+        # wins, as the ADK row does.
+        env_vars=("DECIMAL_API_KEY", "GOOGLE_API_KEY"),
+        default_model="gemini-3.5-flash",
+        capability=Capability(
+            tier="Supported",
+            # What the exporter registers from the traced requests: the model and each
+            # function, by name. Not the system instruction: a run's prompt is the saved
+            # one, whose version each trace names.
+            manifest="✅ partial (model, tools; the prompt by its saved version)",
+            schema_depth="Names only",
+            handoffs="—",
+            skills_rail="`load_skill` tool",
+        ),
+        use_for="Gemini API (`google-genai`) — `agent_config(name)`; each `support.run(question)` "
+                "gives `run.system` (the prompt, then the skill list) for `system_instruction` "
+                "and `load_skill` as a function in `run.tools` for automatic function calling "
+                "(`run.tool_params` and `run.tool_result()` for your own loop); one trace per "
+                "run, nothing patched (0.25+)",
+    ),
+    Framework(
         key="llamaindex",
         title="LlamaIndex",
         cli_label="LlamaIndex",
