@@ -169,10 +169,12 @@ result = agent.run_sync("Where is ORD-1001?", deps=customer)
 
 `support` is a Pydantic AI capability: its instructions are the saved prompt (its `{{variables}}`
 filled from the run's `deps`), then the skill list routed on the run's prompt, and its toolset is
-`load_skill`. It wraps each run in one DecimalAI run span, so a run's model calls are one trace filed
-under the DecimalAI agent. Nothing in Pydantic AI is patched. Traces come from DecimalAI's OpenTelemetry
-exporter: `decimalai.init(otel=True)` plus `Agent.instrument_all()` (Pydantic AI's own spans, any
-provider), or a provider instrumentor such as `decimalai.init(openai=True)`; pick one.
+`load_skill`. Each run is one trace filed under the DecimalAI agent, with no other line:
+`agent_config()` puts DecimalAI's OpenTelemetry exporter on the global tracer provider, sending only
+its runs, and instruments each run of the capability with Pydantic AI's own spans (its model and tool
+calls, any provider); other agents in the process are not instrumented. A run the app already
+instruments (`Agent.instrument_all()`, Logfire) keeps that instrumentation, and one whose model's SDK
+`decimalai.init(openai=True)` traces is not instrumented twice. Nothing in Pydantic AI is patched.
 
 ### Google ADK
 
@@ -632,7 +634,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | OpenAI Agents SDK | ✅ | `agent_config(name)` (tracing only: `init(openai_agents=True)`) |
 | Google ADK | ✅ (native) | `agent_config(name)` + `DecimalAIPlugin()` in `App(plugins=[...])` |
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
-| Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
+| Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])`; traces its own runs |
 | Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
 | OpenAI SDK (Chat Completions / Responses API) | ✅ | `agent_config(name)` from `decimalai.openai`, one `support.run(message)` per user message; traces its own runs |
 | Gemini API (`google-genai`) | ✅ | `agent_config(name)` from `decimalai.google_genai`, one `support.run(message)` per user message; traces its own runs |

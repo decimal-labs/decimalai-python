@@ -67,6 +67,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import sys
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("decimalai.providers")
@@ -286,6 +287,34 @@ def instrument_for_runs(name: str) -> None:
         return
     _instrumented.add(name)
     _note_binding(name, provider, instrumentor, already_on=False)
+
+
+def pipeline_for_runs() -> Any:
+    """The tracer provider a ``agent_config()`` opens its runs on when its framework traces itself.
+
+    Pydantic AI instruments a run with a capability of its own, so there is no
+    instrumentor to turn on: only DecimalAI's exporter, built as ``instrument_for_runs``
+    builds it, on the global tracer provider (created when the app has none) and
+    sending only what DecimalAI runs contain. None without the OpenTelemetry SDK.
+    """
+    from ._config import default_agent_name
+
+    try:
+        return _ensure_pipeline(default_agent_name(None), for_runs=True)
+    except ImportError:
+        return None
+
+
+def traces_calls_of(name: str) -> bool:
+    """Whether OpenInference's instrumentor for ``name`` (a key of ``_PROVIDERS``) is on.
+
+    Cheap enough to ask per run: an instrumentor whose module was never imported
+    cannot be on.
+    """
+    spec = _PROVIDERS.get(name)
+    if spec is None or spec.instrumentor_module not in sys.modules:
+        return False
+    return _instrumentor_on(name)
 
 
 def _sdk_present(sdk_module: str) -> bool:

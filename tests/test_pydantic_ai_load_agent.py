@@ -39,6 +39,9 @@ def platform(monkeypatch):
     monkeypatch.setattr(cfg, "_config", DecimalConfig(api_key="dai_sk_test", base_url=BASE, enabled=True))
     monkeypatch.setattr(cfg, "_client", MagicMock())
     monkeypatch.setattr(binding, "_in_background", lambda fn, *args: fn(*args))
+    # Tracing is tested on its own below (`traced`): here no pipeline, so no run is instrumented.
+    monkeypatch.setattr(pai, "_tracing_turned_on", True)
+    monkeypatch.setattr(pai, "_run_tracer_provider", None)
     fake = FakePlatform()
     router = SkillRouter(api_key="dai_sk_test", base_url=BASE, inject_body=False)
     monkeypatch.setattr(router, "_request", fake.request)
@@ -141,7 +144,14 @@ def test_init_enabled_false_stops_skills_but_not_the_prompt(platform, monkeypatc
     assert platform.menu_calls() == []
 
 
-def test_a_run_is_one_trace_named_for_the_decimalai_agent_with_its_record(platform, monkeypatch):
+# ── tracing: agent_config() alone ───────────────────────────
+
+
+@pytest.fixture
+def traced(platform, monkeypatch):
+    """DecimalAI's real tracing for agent_config(): the exporter it puts on the global tracer
+    provider, here a fresh one standing in for the app's. Yields (that provider, the traces
+    sent, the spans the provider saw)."""
     pytest.importorskip("opentelemetry.sdk.trace")
     from opentelemetry import trace as trace_api
     from opentelemetry.sdk.trace import TracerProvider
@@ -149,71 +159,226 @@ def test_a_run_is_one_trace_named_for_the_decimalai_agent_with_its_record(platfo
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
     import decimalai.otel as otel
+    import decimalai.providers as providers
 
-    exporter = InMemorySpanExporter()
     provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    spans = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(spans))
     monkeypatch.setattr(trace_api, "get_tracer_provider", lambda: provider)
-    rails: dict = {}
-    real_record = otel.record_skill_rail
+    for name in ("_pipeline_provider", "_last_provider", "_pipeline_exporter"):
+        monkeypatch.setattr(providers, name, None)
+    for name in ("_instrumented", "_runs_via_another_tool", "_runs_only"):
+        monkeypatch.setattr(providers, name, set())
+    for name in ("_run_providers", "_explicitly_traced", "_openinference_provider"):
+        monkeypatch.setattr(providers, name, {})
+    # An earlier test's init(otel=True) leaves its provider here, and an exporter built while
+    # one is listed sends every trace, not only runs.
+    monkeypatch.setattr(otel, "_installed_providers", [])
+    sent: list = []
+    monkeypatch.setattr(otel.DecimalSpanExporter, "_send", lambda self, trace: sent.append(trace))
+    monkeypatch.setattr(pai, "_tracing_turned_on", False)
+    monkeypatch.setattr(pai, "_instrumentation_settings", None)
+    yield provider, sent, spans
 
-    def record(**kwargs):
-        rails.setdefault(otel.current_run_key(), []).append(kwargs)
-        return real_record(**kwargs)
 
-    monkeypatch.setattr(otel, "record_skill_rail", record)
+def _names(spans) -> dict:
+    """span name -> its parent's name (None for a root)."""
+    by_id = {span.context.span_id: span.name for span in spans}
+    return {span.name: (by_id.get(span.parent.span_id) if span.parent else None) for span in spans}
+
+
+def test_agent_config_alone_traces_a_run_with_pydantic_ais_own_spans(traced):
+    """No init(otel=True) and no Agent.instrument_all(): the run is one trace, rooted in
+    DecimalAI's run span, carrying Pydantic AI's spans for its two model calls and its tool
+    call, filed under the DecimalAI agent with its record."""
+    import decimalai.otel as otel
+
+    _provider, sent, spans = traced
     support = pai.agent_config("support")
     # An Agent with no name of its own: the trace is still the DecimalAI agent's.
     Agent(FunctionModel(Model(("call", "damaged-item"), "answer")), capabilities=[support],
           deps_type=dict).run_sync("My keyboard arrived cracked.", deps=SAM)
-    (span,) = exporter.get_finished_spans()
-    assert span.name == otel.RUN_SPAN_NAME and span.attributes["decimal.agent_name"] == "support"
-    (run_key,) = rails
-    assert run_key == span.context.trace_id
-    rail = otel._pop_skill_rail(run_key)
-    assert rail["routing_id"] and rail["offered"] == ["damaged-item", "order-support"]
-    assert rail["loaded"] == ["damaged-item"]
-    assert otel._decimal_record_attributes(span)["decimal.prompt.version"] == 4
+    (trace,) = sent
+    assert trace.agent_name == "support" and len(trace.llm_calls) == 2
+    assert trace.skills_loaded_by_agent == ["damaged-item"]
+    assert trace.skills_offered_in_prompt == ["damaged-item", "order-support"] and trace.routing_id
+    tree = _names(spans.get_finished_spans())
+    assert tree[otel.RUN_SPAN_NAME] is None, "DecimalAI's run span is the trace's root"
+    assert tree["invoke_agent agent"] == otel.RUN_SPAN_NAME
+    assert tree["execute_tool load_skill"] == "invoke_agent agent"
+    assert tree["chat function:Model:"] == "invoke_agent agent"
+    run_span = next(s for s in spans.get_finished_spans() if s.name == otel.RUN_SPAN_NAME)
+    assert run_span.attributes["decimal.agent_name"] == "support"
+    assert any(otel._decimal_record_attributes(s).get("decimal.prompt.version") == 4
+               for s in spans.get_finished_spans())
 
 
-def test_under_pydantic_ais_own_instrumentation_the_trace_is_still_the_decimalai_agents(
-        platform, monkeypatch):
-    """`Agent.instrument_all()` is the documented tracing. Its `invoke_agent` span opens before
-    any capability's wrap_run, so it is the trace's root, and the exporter files a trace under
-    its root's `decimal.agent_name` — which that span took from the context when it started:
-    `init(agent_name=...)`'s name. The run is still filed under the DecimalAI agent."""
-    pytest.importorskip("opentelemetry.sdk.trace")
-    from opentelemetry import trace as trace_api
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+def test_only_its_runs_are_instrumented_and_sent(traced):
+    """Another Pydantic AI agent in the process is not instrumented (no global switch), and
+    the app's own spans on the shared provider stay in the process."""
+    provider, sent, spans = traced
+    support = pai.agent_config("support")
+    Agent(FunctionModel(Model("answer"))).run_sync("Hi")  # an agent without the config
+    with provider.get_tracer("app").start_as_current_span("GET /health"):
+        pass
+    assert [s.name for s in spans.get_finished_spans()] == ["GET /health"]
+    assert sent == []
+    agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    (trace,) = sent
+    assert trace.agent_name == "support"
+
+
+def test_a_run_is_a_trace_of_its_own_linked_to_the_span_open_when_it_started(traced):
+    """Inside the app's request span the run is still its own trace (DecimalAI's exporter
+    finalizes a trace at its root), linked to that span."""
+    import decimalai.otel as otel
+
+    provider, sent, spans = traced
+    support = pai.agent_config("support")
+    with provider.get_tracer("app").start_as_current_span("POST /chat") as request:
+        agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    (trace,) = sent
+    (run_span,) = [s for s in spans.get_finished_spans() if s.name == otel.RUN_SPAN_NAME]
+    assert run_span.parent is None
+    assert [link.context.span_id for link in run_span.links] == [request.get_span_context().span_id]
+
+
+def test_a_conversations_runs_share_its_session(traced):
+    _provider, sent, _spans = traced
+    support = pai.agent_config("support")
+    agent = agent_with(support, Model("answer", "answer"))
+    first = agent.run_sync("My keyboard arrived cracked.", deps=SAM)
+    agent.run_sync("Where is my order?", deps=SAM, message_history=first.all_messages())
+    one, two = sent
+    assert one.session_id and one.session_id == two.session_id == first.conversation_id
+
+
+def test_a_later_runs_late_routing_decision_lands_on_its_own_trace(platform, traced, monkeypatch):
+    """A later run shows the local copy at once and routes in the background. Its trace waits
+    for that decision (off the run's path, as the Anthropic and OpenAI runs do), so the
+    decision is on the run's own trace instead of an orphan record."""
+    import contextvars
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from decimalai import _provider_run
+
+    _provider, sent, _spans = traced
+    support = pai.agent_config("support")
+    agent = agent_with(support, Model("answer", "answer"))
+    agent.run_sync("Where is my order?", deps=SAM)  # the first run routes before its model call
+    landed = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    def late(fn, *args):
+        def decide():
+            landed.wait(5)
+            return fn(*args)
+
+        return pool.submit(contextvars.copy_context().run, decide)
+
+    monkeypatch.setattr(binding, "_in_background", late)
+    agent.run_sync("It arrived cracked.", deps=SAM)
+    assert len(sent) == 1, "the run returned; its trace waits for the decision"
+    landed.set()
+    _provider_run._drain_finishing(timeout=5)
+    first, second = sent
+    assert second.routing_id and second.routing_id != first.routing_id
+    assert platform.queries[second.routing_id] == "It arrived cracked."
+
+
+def test_a_run_the_app_instruments_keeps_that_instrumentation_inside_decimalais_span(traced):
+    """`Agent.instrument_all()` / `Agent(instrument=...)` / Logfire: the app's Instrumentation
+    traces the run, once, inside DecimalAI's run span, and keeps Pydantic AI's own name."""
     from pydantic_ai import InstrumentationSettings
 
     import decimalai.otel as otel
 
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(otel._AgentNameStamper())
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    monkeypatch.setattr(trace_api, "get_tracer_provider", lambda: provider)
+    provider, sent, spans = traced
     support = pai.agent_config("support")
     agent = Agent(FunctionModel(Model("answer")), name="pydantic-agent", capabilities=[support],
                   deps_type=dict)
     # The per-agent form of Agent.instrument_all(), which would leave a global switch on.
     agent.instrument = InstrumentationSettings(tracer_provider=provider)
-    token = otel._active_agent_name.set("init-agent")  # what init(agent_name="init-agent") sets
-    try:
-        agent.run_sync("Hi", deps=SAM)
-    finally:
-        otel._active_agent_name.reset(token)
-    spans = list(exporter.get_finished_spans())
-    (root,) = [span for span in spans if span.parent is None]
-    assert root.attributes.get("gen_ai.operation.name") == "invoke_agent"
-    assert root.attributes["decimal.agent_name"] == "support"
-    assert root.attributes["gen_ai.agent.name"] == "pydantic-agent", "Pydantic AI's own name stays"
-    # And the exporter, built with init()'s name as its default, files the trace there.
-    run_trace = otel.DecimalSpanExporter(agent_name="init-agent")._assemble_trace(spans)[0]
-    assert run_trace.agent_name == "support"
+    agent.run_sync("Hi", deps=SAM)
+    finished = spans.get_finished_spans()
+    (framework_run,) = [s for s in finished if s.attributes.get("gen_ai.operation.name") == "invoke_agent"
+                        and s.name != otel.RUN_SPAN_NAME]
+    assert framework_run.attributes["gen_ai.agent.name"] == "pydantic-agent", "Pydantic AI's own name stays"
+    assert _names(finished)[framework_run.name] == otel.RUN_SPAN_NAME
+    (trace,) = sent
+    assert trace.agent_name == "support" and len(trace.llm_calls) == 1
+
+
+def test_a_run_whose_model_sdk_decimalai_traces_is_not_instrumented_again(traced, monkeypatch):
+    """init(openai=True) beside agent_config(): OpenInference records the model calls, so
+    Pydantic AI's spans would report each twice."""
+    import decimalai.otel as otel
+    import decimalai.providers as providers
+
+    _provider, sent, spans = traced
+    monkeypatch.setattr(pai, "_model_sdks", lambda model: {"openai"})
+    monkeypatch.setattr(providers, "traces_calls_of", lambda name: name == "openai")
+    support = pai.agent_config("support")
+    agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    assert [s.name for s in spans.get_finished_spans()] == [otel.RUN_SPAN_NAME]
+    assert len(sent) == 1
+
+
+def test_agent_config_turns_on_tracing_once_and_keyless_runs_are_not_traced(traced, monkeypatch):
+    import decimalai.providers as providers
+
+    _provider, sent, spans = traced
+    calls = []
+    real = providers.pipeline_for_runs
+    monkeypatch.setattr(providers, "pipeline_for_runs", lambda: calls.append(1) or real())
+    pai.agent_config("support")
+    pai.agent_config("support")
+    assert calls == [1]
+
+    monkeypatch.setattr(pai, "_tracing_turned_on", False)
+    monkeypatch.setattr(agent_mod, "_open_prompt", lambda name, fallback: SavedPrompt(
+        agent_name=name, system_prompt=None, keyless=True))
+    keyless = pai.agent_config("support")
+    assert calls == [1] and pai._tracing_turned_on is False
+    spans.clear()
+    agent_with(keyless, Model("answer")).run_sync("Hi", deps=SAM)
+    assert spans.get_finished_spans() == () and sent == []
+
+
+def test_init_enabled_false_stops_the_runs_tracing(traced, monkeypatch):
+    import decimalai._config as cfg
+
+    _provider, sent, spans = traced
+    support = pai.agent_config("support")
+    monkeypatch.setattr(cfg, "_disabled_by_init", lambda: True)
+    agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    assert spans.get_finished_spans() == () and sent == []
+
+
+def test_instructions_keep_the_developers_order_of_capabilities(platform):
+    """The run span is outermost; the prompt and list stay where the developer listed them."""
+    from dataclasses import dataclass
+
+    from pydantic_ai.capabilities import AbstractCapability
+
+    @dataclass
+    class Note(AbstractCapability):
+        text: str = ""
+
+        def get_instructions(self):
+            # A function, as the config's are: Pydantic AI puts plain strings first.
+            async def note(ctx):
+                return self.text
+
+            return note
+
+    support = pai.agent_config("support")
+    model = Model("answer")
+    Agent(FunctionModel(model), instructions="CALLER RULES.", deps_type=dict,
+          capabilities=[Note(text="FIRST."), support, Note(text="LAST.")]).run_sync("Hi", deps=SAM)
+    text = model.requests[0]["instructions"]
+    assert text.startswith("CALLER RULES.\n\nFIRST.\n\nHello Sam.") and text.endswith("LAST.")
 
 
 def test_two_configs_never_compare_equal(platform):

@@ -17,9 +17,8 @@ extension points:
   the run's ``deps``), then the skill list routed on the run's prompt, then one
   sentence naming the tool;
 - its toolset is ``load_skill``, which the model calls for a listed skill's text;
-- ``wrap_run`` opens a DecimalAI run span around each run, so the run's model calls
-  land in one trace, filed under the DecimalAI agent (Pydantic AI's own run span, the
-  trace's root under ``Agent.instrument_all()``, is named for it too).
+- ``wrap_run`` opens a DecimalAI run span around each run, the root of the run's
+  trace, filed under the DecimalAI agent.
 
 Nothing in Pydantic AI is patched, and agents without the capability are untouched.
 Every run is routed on its own prompt: the first run before its first model request,
@@ -34,10 +33,21 @@ run's request ``metadata``, which travels with ``result.all_messages()``, so a r
 given that ``message_history`` (in any process) shows the same text and tool. A newer
 saved prompt or skill list reaches the next conversation.
 
-Tracing is DecimalAI's OpenTelemetry exporter, ``decimalai.init(otel=True)``, carrying
-Pydantic AI's own spans (``Agent.instrument_all()``; any provider) or a provider
-instrumentor's (``decimalai.init(openai=True)``). Pick one, or a model call is reported
-twice.
+Tracing needs no other line. ``agent_config()`` puts DecimalAI's OpenTelemetry exporter
+on the global tracer provider (an app with its own sets it up first), sending only
+DecimalAI runs, and each run of the capability is instrumented with Pydantic AI's own
+``Instrumentation`` (its model calls and tool calls, for any provider), for that run
+alone: other agents in the process are not instrumented. A run is a trace of its own,
+linked to the span open when it started, and a conversation's runs carry its
+``conversation_id`` as the trace's session. A run the app already instruments
+(``Agent.instrument_all()``, ``Agent(instrument=...)``, Logfire) keeps that
+instrumentation, inside DecimalAI's run span; a run whose model's SDK DecimalAI already
+traces (``decimalai.init(openai=True)``, ``anthropic=True``, ``google=True``) is not
+instrumented again, so no model call is reported twice.
+
+``support`` holds two capabilities, which Pydantic AI places apart: the prompt, list and
+tool where you listed it (so instructions keep your order), and the run span outermost,
+around Pydantic AI's ``Instrumentation``, so it is the root of the run's trace.
 
 The harness's ``Skills`` capability is the other way to give an agent skills: files the
 harness loads (``decimalai.pydantic_ai_harness.skills``). An agent that has it gets no
@@ -50,7 +60,7 @@ import logging
 import threading
 from collections import OrderedDict
 from contextvars import ContextVar
-from typing import Any, List, NoReturn, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from decimalai._provider_recovery import retry_model_requests as retry_model_requests
 
@@ -76,6 +86,74 @@ _runs_lock = threading.Lock()
 #: The SkillRouter behind every config. `init()` drops it when a re-init changes
 #: the key or workspace (`decimalai._drop_adapter_skill_routers`).
 _skill_router_singleton: Any = None
+
+#: The tracer provider DecimalAI's exporter for these runs sits on, once a keyed
+#: `agent_config()` turned it on (`_turn_on_tracing`), and the settings of the
+#: Pydantic AI `Instrumentation` a run gets on it.
+_run_tracer_provider: Any = None
+_instrumentation_settings: Any = None
+_tracing_lock = threading.Lock()
+_tracing_turned_on = False
+
+#: Pydantic AI's model modules, by the provider SDK each one calls (a `providers` key).
+_MODEL_SDKS = (
+    ("pydantic_ai.models.openai", "openai"),
+    ("pydantic_ai.models.anthropic", "anthropic"),
+    ("pydantic_ai.models.google", "google"),
+)
+
+
+def _turn_on_tracing() -> None:
+    """DecimalAI's exporter for this module's runs, once per process (`decimalai.anthropic`'s rule)."""
+    global _tracing_turned_on, _run_tracer_provider
+    from ._config import _disabled_by_init
+
+    if _disabled_by_init():
+        return
+    # Held while it is set up: a second first agent_config() on another thread waits for
+    # it, rather than starting a run with nothing to trace it.
+    with _tracing_lock:
+        if _tracing_turned_on:
+            return
+        try:
+            from .providers import pipeline_for_runs
+
+            _run_tracer_provider = pipeline_for_runs()
+        except Exception:
+            logger.warning("DecimalAI could not turn on Pydantic AI tracing (continuing)", exc_info=True)
+        _tracing_turned_on = True
+
+
+def _model_sdks(model: Any) -> set:
+    """The provider SDKs a Pydantic AI model calls, through its wrappers and fallbacks."""
+    found: set = set()
+    seen: set = set()
+    stack = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        module = type(current).__module__ or ""
+        found.update(sdk for prefix, sdk in _MODEL_SDKS
+                     if module == prefix or module.startswith(prefix + "."))
+        stack.append(getattr(current, "wrapped", None))  # WrapperModel
+        models = getattr(current, "models", None)       # FallbackModel
+        if isinstance(models, (list, tuple)):
+            stack.extend(models)
+    return found
+
+
+def _run_instrumentation_settings() -> Any:
+    """`InstrumentationSettings` on DecimalAI's tracer provider, built once per provider."""
+    global _instrumentation_settings
+    with _tracing_lock:
+        provider = _run_tracer_provider
+        if _instrumentation_settings is None or _instrumentation_settings[0] is not provider:
+            from pydantic_ai.models.instrumented import InstrumentationSettings
+
+            _instrumentation_settings = (provider, InstrumentationSettings(tracer_provider=provider))
+        return _instrumentation_settings[1]
 
 
 def _menu_shown(ctx: Any) -> bool:
@@ -247,29 +325,66 @@ def _keep_in_history(ctx: Any, agent_name: str, record: ConversationRecord) -> N
             return
 
 
-def _name_framework_run_span(run_id: Optional[str], agent_name: str) -> None:
-    """Name Pydantic AI's own run span for the DecimalAI agent, when it is open here.
+# ── the run's span ───────────────────────────────────────────
 
-    With Pydantic AI's instrumentation on (``Agent.instrument_all()``), its ``invoke_agent``
-    span opens before any capability's ``wrap_run``, so it is the trace's root and the
-    DecimalAI run span is its child. The exporter files a trace under its root's
-    ``decimal.agent_name``, which that span took from the context when it started:
-    ``init(agent_name=...)``'s name, or none. Matched on the run id Pydantic AI puts on the
-    span (``gen_ai.agent.call.id``), so any other span keeps its name. Never raises.
+
+class _RunTrace:
+    """A run's DecimalAI span: the root of a trace of its own, linked to the span open here.
+
+    Opened on DecimalAI's tracer provider for these runs, with the conversation's id as
+    the trace's session. A run whose routing decision is still in flight when it ends
+    keeps its span open until the decision lands, off the run's path (at most a few
+    seconds, `_provider_run`), so its trace carries the decision.
     """
-    if not run_id:
-        return
-    try:
-        from opentelemetry import trace as trace_api
 
-        from .otel import _DECIMAL_AGENT_NAME
+    def __init__(self, agent_name: str, conversation_id: Optional[str]) -> None:
+        from ._provider_run import open_run_span
 
-        span = trace_api.get_current_span()
-        attributes = getattr(span, "attributes", None) or {}
-        if span.is_recording() and attributes.get("gen_ai.agent.call.id") == run_id:
-            span.set_attribute(_DECIMAL_AGENT_NAME, agent_name)
-    except Exception:  # noqa: BLE001 — naming must never cost the run
-        logger.debug("could not name Pydantic AI's run span", exc_info=True)
+        self._lock = threading.Lock()
+        self._ended = False
+        self._exit_ns: Optional[int] = None
+        self._span, _context, self._tokens = open_run_span(
+            None, agent_name, conversation_id or "", tracer_provider=_run_tracer_provider)
+
+    def close(self, state: Optional[Dict[str, Any]], error: Optional[BaseException]) -> None:
+        import time
+
+        from ._provider_run import _finish_later
+
+        self._exit_ns = time.time_ns()
+        for holder, token in reversed(self._tokens):
+            try:
+                if hasattr(holder, "detach"):
+                    holder.detach(token)
+                else:
+                    holder.reset(token)
+            except Exception:  # noqa: BLE001 — closed in another context than it opened in
+                pass
+        self._tokens = []
+        if self._span is not None and error is not None:
+            try:
+                from opentelemetry.trace import Status, StatusCode
+
+                self._span.record_exception(error)
+                self._span.set_status(Status(StatusCode.ERROR, str(error)))
+            except Exception:  # noqa: BLE001
+                pass
+        pending = (state or {}).get("pending")
+        if self._span is not None and pending is not None and not pending.done():
+            _finish_later(self, pending, self._exit_ns)
+        else:
+            self._end(self._exit_ns)
+
+    def _end(self, end_ns: int) -> None:
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+        if self._span is not None:
+            try:
+                self._span.end(end_time=end_ns)
+            except Exception:  # noqa: BLE001
+                logger.debug("could not end the run's span", exc_info=True)
 
 
 # ── the capability ───────────────────────────────────────────
@@ -279,7 +394,9 @@ class _PydanticAIBinding(AgentBinding):
     """Everything of `PydanticAIAgentConfig` except Pydantic AI's base class.
 
     Kept apart so this module imports without Pydantic AI installed: the class
-    `agent_config()` returns mixes in ``AbstractCapability`` when it is first needed.
+    `agent_config()` returns mixes in ``CombinedCapability`` when it is first needed,
+    with the two capabilities that do the work (`_config_class`). The hooks below are
+    theirs; the config itself defines none, or it would answer for them.
     """
 
     _log = logger
@@ -287,8 +404,6 @@ class _PydanticAIBinding(AgentBinding):
 
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
-        # Unique per agent in a run; Pydantic AI reserves ":" in capability ids.
-        self.id = "decimalai-" + self.name.replace(":", "-")
         self._toolset = self._build_toolset()
 
     def __repr__(self) -> str:
@@ -297,8 +412,8 @@ class _PydanticAIBinding(AgentBinding):
             f"skills={self.skill_names!r})"
         )
 
-    # ── what Pydantic AI asks a capability for ───────────────
-    def get_instructions(self) -> Any:
+    # ── the prompt, the list and load_skill ─────────────────
+    def _instructions(self) -> Any:
         async def decimalai_instructions(ctx: Any) -> str:
             """The agent's prompt, filled, then its skill list. Pydantic AI calls it."""
             agent = getattr(ctx, "agent", None)
@@ -310,10 +425,7 @@ class _PydanticAIBinding(AgentBinding):
 
         return decimalai_instructions
 
-    def get_toolset(self) -> Any:
-        return self._toolset
-
-    async def prepare_tools(self, ctx: Any, tool_defs: List[Any]) -> List[Any]:
+    async def _prepare_tools(self, ctx: Any, tool_defs: List[Any]) -> List[Any]:
         """Show ``load_skill`` only beside a list, naming the listed skills."""
         import dataclasses
 
@@ -331,7 +443,7 @@ class _PydanticAIBinding(AgentBinding):
             prepared.append(tool_def)
         return prepared
 
-    async def before_model_request(self, ctx: Any, request_context: Any) -> Any:
+    async def _before_model_request(self, ctx: Any, request_context: Any) -> Any:
         """On Claude, keep what this run showed in its request, for the conversation's next run."""
         if is_claude(_model_name(ctx)):
             state = self._run_state(getattr(ctx, "run_id", None))
@@ -340,18 +452,55 @@ class _PydanticAIBinding(AgentBinding):
                 _keep_in_history(ctx, self.name, record)
         return request_context
 
-    async def wrap_run(self, ctx: Any, *, handler: Any) -> Any:
-        """One DecimalAI run span around the run, named for the DecimalAI agent."""
-        from .otel import agent_run
+    # ── the run's trace ─────────────────────────────────────
+    def _traced(self) -> bool:
+        """Whether this config's runs are traced: a keyed config, and DecimalAI switched on."""
+        from ._config import _disabled_by_init
 
-        run_id = getattr(ctx, "run_id", None)
-        _name_framework_run_span(run_id, self.name)
-        token = _RUN.set(run_id)
+        return not self._keyless and not _disabled_by_init()
+
+    async def _wrap_run(self, ctx: Any, *, handler: Any) -> Any:
+        """The run, inside DecimalAI's run span: a trace of its own, filed under the agent."""
+        run_key = getattr(ctx, "run_id", None)
+        token = _RUN.set(run_key)
+        trace = _RunTrace(self.name, getattr(ctx, "conversation_id", None)) if self._traced() else None
+        error: Optional[BaseException] = None
         try:
-            with agent_run(self.name):
-                return await handler()
+            return await handler()
+        except BaseException as exc:
+            error = exc
+            raise
         finally:
+            if trace is not None:
+                trace.close(self._run_state(run_key), error)
             _RUN.reset(token)
+
+    def _run_instrumentation(self, ctx: Any) -> Any:
+        """Pydantic AI's ``Instrumentation`` for this run alone, or None when it needs none.
+
+        None when the run is not traced, when the app instruments it already
+        (``Agent.instrument_all()``, ``Agent(instrument=...)``, an ``Instrumentation``
+        capability: Pydantic AI then hands the run a real tracer), and when an
+        OpenInference instrumentor records its model's calls (``init(openai=True)``):
+        one model call, one record.
+        """
+        if not self._traced() or _run_tracer_provider is None:
+            return None
+        try:
+            from opentelemetry.trace import NoOpTracer
+
+            if not isinstance(getattr(ctx, "tracer", None), NoOpTracer):
+                return None
+            from .providers import traces_calls_of
+
+            if any(traces_calls_of(sdk) for sdk in _model_sdks(getattr(ctx, "model", None))):
+                return None
+            from pydantic_ai.capabilities import Instrumentation
+
+            return Instrumentation(settings=_run_instrumentation_settings())
+        except Exception:  # noqa: BLE001 — tracing must never cost the run
+            logger.debug("could not instrument the run (non-fatal)", exc_info=True)
+            return None
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
@@ -402,8 +551,8 @@ class _PydanticAIBinding(AgentBinding):
 
         from .skill_router import LOAD_SKILL_TOOL_DESCRIPTION, LOAD_SKILL_TOOL_NAME
 
-        # No RunContext parameter: the run is `_RUN`, which `wrap_run` sets for the
-        # whole run, tool calls included.
+        # No RunContext parameter: the run is `_RUN`, which the run span's capability
+        # sets for the whole run, tool calls included.
         async def load_skill(name: str) -> str:
             return await self._load(str(name or "").strip())
 
@@ -420,13 +569,64 @@ _config_class_lock = threading.Lock()
 
 
 def _config_class() -> Any:
-    """`PydanticAIAgentConfig`, built once: the binding with Pydantic AI's capability base."""
+    """`PydanticAIAgentConfig`, built once: the binding as a Pydantic AI capability.
+
+    A ``CombinedCapability`` of two, which Pydantic AI flattens into the agent's own list
+    and places apart: ``_Skills`` (the instructions, ``load_skill``, the tool's schema,
+    the Claude record) where the developer listed the config, so instructions keep their
+    order, and ``_RunSpan`` outermost, around Pydantic AI's ``Instrumentation``, so the
+    DecimalAI run span is the root of the run's trace. A single capability could not be
+    both: an ``outermost`` one contributes its instructions before every other's.
+    """
     global _config_class_cache
     with _config_class_lock:
         if _config_class_cache is None:
-            from pydantic_ai.capabilities import AbstractCapability
+            from pydantic_ai.capabilities import (
+                AbstractCapability,
+                CapabilityOrdering,
+                CombinedCapability,
+                Instrumentation,
+            )
 
-            class PydanticAIAgentConfig(_PydanticAIBinding, AbstractCapability):
+            class _Part(AbstractCapability):
+                """One of a config's two capabilities: hooks that call the config."""
+
+                def __init__(self, config: Any, capability_id: str) -> None:
+                    self.config = config
+                    # Unique per agent in a run; Pydantic AI reserves ":" in capability ids.
+                    self.id = capability_id
+
+                # One part is one object (the base's dataclass equality compares fields).
+                __eq__ = object.__eq__
+                __hash__ = object.__hash__
+
+            class _Skills(_Part):
+                def get_instructions(self) -> Any:
+                    return self.config._instructions()
+
+                def get_toolset(self) -> Any:
+                    return self.config._toolset
+
+                async def prepare_tools(self, ctx: Any, tool_defs: List[Any]) -> List[Any]:
+                    return await self.config._prepare_tools(ctx, tool_defs)
+
+                async def before_model_request(self, ctx: Any, request_context: Any) -> Any:
+                    return await self.config._before_model_request(ctx, request_context)
+
+            class _RunSpan(_Part):
+                def get_ordering(self) -> Any:
+                    return CapabilityOrdering(position="outermost", wraps=[Instrumentation])
+
+                async def for_run(self, ctx: Any) -> Any:
+                    instrumentation = self.config._run_instrumentation(ctx)
+                    if instrumentation is None:
+                        return self
+                    return CombinedCapability([self, instrumentation])
+
+                async def wrap_run(self, ctx: Any, *, handler: Any) -> Any:
+                    return await self.config._wrap_run(ctx, handler=handler)
+
+            class PydanticAIAgentConfig(_PydanticAIBinding, CombinedCapability):
                 """One agent's prompt and skills in DecimalAI, as a Pydantic AI capability.
 
                 Made by :func:`agent_config`. Pass it in ``Agent(capabilities=[...])``::
@@ -438,6 +638,12 @@ def _config_class() -> Any:
                 Attributes:
                     name: The agent's canonical DecimalAI name.
                 """
+
+                def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+                    _PydanticAIBinding.__init__(self, prompt, fallback=fallback, on_unavailable=on_unavailable)
+                    part_id = "decimalai-" + self.name.replace(":", "-")
+                    CombinedCapability.__init__(self, capabilities=[
+                        _RunSpan(self, part_id + "-run"), _Skills(self, part_id)])
 
                 # One config is one object: Pydantic AI's base is a dataclass, whose
                 # generated equality would make two agents' configs compare equal.
@@ -481,6 +687,14 @@ def agent_config(
     are filled from the run's ``deps`` (attributes or dict keys). Initializes the SDK
     from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
 
+    Each run is traced with no other line: one trace per run, filed under the agent,
+    carrying Pydantic AI's own spans for that run's model and tool calls. Here,
+    DecimalAI's OpenTelemetry exporter goes on the global tracer provider (an app with
+    its own sets it up first), sending only DecimalAI runs. A run the app instruments
+    itself (``Agent.instrument_all()``, Logfire) keeps its instrumentation, and one
+    whose model's SDK ``init(openai=True)`` (or ``anthropic=``, ``google=``) traces is
+    not instrumented twice.
+
     With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
     ``init(load_skill_tool=False)``), every run is routed and the text of the skills
     picked for it goes into the instructions instead (``inject_skill_body``).
@@ -512,7 +726,10 @@ def agent_config(
     from ._agent import _open_prompt
 
     prompt = _open_prompt(agent_name, fallback)
-    return _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)
+    config = _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)
+    if not prompt.keyless:  # keyless runs are traced nowhere
+        _turn_on_tracing()
+    return config
 
 
 def load_agent(*args: Any, **kwargs: Any) -> NoReturn:

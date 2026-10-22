@@ -136,14 +136,16 @@ def _unpatch() -> None:
     """Turn off the process-wide switches these cells turn on.
 
     ``init(openai=True)`` and ``decimalai.anthropic.agent_config()`` turn OpenInference's
-    instrumentors on, and Pydantic AI's ``Agent.instrument_all()`` is global too. Each
+    instrumentors on, and Pydantic AI's ``Agent.instrument_all()`` is global too (no cell
+    calls it now; one left on by another file would trace the controls). Each
     cell starts and ends with them off, so no cell traces another's calls, and a later
     file meets the SDK unpatched (the 0.23.0 gate failed on one left on, f426799).
     """
     for cls in _openinference_instrumentors():
         if cls().is_instrumented_by_opentelemetry:
             cls().uninstrument()
-    for name in ("decimalai.anthropic", "decimalai.openai", "decimalai.google_genai"):
+    for name in ("decimalai.anthropic", "decimalai.openai", "decimalai.google_genai",
+                 "decimalai.pydantic_ai"):
         try:
             # So the next agent_config() turns its provider's tracing on again.
             __import__(name, fromlist=["_tracing_turned_on"])._tracing_turned_on = False
@@ -198,12 +200,10 @@ def _pydantic_ai(provider: str, model: str, agent_name: str, *, skills: bool) ->
         # Instrumentation is off here (the fixture), so the control is not traced.
         return str(Agent(model_id, instructions=_INSTRUCTION).run_sync(_QUERY).output)
 
-    import decimalai
     from decimalai.pydantic_ai import agent_config
 
-    # As `decimalai init --framework pydantic-ai` writes it: OTel export, then instrument_all().
-    decimalai.init(api_key=h.API_KEY, base_url=h.BACKEND_URL, agent_name=agent_name, otel=True)
-    Agent.instrument_all()
+    # As `decimalai init --framework pydantic-ai` writes it: agent_config() alone, which
+    # traces its own runs (no init(otel=True), no Agent.instrument_all()).
     support = agent_config(agent_name)
     agent = Agent(model_id, name=support.name, capabilities=[support])
     return str(agent.run_sync(_QUERY).output)

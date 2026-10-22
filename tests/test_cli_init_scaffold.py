@@ -317,7 +317,7 @@ LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "an
                          "google-genai")
 #: How many init() calls each template makes. The agent_config() templates make none
 #: (scaffold.py point 5), except pydantic-ai's exporter, made only with a key.
-INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0,
+INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 0, "adk": 0, "anthropic": 0,
               "openai": 0, "google-genai": 0}
 
 
@@ -338,21 +338,16 @@ class TestSkillLoaderIsOn:
             assert "enable_skill_loader" not in render_agent_file(AGENT, framework, SKILLS)
 
     #: Every `init()` keyword that installs a span source, and — per framework —
-    #: the ONE this template is allowed to carry.
+    #: the one this template is allowed to carry: none. Every template's
+    #: `agent_config()` installs its span source itself, so any flag here is a SECOND
+    #: one: on langchain the first wins and the explicit call's other options are
+    #: dropped with a warning, on openai-agents the adapter is installed twice, and on
+    #: pydantic-ai (which carried `otel=True` and `Agent.instrument_all()` until 0.25,
+    #: when its capability installed no exporter) a provider flag would report each
+    #: model call a second time. Kept as a map so a framework that ever needs one says
+    #: so here.
     #:
-    #: An allow-list of one rather than a blanket ban, because "no flag" and
-    #: "exactly one flag" are the same rule seen from two adapters. On langchain
-    #: and openai-agents `instrument()` installs the span source itself, so any
-    #: flag here is a SECOND install of the same adapter: on langchain the first
-    #: one wins and the explicit call's other options are dropped with a warning,
-    #: and on openai-agents the adapter is installed twice. On pydantic-ai nothing
-    #: else installs one: `agent_config()`'s capability opens the run span and
-    #: Pydantic AI's own instrumentation emits the rest, through the exporter
-    #: `otel=True` installs. So it is the first span source rather than the second
-    #: — and without it the generated file runs, delivers every skill, and traces
-    #: nothing at all.
-    #:
-    #: What both halves forbid is the same thing: two span sources on one file.
+    #: What it forbids is two span sources on one file.
     TRACING_FLAGS = (
         "langchain", "openai_agents", "crewai", "otel", "adk", "llamaindex",
         "claude_agent_sdk", "autogen", "openai", "anthropic", "google",
@@ -360,7 +355,7 @@ class TestSkillLoaderIsOn:
     ALLOWED_TRACING_FLAG = {
         "langchain": None,
         "openai-agents": None,
-        "pydantic-ai": "otel",
+        "pydantic-ai": None,
         "adk": None,
         # agent_config() traces its own runs; anthropic=True would widen that to every
         # Anthropic call in the process, which a one-agent file has no use for.
@@ -811,9 +806,6 @@ class TestRunsWithoutAKey:
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         inits = calls(tree, "init")
         assert all(self._guarded_by_a_key_check(tree, c) for c in inits), ast.unparse(tree)
-        if framework == "pydantic-ai":
-            (init,) = inits
-            assert kwarg(init, "otel") is True, "its exporter is the one agent_config() leaves out"
 
     def test_the_openai_agents_template_has_an_example_tool_beside_load_skill(self):
         """The docs' keyless example's shape: one of your tools, then load_skill."""

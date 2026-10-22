@@ -263,7 +263,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         module="decimalai.pydantic_ai",
         entry_point="`agent_config(name)`",
         init_flag=None,
-        init_flag_note="— (no flag; tracing is `otel=True` + `Agent.instrument_all()`)",
+        init_flag_note="— (no flag; `agent_config()` traces its runs)",
         extra="pydantic-ai",
         scaffold=TEMPLATE,
         # One line, whatever the model. `decimalai[pydantic-ai]` resolves to

@@ -161,20 +161,21 @@ _stack.enter_context(patch(
     "pydantic_ai.models.infer_model", return_value=FunctionModel(_reply),
 ))
 
-# The name each DecimalAI run span is opened with. agent_config()'s capability
-# passes it to decimalai.otel.agent_run in wrap_run, and the exporter files the
-# run's trace under it.
+# The name each DecimalAI run span is opened with, which is the name its trace is
+# filed under: what agent_config()'s capability read off the config, not the literal
+# from the template.
 import decimalai.otel as _otel
+import decimalai.pydantic_ai as _dp
 _runs = []
-_agent_run = _otel.agent_run
+_open_run = _dp._RunTrace.__init__
 
 
-def _named_run(agent_name=None, **kwargs):
-    _runs.append(agent_name)
-    return _agent_run(agent_name, **kwargs)
+def _named_run(self, *args, **kwargs):
+    _open_run(self, *args, **kwargs)
+    _runs.append((getattr(self._span, "attributes", None) or {}).get(_otel._DECIMAL_AGENT_NAME))
 
 
-_stack.enter_context(patch.object(_otel, "agent_run", _named_run))
+_stack.enter_context(patch.object(_dp._RunTrace, "__init__", _named_run))
 """,
         "probe": """
 # What the model was handed, request by request. agent_config()'s capability puts
@@ -487,11 +488,11 @@ _ENV = {
     "DECIMALAI_SUPPRESS_DISK_RUNTIME_WARNING": "1",
     "DECIMAL_AUTOINIT": "false",
     # Port 9 (discard) refuses instantly, which is what makes this hermetic
-    # rather than merely fast. The pydantic-ai template calls `init(otel=True)`
-    # — the only way that adapter traces at all — and a real span exporter with
-    # the hosted default would spend the subprocess's exit trying to POST this
-    # run's prompts to api.decimal.ai with a fake key. The router is patched;
-    # the exporter is not, and is not the thing under test.
+    # rather than merely fast. A keyed agent_config() turns its framework's
+    # tracing on (the pydantic-ai one puts a real span exporter on the tracer
+    # provider), and with the hosted default it would spend the subprocess's exit
+    # trying to POST this run's prompts to api.decimal.ai with a fake key. The
+    # router is patched; the exporter is not, and is not the thing under test.
     "DECIMAL_BASE_URL": "http://127.0.0.1:9",
 }
 

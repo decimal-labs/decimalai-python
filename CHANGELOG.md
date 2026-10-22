@@ -29,6 +29,29 @@ and patch releases are fixes.
 - It was `OpenAIAgentConfig`, the name the OpenAI Agents SDK module's config already had, so
   `print(support)` could not tell the two apart. Unreleased, so nothing else moves.
 
+### Changed: Pydantic AI's `agent_config()` traces its runs with no other line
+
+- `Agent(capabilities=[agent_config("support")])` is now the whole setup, as on the other
+  bindings: no `decimalai.init(otel=True)`, no `Agent.instrument_all()`. `agent_config()` puts
+  DecimalAI's OpenTelemetry exporter on the global tracer provider (an app with its own sets it up
+  first), sending only DecimalAI runs, and each run of the capability is instrumented with Pydantic
+  AI's own `Instrumentation`, for that run alone: its model calls and its tool calls, results
+  included, for any provider. Other agents in the process are not instrumented.
+- A run is a trace of its own, rooted in DecimalAI's run span and linked to the span open when it
+  started (a web request's, say), as an Anthropic or OpenAI run is. A conversation's runs carry its
+  `conversation_id` as the trace's session. A later run whose routing decision is still in flight
+  when it ends keeps its trace open until the decision lands (a few seconds at most, off the run's
+  path; `decimalai.flush()` waits for it), so the trace carries it, as on the other bindings.
+- Existing setups keep working, without double reporting: a run the app already instruments
+  (`Agent.instrument_all()`, `Agent(instrument=...)`, an `Instrumentation` capability, Logfire)
+  keeps that instrumentation, inside DecimalAI's run span, and a run whose model's SDK
+  `init(openai=True)` (or `anthropic=True`, `google=True`) traces is not instrumented again.
+- `support` is now two capabilities in one, which Pydantic AI places apart: the prompt, skill list
+  and `load_skill` where you list `support`, so instructions keep your order, and the run span
+  outermost, around Pydantic AI's `Instrumentation`.
+- `decimalai init --framework pydantic-ai` writes no `init()` and no `Agent.instrument_all()`, like
+  the other `agent_config()` templates.
+
 ### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
 
 - For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an

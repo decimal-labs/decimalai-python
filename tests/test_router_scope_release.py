@@ -340,7 +340,7 @@ class TestPydanticAI:
         monkeypatch.setattr(agent_mod, "read_prompt",
                             lambda name, **kw: SavedPrompt(agent_name=name, system_prompt=None))
         support = pa.agent_config("support")
-        instructions = support.get_instructions()
+        instructions = support._instructions()
         tracer = pipeline.get_tracer("fake-model")
         prompts: List[str] = []
         loads: List[str] = []

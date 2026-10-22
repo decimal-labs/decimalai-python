@@ -81,51 +81,23 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    floors `langchain-core>=1.6.10`, so the `langchain` that resolves beside it
    is a 1.x release, which is where `create_agent` lives.
 
-4. TRACING IS NOT AUTOMATIC ON EVERY ADAPTER, and the pydantic-ai template is
-   where that bites. `decimalai init` ends by printing "The trace appears at →
-   /agents/<name>", which is a promise about the file it just wrote. The
-   langchain and openai-agents adapters keep it themselves — their
-   `agent_config()` installs a callback handler / a trace processor — and so does
-   `decimalai.anthropic.agent_config()` and `decimalai.openai.agent_config()`,
-   which turn on their provider's tracing for the calls made inside their runs.
-   `decimalai.pydantic_ai`
-   deliberately does not: its `agent_config()` capability ships the prompt, the
-   skills and the run BOUNDARY (one DecimalAI run span per run) and leaves the
-   span content to Pydantic AI's own instrumentation or a provider instrumentor. `init()` with no flags installs no
-   exporter at all (see `decimalai/__init__.py` — the exporter is built inside
-   the `if otel or crewai or autogen:` branch), so a pydantic-ai file that called
-   a bare `init()` would run, deliver its skills, and leave the user staring at
-   an empty traces page having done everything right.
-
-   The template therefore pairs ONE exporter — `init(otel=True)` — with Pydantic
-   AI's own OpenTelemetry instrumentation (`Agent.instrument_all()`), rather than
-   the provider-instrumentor pairing the docs show for adding DecimalAI to an
-   agent you already have (`init(openai=True)` +
-   `openinference-instrumentation-openai`). Three reasons, in the order they
-   decided it:
-
-     * it is provider-agnostic. `Agent.instrument_all()` emits the same spans for
-       `openai:…`, `google:…` and `anthropic:…`, so `--model google:gemini-…`
-       needs no second install line and no different init flag. The provider
-       route would need one instrumentor package per provider, chosen by the
-       model string — and the fleet that walks this journey is Gemini-only.
-     * one install line. `opentelemetry-sdk` is already a core dependency of
-       `decimalai`, so `pip install "decimalai[pydantic-ai]"` is the whole
-       requirement. The provider route adds a package whose import name
-       (`openinference.instrumentation.openai`) does not match its distribution
-       name, which is exactly the shape that makes an automated requirement check
-       give up.
-     * it is ONE exporter, which is the same one-install rule points 1-3
-       protect. Adding `init(openai=True)` on top would put an OpenInference
-       span and a Pydantic AI span on the same model call.
-
-   `Agent.instrument_all()` lives in the generated file rather than inside
-   `decimalai.pydantic_ai.agent_config()` on purpose: turning it on inside the
-   adapter would silently double up for every existing user who already pairs a
-   provider instrumentor, which is the failure this point is about.
-
-   `init(otel=True)` runs only when `DECIMAL_API_KEY` (or `DECIMALAI_API_KEY`) is
-   set, for the reason in point 5.
+4. EVERY TEMPLATE'S `agent_config()` IS ITS SPAN SOURCE. `decimalai init` ends by
+   printing "The trace appears at → /agents/<name>", which is a promise about the
+   file it just wrote, and each adapter keeps it itself: langchain's and
+   openai-agents' `agent_config()` install a callback handler / a trace
+   processor, `decimalai.anthropic.agent_config()` and
+   `decimalai.openai.agent_config()` turn on their provider's tracing for the
+   calls made inside their runs, ADK's `DecimalAIPlugin()` traces the app, and
+   `decimalai.pydantic_ai.agent_config()` (0.25) puts DecimalAI's exporter on the
+   process's tracer provider and instruments each of its own runs with Pydantic
+   AI's own `Instrumentation`. So no template passes a tracing flag to `init()`:
+   a second span source double-reports every call. The pydantic-ai template
+   carried `init(otel=True)` and `Agent.instrument_all()` until 0.25, when its
+   adapter installed no exporter: a bare `init()` there ran, delivered its
+   skills, and traced nothing. Pydantic AI's instrumentation is provider-agnostic,
+   so `--model google:gemini-…` or `anthropic:…` needs no other line, and the
+   adapter leaves a run alone that the app instruments itself or whose model's
+   SDK `init(openai=True)` already traces.
 
 5. The file RUNS WITHOUT A DECIMALAI KEY (SDK 0.24+). With no key, every
    `agent_config()` runs keyless (`decimalai/_keyless.py`): its `fallback=`
@@ -137,10 +109,9 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    pydantic-ai, adk, anthropic, openai) therefore call no `init()`: with a key,
    `agent_config()` initializes the SDK from the environment itself and turns
    its framework's tracing on (ADK's through `DecimalAIPlugin()`), and the name
-   it is given is the one its traces are filed under. Pydantic AI's exporter is
-   the one piece `agent_config()` does not install (point 4), so that file keeps
-   `init(agent_name=AGENT_NAME, otel=True)` behind a check for the key. A
-   non-default base_url, which `init(base_url=...)` used to carry, is set as
+   it is given is the one its traces are filed under. The pydantic-ai file kept
+   `init(agent_name=AGENT_NAME, otel=True)` behind a check for the key until
+   0.25 (point 4). A non-default base_url, which `init(base_url=...)` used to carry, is set as
    `DECIMAL_BASE_URL` before the `decimalai` import (`_import_lines`): importing
    decimalai with a key in the environment already initializes from it. The
    langchain file called `init()` until 0.25, when its skills came through
@@ -162,10 +133,7 @@ share is identical, deliberately:
     instructions and tools go into the file's own `Agent(...)`, and the file
     calls no init() (point 5).
   * pydantic-ai: `agent_config(AGENT_NAME)` passed as `Agent(capabilities=[support])`,
-    with `init(..., otel=True)` (when a key is set) and `Agent.instrument_all()`
-    for the spans.
-    That is the same rule: exactly one span source per file. On langchain and
-    openai-agents the adapter IS the span source; here it is not (point 4).
+    and the file calls no init(): the capability traces its own runs (point 4).
   * adk: `agent_config(AGENT_NAME)`'s instruction and tools go into the file's own
     `LlmAgent(...)`, and `DecimalAIPlugin()` into its `App(plugins=[...])`, the one
     span source; no init().
@@ -519,30 +487,6 @@ def _agent_config_lines(described: Sequence[str], call: str = "support = agent_c
     ]
 
 
-def _init_call(base_url: Optional[str], *flags: str) -> str:
-    """`decimalai.init(agent_name=AGENT_NAME, ...)` — with a base_url only when
-    one is needed.
-
-    `agent_name=AGENT_NAME` names the agent for every adapter's `instrument()`
-    (point 2).
-
-    The key is read from the environment by `init()` itself, so no generated
-    file ever contains one. A non-default base_url IS baked in: it is not a
-    secret, and someone who scaffolded against a local or self-hosted backend
-    gets a file that points at production otherwise.
-
-    `flags` names init keywords to set True. Only the pydantic-ai template
-    passes any (`otel`), and only because that adapter installs no exporter of
-    its own — see point 4 in the module docstring. A template that can trace
-    without one must not pass one: a second exporter double-sends every span.
-    """
-    args = ["agent_name=AGENT_NAME"]
-    if base_url:
-        args.append(f"base_url={_py(base_url)}")
-    args += [f"{flag}=True" for flag in flags]
-    return f"decimalai.init({', '.join(args)})"
-
-
 # ── templates ────────────────────────────────────────────────────────
 
 
@@ -755,29 +699,13 @@ def _render_pydantic_ai(
         "MAX_RUN_SECONDS = 90",
         "",
         *_key_guard_lines("pydantic-ai", model),
-        "# otel=True installs DecimalAI's OpenTelemetry exporter, which turns this",
-        "# agent's spans into traces. A bare init() here would run fine and deliver",
-        "# every skill, and your traces page would stay empty. Only with a DecimalAI",
-        "# key (exported, or in a .env file here): init() refuses to start without",
-        "# one, and an agent without one runs keyless, with nothing to trace.",
-        "if os.environ.get(\"DECIMAL_API_KEY\") or os.environ.get(\"DECIMALAI_API_KEY\"):",
-        f"    {_init_call(None, 'otel')}",
-        "",
-        "# Pydantic AI's own OpenTelemetry instrumentation, which is where the",
-        "# spans come from. It is a global switch and it is provider-agnostic —",
-        "# swapping MODEL to a Gemini or Claude string changes nothing here.",
-        "#",
-        "# Keep it BELOW init(): init(otel=True) is what installs the DecimalAI",
-        "# exporter on the process's tracer provider, and these spans have nowhere",
-        "# to go until it has.",
-        "Agent.instrument_all()",
-        "",
         *_agent_config_lines([
             "# Your agent's prompt and skills, as they stand in the dashboard, as one",
             "# Pydantic AI capability: its instructions are the saved prompt, then the",
             "# skill list picked for each run's prompt, and its toolset is load_skill,",
-            "# which the model calls for a listed skill's text. It also wraps each run",
-            "# in one DecimalAI run span, so a run is one trace filed under this agent.",
+            "# which the model calls for a listed skill's text. It also traces each",
+            "# run, with Pydantic AI's own spans for its model and tool calls, as one",
+            "# trace filed under this agent; other agents in the process are untouched.",
             "# Nothing in Pydantic AI is patched.",
             "#",
             "# The prompt is re-read in the background at most once a minute, so",

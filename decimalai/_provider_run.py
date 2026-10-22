@@ -1,7 +1,8 @@
 """What a provider SDK's ``agent_config()`` runs share: the run's span, and its finishing.
 
 ``decimalai.anthropic`` and ``decimalai.openai`` give code that calls a provider SDK
-itself one run per user message, opened with ``with support.run(question) as run:``.
+itself one run per user message, opened with ``with support.run(question) as run:``;
+``decimalai.pydantic_ai`` opens one around each Pydantic AI run.
 Opening a run starts a span of its own, the root of the run's trace, and the
 provider's calls made inside the block nest under it. Closing it ends the span,
 unless the run's routing decision is still in flight: the span then waits for it
@@ -60,8 +61,12 @@ def _event_loop_running() -> bool:
         return False
 
 
-def open_run_span(provider: str, agent_name: str, session_id: str) -> Tuple[Any, Any, List[Tuple[Any, Any]]]:
+def open_run_span(provider: Optional[str], agent_name: str, session_id: str, *,
+                  tracer_provider: Any = None) -> Tuple[Any, Any, List[Tuple[Any, Any]]]:
     """A run's span: a new trace of its own, linked to any span already open.
+
+    Opened on ``tracer_provider`` when given (a framework that emits its own spans,
+    Pydantic AI), else on the one ``provider``'s calls are traced on.
 
     Returns ``(span, context, tokens)``: the span (None without OpenTelemetry or
     on failure), the OpenTelemetry context holding it, and the (holder, token)
@@ -80,7 +85,8 @@ def open_run_span(provider: str, agent_name: str, session_id: str) -> Tuple[Any,
     try:
         # The provider this process's calls of `provider` are traced on, so the
         # calls nest under the run (not whichever provider was attached last).
-        tracer_provider = providers._run_provider(provider) or trace_api.get_tracer_provider()
+        tracer_provider = (tracer_provider or (providers._run_provider(provider) if provider else None)
+                           or trace_api.get_tracer_provider())
         current = trace_api.get_current_span().get_span_context()
         links = [trace_api.Link(current)] if current.is_valid else None
         attributes = {

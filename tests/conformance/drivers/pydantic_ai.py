@@ -9,21 +9,17 @@ the developer's own ``Agent``::
 
 The capability is the whole integration: its instructions (the saved prompt, then
 the skill list routed on the run's prompt), its ``load_skill`` toolset, and the
-DecimalAI run span its ``wrap_run`` opens around each run, which puts a run's
-model calls in one trace filed under the DecimalAI agent. Nothing is patched, so
-every phase builds its agent that way (``Driver.loads_agent_from_platform``: the
-harness puts each phase's agent in the workspace first, as the dashboard would).
-
-Tracing is the provider pairing, ``decimalai.init(openai=True)`` (OpenInference's
-instrumentor for the ``openai`` SDK, through DecimalAI's OTel exporter). The other
-documented route, ``Agent.instrument_all()``, is a process-wide switch, so this
-in-process driver keeps to the pairing.
+tracing: DecimalAI's run span around each run, the root of the run's trace, with
+Pydantic AI's own spans for that run's model and tool calls inside it (its
+``Instrumentation``, for the capability's runs alone), filed under the DecimalAI
+agent. Nothing is patched, so every phase builds its agent that way
+(``Driver.loads_agent_from_platform``: the harness puts each phase's agent in the
+workspace first, as the dashboard would). ``init()`` only points the SDK at the
+probe: no ``otel=True``, no ``openai=True``, no ``Agent.instrument_all()``.
 
 The model is a stub and the model path is real: Pydantic AI's own
-``OpenAIChatModel`` talking to :mod:`._openai_wire` over a socket. That is
-load-bearing here beyond the usual reason: the model-call spans this pairing
-produces are the ones OpenInference derives from real ``openai`` client calls, so
-a monkeypatched client would leave nothing to grade at all.
+``OpenAIChatModel`` talking to :mod:`._openai_wire` over a socket, so the model-call
+spans are the ones Pydantic AI records of real requests and responses.
 
 NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 """
@@ -141,11 +137,11 @@ def _setup(ctx: Ctx, *, fail: bool = False, skills_rail: bool = False) -> None:
     _wire().register(
         ctx, script=_skill_script(ctx) if skills_rail else None, fail=fail
     )
+    # Where the probe is, no more: agent_config() turns the tracing on itself.
     decimalai.init(
         api_key=ctx.api_key,
         base_url=ctx.base_url,
         verify=False,
-        openai=True,               # the provider pairing that carries the traces
         agent_name=ctx.agent_name,
     )
 
@@ -223,13 +219,9 @@ def run_conversation(ctxs: Sequence[Ctx]) -> Any:
 DRIVER = Driver(
     name="pydantic-ai",
     covers=frozenset({"pydantic-ai"}),
-    # `openinference` (not the dotted instrumentor path) because that is the
-    # honest requirement: without the openai instrumentor installed,
-    # `init(openai=True)` warns and skips, and the driver would be graded on a
-    # tracing path the environment never turned on.
-    requires=("pydantic_ai", "openai", "openinference"),
+    requires=("pydantic_ai", "openai"),
     frameworks=("pydantic-ai-slim",),
-    entrypoint="decimalai.pydantic_ai.agent_config(name) + decimalai.init(openai=True)",
+    entrypoint="decimalai.pydantic_ai.agent_config(name)",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
