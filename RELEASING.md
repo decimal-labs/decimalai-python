@@ -251,7 +251,9 @@ RELEASE_GATE_PROVIDERS="openai anthropic google" ./scripts/release.sh
 
 Provider-native frameworks are only tested against their own model (`openai_agents` → OpenAI,
 `claude_agent_sdk` → Anthropic, `adk` → Gemini); generic frameworks are tested against every provider
-in the run. Every release since 0.22.1 ran with `--providers openai anthropic`.
+in the run. Every release since 0.22.1 ran with `--providers openai anthropic`. One exception: the
+binding test's `adk-openai` cell runs ADK on an OpenAI model through LiteLLM, which pins `openai<3`,
+so the gate runs it in the openai2 venv (its "openai (openai2)" row) whenever OpenAI is in the run.
 
 ## Skipping the live gate
 

@@ -100,6 +100,10 @@ OPENAI2_UNIT_TESTS = (
     # Native mode (Phase 3): the CrewAI and Strands hooks and their native-column cells
     # run here; the other six frameworks' cells skip as graded in openai3.
     "native/test_*.py",
+    # The live binding test's adk-openai cell: ADK on an OpenAI model goes through litellm,
+    # which pins openai<3. The release gate's openai2 leg runs it; live, so outside a live
+    # run it is deselected like every live_llm test.
+    "integration/test_framework_live_binding_skill_loading.py",
 )
 
 #: Importable in the openai 2 environment, or the slice above would pass by
