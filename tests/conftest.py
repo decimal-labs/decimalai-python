@@ -36,7 +36,12 @@ don't have to:
    of the session, and every LATER test that runs a real chain with its own
    per-call handler is traced TWICE — it asserts one trace and gets two.
    The ``_clear_langchain_global_handler`` autouse fixture below is that
-   missing teardown.
+   missing teardown. It also marks the adapter uninstalled: with the var
+   cleared and ``_installed`` still set, the next install — an
+   ``agent_config()`` in the next test, which turns tracing on through
+   ``instrument()`` — returned early and left the var empty, so that test's
+   runs were never traced (the live binding test's second LangChain cell,
+   2026-10-22).
 
 4. **The SDK's ContextVars are put back after each test.** pytest runs every
    test in one thread and one Context, so a ContextVar a test sets outside a
@@ -379,6 +384,7 @@ def _clear_langchain_global_handler():
         lc_mod = sys.modules.get("decimalai.langchain")
         if lc_mod is not None:
             lc_mod._decimal_callback_var.set(None)
+            lc_mod._installed = False
 
 
 # ── 4. Span exports are drained between tests ──────────────────────────────────

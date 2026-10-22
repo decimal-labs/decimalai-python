@@ -13,6 +13,8 @@ Each cell builds the agent the way ``decimalai init`` and the docs build it:
     adk-openai                    LlmAgent(model=LiteLlm("openai/..."), instruction=support.instruction,
                                   tools=[*support.tools]); runs only in the openai2 environment,
                                   because litellm pins openai<3 (skips elsewhere)
+    langchain-openai              create_agent("openai:...", middleware=[support.middleware])
+    langchain-anthropic           the same, on Claude
 
 ADK on Gemini has its own file, ``test_framework_live_adk_skill_delivery.py``, which this one
 generalizes.
@@ -91,6 +93,8 @@ _CELLS = [
     pytest.param("pydantic_ai", "openai", id="pydantic_ai-openai"),
     pytest.param("neutral", "openai", id="neutral-openai"),
     pytest.param("adk", "openai", id="adk-openai"),
+    pytest.param("langchain", "openai", id="langchain-openai"),
+    pytest.param("langchain", "anthropic", id="langchain-anthropic"),
     pytest.param("pydantic_ai", "anthropic", id="pydantic_ai-anthropic"),
     pytest.param("anthropic_messages", "anthropic", id="anthropic_messages-anthropic"),
 ]
@@ -291,7 +295,30 @@ def _adk(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
     return asyncio.run(_go())
 
 
+def _langchain(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
+    pytest.importorskip("langchain.agents")
+    pytest.importorskip(f"langchain_{provider}")
+    from langchain.agents import create_agent
+
+    def final_text(result) -> str:
+        return str(result["messages"][-1].text or "")   # a property in langchain-core 1.x
+
+    model_id = f"{provider}:{model}"
+    ask = {"messages": [{"role": "user", "content": _QUERY}]}
+    if not skills:
+        return final_text(create_agent(model_id, tools=[], system_prompt=_INSTRUCTION).invoke(ask))
+
+    from decimalai.langchain import agent_config
+
+    # As `decimalai init --framework langchain` writes it: the middleware, and no init() line,
+    # since agent_config() turns LangChain tracing on.
+    support = agent_config(agent_name)
+    agent = create_agent(model_id, tools=[], middleware=[support.middleware])
+    return final_text(agent.invoke(ask))
+
+
 _RUNNERS = {
+    "langchain": _langchain,
     "openai_agents": _openai_agents,
     "pydantic_ai": _pydantic_ai,
     "anthropic_messages": _anthropic_messages,
