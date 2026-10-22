@@ -293,7 +293,8 @@ def _distributions_for(module: str, installed: Dict[str, List[str]]) -> set:
 def test_no_unit_test_skips_for_a_module_that_no_environment_installs():
     """A skip on a module only a live extra installs runs on a developer's venv and nowhere else.
 
-    That was tests/test_skill_route_split_langchain.py's ChatAnthropic case:
+    That was the ChatAnthropic case of the LangChain loader's placement tests (removed with the
+    loader in 0.25):
     ``langchain_anthropic`` came only from ``live-llm-tests``, so in an
     environment built from either test extra it skipped. Checked here against
     what each environment's extras declare, plus everything those pull in.

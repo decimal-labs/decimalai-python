@@ -175,7 +175,13 @@ met**, so: run the gate, then cut the GitHub Release and let `publish.yml` do th
    - add an `<Update>` entry to `changelog.mdx` — the page promises SDK release tracking;
    - if the release adds/changes CLI commands, update `sdk/cli.mdx`;
    - if `requires-python` changed, update the floor noted in `quickstart.mdx`, `faq.mdx`, and this
-     repo's README.
+     repo's README;
+   - if `decimalai/_frameworks.py` changed since the last release, regenerate the framework tables
+     in `sdk/python/frameworks.mdx`: `python3 scripts/check_generated_framework_tables.py --write`
+     in decimalai-docs, with this release's checkout beside it. This repo's suite holds that page
+     to the registry of the release its `changelog.mdx` names newest (the release's tag, or this
+     tree while the release is untagged), so the SDK lands on main without the page, and the
+     page waits for the release.
 6. **Commit and push** the release commit. The script refuses to release a commit that is not on the
    remote (otherwise `gh` would tag the wrong revision).
 7. **Publish**, per the regime you confirmed above:

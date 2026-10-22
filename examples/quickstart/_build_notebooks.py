@@ -546,6 +546,9 @@ lc_cells = [
 
 This notebook shows how to add DecimalAI tracing to any LangChain / LangGraph
 application. Every LLM call, tool invocation, and chain step is captured automatically.
+It is the tracing half: to give an agent its prompt and skills from DecimalAI as well,
+add `decimalai.langchain.agent_config(name).middleware` to `create_agent(...)`
+([LangChain docs](https://docs.decimal.ai/sdk/python/frameworks/langchain)).
 
 **Prerequisites:** an OpenAI API key (or any LangChain-supported LLM) for Steps 2-3 —
 that is the LLM the agent runs on, and there is no agent run without it. A DecimalAI
@@ -566,11 +569,12 @@ would need.
 '''),
 
     code(keyless_start(
-        init_kwargs=", langchain=True",
+        init_kwargs=", langchain=True, skills=False",
         offline_effect=r'''
 # is a real kill switch: no client, no network call, and the langchain=True flag
 # is ignored, so no adapter is installed and nothing is captured. The LangChain
-# agent below still runs — it just runs untraced.
+# agent below still runs — it just runs untraced. (skills=False says this
+# notebook traces only, on purpose: agent_config() is what gives an agent skills.)
 ''',
         llm_key_block=_OPENAI_KEY_BLOCK,
         banner=r'''

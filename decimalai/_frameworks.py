@@ -158,17 +158,17 @@ class Framework:
 FRAMEWORKS: Tuple[Framework, ...] = (
     Framework(
         key="langchain",
-        title="LangChain / LangGraph",
+        title="LangChain / LangGraph (with `agent_config(...)`)",
         cli_label="LangChain",
         module="decimalai.langchain",
-        entry_point="`instrument()`",
+        entry_point="`agent_config(name).middleware`",
         init_flag="langchain",
         extra="langchain",
         scaffold=TEMPLATE,
-        # The generated file imports `langchain.chat_models` and calls an OpenAI model,
-        # so the extra alone is not enough. The quotes are load-bearing: zsh globs a
-        # bare `decimalai[langchain]` and pip never sees it.
-        install='pip install "decimalai[langchain]" langchain langchain-openai',
+        # The extra brings `langchain` (create_agent and its middleware); the generated
+        # file calls an OpenAI model, so langchain-openai too. The quotes are load-bearing:
+        # zsh globs a bare `decimalai[langchain]` and pip never sees it.
+        install='pip install "decimalai[langchain]" langchain-openai',
         env_vars=("DECIMAL_API_KEY", "OPENAI_API_KEY"),
         default_model=DEFAULT_MODEL,
         native_loaders=(
@@ -188,9 +188,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             manifest="✅ full",
             schema_depth="Full schemas",
             handoffs="✅",
-            skills_rail="Prompt injection",
+            skills_rail="`load_skill` tool",
         ),
-        use_for="LangChain / LangGraph callbacks; skill injection via `enable_skill_loader=True`",
+        use_for="LangChain / LangGraph — `agent_config(name).middleware` in `create_agent` gives "
+                "the agent its prompt and `load_skill`; `init(langchain=True)` traces",
     ),
     Framework(
         key="openai-agents",

@@ -120,7 +120,10 @@ dependencies = [
 # (1.4.8, context.run(create_task)) — so one marker-free line holds on every
 # supported Python. No `<2`: langchain and langgraph both cap <2 themselves, and
 # for a bare langchain-core install the cap predicted a release that does not exist.
-langchain = ["langchain-core>=1.6.10"]
+# langchain: agent_config() is create_agent middleware (langchain.agents.middleware:
+# AgentMiddleware, before_agent / wrap_model_call, PrivateStateAttr), from 1.4.5. It
+# brings langgraph into a tracing-only install too.
+langchain = ["langchain>=1.4.5", "langchain-core>=1.6.10"]
 # The provider SDK the init(openai=True) one-liner instruments. decimalai code
 # never imports `openai`; this extra exists so `pip install "decimalai[openai]"`
 # co-installs it.
@@ -190,10 +193,11 @@ dev = [
     # this repo's.
     "langchain>=1.4.5",
     "langchain-openai>=1.7.1",
-    # The ChatAnthropic case in tests/test_skill_route_split_langchain.py. It was
-    # only in `live-llm-tests`, so the case ran on a developer's fuller venv and
-    # in no environment CI or the gate builds (tests/test_test_environments_phase1.py
-    # holds every unit test's importorskip to an environment's extras).
+    # The `decimalai init` LangChain template's Claude cells in
+    # tests/test_cli_init_scaffold_runs.py. Only in `live-llm-tests`, they would run
+    # on a developer's fuller venv and in no environment CI or the gate builds
+    # (tests/test_test_environments_phase1.py holds every unit test's importorskip
+    # to an environment's extras).
     "langchain-anthropic>=1.7.6",
     "openai-agents>=0.23.1",
     # For the create_react_agent introspection test.

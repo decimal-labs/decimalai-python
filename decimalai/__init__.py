@@ -5,12 +5,11 @@ Quick start::
     import decimalai
     decimalai.init()  # reads DECIMAL_API_KEY from env
 
-    # LangChain — one-liner: traces, and the agent's skills in every prompt
-    decimalai.init(langchain=True, agent_name="support")
-
-    # Or install the adapter yourself, with its own options
-    from decimalai.langchain import instrument
-    instrument(agent_name="support", enable_skill_loader=True)
+    # LangChain: traces; the agent's prompt and skills come from its middleware
+    decimalai.init(langchain=True)
+    from decimalai.langchain import agent_config
+    support = agent_config("support")
+    agent = create_agent(model, tools=[...], middleware=[support.middleware])
 
     # Generic / any framework
     @decimalai.trace(agent_name="my-agent")
@@ -848,15 +847,14 @@ def init(
         decimalai.init(crewai=True)          # CrewAI
         decimalai.init(otel=True)            # Any OpenTelemetry framework
 
-    On the two frameworks with a skill loader — ``langchain`` and ``crewai`` —
-    the flag both traces and delivers the agent's skills, so
-    ``init(langchain=True, agent_name="support")`` is the whole setup. It is the
-    same install as calling that adapter's
-    ``instrument(agent_name=..., enable_skill_loader=True)`` after a bare
-    ``init()``; do one or the other, not both. ``skills=False``, or
-    ``DECIMALAI_SKILLS=0`` in the environment, keeps the flag to tracing only.
-    ``openai_agents`` traces only: an OpenAI agent gets its prompt and skills
-    from ``decimalai.openai_agents.agent_config(name)``.
+    ``crewai`` is the one flag with a skill loader: it both traces and delivers
+    the agent's skills, the same install as ``decimalai.crewai.instrument(
+    enable_skill_loader=True)`` after a bare ``init()``. ``skills=False``, or
+    ``DECIMALAI_SKILLS=0`` in the environment, keeps it to tracing only.
+    ``langchain`` and ``openai_agents`` trace only: an agent gets its prompt and
+    skills from ``agent_config(name)`` — for LangChain,
+    ``create_agent(..., middleware=[decimalai.langchain.agent_config(name).middleware])``;
+    for OpenAI Agents, ``decimalai.openai_agents.agent_config(name)``.
 
     ``decimalai.init(autogen=True)`` still runs, but AutoGen / AG2 is no longer
     a supported integration: the flag is now an alias for ``otel=True`` that
@@ -886,8 +884,9 @@ def init(
             EARLIER ``init()`` installed: while disabled, no message is routed
             and no skill is injected or loaded. A later ``init(enabled=True)``
             turns it back on.
-        langchain: If ``True``, instrument LangChain / LangGraph, and deliver
-            skills into every chat-model call (see ``skills``).
+        langchain: If ``True``, trace LangChain / LangGraph. Tracing only since
+            0.25: an agent gets its prompt and skills from
+            ``decimalai.langchain.agent_config(name).middleware``.
         openai_agents: If ``True``, trace the OpenAI Agents SDK. Tracing only:
             an agent gets its DecimalAI prompt and skills from
             ``decimalai.openai_agents.agent_config(name)``, which you pass into
@@ -948,10 +947,12 @@ def init(
         verify_timeout: Seconds before the verify probe gives up.
             On timeout, init() logs a warning and continues (does not
             raise) so a transiently slow backend doesn't break startup.
-        skills: Whether the ``langchain`` or ``crewai`` flag also turns
-            on that adapter's skill loader. ``True`` makes the flag form deliver
-            the agent's skills; ``False`` installs tracing only, exactly as
-            ``instrument()`` does without ``enable_skill_loader``. Left unset,
+        skills: Whether the ``crewai`` flag also turns on CrewAI's skill
+            loader. ``True`` makes the flag form deliver the agent's skills;
+            ``False`` installs tracing only, exactly as ``instrument()`` does
+            without ``enable_skill_loader``. With ``langchain``, ``False`` says
+            the app traces only, so a run with no ``agent_config()`` middleware
+            gets no warning. Left unset,
             it falls back to the ``DECIMALAI_SKILLS`` env var (``0``/``false``/
             ``no``/``off`` is ``False``; a value it does not recognise is
             ``False`` too, with a warning), then to ``True``. That variable is
@@ -960,12 +961,11 @@ def init(
             default and nothing more: an explicit
             ``instrument(enable_skill_loader=True)`` is not affected. Ignored
             when no skill-capable framework flag is set, and when ``enabled``
-            is ``False``. With the loader on, the default ``skill_authority``
-            ("auto") treats the router as the skills channel, so the LangChain
-            adapter stops reading local SKILL.md files and syncing them to the
-            platform (the OpenAI Agents adapter reads them only when asked);
-            pass ``skill_authority="harness"`` to keep that. No adapter writes
-            skills to disk either way: registry skills get there through
+            is ``False``. Whatever it says, the LangChain and OpenAI Agents
+            adapters read local SKILL.md files (and sync the ones you wrote to
+            the platform) only when asked: ``skill_dirs=``, ``disk_sync=True``
+            or ``skill_authority="harness"``. No adapter writes skills to disk
+            either way: registry skills get there through
             ``decimalai skills add``.
 
     Re-initializing with a different key, base URL, ``inject_skill_body`` or
@@ -1162,11 +1162,12 @@ def init(
                 "instrumentation; no adapter installed and no skills synced."
             )
     else:
-        # The flag form is what the quickstart teaches, so it installs what the
-        # agent needs: tracing AND the skill loader. `skills=False` is
-        # the tracing-only install, and so is `DECIMALAI_SKILLS=0` when the
+        # `crewai=True` installs tracing AND CrewAI's skill loader. `skills=False`
+        # is the tracing-only install, and so is `DECIMALAI_SKILLS=0` when the
         # argument is left unset — the opt-out for `DECIMAL_AUTO_TRACE`, which
-        # calls these flags with no `init()` line anyone could add it to.
+        # calls these flags with no `init()` line anyone could add it to. For
+        # `langchain=True` it only says whether a run without agent_config() is
+        # worth a warning: that flag traces, and nothing more, since 0.25.
         if skills_from_env:
             skills = (
                 _skills_from_env()
@@ -1180,8 +1181,10 @@ def init(
                     _SKILLS_ENV_VAR,
                 )
         if langchain:
-            from .langchain import instrument as _lc_install
-            _lc_install(agent_name=agent_name, enable_skill_loader=skills)
+            from . import langchain as _lc_adapter
+
+            _lc_adapter.instrument(agent_name=agent_name)
+            _lc_adapter._say_runs_get_no_skills = bool(skills)
 
         if openai_agents:
             from .openai_agents import instrument as _oai_install
@@ -2282,16 +2285,16 @@ __all__ = [
 
 
 # ── Auto-init from environment variable ────────────────────────
-# Setting DECIMAL_AUTO_TRACE=langchain will auto-init and install tracing, plus
-# the skill loader unless DECIMALAI_SKILLS=0.
+# Setting DECIMAL_AUTO_TRACE=langchain will auto-init and install tracing; =crewai
+# adds CrewAI's skill loader unless DECIMALAI_SKILLS=0.
 
 def _auto_init_from_env() -> None:
     """Auto-initialize from environment variables if configured.
 
     Two paths:
     1. `DECIMAL_AUTO_TRACE=<framework>` — full framework auto-install, the same
-       as passing that framework's flag to `init()`: on langchain and
-       crewai that includes the skill loader.
+       as passing that framework's flag to `init()`: on crewai that includes
+       the skill loader.
        `DECIMALAI_SKILLS=0` keeps it to tracing only (`init()` reads it as its
        `skills=` default, and this path passes none).
     2. `DECIMAL_API_KEY` present AND `DECIMAL_AUTOINIT != "false"` — bare

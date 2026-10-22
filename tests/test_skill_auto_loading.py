@@ -363,7 +363,12 @@ class TestOpenAIAgentsAutoLoading:
 
 
 class TestLangChainAutoLoading:
-    """instrument() auto-discovers skills and stores in _explicit_manifest_config."""
+    """instrument() reads local skills when asked, into _explicit_manifest_config.
+
+    Since 0.25 a LangChain agent's skills come from DecimalAI through `agent_config()`,
+    as an OpenAI agent's do, so the project's SKILL.md files are read only when asked:
+    `skill_dirs=`, `disk_sync=True`, or the harness skill authority.
+    """
 
     def test_install_with_skill_dirs_discovers(self, skill_dir, in_tmp_project):
         """instrument(skill_dirs=[...]) auto-discovers skills."""
@@ -388,8 +393,8 @@ class TestLangChainAutoLoading:
             names = {s["name"] for s in skills}
             assert names == {"code-review", "test-generator"}
 
-    def test_install_with_tools_and_no_skills_auto_discovers(self):
-        """instrument(tools=[...]) without skills= still triggers skill discovery."""
+    def test_install_reads_no_local_skills_unless_asked(self):
+        """instrument(tools=[...]) with neither skills= nor skill_dirs= reads none."""
         with patch.dict("sys.modules", {
             "langchain_core": MagicMock(),
             "langchain_core.tracers": MagicMock(),
@@ -407,9 +412,11 @@ class TestLangChainAutoLoading:
                 ]
                 from decimalai.langchain import instrument
                 instrument(tools=[{"name": "search"}])
+                mock_discover.assert_not_called()
 
+                lc._installed = False
+                instrument(tools=[{"name": "search"}], disk_sync=True)
                 mock_discover.assert_called_once()
-                assert lc._explicit_manifest_config["skills"] is not None
                 assert lc._explicit_manifest_config["skills"][0]["name"] == "auto-skill"
 
     def test_install_explicit_skills_skip_discovery(self):

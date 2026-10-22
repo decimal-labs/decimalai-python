@@ -46,11 +46,11 @@ import pytest
 #: a line here for an N/A that no longer happens (a stale exemption reads like
 #: debt that has already been paid).
 DECLARED_NA: Dict[str, str] = {
-    # A rail that is prompt-injection only: the model cannot ASK for a body, so
-    # there is no model-initiated pull for C13b to find. C13 still applies and is
-    # graded, and so is C14 — the delivery verdict is NOT exempt here, which is
-    # the correction that came out of the 2026-08-28 defect.
-    "langchain:C13b": "model_can_load_skill_bodies",
+    # LangChain left here on 2026-10-22: its prompt-injection loader is gone, and
+    # `decimalai.langchain.agent_config()`'s middleware gives the model a load_skill
+    # tool, so C13b is graded on its pulls. (While the rail was injection only, the
+    # model could not ASK for a body; C13 and C14 were graded all along, the
+    # correction that came out of the 2026-08-28 defect.)
     # ADK left here on 2026-10-20 (decimalai 0.20): `decimalai.adk.agent_config()`
     # gives the agent a real load_skill tool, so C13b is graded on its pulls.
     # Anthropic left the same day (decimalai 0.23), for the same reason:
@@ -135,7 +135,9 @@ DECLARED_NA: Dict[str, str] = {
 # Lowered 35 -> 32 on 2026-10-20: Anthropic's C13b, C15 and C16 are graded.
 # `decimalai.anthropic.agent_config()` gives each run a load_skill tool and takes
 # on_trace, where the removed instrument() patch had neither.
-NA_BUDGET = 32
+# Lowered 32 -> 31 on 2026-10-22: LangChain's C13b is graded, now that agent_config()'s
+# middleware gives the model a load_skill tool.
+NA_BUDGET = 31
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -145,9 +147,9 @@ NA_BUDGET = 32
 #: ``contract._grade_framework_limit`` refuses the N/A unless the adapter emits
 #: its documented refusal and delivers nothing by that channel.
 DECLARED_DELIVERY_NA: Dict[str, str] = {
-    # An invoke-layer callback patch observes one model call; it does not own the
-    # turn, so a load_skill result has nowhere to be routed back to.
-    "langchain:tool_loaded": "decimalai/langchain.py",
+    # LangChain left here on 2026-10-22. Its invoke-layer patch observed one model call
+    # and did not own the turn; `decimalai.langchain.agent_config()`'s middleware hands
+    # create_agent's loop a load_skill tool.
     # Anthropic left here on 2026-10-20 (decimalai 0.23). The patched
     # `messages.create()` saw one provider request and never the caller's tool
     # loop; `decimalai.anthropic.agent_config()` hands the loop a load_skill tool
@@ -173,7 +175,9 @@ DECLARED_DELIVERY_NA: Dict[str, str] = {
 # gives the agent a load_skill tool, so its tool_loaded cell delivers and is graded.
 # Lowered 3 -> 2 on 2026-10-20: Anthropic's line retired, the same move:
 # `decimalai.anthropic.agent_config()` gives each run a load_skill tool.
-DELIVERY_NA_BUDGET = 2
+# Lowered 2 -> 1 on 2026-10-22: LangChain's line retired, the same move:
+# `decimalai.langchain.agent_config()`'s middleware gives each run a load_skill tool.
+DELIVERY_NA_BUDGET = 1
 
 # ── journey-axis N/As ────────────────────────────────────────────────────────
 

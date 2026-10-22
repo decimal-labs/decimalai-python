@@ -323,10 +323,11 @@ def test_a_failed_route_cannot_certify_the_next_pasted_body_on_anthropic_load_ag
     assert served.skills_delivered_versions == []
 
 
-@pytest.mark.parametrize("loaded", [False, True], ids=["prompt", "tool"])
+# Since 0.25 no LangChain model call has a body built into its prompt by the adapter
+# (the loader is gone), so only the load case is left to prove here.
+@pytest.mark.parametrize("loaded", [True], ids=["tool"])
 def test_real_langchain_calls_keep_exact_witnesses_for_same_name_concurrently(monkeypatch, sdk, loaded):
     pytest.importorskip("langchain_core")
-    from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
     from langchain_core.runnables import RunnableLambda
 
@@ -335,11 +336,6 @@ def test_real_langchain_calls_keep_exact_witnesses_for_same_name_concurrently(mo
 
     shared = router(monkeypatch)
     monkeypatch.setattr(lc, "_skill_router_singleton", shared)
-    monkeypatch.setattr(BaseChatModel, "invoke", BaseChatModel.invoke)
-    monkeypatch.setattr(BaseChatModel, "ainvoke", BaseChatModel.ainvoke)
-    monkeypatch.setattr(lc, "_skill_loader_installed", False)
-    if not loaded:
-        lc._install_skill_loader()
     observed = []
 
     def invoke(index):
@@ -425,13 +421,12 @@ def test_partial_or_noncanonical_pair_preserves_legacy_hash_only(pair):
 # Not openai_agents or adk: since 0.18 and 0.20 they never build a body into a prompt
 # (load_skill only). Not anthropic: since 0.21 its prompt comes from agent_config(),
 # graded above by test_a_failed_route_cannot_certify_the_next_pasted_body_on_anthropic_load_agent.
-@pytest.mark.parametrize("adapter", ["crewai", "langchain"])
+# Not langchain: since 0.25 its prompt comes from agent_config() too.
+@pytest.mark.parametrize("adapter", ["crewai"])
 @pytest.mark.parametrize("failure", ["writes-then-fails", "stale-before-fails"])
 def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapter, failure):
     import decimalai.otel as otel
 
-    if adapter == "langchain":
-        pytest.importorskip("langchain_core.messages")
     current = [41]
     monkeypatch.setattr(otel, "current_run_key", lambda: current[0])
     stale = {"name": NAME, "hash": HASHES[0], "skill_id": SKILL_ID, "version_id": VERSION_IDS[0]}
@@ -460,21 +455,11 @@ def test_failed_prompt_build_cannot_certify_next_legacy_body(monkeypatch, adapte
         sr._last_delivered_versions_ctx.set([dict(stale)])
 
     def build():
-        if adapter == "crewai":
-            messages = [{"role": "user", "content": "synthetic request"}]
-            module._skill_hook(SimpleNamespace(
-                executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
-            ))
-            return "\n".join(message["content"] for message in messages)
-        tokens = module._open_call_rails()
-        try:
-            messages = module._inject_skills_into_input("synthetic request")
-            if current[0] == 42:
-                assert module._skills_delivered_ctx.get() == {NAME}
-                assert module._skills_delivered_versions_ctx.get() == []
-            return "\n".join(getattr(message, "content", "") for message in messages) if isinstance(messages, list) else messages
-        finally:
-            module._close_call_rails(tokens)
+        messages = [{"role": "user", "content": "synthetic request"}]
+        module._skill_hook(SimpleNamespace(
+            executor=object(), messages=messages, task=None, agent=None, crew=None, llm=None,
+        ))
+        return "\n".join(message["content"] for message in messages)
 
     build()
     assert sr._last_delivered_versions_ctx.get() is None

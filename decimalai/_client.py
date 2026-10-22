@@ -1076,6 +1076,26 @@ class DecimalAIClient:
         _raise_for_status(resp)
         return cast(Dict[str, Any], resp.json())
 
+    def set_always_include(
+        self, agent_name: str, skill: str, always_include: bool = True,
+    ) -> Dict[str, Any]:
+        """Put a skill's full text into every run of one agent, or stop (D-C).
+
+        ``skill`` is the skill's name or id; it must be assigned to the agent. Idempotent:
+        a repeat answers ``changed: False``. See :meth:`SkillRouter.set_always_include`.
+
+        Raises:
+            DecimalAPIError: a 4xx/5xx, including the 404 for a skill not assigned to
+                the agent, or a backend without the route.
+        """
+        path = (f"/api/v1/agents/{urllib.parse.quote(str(agent_name), safe='')}"
+                f"/skills/{urllib.parse.quote(str(skill), safe='')}/always-include")
+        resp = self._request_with_retry(
+            "PUT", path, json={"always_include": bool(always_include)}, idempotent=True,
+        )
+        _raise_for_status(resp)
+        return cast(Dict[str, Any], resp.json())
+
     # ── Manifest registration ─────────────────────────────────
 
     def register_manifest(self, manifest: Any) -> ManifestRegistrationResponse:

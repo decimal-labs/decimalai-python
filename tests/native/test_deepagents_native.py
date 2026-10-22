@@ -1,5 +1,6 @@
 """Deep Agents native mode: a ``read_file`` of a SKILL.md is an activation of the version
-read, the router stays out of the agent's prompt, and the pointer helper shows the skills.
+read, DecimalAI puts nothing into the agent's prompt (``init(langchain=True)`` traces only),
+and the pointer helper shows the skills.
 
 The framework runs for real (deepagents, LangGraph underneath, traced by the LangChain
 adapter) with a scripted model, in a child process per scenario
@@ -11,7 +12,6 @@ touch no process-wide state.
 from __future__ import annotations
 
 import importlib.util
-import logging
 from typing import Any, Dict, List
 
 import pytest
@@ -92,18 +92,34 @@ def test_the_listing_the_model_was_shown_is_offered(native_project):
     assert offered == listed, (offered, listed)
 
 
-def test_the_router_stays_out_of_a_deep_agent_and_serves_a_plain_graph(native_project):
+def _told(warned: List[str], words: str) -> List[str]:
+    return [line for line in warned if words in line]
+
+
+def test_init_puts_nothing_in_a_deep_agent_and_tells_only_a_plain_graph(native_project):
+    """``init(langchain=True)`` traces only since 0.25: no DecimalAI text reaches either
+    model and no run is routed. The plain graph is the run told so, once, and the Deep
+    Agents agent is not: its skills come from its own middleware, as documented."""
     result = _scenario("checks", native_project)
-    assert result["errors"] == [None, None, None]
-    assert result["deepagents"]["injected"] == []
-    deep, plain = result["traces"][0][0], result["traces"][1][0]
-    assert deep.get("routing_id") is None
-    # The control: the same router, in the same process, injects into a graph without
-    # the skills middleware, so the empty list above is the rule, not a dead router.
-    assert result["plain"]["injected"], "the router injected nothing anywhere"
-    assert plain.get("routing_id")
-    said = [line for line in result["logs"] if "does not inject its menu" in line]
-    assert len(said) == 1 and said[0].startswith("INFO"), result["logs"]
+    assert result["errors"] == [None] * 5
+    assert result["deepagents"]["injected"] == [] and result["plain"]["injected"] == []
+    assert [runs[0].get("routing_id") for runs in result["traces"][:3]] == [None] * 3
+    assert _told(result["deepagents"]["warned"], "traces only") == []
+    told = _told(result["plain"]["warned"], "traces only")
+    assert len(told) == 1 and "agent_config(name).middleware" in told[0], result["logs"]
+
+
+def test_agent_config_beside_deep_agents_skills_warns_once(native_project):
+    """Deep Agents' skills middleware and ``agent_config()``'s in one agent show the model
+    two skill lists. Deep Agents runs a user's middleware before its skills middleware, so
+    ``skills_metadata`` is not in the state at our ``before_agent``: the check is made at the
+    model call. Said once per config, on the first run."""
+    result = _scenario("checks", native_project)
+    first, second = result["both"]["warned"]
+    assert len(_told(first, "two skill lists")) == 1, first
+    assert _told(second, "two skill lists") == [], second
+    assert result["both"]["prompt_shown"], "the agent's prompt is not in the call"
+    assert result["both"]["listed"], "Deep Agents' own list is not in the call"
 
 
 def test_a_pinned_skill_is_an_activation_too(native_project):
@@ -125,7 +141,7 @@ def test_the_pointer_helper_lists_the_installed_skills(native_project):
 # ── the handler, driven directly ─────────────────────────────────────────────
 
 
-def _drive_read(handler, *, path: str, output: Any, router_injected: bool = False) -> None:
+def _drive_read(handler, *, path: str, output: Any) -> None:
     from uuid import uuid4
 
     from langchain_core.messages import ToolMessage
@@ -135,7 +151,6 @@ def _drive_read(handler, *, path: str, output: Any, router_injected: bool = Fals
     handler.on_chain_start({}, {}, run_id=node, parent_run_id=root,
                            name="SkillsMiddleware.before_agent")
     handler.on_chain_end({}, run_id=node, parent_run_id=root)
-    handler._runs[root].router_injected = router_injected
     handler.on_tool_start({"name": "read_file"}, str({"file_path": path}), run_id=tool,
                           parent_run_id=root, inputs={"file_path": path})
     handler.on_tool_end(ToolMessage(content=output, tool_call_id="c1", name="read_file"),
@@ -167,20 +182,3 @@ def test_a_partial_read_is_reported_unverified(native_project):
     assert len(entries) == 1
     assert entries[0]["skill_id"] == want["skill_id"] and "version_id" not in entries[0]
     assert entries[0]["body_sha256"] != want["body_sha256"]
-
-
-def test_a_native_load_on_a_routed_run_warns_once(native_project, monkeypatch, caplog):
-    pytest.importorskip("langchain_core")
-    import decimalai.langchain as lc
-
-    monkeypatch.setattr(lc, "_native_double_catalog_warned", False)
-    path, text = _skill_md(native_project)
-    with caplog.at_level(logging.WARNING, logger="decimalai.langchain"):
-        for _ in range(2):
-            handler = lc.CallbackHandler(agent_name="routed", auto_send=False)
-            _drive_read(handler, path=path, output=f"@@ lines 1-25 of 25 @@\n{text}",
-                        router_injected=True)
-            assert _target_entries(_built(handler), {native_project.expected()["name"]}) == [
-                native_project.expected()]
-    warned = [r for r in caplog.records if "two catalogs" in r.getMessage()]
-    assert len(warned) == 1

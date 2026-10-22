@@ -94,14 +94,18 @@ class TestWarningGuards:
         with pytest.raises(ImportError, match=r'decimalai\[pydantic-ai\]'):
             pai.agent_config("support")
 
-    def test_langchain_loader_warns_with_extra(self, monkeypatch, caplog):
+    def test_langchain_agent_config_names_the_extra_before_any_call(self, monkeypatch):
+        """LangChain's skills come from agent_config()'s create_agent middleware, which
+        needs `langchain` 1.x outright (the extra brings it): it raises, naming the extra,
+        before init() or any request."""
+        import decimalai._agent as agent_mod
         import decimalai.langchain as lc
 
-        _block(monkeypatch, "langchain_core")
-        monkeypatch.setattr(lc, "_skill_loader_installed", False)
-        with caplog.at_level("WARNING"):
-            lc._install_skill_loader()
-        assert 'decimalai[langchain]' in caplog.text
+        _block(monkeypatch, "langchain")
+        monkeypatch.setattr(agent_mod, "_open_prompt",
+                            lambda *a: pytest.fail("set up before the import check"))
+        with pytest.raises(ImportError, match=r'decimalai\[langchain\]'):
+            lc.agent_config("support")
 
     def test_openai_agents_load_agent_names_the_extra_before_any_call(self, monkeypatch):
         """Since 0.18 the skills come from agent_config(), which needs the SDK

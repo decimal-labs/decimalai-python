@@ -1,4 +1,4 @@
-"""The injected skill menu must not sit in front of the caller's prompt.
+"""The skill list must not sit in front of the caller's prompt.
 
 THE RULE, one sentence: stable content stays in the cacheable prefix;
 query-varying content goes after it.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import types
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 import pytest
 
@@ -96,175 +96,6 @@ def _assert_prefix_is_stable(first: bytes, second: bytes, *, adapter: str) -> No
         f"{adapter}: the caller's own prompt is not in the cacheable prefix at "
         f"all — it must lead, not trail"
     )
-
-
-# ── LangChain ────────────────────────────────────────────────────
-
-
-def _lc_messages(msgs: List[Any]) -> List[Tuple[str, str]]:
-    return [
-        (
-            str(getattr(m, "type", None) or getattr(m, "role", "?")),
-            str(getattr(m, "content", m)),
-        )
-        for m in msgs
-    ]
-
-
-def _lc_split_at_fragment(result: List[Any]) -> Tuple[bytes, int]:
-    """Return (bytes before the injected menu, its index)."""
-    rendered = _lc_messages(result)
-    for idx, (_role, content) in enumerate(rendered):
-        if MENU_MARKER in content:
-            return json.dumps(rendered[:idx]).encode(), idx
-    raise AssertionError(f"no skill fragment found in {rendered!r}")
-
-
-@pytest.fixture
-def langchain_router(monkeypatch, quiet_rails):
-    pytest.importorskip("langchain_core")
-    import decimalai.langchain as lc_mod
-
-    router = _QueryVaryingRouter()
-    monkeypatch.setattr(lc_mod, "_skill_router_singleton", router)
-    return lc_mod, router
-
-
-class TestLangChainOrdering:
-    """`_inject_skills_into_input` — decimalai/langchain.py."""
-
-    def test_prefix_before_the_menu_is_byte_identical_across_queries(
-        self, langchain_router
-    ):
-        """THE cache property, stated in cache terms rather than index terms."""
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        lc_mod, _router = langchain_router
-
-        prefixes = []
-        for query in ("how do refunds work?", "write me a haiku about otters"):
-            result = lc_mod._inject_skills_into_input(
-                [SystemMessage(content=CALLER_PROMPT), HumanMessage(content=query)]
-            )
-            prefix, idx = _lc_split_at_fragment(result)
-            assert idx == 1, "the menu belongs directly after the caller's system msg"
-            prefixes.append(prefix)
-
-        _assert_prefix_is_stable(*prefixes, adapter="langchain")
-
-    def test_menu_lands_after_every_leading_system_message(self, langchain_router):
-        """Several leading system messages are ALL the caller's prefix."""
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        lc_mod, _router = langchain_router
-
-        result = lc_mod._inject_skills_into_input(
-            [
-                SystemMessage(content=CALLER_PROMPT),
-                SystemMessage(content=SECOND_CALLER_PROMPT),
-                HumanMessage(content="hello"),
-            ]
-        )
-
-        rendered = _lc_messages(result)
-        assert [r for r, _ in rendered] == ["system", "system", "system", "human"]
-        assert rendered[0][1] == CALLER_PROMPT
-        assert rendered[1][1] == SECOND_CALLER_PROMPT
-        assert MENU_MARKER in rendered[2][1]
-
-    def test_no_system_message_still_puts_the_menu_first(self, langchain_router):
-        """Unchanged from before the fix: with nothing to sit behind, the menu
-        leads. There is no caller prefix to protect, so index 0 is correct."""
-        from langchain_core.messages import HumanMessage
-
-        lc_mod, _router = langchain_router
-
-        result = lc_mod._inject_skills_into_input([HumanMessage(content="hello")])
-
-        _prefix, idx = _lc_split_at_fragment(result)
-        assert idx == 0
-
-    def test_bare_string_input_puts_the_menu_first(self, langchain_router):
-        """A bare string is one human turn — again, no caller prefix exists."""
-        lc_mod, _router = langchain_router
-
-        result = lc_mod._inject_skills_into_input("hello")
-
-        rendered = _lc_messages(result)
-        assert MENU_MARKER in rendered[0][1]
-        assert rendered[1][1] == "hello"
-
-    def test_prompt_value_input_keeps_its_system_message_in_front(
-        self, langchain_router
-    ):
-        """`prompt | llm` hands the model a PromptValue, and its template's
-        system message is the caller's cacheable prefix just the same."""
-        from langchain_core.prompts import ChatPromptTemplate
-
-        lc_mod, _router = langchain_router
-
-        prefixes = []
-        for query in ("first question", "totally different second question"):
-            value = ChatPromptTemplate.from_messages(
-                [("system", CALLER_PROMPT), ("human", "{q}")]
-            ).invoke({"q": query})
-            result = lc_mod._inject_skills_into_input(value)
-            prefix, idx = _lc_split_at_fragment(result)
-            assert idx == 1
-            prefixes.append(prefix)
-
-        _assert_prefix_is_stable(*prefixes, adapter="langchain/PromptValue")
-
-    def test_a_system_message_later_in_the_thread_is_not_jumped(
-        self, langchain_router
-    ):
-        """Only the LEADING run of system messages is the cacheable prefix.
-
-        A system message that appears mid-conversation sits behind turns that
-        already vary, so there is nothing to protect by moving past it — and
-        moving past it would reorder the caller's conversation.
-        """
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        lc_mod, _router = langchain_router
-
-        result = lc_mod._inject_skills_into_input(
-            [
-                SystemMessage(content=CALLER_PROMPT),
-                HumanMessage(content="hi"),
-                SystemMessage(content="mid-thread note"),
-                HumanMessage(content="again"),
-            ]
-        )
-
-        rendered = _lc_messages(result)
-        assert [r for r, _ in rendered] == [
-            "system", "system", "human", "system", "human",
-        ]
-        assert MENU_MARKER in rendered[1][1]
-
-    @pytest.mark.parametrize(
-        "system_msg",
-        [
-            {"role": "system", "content": CALLER_PROMPT},
-            ("system", CALLER_PROMPT),
-        ],
-        ids=["dict", "tuple"],
-    )
-    def test_unconverted_system_shapes_are_recognized(
-        self, langchain_router, system_msg
-    ):
-        """LangChain accepts dicts and ("system", "...") tuples in the list it
-        is handed; the injector runs BEFORE that conversion, so it has to know
-        those shapes or it would inject in front of them."""
-        lc_mod, _router = langchain_router
-
-        result = lc_mod._inject_skills_into_input(
-            [system_msg, {"role": "user", "content": "hello"}]
-        )
-
-        assert result[0] is system_msg
-        assert MENU_MARKER in str(getattr(result[1], "content", ""))
 
 
 # ── Anthropic ────────────────────────────────────────────────────
@@ -417,27 +248,3 @@ class TestOpenAIAgentsOrdering:
         out = _openai_instructions(make(""), "q")
 
         assert out.startswith(MENU_MARKER)
-
-
-class TestDeveloperRoleIsAlsoACallerPrefix:
-    """OpenAI renamed the system role to `developer`, and LangChain converts it
-    to a SystemMessage. Matching only "system" made the whole reordering
-    silently no-op for anyone on the modern spelling — the varying fragment
-    went straight back to byte 0, which is the bug this file exists to stop."""
-
-    def test_developer_dict_is_recognised(self):
-        import decimalai.langchain as lc
-        assert lc._is_system_message({"role": "developer", "content": "you are…"})
-
-    def test_developer_tuple_is_recognised(self):
-        import decimalai.langchain as lc
-        assert lc._is_system_message(("developer", "you are…"))
-
-    def test_a_developer_prefix_is_not_jumped(self):
-        import decimalai.langchain as lc
-        msgs = [{"role": "developer", "content": "P"}, {"role": "user", "content": "q"}]
-        assert lc._system_prefix_len(msgs) == 1
-
-    def test_user_role_is_still_not_a_prefix(self):
-        import decimalai.langchain as lc
-        assert not lc._is_system_message({"role": "user", "content": "q"})

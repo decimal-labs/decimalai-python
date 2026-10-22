@@ -1,9 +1,18 @@
 """LangChain / LangGraph driver — the reference implementation.
 
 Runs the snippets documented at ``https://docs.decimal.ai/sdk/python/frameworks/langchain``:
-a compiled LangGraph invoked with ``config={"callbacks": [CallbackHandler(...)]}``
-for the traced phases, and the process-wide ``instrument(enable_skill_loader=True)``
-form for the skills rail (the only form the rail has).
+a compiled LangGraph invoked with ``config={"callbacks": [CallbackHandler(...)]}`` for the
+traced phases, and for the skills rail the ``agent_config(name)`` form: the agent's prompt
+and skills pulled from DecimalAI as one ``create_agent`` middleware
+(``Driver.loads_agent_from_platform``: the harness puts each phase's agent in the workspace
+first, as the dashboard would). The middleware gives every model call the system message (the
+saved prompt, then the skill list) and a real ``load_skill`` tool in create_agent's tool loop,
+so the body comes back mid-run as the tool's result. Until the loader was removed this rail
+was ``instrument(enable_skill_loader=True)``, prompt injection only.
+
+``agent_config()`` turns LangChain tracing on for the process, as the docs say, so the skills
+phases pass no handler of their own; the traced phases still pass a per-call one, which wins
+over the process's (``handle_class`` dedupes by type), so nothing is traced twice.
 
 The model is a stub — no key, no network, deterministic tokens — so every phase
 runs on every commit. Everything the contract asserts (prompt text, completion
@@ -15,9 +24,9 @@ NO ASSERTIONS BELOW THIS LINE. That is the driver contract.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
-from ..delivery import TOOL_LOADED
+from ..delivery import INJECTED
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
@@ -25,7 +34,7 @@ from . import (
     Ctx,
     Driver,
     DriverError,
-    FrameworkLimit,
+    StubTurn,
     fanout_threads,
     stub_script,
     tool_result,
@@ -36,14 +45,15 @@ from . import (
 # ── the stub model ───────────────────────────────────────────────────────────
 
 
-def _stub_model(ctx: Ctx, *, use_tool: bool = True, fail: bool = False) -> Any:
+def _stub_model(ctx: Ctx, *, use_tool: bool = True, fail: bool = False,
+                script: Optional[List[StubTurn]] = None) -> Any:
     """Map the shared stub script onto langchain-core's chat-model interface."""
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
     from pydantic import PrivateAttr
 
-    script = stub_script(ctx, use_tool=use_tool)
+    script = script if script is not None else stub_script(ctx, use_tool=use_tool)
 
     class StubChatModel(BaseChatModel):
         fail: bool = False
@@ -58,7 +68,12 @@ def _stub_model(ctx: Ctx, *, use_tool: bool = True, fail: bool = False) -> Any:
             return {"model_name": STUB_MODEL_NAME, "temperature": 0.0}
 
         def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Any:
-            return self.bind(tools=[getattr(t, "name", str(t)) for t in tools])
+            # A BaseTool by its name; the middleware's load_skill is an OpenAI-format dict.
+            return self.bind(tools=[
+                getattr(t, "name", None) or (t.get("function") or {}).get("name")
+                if isinstance(t, dict) else getattr(t, "name", str(t))
+                for t in tools
+            ])
 
         def _generate(
             self, messages: List[Any], stop: Optional[List[str]] = None,
@@ -73,7 +88,7 @@ def _stub_model(ctx: Ctx, *, use_tool: bool = True, fail: bool = False) -> Any:
                 name, args = turn.tool_call
                 tool_calls = [{
                     "name": name, "args": args,
-                    "id": "call_conformance_1", "type": "tool_call",
+                    "id": f"call_conformance_{self._turn}", "type": "tool_call",
                 }]
             message = AIMessage(
                 content=turn.content,
@@ -89,19 +104,54 @@ def _stub_model(ctx: Ctx, *, use_tool: bool = True, fail: bool = False) -> Any:
     return StubChatModel(fail=fail)
 
 
-# ── the documented snippet ───────────────────────────────────────────────────
+def _skill_script(ctx: Ctx) -> List[StubTurn]:
+    """The rail's script: call ``load_skill``, then answer.
+
+    ``load_skill`` is the rail the middleware gives the model, and it is a real tool in
+    create_agent's real tool loop — the body comes back mid-run. Same shape and same reply
+    text as the shared script; only the tool called differs, because the tool IS the
+    mechanism under test.
+
+    In the ``injected`` delivery cell the ``load_skill`` tool is switched OFF in this
+    process's environment (``DECIMALAI_LOAD_SKILL_TOOL=0``), so the model is scripted onto
+    the ordinary conformance tool instead: the body has to arrive pasted into the system
+    message in that cell, which is the point of it.
+    """
+    turns = stub_script(ctx)
+    if not ctx.skills or ctx.delivery_mode == INJECTED:
+        return turns
+    ask, answer = turns[0], turns[-1]
+    return [
+        StubTurn(
+            tool_call=("load_skill", {"name": ctx.skills[0]["name"]}),
+            content=ask.content,
+            input_tokens=ask.input_tokens,
+            output_tokens=ask.output_tokens,
+        ),
+        answer,
+    ]
 
 
-def _graph(ctx: Ctx, model: Any) -> Any:
+# ── the documented snippets ──────────────────────────────────────────────────
+
+
+def _tool(ctx: Ctx) -> Any:
     from langchain_core.tools import tool
-    from langgraph.graph import END, START, MessagesState, StateGraph
-    from langgraph.prebuilt import ToolNode
 
     @tool(ctx.tool_name)
     def lookup(query: str) -> str:
         """Look a value up for the conformance run."""
         return tool_result(ctx, query)
 
+    return lookup
+
+
+def _graph(ctx: Ctx, model: Any) -> Any:
+    """A hand-built LangGraph: model node, tool node, loop until no tool call."""
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+
+    lookup = _tool(ctx)
     bound = model.bind_tools([lookup])
 
     def call_model(state):
@@ -125,6 +175,34 @@ def _messages(ctx: Ctx) -> list:
     return [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_message(ctx))]
 
 
+def _config(ctx: Ctx, configs: Dict[str, Any]) -> Any:
+    """The documented module-level ``agent_config()``, one per agent name."""
+    from decimalai.langchain import agent_config
+
+    if ctx.agent_name not in configs:
+        configs[ctx.agent_name] = agent_config(ctx.agent_name)
+    return configs[ctx.agent_name]
+
+
+def _agent(ctx: Ctx, support: Any, *, checkpointer: Any = None) -> Any:
+    """The documented ``agent_config()`` snippet: ``create_agent`` with the middleware.
+
+    The graph is left unnamed (LangGraph calls it ``LangGraph``): the run is filed under the
+    DecimalAI agent the config was built for, whatever the graph is called.
+    """
+    from langchain.agents import create_agent
+
+    return create_agent(_stub_model(ctx, script=_skill_script(ctx)), tools=[_tool(ctx)],
+                        middleware=[support.middleware], checkpointer=checkpointer)
+
+
+def _ask(ctx: Ctx) -> dict:
+    return {"messages": [{"role": "user", "content": user_message(ctx)}]}
+
+
+# ── phases ───────────────────────────────────────────────────────────────────
+
+
 def run(ctx: Ctx) -> Any:
     """The documented per-call-handler snippet, over a compiled LangGraph."""
     from decimalai.langchain import CallbackHandler
@@ -137,11 +215,8 @@ def run(ctx: Ctx) -> Any:
 def run_nested(ctx: Ctx) -> Any:
     """The per-call-handler snippet, with the suite's observer on the handler.
 
-    ``handler.on_trace`` is the form ``decimalai init``'s generated Support
-    project uses (``decimalai/cli/project.py``), and the per-call handler is the
-    one form that adds no process-wide state — ``instrument(on_trace=...)``
-    would publish a global handler that traces every later phase a second time.
-    The harness runs this inside a ``decimalai.start_trace()`` of its own.
+    ``handler.on_trace`` is the per-call form of the observer; the per-call handler adds no
+    process-wide state. The harness runs this inside a ``decimalai.start_trace()`` of its own.
     """
     from decimalai.langchain import CallbackHandler
 
@@ -174,87 +249,52 @@ def run_degenerate(ctx: Ctx) -> Any:
 
 
 def run_skills(ctxs: Sequence[Ctx]) -> Any:
-    """The skills rail, which exists only in the process-wide form.
+    """The skills rail: ``agent_config()`` middleware agents, N lanes at once.
 
-    ``instrument(enable_skill_loader=True)`` monkey-patches ``BaseChatModel``
-    and publishes a process-global handler, so this phase runs LAST — it cannot
-    be undone, and a global handler would double-trace every other phase. The
-    lanes then run through that one global handler, which is what a real
-    multi-request process does.
-
-    In the ``tool_loaded`` delivery cell the driver ASKS for the tool loop
-    (``enable_load_skill_tool=True``) instead of quietly not asking. That is what
-    turns this framework's N/A from a sentence into an observation: the adapter
-    has to refuse, out loud, on this run, or the cell fails instead of being
-    excused. Asking is not an assertion — the grading of what comes back lives
-    in ``contract.grade_delivery``.
+    The lanes share one agent name and so one config, the way every run of a module-level
+    agent does; the config is built before any lane starts. Each lane asks a different
+    question, so the router mints a routing decision per lane and a leaked one is visible.
     """
-    from decimalai.langchain import instrument
+    configs: Dict[str, Any] = {}
+    agents = [(ctx, _agent(ctx, _config(ctx, configs))) for ctx in ctxs]
 
-    instrument(
-        agent_name=ctxs[0].agent_name,
-        enable_skill_loader=True,
-        enable_load_skill_tool=ctxs[0].delivery_mode == TOOL_LOADED,
-    )
+    def _one(pair: Any) -> Any:
+        ctx, agent = pair
+        return agent.invoke(_ask(ctx))
 
-    def _one(ctx: Ctx) -> Any:
-        return _graph(ctx, _stub_model(ctx)).invoke({"messages": _messages(ctx)})
-
-    return fanout_threads(_one)(ctxs)
-
-
-def _rail_on() -> None:
-    """The rail, as the docs install it — a no-op once the skills phase has.
-
-    ``instrument()`` is one-shot per process: a repeat call reconfigures
-    nothing (it says so). So the agent name the skills phase installed stays
-    the install name for every phase after it, which is what makes the
-    per-call name below a different answer from the install's.
-    """
-    from decimalai.langchain import instrument
-
-    instrument(enable_skill_loader=True)
+    return fanout_threads(_one)(agents)
 
 
 def run_unnamed(ctx: Ctx) -> Any:
-    """The rail on an unnamed graph, named per call: ``CallbackHandler(agent_name=...)``.
+    """The rail on a graph LangChain names one way and DecimalAI another.
 
-    The graph carries no name of its own (LangGraph calls it ``LangGraph``),
-    and the process-wide install was named for a different agent by the skills
-    phase. The per-call handler is the documented way to name this run — and
-    the adapter documents that skills are routed for the agent the trace is
-    filed under: the handler's name first.
+    ``create_agent`` names its graph ``LangGraph`` unless told otherwise, while the
+    DecimalAI agent, named once in ``agent_config()``, is this run's. The trace and the
+    routing call must both name the DecimalAI agent.
     """
-    from decimalai.langchain import CallbackHandler
-
-    _rail_on()
-    handler = CallbackHandler(agent_name=ctx.agent_name)
-    graph = _graph(ctx, _stub_model(ctx))
-    return graph.invoke({"messages": _messages(ctx)}, config={"callbacks": [handler]})
+    return _agent(ctx, _config(ctx, {})).invoke(_ask(ctx))
 
 
 def run_conversation(ctxs: Sequence[Ctx]) -> Any:
-    """Two turns: the second invoke carries the first's messages, then a new one.
+    """Two turns of one thread: a checkpointer and a ``thread_id``, the documented
+    LangGraph conversation. The second invoke carries only the new message; the thread
+    keeps the first's messages, system message and load_skill definition."""
+    from langgraph.checkpoint.memory import InMemorySaver
 
-    The LangGraph way to continue a conversation without a checkpointer — the
-    state's message list, extended. Both turns run through the process-wide
-    handler, named for this agent by the skills phase.
-    """
-    from langchain_core.messages import HumanMessage
-
-    _rail_on()
     first, second = ctxs
-    turn_one = _graph(first, _stub_model(first)).invoke({"messages": _messages(first)})
-    history = list(turn_one["messages"]) + [HumanMessage(content=user_message(second))]
-    return _graph(second, _stub_model(second)).invoke({"messages": history})
+    support = _config(first, {})
+    agent = _agent(first, support, checkpointer=InMemorySaver())
+    thread = {"configurable": {"thread_id": f"conformance-{first.agent_name}"}}
+    agent.invoke(_ask(first), thread)
+    return agent.invoke(_ask(second), thread)
 
 
 DRIVER = Driver(
     name="langchain",
     covers=frozenset({"langchain", "langgraph"}),
-    requires=("langchain_core", "langgraph"),
+    requires=("langchain_core", "langgraph", "langchain.agents.middleware"),
     frameworks=("langchain-core", "langgraph"),
-    entrypoint="decimalai.langchain.CallbackHandler / instrument()",
+    entrypoint="decimalai.langchain.CallbackHandler / agent_config(name).middleware",
     run=run,
     run_concurrent=fanout_threads(run),
     run_error=run_error,
@@ -263,46 +303,12 @@ DRIVER = Driver(
     run_nested=run_nested,
     run_unnamed=run_unnamed,
     run_conversation=run_conversation,
+    loads_agent_from_platform=True,
     capabilities=Capabilities(
         has_tools=True,
         has_skills_rail=True,
-        model_can_load_skill_bodies=False,
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=True,
-        reasons={
-            "model_can_load_skill_bodies": (
-                "this rail is prompt-injection only. enable_load_skill_tool is accepted "
-                "but DORMANT on this adapter — decimalai/langchain.py logs "
-                "'enable_load_skill_tool is not supported on the langchain adapter "
-                "(invoke-layer patch, no tool loop); staying on prompt injection. Use "
-                "openai_agents or pydantic_ai for the native load_skill tool' — because "
-                "an invoke-layer patch cannot route a tool result back mid-turn. The "
-                "model therefore has no way to ASK for a body, so the strongest rung "
-                "observable here is DELIVERED, and delivery is not activation. "
-                "snippets/silent-noops.mdx already says it: 'activation isn't measurable "
-                "for bare prompt-injection usage.' C13 still applies and is graded: with "
-                "no loader, a delivered body is exactly what is most likely to be "
-                "promoted to a fabricated activation."
-            ),
-        },
-        delivery_limits={
-            TOOL_LOADED: FrameworkLimit(
-                reason=(
-                    "LangChain's callback/invoke layer is an OBSERVER of a turn, not "
-                    "the owner of a tool loop: this adapter patches "
-                    "BaseChatModel.invoke/ainvoke, which sees one model call and "
-                    "cannot route a tool RESULT back into the same turn. There is "
-                    "nowhere for a load_skill result to go, so the tool-loaded "
-                    "channel does not exist here at any setting of any flag. "
-                    "Prompt injection is the whole rail — which is why the injected "
-                    "cell is graded strictly and is not allowed to be N/A."
-                ),
-                adapter_module="decimalai/langchain.py",
-                refusal_marker=(
-                    "enable_load_skill_tool is not supported on the langchain adapter"
-                ),
-            ),
-        },
     ),
 )

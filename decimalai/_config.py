@@ -307,17 +307,18 @@ class DecimalConfig:
         An explicit setting always wins — init(inject_skill_body=...) or
         DECIMALAI_INJECT_SKILL_BODY=0/1. Unset, the answer comes from the adapter:
 
-          no tool loop  (langchain, crewai)         => True
+          no tool loop  (crewai)                    => True
               Prompt injection is the ONLY body channel these have. Without it the model
               is handed a menu of skill titles it has no mechanism to read, which is not a
               degraded rail — it is a rail that cannot work.
 
-          has tool loop (every agent_config(): openai_agents, pydantic_ai, adk, anthropic) => False
+          has tool loop (every agent_config(): langchain, openai_agents, pydantic_ai, adk,
+                         anthropic) => False
               These register a real `load_skill` tool, so the model fetches on demand.
               Injecting as well would double-deliver and double the token cost.
 
-        Only reached once an adapter's skills were asked for — its skill loader enabled
-        (`enable_skill_loader=True`, off by default) or a `agent_config()` — so nobody who
+        Only reached once an adapter's skills were asked for — CrewAI's skill loader enabled
+        (`enable_skill_loader=True`, off by default) or an `agent_config()` — so nobody who
         never asked for skills is affected.
         """
         if self.inject_skill_body is not None:
@@ -390,8 +391,8 @@ def _disabled_by_init() -> bool:
 
     Unlike ``not _is_enabled()``, False before any ``init()``. The skill
     loaders read it at their one door to the platform (each adapter's
-    ``_get_skill_router``): a loader an earlier ``init(langchain=True)``
-    installed patches the framework for the life of the process, so without
+    ``_get_skill_router``): a loader an earlier ``init(crewai=True)``
+    installed hooks the framework for the life of the process, so without
     this a later ``init(enabled=False)`` stopped traces while every user
     message still went to ``/skills/route`` and skills were still injected.
     """

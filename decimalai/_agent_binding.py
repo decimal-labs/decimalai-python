@@ -42,6 +42,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -298,7 +299,10 @@ def attach_prompt_records(spans: List[Any], records: Any) -> None:
     The backend stores span attributes as they come, so a trace says which
     prompt version a run used, with which variable NAMES (never values:
     those are often personal data), without a column of its own. An agent with
-    no span of its own gets a span named ``decimalai.prompt``.
+    no span of its own gets a span named ``decimalai.prompt``, under the run's root
+    span and spanning the run: the backend refuses a span with no start or end, and
+    that refusal used to lose the whole trace whenever the framework named its run
+    otherwise (a LangChain graph is "LangGraph" unless named).
     """
     if not isinstance(records, dict) or not records:
         return
@@ -320,8 +324,14 @@ def attach_prompt_records(spans: List[Any], records: Any) -> None:
             None,
         )
         if target is None:
+            timed = [s for s in spans if getattr(s, "started_at", None) is not None]
+            root = next((s for s in timed if getattr(s, "parent_span_id", None) is None), None)
+            now = datetime.now(timezone.utc)
             spans.append(TraceSpan(
                 span_type=SpanType.OTHER, name="decimalai.prompt",
+                parent_span_id=root.id if root is not None else None,
+                started_at=min((s.started_at for s in timed), default=now),
+                ended_at=max((s.ended_at or s.started_at for s in timed), default=now),
                 attributes={**attributes, "decimal.prompt.agent": agent_name},
             ))
         else:

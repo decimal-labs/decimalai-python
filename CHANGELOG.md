@@ -6,9 +6,61 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: LangChain's `agent_config()`, a `create_agent` middleware (the skill loader is gone)
+
+- `decimalai.langchain.agent_config("support")` returns the agent's prompt and skills as one
+  middleware: `create_agent(model, tools=[...], middleware=[support.middleware])`. Every model
+  call gets a system message (the saved prompt, filled from the run's `context=`, then the
+  agent's skill list) and a `load_skill` tool; the model reads a skill's full text with it, as a
+  tool result. Its runs are traced (it turns LangChain tracing on, like the other bindings) and
+  filed under the agent, with their prompt record.
+- A thread (a `thread_id`, with a checkpointer) keeps its first message's system message and
+  `load_skill` definition, in its private state, for every later message. Claude rejects a
+  changed system prompt once a thinking block is in the history, and an unchanged prefix is what
+  a prompt cache reuses; a prompt saved mid-chat reaches the next thread. A later message whose
+  skill list is cut to fit is routed on its own text, and the skills it picks that the thread has
+  not shown arrive as one tagged human message after the user's.
+- A hand-built LangGraph graph uses `support.system_message(messages, context=...)` (or
+  `asystem_message`) and `support.tools`.
+- It warns when `create_agent(system_prompt=)` is also set (pass your code's prompt as
+  `agent_config(..., fallback=...)`), when another tool is named `load_skill`, when Deep Agents'
+  skills run beside it, and on an async run on Python 3.10 (its trace leaves the model calls out).
+- **Removed:** the skill loader that patched `BaseChatModel.invoke`/`ainvoke`/`stream`/`astream`,
+  and `instrument()`'s `enable_skill_loader`, `enable_load_skill_tool`, `skill_body_top_k`,
+  `priority_skills` and `runtime_policy`. `decimalai.init(langchain=True)` and `instrument()`
+  trace only; the first traced run with no `agent_config()` middleware says so, once
+  (`init(langchain=True, skills=False)` silences it). `instrument()` reads and uploads local
+  `SKILL.md` files only when asked (`disk_sync=True`, `skill_dirs=`, or the harness authority), as
+  the OpenAI Agents adapter does.
+- The `[langchain]` extra now installs `langchain` (create_agent and its middleware) beside
+  `langchain-core`, which brings `langgraph` with it.
+- `decimalai init`'s LangChain template is the middleware, with an example tool and no
+  `init()`; it runs keyless like the other templates.
+
+### New: an agent's "always include" skills go into every run in full
+
+- A skill set to "always include" on the agent (in the dashboard, or with
+  `SkillRouter.set_always_include(agent, skill)` / `DecimalAIClient.set_always_include`) reaches
+  every `agent_config()` run with its full text, for a skill nearly every answer needs, like a
+  reply format. The platform lists such skills on its menu and route answers; the SDK fetches
+  their text once per version. It ends the skill section of the system text (so a conversation
+  keeps it with the list, inside the Anthropic module's cached block), and on LangChain goes in
+  as one tagged message at a thread's first message. The run's trace says it was delivered, with
+  its version, and `load_skill` answers for it that it is already loaded. An older platform lists
+  none, and nothing changes.
+- `decimalai init --project` (the Support project) sets its three Support skills to always
+  include, and its agent is the LangChain middleware; it needs a platform that has the setting.
+
+### Fixed: a run's prompt record no longer costs it its trace
+
+- A run whose agent has no span of its own name gets its `agent_config()` prompt record on a
+  `decimalai.prompt` span. That span had no start or end time, which the platform refuses, so the
+  whole trace was rejected. It now spans the run, under the run's root span.
+
 ### New: agents can take part in experiments (skill holdouts and prompt splits)
 
-- An `agent_config()` agent (`decimalai`, `openai_agents`, `pydantic_ai`, `adk`, `anthropic`) whose
+- An `agent_config()` agent (`decimalai`, `openai_agents`, `pydantic_ai`, `adk`, `anthropic`,
+  `langchain`) whose
   DecimalAI agent runs an experiment routes every run before its model call, and marks that call
   `experiments=this_run`. The platform then decides the run's arm in the same call (no extra
   request): a held-out skill is left out of that run's list, or a prompt split's B arm gets its
@@ -25,8 +77,8 @@ and patch releases are fixes.
 - A conversation that starts during an experiment keeps its first decision for every message: one
   conversation is one unit of the experiment.
 - Not taking part (they get the agent's configured setup): keyless runs, native skill loaders and
-  `claude_agent_sdk`, `SkillRouter` used directly, and the LangChain and CrewAI skill loaders,
-  whose runs can make several routing decisions.
+  `claude_agent_sdk`, `SkillRouter` used directly, and the CrewAI skill loader, whose runs can make
+  several routing decisions.
 
 ### Changed: skills syncs and boot syncs (from the Phase 2 work)
 

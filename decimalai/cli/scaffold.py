@@ -20,35 +20,28 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    for them. Both now read it with `decimalai.agent_config(...)`.
 
    EXPLICITLY, and that is the design, not an implementation detail: the
-   prompt lands in a variable in THEIR file and is passed to the model by a
-   line they can see. On langchain skills go the other way (instrument()
-   injects them), because a skill menu is additive and a system prompt is not —
-   silently replacing one means their repo says "Never issue refunds over $500"
-   while the model receives something else, which is unfixable from their
-   side. On openai-agents, pydantic-ai, adk and anthropic nothing is injected:
-   `agent_config()` returns the prompt and the skills together, and the file
-   hands both to its own agent (on anthropic, to the SDK's Tool Runner, one
-   run per question).
+   prompt reaches the model through a line in THEIR file they can see, because
+   silently replacing a system prompt means their repo says "Never issue refunds
+   over $500" while the model receives something else, which is unfixable from
+   their side. Nothing is injected: `agent_config()` returns the prompt and the
+   skills together, and the file hands both to its own agent — on langchain as
+   `create_agent(middleware=[support.middleware])` (0.25+), on anthropic to the
+   SDK's Tool Runner, one run per question.
 
    `agent_config()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
    prompt set (a real state — it is optional at creation) the file still runs
    and sends nothing rather than inventing one.
 
-1. `enable_skill_loader=True`. Every adapter's `instrument()` defaults it to
-   False (decimalai/langchain.py, decimalai/openai_agents.py, …), so a file
-   that calls `instrument()` without it traces beautifully and delivers NONE of
-   the agent's skills. The failure is silent and it is the whole reason the
-   scaffold is worth shipping: without the flag the model is handed a list of
-   skill titles it cannot read. Every generated file whose adapter has a
-   loader carries it, and `tests/test_cli_init_scaffold.py` fails the build if
-   one stops. The openai-agents (0.18+), pydantic-ai (0.19+), adk (0.20+) and
-   anthropic (0.23+) files have no loader to turn on: their skills reach the
-   model only through the `agent_config()` pieces they pass to their agent, which
-   the same tests check.
-   (`init(langchain=True)` and `init(crewai=True)` turn the loader on
-   themselves since 2026-10-14; the langchain template keeps the explicit
-   `instrument()` line because it is where the adapter's other options go.)
+1. The skills reach the model. A file that traces beautifully and delivers
+   NONE of the agent's skills fails silently, and that is the whole reason the
+   scaffold is worth shipping. No generated file turns a loader on any more:
+   the langchain (0.25+), openai-agents (0.18+), pydantic-ai (0.19+), adk
+   (0.20+) and anthropic (0.23+) files' skills reach the model only through the
+   `agent_config()` pieces they pass to their agent, and
+   `tests/test_cli_init_scaffold.py` fails the build if one stops. Until 0.25
+   the langchain file called `instrument(enable_skill_loader=True)`, which
+   patched every chat model in the process.
 
 2. The agent name is BOUND, and written ONCE. An unbound name means the
    adapter auto-detects one off the runnable ("langchain-agent" when it cannot
@@ -61,11 +54,9 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    `agent_config(...)` and in the framework's own `Agent(name=...)`, beside an
    `AGENT_NAME` constant only error strings read — so renaming the agent meant
    finding every copy, and a missed one filed traces under the old name with no
-   error. Now each file assigns `AGENT_NAME` once. The langchain file passes it
-   to `init(agent_name=AGENT_NAME)`, which every adapter's `instrument()` falls
-   back to (`decimalai/_config.py` `default_agent_name`); the `agent_config()`
-   files pass it to `agent_config(AGENT_NAME)`, which files the runs' traces
-   under it (point 5). The other uses read the constant.
+   error. Now each file assigns `AGENT_NAME` once and passes it to
+   `agent_config(AGENT_NAME)`, which files the runs' traces under it (point 5).
+   The other uses read the constant.
    `tests/test_cli_init_scaffold.py` fails if the literal appears twice.
 
 3. What comes out is an AGENT. Until 2026-08-29 the langchain template emitted
@@ -92,8 +83,8 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
 4. TRACING IS NOT AUTOMATIC ON EVERY ADAPTER, and the pydantic-ai template is
    where that bites. `decimalai init` ends by printing "The trace appears at →
    /agents/<name>", which is a promise about the file it just wrote. The
-   langchain and openai-agents adapters keep it themselves — their `instrument()`
-   installs a callback handler / a trace processor — and so does
+   langchain and openai-agents adapters keep it themselves — their
+   `agent_config()` installs a callback handler / a trace processor — and so does
    `decimalai.anthropic.agent_config()`, which turns on Anthropic tracing for the
    calls made inside its runs. `decimalai.pydantic_ai`
    deliberately does not: its `agent_config()` capability ships the prompt, the
@@ -150,8 +141,8 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    non-default base_url, which `init(base_url=...)` used to carry, is set as
    `DECIMAL_BASE_URL` before the `decimalai` import (`_import_lines`): importing
    decimalai with a key in the environment already initializes from it. The
-   langchain file keeps its `init()`: its skills come through `instrument()`,
-   which has no keyless mode.
+   langchain file called `init()` until 0.25, when its skills came through
+   `instrument()`, which has no keyless mode.
 
 RELATIONSHIP TO THE DASHBOARD'S COPY-PASTE SNIPPETS
 ---------------------------------------------------
@@ -162,10 +153,9 @@ the agent you already have" and therefore end at `agent.invoke(...)` on an
 they additionally construct a model and an entry point. Every claim the two
 share is identical, deliberately:
 
-  * langchain: `init()` with no framework flag, then a single
-    `instrument(enable_skill_loader=True)`. `init(langchain=True)` is the same
-    install, so passing it as well installs twice: the first one wins, and the
-    explicit call's other arguments are dropped with a warning.
+  * langchain: `agent_config(AGENT_NAME)`'s middleware goes into the file's own
+    `create_agent(middleware=[...])`, and the file calls no init(): agent_config()
+    turns LangChain tracing on for the process (point 5).
   * openai-agents: no `instrument()` at all. `agent_config(AGENT_NAME)`'s
     instructions and tools go into the file's own `Agent(...)`, and the file
     calls no init() (point 5).
@@ -183,11 +173,7 @@ share is identical, deliberately:
     `agent_config()` traces its own runs, and `init(anthropic=True)` would also
     trace every other Anthropic call in the process.
 
-Two differences are intentional. The snippets name the agent on
-`instrument(agent_name=...)`; the langchain template names it on
-`init(agent_name=...)` (point 2). It is the same binding — `init()`'s name is the one every
-`instrument()` falls back to — moved to the one call that reaches every
-adapter, so a whole file can name its agent once. The openai-agents snippet awaits
+One difference is intentional. The openai-agents snippet awaits
 `Runner.run(...)` because it is being pasted into an async app, while the
 generated file is a standalone script and uses `Runner.run_sync(...)`.
 
@@ -195,9 +181,9 @@ WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. Six adapters have one: `enable_skill_loader` on two
-(langchain, crewai) and an agent config on four (openai_agents,
-pydantic_ai, adk, anthropic). The rest — llamaindex, claude_agent_sdk,
+loader can use. Six adapters have one: `enable_skill_loader` on one (crewai)
+and an agent config on five (langchain, openai_agents, pydantic_ai, adk,
+anthropic). The rest — llamaindex, claude_agent_sdk,
 autogen/otel — trace and version but have no loader, and generating a file for
 them would hand someone a program that looks correct and quietly ignores every
 skill they picked. `--framework` names the reason rather than printing a bare
@@ -528,8 +514,8 @@ def _init_call(base_url: Optional[str], *flags: str) -> str:
     """`decimalai.init(agent_name=AGENT_NAME, ...)` — with a base_url only when
     one is needed.
 
-    `agent_name=AGENT_NAME` names the agent for every adapter's `instrument()`,
-    so the template's `instrument()` line does not repeat it (point 2).
+    `agent_name=AGENT_NAME` names the agent for every adapter's `instrument()`
+    (point 2).
 
     The key is read from the environment by `init()` itself, so no generated
     file ever contains one. A non-default base_url IS baked in: it is not a
@@ -555,89 +541,70 @@ def _render_langchain(
     agent_name: str, model: str, base_url: Optional[str]
 ) -> List[str]:
     return [
-        "import os",
-        "",
-        "import decimalai",
-        "from decimalai.langchain import instrument",
-        "from langchain.agents import create_agent",
-        "from langchain.chat_models import init_chat_model",
-        "from langchain_core.messages import HumanMessage",
+        *_import_lines(
+            ["import os"],
+            ["import decimalai",
+             "from decimalai.langchain import agent_config",
+             "from langchain.agents import create_agent",
+             "from langchain.chat_models import init_chat_model",
+             "from langchain_core.messages import HumanMessage",
+             "from langchain_core.tools import tool"],
+            base_url),
         "",
         "# Change this to any chat model you have a key for, e.g.",
         '#   "gpt-4o-mini" · "anthropic:claude-sonnet-4-6" · "google_genai:gemini-3.5-flash"',
         "# (install that provider\'s package too: langchain-anthropic /",
         "#  langchain-google-genai)",
         f"MODEL = {_py(model)}",
-        *_agent_name_lines(agent_name),
+        *_agent_name_lines(agent_name, load_agent_routes=True),
         "",
         *_key_guard_lines("langchain", model),
-        "# Reads DECIMAL_API_KEY from the environment. Never paste a key into a",
-        "# file you are going to commit.",
-        _init_call(base_url),
+        *_agent_config_lines([
+            "# This agent's prompt and skills, as one LangChain middleware. Nothing is",
+            "# injected behind your back: middleware=[support.middleware] below is where",
+            "# they go in. On every model call of the agent it sets:",
+            "#   the system message  the prompt saved in the dashboard, then the list of",
+            "#                       this agent's skills. Re-read at most once a minute, so",
+            "#                       a prompt saved in the dashboard reaches the next",
+            "#                       conversation with no redeploy. {{variables}} in it are",
+            "#                       filled from agent.invoke(..., context=...).",
+            "#   load_skill          the tool the model reads a skill's full text with.",
+            "# A conversation (a thread_id, with a checkpointer) keeps its first message's",
+            "# system message, so a prompt saved mid-chat cannot break it. With no prompt",
+            "# saved, the agent gets only the skill list: nothing this file made up. Pass",
+            "# agent_config(AGENT_NAME, fallback=...) to supply one; put your code's own",
+            "# prompt there too, not in create_agent(system_prompt=...).",
+        ]),
         "",
-        "# Two things have to be true for a skill to reach the model on LangChain.",
-        "# enable_skill_loader=True puts the skill MENU in the prompt. Delivering the",
-        "# skill's BODY is separate: the DecimalAI LangChain adapter registers no",
-        "# load_skill tool — it installs on the chat model, below any loop — so",
-        "# prompt injection is the only body channel it has. That stays true no",
-        "# matter how many tools you add to TOOLS below; the agent loop is yours,",
-        "# not a channel the adapter can hand a skill body back through.",
-        "# The SDK turns injection on by default for adapters with no load_skill",
-        "# tool — pass init(inject_skill_body=False) if you want menu-only.",
-        "#",
-        "# No agent_name here: init() above already named the agent. Do not also",
-        "# pass langchain=True to init(). That is this same install, and the first",
-        "# one wins: options you add to this call later would be dropped.",
-        "instrument(enable_skill_loader=True)",
         "",
-        "# Your agent's system prompt, as it stands in the dashboard right now.",
-        "# It is handed to you as data and sent by the line YOU can see below —",
-        "# nothing injects it behind your back, so what this file sends is what",
-        "# this file says. (Skills are the other way round: instrument() delivers",
-        "# those for you, because a menu is additive and a system prompt is not.)",
-        "#",
-        "# Read at run time, so editing the prompt in the dashboard changes the",
-        "# next run of this file. Nothing to redeploy, nothing to regenerate.",
-        "support = decimalai.agent_config(AGENT_NAME)",
+        "@tool",
+        "def lookup_order(order_id: str) -> str:",
+        "    \"\"\"Look up an order's status by its id, for example A1001.\"\"\"",
+        "    # An example. Replace it with a call to your own system.",
+        "    return f\"Order {order_id}: shipped, arriving in two days.\"",
         "",
-        "# Your tools go here. An empty list is a WORKING agent, not a stub: the",
-        "# loop runs, the skills rail delivers, and adding a tool later needs no",
-        "# other change to this file.",
-        "#",
-        "# This has to be an agent loop and not a bare chat model, which is what",
-        "# this template used to emit. `init_chat_model(MODEL)` on its own has no",
-        "# loop, so the moment you bind a tool to it the model replies with",
-        "# tool_calls and an EMPTY .content — nothing runs the tool, nothing feeds",
-        "# the result back, and run() returns \"\". Measured on gpt-4o-mini,",
-        "# 2026-08-28; the old template's own docstring invited exactly that.",
-        "TOOLS: list = []",
         "",
-        "# create_agent runs the tool loop and returns the final state. The system",
-        "# prompt is handed to it BY THIS LINE, from the prompt read above — and",
-        "# None (this agent has no prompt set, a real state; a failed read raises",
-        "# instead) means it sends no system message at all, rather than one this",
-        "# file invented.",
+        "# Your tools go here, as @tool functions; the middleware adds load_skill.",
+        "TOOLS: list = [lookup_order]",
+        "",
+        "# create_agent runs the tool loop and returns the final state.",
         "agent = create_agent(",
         "    init_chat_model(MODEL),",
         "    tools=TOOLS,",
-        "    system_prompt=support.prompt,",
+        "    middleware=[support.middleware],",
         ")",
         "",
         "",
         "def run(question: str) -> str:",
         '    """One turn: the loop runs until the model answers.',
         "",
-        "    Add tools to TOOLS above — the skills rail is installed on the chat",
-        "    model itself, so it stays wired through every turn of the loop.",
+        "    Add tools to TOOLS above, or middleware beside support.middleware: the",
+        "    agent's prompt and skills ride on every model call of the loop.",
         '    """',
-        "    # A HumanMessage object, not a (\"human\", \"...\") tuple: the skills rail",
-        "    # reads the trailing human turn to route, and a tuple carries no role",
-        "    # it can read — with tuples every call falls back to the full menu.",
         "    # No turn cap here, unlike MAX_TURNS / MAX_REQUESTS on the other templates:",
         "    # create_agent compiles its graph with recursion_limit=9_999 (langchain/",
         "    # agents/factory.py) — effectively uncapped, NOT langchain-core's default of",
-        "    # 25. With TOOLS=[] the loop is one step and cannot run away; once you add",
-        "    # a tool, cap it — each turn is two graph steps (model, tools):",
+        "    # 25. Each turn is two graph steps (model, tools); to cap it:",
         "    #   agent.invoke(..., config={\"recursion_limit\": 2 * MAX_TURNS + 1})",
         "    # and catch langgraph.errors.GraphRecursionError the way the openai-agents",
         "    # template catches MaxTurnsExceeded.",
@@ -649,8 +616,8 @@ def _render_langchain(
         "",
         'if __name__ == "__main__":',
         '    print(run("What can you help me with?"))',
-        "    # Short-lived scripts exit before the background sender drains. init()",
-        "    # registers an atexit flush; this makes it explicit.",
+        "    # Short-lived scripts exit before the background sender drains; this",
+        "    # sends the traces now.",
         "    decimalai.flush()",
     ]
 

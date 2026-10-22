@@ -1,12 +1,13 @@
 """`DECIMALAI_SKILLS=0`: the environment opt-out for the init() skill loader.
 
-Phase 1 made `init()`'s framework flags (`langchain`, `openai_agents`, `adk`,
-`crewai`) install the skill loader as well as tracing, with `init(...,
-skills=False)` as the way back to tracing only. `DECIMAL_AUTO_TRACE=<framework>`
-calls those same flags at import, so it started delivering skills too: every
-chat-model call routes the turn's message through the platform and the prompt
-gains a skills menu. On that path nobody writes an `init()` call, so a code
-argument is no opt-out at all.
+Phase 1 made `init()`'s framework flags install the skill loader as well as
+tracing, with `init(..., skills=False)` as the way back to tracing only.
+`DECIMAL_AUTO_TRACE=<framework>` calls those same flags at import, so it started
+delivering skills too. On that path nobody writes an `init()` call, so a code
+argument is no opt-out at all. Since 0.25 only `crewai` has a loader;
+`langchain` traces only, and for it `skills=False` (or the variable) says the
+app traces only, so a run without an `agent_config()` middleware is not warned
+about (`decimalai.langchain._say_runs_get_no_skills`).
 
 `DECIMALAI_SKILLS` is the environment default of `init(skills=...)`, the way
 `DECIMALAI_LOAD_SKILL_TOOL` is for `load_skill_tool` and
@@ -78,17 +79,25 @@ def langchain_adapter(monkeypatch):
 
     _keep(
         monkeypatch, lc,
-        "_installed", "_skill_loader_installed", "_install_agent_name",
+        "_installed", "_install_agent_name", "_say_runs_get_no_skills",
         "_explicit_manifest_config", "_evals", "_builtin_evals_enabled",
-        "_skill_body_top_k", "_priority_skills", "_runtime_policy",
     )
     monkeypatch.setattr(lc, "_installed", False)
+    monkeypatch.setattr(lc, "_say_runs_get_no_skills", False)
     monkeypatch.setattr(lc_ctx, "register_configure_hook", lambda *a, **k: None)
     # This machine's own ~/.claude/skills must not be uploaded by a unit test.
     monkeypatch.setattr(skills_mod, "discover_skills", lambda *a, **k: [])
-    loader: List[int] = []
-    monkeypatch.setattr(lc, "_install_skill_loader", lambda *a, **k: loader.append(1))
-    return lc, loader
+    return lc
+
+
+def _langchain_flag(monkeypatch, **init_kwargs: Any) -> tuple:
+    """`(instrument() calls, _say_runs_get_no_skills)` after one `init(langchain=True, ...)`."""
+    import decimalai.langchain as lc
+
+    calls = _record_instrument(monkeypatch, "langchain")
+    monkeypatch.setattr(lc, "_say_runs_get_no_skills", False)
+    _init(langchain=True, **init_kwargs)
+    return calls, lc._say_runs_get_no_skills
 
 
 def _record_instrument(monkeypatch, module_name: str) -> List[Dict[str, Any]]:
@@ -133,25 +142,23 @@ def _auto_trace(monkeypatch, framework: str, skills_env: Any = None) -> None:
 
 
 class TestAutoTraceOptOut:
-    def test_langchain_auto_trace_with_skills_off_is_tracing_only(
+    def test_langchain_auto_trace_with_skills_off_traces_and_warns_of_nothing(
         self, langchain_adapter, monkeypatch,
     ):
-        lc, loader = langchain_adapter
+        lc = langchain_adapter
         _auto_trace(monkeypatch, "langchain", "0")
         assert lc._installed is True, "the opt-out must still install tracing"
-        assert loader == [], (
-            "DECIMAL_AUTO_TRACE=langchain with DECIMALAI_SKILLS=0 installed the "
-            "skill loader: a zero-code deployment has no way to stay tracing-only"
-        )
+        assert lc._say_runs_get_no_skills is False
 
-    def test_langchain_auto_trace_still_delivers_skills_by_default(
+    def test_langchain_auto_trace_unset_traces_and_says_runs_get_no_skills(
         self, langchain_adapter, monkeypatch,
     ):
-        """The opt-out is an opt-out: unset, the env path is the flag form."""
-        lc, loader = langchain_adapter
+        """Unset, the env path is the flag form: tracing, and since 0.25 no skills, which the
+        first run without an agent_config() middleware says."""
+        lc = langchain_adapter
         _auto_trace(monkeypatch, "langchain")
         assert lc._installed is True
-        assert loader == [1]
+        assert lc._say_runs_get_no_skills is True
 
     @pytest.mark.parametrize("skills_env", ["0", None])
     def test_openai_agents_auto_trace_installs_tracing_either_way(self, monkeypatch, skills_env):
@@ -175,37 +182,32 @@ class TestAutoTraceOptOut:
 
 class TestEnvironmentDefault:
     @pytest.mark.parametrize("raw", ["0", "false", "no", "off", " OFF ", "False"])
-    def test_an_off_value_keeps_the_flag_to_tracing(self, monkeypatch, raw):
-        calls = _record_instrument(monkeypatch, "langchain")
+    def test_an_off_value_says_the_app_traces_only(self, monkeypatch, raw):
         monkeypatch.setenv(ENV, raw)
-        _init(langchain=True, agent_name="support")
-        assert calls == [{"agent_name": "support", "enable_skill_loader": False}]
+        calls, warns = _langchain_flag(monkeypatch, agent_name="support")
+        assert calls == [{"agent_name": "support"}] and warns is False
 
     @pytest.mark.parametrize("raw", ["1", "true", "yes", "on", " On ", ""])
-    def test_an_on_value_or_an_empty_one_delivers_skills(self, monkeypatch, raw):
-        calls = _record_instrument(monkeypatch, "langchain")
+    def test_an_on_value_or_an_empty_one_expects_skills(self, monkeypatch, raw):
         monkeypatch.setenv(ENV, raw)
-        _init(langchain=True, agent_name="support")
-        assert calls == [{"agent_name": "support", "enable_skill_loader": True}]
+        calls, warns = _langchain_flag(monkeypatch, agent_name="support")
+        assert calls == [{"agent_name": "support"}] and warns is True
 
-    def test_unset_delivers_skills(self, monkeypatch):
-        calls = _record_instrument(monkeypatch, "langchain")
-        _init(langchain=True, agent_name="support")
-        assert calls == [{"agent_name": "support", "enable_skill_loader": True}]
+    def test_unset_expects_skills(self, monkeypatch):
+        calls, warns = _langchain_flag(monkeypatch, agent_name="support")
+        assert calls == [{"agent_name": "support"}] and warns is True
 
     def test_an_explicit_true_beats_the_variable(self, monkeypatch):
         """explicit parameter → environment variable → default, like every
         other init() knob."""
-        calls = _record_instrument(monkeypatch, "langchain")
         monkeypatch.setenv(ENV, "0")
-        _init(langchain=True, skills=True)
-        assert calls[0]["enable_skill_loader"] is True
+        _calls, warns = _langchain_flag(monkeypatch, skills=True)
+        assert warns is True
 
     def test_an_explicit_false_beats_the_variable(self, monkeypatch):
-        calls = _record_instrument(monkeypatch, "langchain")
         monkeypatch.setenv(ENV, "1")
-        _init(langchain=True, skills=False)
-        assert calls[0]["enable_skill_loader"] is False
+        _calls, warns = _langchain_flag(monkeypatch, skills=False)
+        assert warns is False
 
     @pytest.mark.parametrize("bad", [None, "0", 0, [{"name": "x"}]])
     def test_skills_still_takes_only_a_bool(self, monkeypatch, bad):
@@ -229,16 +231,6 @@ class TestEnvironmentDefault:
             _init(anthropic=True)
         assert ENV not in caplog.text
 
-    def test_it_does_not_reach_an_explicit_instrument_call(
-        self, langchain_adapter, monkeypatch,
-    ):
-        """It is init()'s default, not a kill switch for code that asked for
-        the loader by name."""
-        lc, loader = langchain_adapter
-        monkeypatch.setenv(ENV, "0")
-        _init()
-        lc.instrument(agent_name="support", enable_skill_loader=True)
-        assert loader == [1]
 
 
 # ── 3. an unrecognised value is an opt-out, said out loud ───────────────
@@ -247,11 +239,10 @@ class TestEnvironmentDefault:
 class TestUnrecognisedValue:
     @pytest.mark.parametrize("raw", ["disabled", "none", "2", "of"])
     def test_it_turns_the_loader_off_and_warns(self, monkeypatch, caplog, raw):
-        calls = _record_instrument(monkeypatch, "langchain")
         monkeypatch.setenv(ENV, raw)
         with caplog.at_level(logging.WARNING, logger="decimalai"):
-            _init(langchain=True)
-        assert calls[0]["enable_skill_loader"] is False
+            _calls, warns = _langchain_flag(monkeypatch)
+        assert warns is False
         warned = [r for r in caplog.records if ENV in r.getMessage()]
         assert len(warned) == 1, caplog.text
         message = warned[0].getMessage()
@@ -265,8 +256,8 @@ class TestUnrecognisedValue:
 
 
 @pytest.mark.parametrize("skills_env, expected", [
-    ("0", "installed=True loader=False"),
-    (None, "installed=True loader=True"),
+    ("0", "installed=True warns=False"),
+    (None, "installed=True warns=True"),
 ])
 def test_import_time_auto_trace_honours_the_variable(tmp_path, skills_env, expected):
     """The reviewer's repro: `DECIMAL_AUTO_TRACE=langchain`, then `import
@@ -292,7 +283,7 @@ def test_import_time_auto_trace_honours_the_variable(tmp_path, skills_env, expec
         env[ENV] = skills_env
     code = (
         "import decimalai, decimalai.langchain as lc\n"
-        "print(f'installed={lc._installed} loader={lc._skill_loader_installed}')\n"
+        "print(f'installed={lc._installed} warns={lc._say_runs_get_no_skills}')\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code], cwd=tmp_path, env=env,

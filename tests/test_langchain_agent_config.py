@@ -159,6 +159,13 @@ def test_the_first_run_gets_the_prompt_then_the_list_and_load_skill(platform):
     assert trace.skills_loaded_by_agent == ["damaged-item"]
     prompt_spans = [s for s in trace.spans if (s.attributes or {}).get("decimal.prompt.version") == 4]
     assert prompt_spans and prompt_spans[0].attributes["decimal.prompt.variables"] == ["customer.name"]
+    # The graph is "support-graph", so the record has a span of its own. The backend refuses a span
+    # with no start or end (and with it the whole trace): it spans the run, under its root.
+    (record_span,) = prompt_spans
+    assert record_span.name == "decimalai.prompt"
+    assert all(s.started_at is not None and s.ended_at is not None for s in trace.spans)
+    roots = [s for s in trace.spans if s.parent_span_id is None]
+    assert record_span.parent_span_id == roots[0].id
 
 
 def test_a_missing_variable_stops_the_run_before_any_model_call(platform):

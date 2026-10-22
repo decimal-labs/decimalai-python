@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import inspect
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional, Tuple
 
 import pytest
 
@@ -31,6 +32,7 @@ REGISTRY_FILE = REPO_ROOT / "decimalai" / "_frameworks.py"
 # The sibling docs checkout: absent in GitHub Actions, where the docs comparison skips
 # (tests/conformance/test_coverage.py reads the same file the same way).
 DOCS_FRAMEWORKS = REPO_ROOT.parent / "decimalai-docs" / "sdk" / "python" / "frameworks.mdx"
+DOCS_CHANGELOG = REPO_ROOT.parent / "decimalai-docs" / "changelog.mdx"
 
 #: What scaffold.py typed out by hand until 2026-10-18, when it began deriving these from
 #: the registry. Equal by value, on purpose: a registry edit made for the docs or the
@@ -52,7 +54,7 @@ SCAFFOLD_BEFORE = {
         "otel": "The generic OpenTelemetry rail",
     },
     "INSTALL": {
-        "langchain": 'pip install "decimalai[langchain]" langchain langchain-openai',
+        "langchain": 'pip install "decimalai[langchain]" langchain-openai',
         "openai-agents": 'pip install "decimalai[openai-agents]"',
         "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
         "adk": 'pip install "decimalai[adk]"',
@@ -259,19 +261,66 @@ def test_replace_block_round_trips_on_a_page():
         reg.extract_block(page.replace(reg.end_marker("capability-table"), ""), "capability-table")
 
 
-def test_docs_generated_blocks_are_the_registrys():
-    """The docs page carries exactly what the renderers produce. Skips without the docs
-    checkout; decimalai-docs' scripts/check_generated_framework_tables.py makes the same
-    comparison from that side (`--write` regenerates)."""
+def _documented_release(changelog: Path) -> Optional[str]:
+    """The newest SDK version the docs' changelog names: the release the docs describe.
+
+    decimalai-docs' scripts/test_docs_sdk_drift.py reads it the same way: the newest
+    ``<Update>`` that names a version (a platform-only entry names none)."""
+    text = changelog.read_text(encoding="utf-8")
+    for description in re.findall(r'<Update label="[^"]*" description="([^"]*)"', text):
+        versions = [tuple(int(x) for x in v.split("."))
+                    for v in re.findall(r"\b(\d+\.\d+\.\d+)\b", description)]
+        if versions:
+            return ".".join(str(x) for x in max(versions))
+    return None
+
+
+def _documented_registry(changelog: Path, tmp_path: Path, monkeypatch) -> Tuple[Any, str]:
+    """The registry the docs page describes, and what it is.
+
+    The page tells users what to install from PyPI and what to call, so it describes a
+    release, not this tree. Main runs ahead of a release: held to the working tree, an SDK
+    commit could land only by publishing an API ``pip install`` could not deliver yet (0.25's
+    LangChain middleware landed before 0.25 shipped). So the release is the newest version the
+    docs' changelog names, read from its tag, the rule the dashboard's frameworks.json has
+    followed since 2026-10-19 (platform scripts/sync_framework_registry.py). A version the
+    docs name with no tag here is the release being prepared, and its registry is this tree's.
+    """
+    version = _documented_release(changelog) if changelog.exists() else None
+    if version is None:
+        return reg, "this tree (the docs name no SDK version)"
+    tag = f"v{version}"
+    shown = subprocess.run(["git", "show", f"{tag}:decimalai/_frameworks.py"], cwd=REPO_ROOT,
+                           capture_output=True, text=True)
+    if shown.returncode != 0:
+        return reg, f"this tree ({tag}, the release the docs name, is not tagged yet)"
+    path = tmp_path / "_frameworks_released.py"
+    path.write_text(shown.stdout, encoding="utf-8")
+    name = "_frameworks_" + version.replace(".", "_")
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)   # @dataclass looks its module up there
+    spec.loader.exec_module(module)
+    return module, f"{tag}, the release the docs name"
+
+
+def test_docs_generated_blocks_are_the_documented_releases(tmp_path, monkeypatch):
+    """The docs page carries exactly what the registry of the release it documents renders.
+    Skips without the docs checkout; decimalai-docs' scripts/check_generated_framework_tables.py
+    makes the comparison from that side (`--write` regenerates), and a release's docs change
+    regenerates the blocks (RELEASING.md, docs sync)."""
     if not DOCS_FRAMEWORKS.exists():
         pytest.skip(f"docs repo not on disk at {DOCS_FRAMEWORKS}")
+    registry, source = _documented_registry(DOCS_CHANGELOG, tmp_path, monkeypatch)
     text = DOCS_FRAMEWORKS.read_text(encoding="utf-8")
-    for name in reg.GENERATED_BLOCKS:
-        have = reg.extract_block(text, name)
+    for name in registry.GENERATED_BLOCKS:
+        have = registry.extract_block(text, name)
         assert have is not None, f"frameworks.mdx has no generated {name!r} block"
-        assert have == reg.render_block(name), (
-            f"frameworks.mdx's {name!r} block differs from the registry. In decimalai-docs run "
-            f"`python3 scripts/check_generated_framework_tables.py --write`.")
+        assert have == registry.render_block(name), (
+            f"frameworks.mdx's {name!r} block differs from the registry of {source}. In "
+            f"decimalai-docs run `python3 scripts/check_generated_framework_tables.py --write` "
+            f"with the docs for that release.")
 
 
 # ── the JSON, and loading the file on its own ────────────────────────

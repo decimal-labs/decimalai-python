@@ -31,7 +31,8 @@ Per invocation of the agent (one user message):
   result.
 - The run's record (prompt version, variable names, skills offered and loaded, routing id)
   reaches :class:`decimalai.langchain.CallbackHandler` through its per-call rails, and the trace
-  is filed under the DecimalAI agent. Tracing stays ``decimalai.init(langchain=True)``.
+  is filed under the DecimalAI agent. ``agent_config()`` turns LangChain tracing on for the
+  process (``instrument()``), as ``decimalai.init(langchain=True)`` does.
 
 A hand-built LangGraph graph uses :meth:`LangChainAgentConfig.system_message` and
 :attr:`LangChainAgentConfig.tools` instead of the middleware.
@@ -407,6 +408,7 @@ class LangChainAgentConfig(AgentBinding):
         run_key, record = self._call_record(request)
         if record is None:
             return request, []
+        _warn_native_skills(self, getattr(request, "state", None))
         overrides: Dict[str, Any] = {"tools": self._tools_for(list(getattr(request, "tools", None) or []), record)}
         if record.text:
             mine = getattr(request, "system_message", None)
@@ -582,11 +584,9 @@ def _build_middleware(config: LangChainAgentConfig) -> Any:
             return "DecimalAI_" + re.sub(r"[^A-Za-z0-9_.-]", "_", config.name)
 
         def before_agent(self, state: Any, runtime: Any) -> Dict[str, Any]:
-            _warn_native_skills(config, state)
             return config._start_sync(_context(state, runtime), f"run_{uuid4().hex}")
 
         async def abefore_agent(self, state: Any, runtime: Any) -> Dict[str, Any]:
-            _warn_native_skills(config, state)
             _warn_async_before_311(config)
             return await config._start(_context(state, runtime), f"run_{uuid4().hex}")
 
@@ -616,7 +616,10 @@ def _build_middleware(config: LangChainAgentConfig) -> Any:
 
 
 def _warn_native_skills(config: LangChainAgentConfig, state: Any) -> None:
-    """Deep Agents' own skills beside DecimalAI's: the model is shown two lists."""
+    """Deep Agents' own skills beside DecimalAI's: the model is shown two lists.
+
+    Checked at each model call, when every ``before_agent`` hook has run (Deep Agents' writes
+    ``skills_metadata``), so the order of the middleware list does not matter."""
     if isinstance(state, Mapping) and state.get("skills_metadata") is not None:
         config._warn_once(None, (
             "this agent also loads skills with Deep Agents' SkillsMiddleware, so the model is "

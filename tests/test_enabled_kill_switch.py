@@ -100,16 +100,7 @@ def fresh_sdk(monkeypatch, tmp_path):
     # Keep the real adapter's skill sync/pull intact — only neutralize the
     # global callback registration, which has no bearing on this behaviour.
     monkeypatch.setattr(lc_ctx, "register_configure_hook", lambda *a, **k: None)
-    # `init(langchain=True)` also installs the skill loader, which rebinds
-    # BaseChatModel's four entry points for the whole process. Put them back,
-    # or every later test in the session runs on a patched chat model.
-    from langchain_core.language_models.chat_models import BaseChatModel
-
-    for entry_point in ("invoke", "ainvoke", "stream", "astream"):
-        monkeypatch.setattr(
-            BaseChatModel, entry_point, getattr(BaseChatModel, entry_point)
-        )
-    monkeypatch.setattr(dlc, "_skill_loader_installed", dlc._skill_loader_installed)
+    monkeypatch.setattr(dlc, "_say_runs_get_no_skills", dlc._say_runs_get_no_skills)
     return tmp_path
 
 
@@ -256,44 +247,51 @@ def test_a_disabled_config_builds_no_router(monkeypatch, adapter):
     assert module._skill_router_singleton is None
 
 
-def test_langchain_loader_stops_routing_after_a_disabled_reinit(monkeypatch, fresh_sdk):
-    """The real loader on the real BaseChatModel: routes while enabled, makes
-    no call to the platform once disabled, and routes again when re-enabled."""
+def test_langchain_agent_config_skills_stop_after_a_disabled_reinit(monkeypatch, fresh_sdk):
+    """A LangChain agent config built while enabled keeps a copy of its skill list. After
+    `init(enabled=False)` its middleware neither routes nor shows that copy, and gives the
+    model no load_skill; the prompt it read still runs."""
+    pytest.importorskip("langchain.agents.middleware")
     import decimalai
+    import decimalai._config as cfg
     import decimalai.langchain as dlc
+    from langchain.agents import create_agent
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
     fake = _RoutingPlatform()
     monkeypatch.setattr(httpx, "request", fake)
     monkeypatch.setattr(dlc, "_skill_router_singleton", None)
     seen: List[Any] = []
-    real_generate = FakeListChatModel._generate
 
-    def recording_generate(self, messages, *args, **kwargs):
-        seen.append(" ".join(str(m.content) for m in messages))
-        return real_generate(self, messages, *args, **kwargs)
+    class Model(FakeListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            seen.append(("tools", [getattr(t, "name", None) or t["function"]["name"] for t in tools]))
+            return self
 
-    monkeypatch.setattr(FakeListChatModel, "_generate", recording_generate)
-    llm = FakeListChatModel(responses=["ok"] * 3)
+        def _generate(self, messages, *args, **kwargs):
+            seen.append(("system", str(messages[0].content)))
+            return super()._generate(messages, *args, **kwargs)
 
-    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", langchain=True)
-    llm.invoke("how do refunds work?")
-    assert fake.skill_calls(), "control: the enabled loader did not route at all"
-    assert "Recommended Skills" in seen[-1]
+    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9")
+    monkeypatch.setattr(cfg._client, "get_agent_prompt", lambda name, version=None: {
+        "agent_name": name, "system_prompt": "You help.", "version_number": 1,
+    })
+    support = dlc.agent_config("support")
+
+    def ask(text):
+        seen.clear()
+        agent = create_agent(Model(responses=["ok"]), middleware=[support.middleware])
+        agent.invoke({"messages": [{"role": "user", "content": text}]})
+        return dict(seen)
+
+    first = ask("how do refunds work?")
+    assert "Recommended Skills" in first["system"] and "load_skill" in first["tools"], "control"
 
     decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=False)
     before = list(fake.skill_calls())
-    llm.invoke("can I return an opened box?")
-    assert fake.skill_calls() == before, (
-        "init(enabled=False) did not stop the skill loader: "
-        + repr(fake.skill_calls()[len(before):])
-    )
-    assert "Recommended Skills" not in seen[-1]
-
-    decimalai.init(api_key="dai_sk_test", base_url="http://localhost:9", enabled=True)
-    llm.invoke("what is the restocking fee?")
-    assert len(fake.skill_calls()) > len(before), "re-enabling did not resume routing"
-    assert "Recommended Skills" in seen[-1]
+    later = ask("can I return an opened box?")
+    assert later["system"] == "You help." and "load_skill" not in later.get("tools", [])
+    assert fake.skill_calls() == before
 
 
 def test_openai_agents_load_agent_skills_stop_after_a_disabled_reinit(monkeypatch, tmp_path):

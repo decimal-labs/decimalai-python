@@ -42,7 +42,6 @@ import pytest
 
 pytest.importorskip("langchain_core")
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.runnables import RunnableLambda
 
@@ -90,7 +89,6 @@ def sdk(monkeypatch):
     import decimalai._config as cfg
     import decimalai.langchain as lc_mod
     from decimalai._config import DecimalConfig
-    from decimalai.schema.manifest import ManifestTracker
 
     cfg._config = DecimalConfig(
         api_key="dai_sk_test", base_url="http://localhost:8000", enabled=True,
@@ -122,24 +120,6 @@ def router(monkeypatch):
     return r
 
 
-@pytest.fixture
-def loader(monkeypatch):
-    """Install the invoke/ainvoke skill-injection patch, restored at teardown.
-
-    ``_install_skill_loader`` rebinds ``BaseChatModel.invoke`` for the whole
-    process; recording the originals with monkeypatch FIRST is what puts them
-    back, so later tests in the session do not route model calls through the
-    injector (and out to the network).
-    """
-    import decimalai.langchain as lc_mod
-
-    monkeypatch.setattr(BaseChatModel, "invoke", BaseChatModel.invoke)
-    monkeypatch.setattr(BaseChatModel, "ainvoke", BaseChatModel.ainvoke)
-    monkeypatch.setattr(lc_mod, "_skill_loader_installed", False)
-    lc_mod._install_skill_loader()
-    yield
-
-
 def _sent_traces():
     import decimalai._config as cfg
 
@@ -161,7 +141,7 @@ def _handler(name: str):
 
 
 class TestLoadsStayOnTheRunThatMadeThem:
-    def test_two_threads_each_keep_their_own_load(self, router, loader):
+    def test_two_threads_each_keep_their_own_load(self, router):
         """A loads ``alpha``, B loads ``beta``, and B ships first.
 
         Against the unscoped drain B's ``build_trace`` took BOTH names and A
@@ -206,7 +186,7 @@ class TestLoadsStayOnTheRunThatMadeThem:
         assert traces["run-A"].skills_loaded_by_agent == ["alpha"]
         assert traces["run-B"].skills_loaded_by_agent == ["beta"]
 
-    def test_a_run_that_loaded_nothing_reports_no_activation(self, router, loader):
+    def test_a_run_that_loaded_nothing_reports_no_activation(self, router):
         """The fabrication half of the defect, on its own.
 
         B never calls ``load_skill``. Nothing may put ``alpha`` on B's
@@ -249,7 +229,7 @@ class TestLoadsStayOnTheRunThatMadeThem:
         assert "alpha" not in traces["run-B"].skills_delivered
         assert traces["run-A"].skills_loaded_by_agent == ["alpha"]
 
-    def test_two_asyncio_tasks_each_keep_their_own_load(self, router, loader):
+    def test_two_asyncio_tasks_each_keep_their_own_load(self, router):
         """Same defect over ``ainvoke``: LangChain runs concurrent tasks in
         copied contexts on ONE thread, so a thread-local fix would not hold
         here."""
@@ -295,141 +275,17 @@ class TestLoadsStayOnTheRunThatMadeThem:
 # ── offered / delivered / routing_id: the rungs below activation ─────────────
 
 
-class TestRoutingRailsStayOnTheRunThatEarnedThem:
-    def test_a_run_with_no_model_call_claims_no_routing_decision(
-        self, router, loader,
-    ):
-        """B is a chain with no model call at all, so it captures nothing of
-        its own and falls through to the last-resort rail. It must still not
-        report A's routing_id or A's offered set — the model in run B was
-        never shown anything, and there is no model in run B to show it to."""
-        llm = FakeListChatModel(responses=list("ABCDEFGH"))
-        a_routed = threading.Event()
-        b_shipped = threading.Event()
-
-        def a_tool(_x):
-            return "question A"
-
-        def a_after(_x):
-            a_routed.set()
-            b_shipped.wait(20)
-            return _x
-
-        def b_only(_x):
-            a_routed.wait(20)
-            return "B never called a model"
-
-        ha, hb = _handler("run-A"), _handler("run-B")
-        chain_a = (
-            RunnableLambda(a_tool) | llm | RunnableLambda(a_after)
-        ).with_config(run_name="ChainA", callbacks=[ha])
-        chain_b = (RunnableLambda(b_only) | RunnableLambda(lambda x: x)).with_config(
-            run_name="ChainB", callbacks=[hb],
-        )
-
-        ta = threading.Thread(target=lambda: chain_a.invoke("a"))
-        tb = threading.Thread(target=lambda: chain_b.invoke("b"))
-        ta.start()
-        tb.start()
-        tb.join(30)
-        b_shipped.set()
-        ta.join(30)
-
-        traces = _sent_traces()
-        assert set(traces) == {"run-A", "run-B"}, traces
-        b = traces["run-B"]
-        assert b.llm_calls == []
-        assert b.routing_id is None
-        assert b.skills_offered_in_prompt == []
-        assert b.skills_delivered == []
-        # A still reports its own decision — the fix removes a false claim,
-        # it does not silence a true one.
-        a = traces["run-A"]
-        assert a.routing_id == "rt_" + "0" * 24
-        assert a.skills_offered_in_prompt == ["alpha", "beta"]
-
-
-    def test_a_bare_llm_invoke_does_not_donate_its_decision(
-        self, router, loader,
-    ):
-        """The one case LangChain's own run ids cannot cover.
-
-        ``llm.invoke()`` emits no chain callbacks, and its injection runs
-        BEFORE the callback manager has minted any run id — so the routing
-        decision it puts on the Router has no LangChain id to be filed under.
-        Left unowned, a concurrent run that captured nothing of its own would
-        happily claim it. The per-model-call token is what closes that.
-        """
-        blocked = threading.Event()
-        b_shipped = threading.Event()
-
-        class _BlockingChat(FakeListChatModel):
-            def _generate(self, messages, *args, **kwargs):
-                blocked.set()
-                b_shipped.wait(20)
-                return super()._generate(messages, *args, **kwargs)
-
-        llm = _BlockingChat(responses=["ok"])
-        ha, hb = _handler("bare-A"), _handler("chain-B")
-
-        def run_a():
-            llm.invoke("bare question", config={"callbacks": [ha]})
-
-        def run_b():
-            blocked.wait(20)  # B drains strictly AFTER A's injection wrote
-            (
-                RunnableLambda(lambda x: "no model here")
-                | RunnableLambda(lambda x: x)
-            ).with_config(run_name="ChainB", callbacks=[hb]).invoke("b")
-
-        ta = threading.Thread(target=run_a)
-        tb = threading.Thread(target=run_b)
-        ta.start()
-        tb.start()
-        tb.join(30)
-        b_shipped.set()
-        ta.join(30)
-
-        traces = _sent_traces()
-        assert set(traces) == {"bare-A", "chain-B"}, traces
-        assert traces["chain-B"].routing_id is None
-        assert traces["chain-B"].skills_offered_in_prompt == []
-        # A keeps its own decision.
-        assert traces["bare-A"].routing_id == "rt_" + "0" * 24
-        assert traces["bare-A"].skills_offered_in_prompt == ["alpha", "beta"]
-
-
 # ── the fallback the unscoped drain existed to provide still works ───────────
 
 
 class TestTheSingleRunFallbackSurvives:
-    """LangChain dispatches callbacks under ``copy_context()``, so a rail the
-    injection wrote inside the runnable's context is invisible to the handler.
+    """LangChain dispatches callbacks under ``copy_context()``, so a rail a
+    tool wrote inside the runnable's context is invisible to the handler.
     That is why the singleton drain exists, and a fix that simply deleted it
     would regress a working path. A lone run must still get its names.
     """
 
-    def test_a_lone_run_still_reports_offered_and_delivered(self, router, loader):
-        import decimalai.skill_router as sr
-
-        # Blind the ContextVar rails, which is what `copy_context()` does to
-        # them in the frameworks this fallback was added for. Everything the
-        # trace reports now has to come off the router itself.
-        sr._last_offered_names_ctx.set(None)
-        sr._last_delivered_names_ctx.set(None)
-
-        llm = FakeListChatModel(responses=["ok"])
-        h = _handler("solo")
-        chain = (RunnableLambda(lambda x: "q") | llm).with_config(
-            run_name="Solo", callbacks=[h],
-        )
-        chain.invoke("x")
-
-        traces = _sent_traces()
-        assert traces["solo"].routing_id == "rt_" + "0" * 24
-        assert traces["solo"].skills_offered_in_prompt == ["alpha", "beta"]
-
-    def test_a_lone_run_still_reports_a_load(self, router, loader):
+    def test_a_lone_run_still_reports_a_load(self, router):
         llm = FakeListChatModel(responses=["ok"])
         h = _handler("solo")
 
@@ -495,7 +351,7 @@ class TestPerRunStateIsCleanedUp:
     exactly the kind that accumulates one per request forever."""
 
     def test_a_scoped_rail_is_drained_by_the_run_that_owns_it(
-        self, router, loader,
+        self, router,
     ):
         """After the owning run ships, nothing of its is left on the router
         for the next run to pick up."""
@@ -516,7 +372,7 @@ class TestPerRunStateIsCleanedUp:
         assert router.consume_loaded_names() == []
         assert router.consume_offered_names() == []
 
-    def test_a_run_that_raises_leaves_nothing_behind(self, router, loader):
+    def test_a_run_that_raises_leaves_nothing_behind(self, router):
         """The exception path is the one that matters: a run that blew up on
         its way out is exactly the run whose rails nobody would come back
         for."""
@@ -536,12 +392,12 @@ class TestPerRunStateIsCleanedUp:
         assert router._scoped_routing_rails == {}
 
     def test_a_run_that_never_builds_a_trace_still_releases_its_rails(
-        self, router, loader,
+        self, router,
     ):
         """The leak with no other reader: tracing switched off.
 
-        The Router keeps working — the menu is still injected, `load_skill`
-        still serves bodies — but `_auto_send` returns before assembling
+        The Router keeps working — `load_skill` still serves bodies — but
+        `_auto_send` returns before assembling
         anything, so nothing ever drains what those calls filed. One entry per
         request, forever, in a process that is doing no tracing at all.
         """
@@ -567,7 +423,7 @@ class TestPerRunStateIsCleanedUp:
         assert router._scoped_routing_rails == {}
 
     def test_a_manual_caller_still_gets_the_rails_after_the_chain_returns(
-        self, router, loader,
+        self, router,
     ):
         """The other side of that cleanup. With ``auto_send=False`` the run's
         only reader is the caller's own ``build_trace()``, which happens after
@@ -589,7 +445,7 @@ class TestPerRunStateIsCleanedUp:
 
         assert trace.skills_loaded_by_agent == ["alpha"]
 
-    def test_an_evicted_run_releases_its_rails(self, router, loader):
+    def test_an_evicted_run_releases_its_rails(self, router):
         """A root chain that starts and never ends is evicted at the
         in-flight cap; its trace is already lost, so its rails have no reader
         left and must not sit on the singleton either."""

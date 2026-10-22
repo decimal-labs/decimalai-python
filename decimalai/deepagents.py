@@ -15,9 +15,9 @@ middleware lists each skill (name, description, ``SKILL.md`` path) in the system
 and the model loads one by calling ``read_file`` on that path. The adapter sees the read
 in its tool callbacks and reports it as an activation carrying the registry identity of
 the bytes ``read_file`` returned (:mod:`decimalai._native`), never of the file as it is
-on disk by the time the trace is built. With the skills middleware on the agent, the
-adapter does not inject its own skill menu into that agent's model calls: the model
-would see two catalogs.
+on disk by the time the trace is built. The adapter puts nothing into the agent's model
+calls (``init(langchain=True)`` traces only). ``agent_config()``'s middleware on the same
+agent would show the model a second skill list, and it says so when it sees Deep Agents'.
 
 What ``read_file`` hands the model, measured on deepagents 0.7.25: optional bracketed
 notices, a status header ``@@ lines 1-25 of 25 @@`` (more fields when the window stops

@@ -451,6 +451,9 @@ class Probe:
         # Skills the probe's router offers. Populated by the harness so the
         # skills rail is exercisable with no platform and no provider key.
         self.skills: List[Dict[str, Any]] = []
+        # Skills set to "always include" (D-C), by name: the menu and route answers
+        # list them under `always_include`. One workspace, so not per agent.
+        self.always_include: set = set()
         # routing_id -> the query text the routing decision was made FOR.
         # This is the provenance that makes a leaked routing decision
         # deterministically detectable: if run A's trace carries a routing_id
@@ -701,6 +704,18 @@ class Probe:
             return 200, {"id": m.group(1), **row}, []
 
         # ── skills rail (hermetic SkillRouter) ───────────────
+        m = re.fullmatch(r"/api/v1/agents/([^/]+)/skills/([^/]+)/always-include", path)
+        if method == "PUT" and m:
+            skill = self._skill(m.group(2))
+            if skill is None:
+                return 404, {"detail": f"Skill {m.group(2)!r} is not assigned to agent {m.group(1)!r}."}, []
+            on = bool((body or {}).get("always_include")) if isinstance(body, dict) else False
+            with self._lock:
+                changed = (skill["name"] in self.always_include) != on
+                (self.always_include.add if on else self.always_include.discard)(skill["name"])
+            return 200, {"status": "ok", "agent_name": m.group(1), "skill_name": skill["name"],
+                         "always_include": on, "changed": changed}, []
+
         if method == "POST" and path == "/api/v1/skills/route":
             return self._route_skills(body)
 
@@ -1068,7 +1083,14 @@ class Probe:
             "rows_total": len(rows),
             "truncated": False,
             "routing_id": self._mint_routing_id(query),
+            **self._always_include_rows(rows),
         }
+
+    def _always_include_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """``{"always_include": [...]}`` for an answer, or nothing (as an older platform)."""
+        flagged = [{"name": r["name"], "version": r["version"]} for r in rows
+                   if r["name"] in self.always_include]
+        return {"always_include": flagged} if flagged else {}
 
     def _menu(self, query: Dict[str, List[str]]) -> Tuple[int, Any, List[str]]:
         # `agent_name` / `category` / `project_id` are accepted and recorded (the
@@ -1123,6 +1145,7 @@ class Probe:
             "extracted_keywords": [],
             # Every row came out of retrieval against this query.
             "query_ranked": bool(top),
+            **self._always_include_rows(rows),
         }, []
 
     # ── views the contract reads ─────────────────────────────

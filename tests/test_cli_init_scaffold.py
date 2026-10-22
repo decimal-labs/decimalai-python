@@ -105,6 +105,11 @@ def kwarg(call: ast.Call, name: str):
     return None
 
 
+def kwarg_node(call: ast.Call, name: str):
+    """The expression one keyword on a call passes, or `None` if absent."""
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
 def has_kwarg(call: ast.Call, name: str) -> bool:
     return any(kw.arg == name for kw in call.keywords)
 
@@ -295,14 +300,12 @@ class TestTemplateIsCode:
 
 #: The templates with no instrument() at all: `agent_config()` hands the pieces to the
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
-#: anthropic's Tool Runner since 0.23).
-LOAD_AGENT_FRAMEWORKS = ("openai-agents", "pydantic-ai", "adk", "anthropic")
+#: anthropic's Tool Runner since 0.23, langchain's create_agent middleware since 0.25).
+#: Every template is one now.
+LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic")
 #: How many init() calls each template makes. The agent_config() templates make none
 #: (scaffold.py point 5), except pydantic-ai's exporter, made only with a key.
-INIT_CALLS = {"langchain": 1, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0}
-
-#: The templates whose skills arrive through instrument()'s loader.
-LOADER_FRAMEWORKS = [f for f in SUPPORTED_FRAMEWORKS if f not in LOAD_AGENT_FRAMEWORKS]
+INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0}
 
 
 def _support_attr(node: ast.AST, attr: str) -> bool:
@@ -311,15 +314,15 @@ def _support_attr(node: ast.AST, attr: str) -> bool:
 
 
 class TestSkillLoaderIsOn:
-    @pytest.mark.parametrize("framework", LOADER_FRAMEWORKS)
-    def test_enable_skill_loader_is_true_on_instrument(self, framework):
-        """Both adapters default it to False. Without it the file traces and
-        delivers no skills, with no error anywhere — the exact silent failure
-        the scaffold exists to prevent."""
-        tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        instruments = calls(tree, "instrument")
-        assert len(instruments) == 1, "expected exactly one instrument() call"
-        assert kwarg(instruments[0], "enable_skill_loader") is True
+    def test_every_template_brings_its_skills_through_agent_config(self):
+        """No template turns a process-wide loader on any more (the langchain one called
+        instrument(enable_skill_loader=True) until 0.25): each one's skills arrive only
+        through the agent_config() pieces it hands its own agent, checked below."""
+        assert set(SUPPORTED_FRAMEWORKS) == set(LOAD_AGENT_FRAMEWORKS)
+        for framework in SUPPORTED_FRAMEWORKS:
+            tree = parse(render_agent_file(AGENT, framework, SKILLS))
+            assert calls(tree, "instrument") == [], framework
+            assert "enable_skill_loader" not in render_agent_file(AGENT, framework, SKILLS)
 
     #: Every `init()` keyword that installs a span source, and — per framework —
     #: the ONE this template is allowed to carry.
@@ -688,21 +691,6 @@ class TestNoKeyInFile:
         assert "dai_sk_supersecret_value" not in written
         assert "supersecret" not in written
 
-    def test_a_default_base_url_is_not_baked_in(self):
-        """No inert line pinning the hosted default — but see below: a
-        non-default one IS pinned, deliberately."""
-        source = render_agent_file(AGENT, "langchain", SKILLS,
-                                   base_url=None)
-        assert kwarg(calls(parse(source), "init")[0], "base_url") is None
-
-    def test_a_local_base_url_is_baked_in(self):
-        """Otherwise a file scaffolded against a local backend silently points
-        at production — a URL is not a secret and the surprise costs more."""
-        source = render_agent_file(AGENT, "langchain", SKILLS,
-                                   base_url="http://localhost:8000")
-        assert kwarg(calls(parse(source), "init")[0],
-                     "base_url") == "http://localhost:8000"
-
     @pytest.mark.parametrize("framework", LOAD_AGENT_FRAMEWORKS)
     def test_an_agent_config_template_sets_a_local_base_url_before_importing_decimalai(
             self, framework):
@@ -1005,9 +993,11 @@ class TestCliWritesTheFile:
         source = (tmp_path / "agent.py").read_text()
         compile(source, "agent.py", "exec")
         tree = parse(source)
-        assert kwarg(calls(tree, "instrument")[0], "enable_skill_loader") is True
         assert assigned(tree, "AGENT_NAME") == AGENT
-        assert kwarg_reads(calls(tree, "init")[0], "agent_name", "AGENT_NAME")
+        (load,) = calls(tree, "agent_config")
+        assert reads(load.args[0], "AGENT_NAME")
+        (agent,) = calls(tree, "create_agent")
+        assert ast.unparse(kwarg_node(agent, "middleware")) == "[support.middleware]"
 
     def test_out_path_is_honored(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1138,7 +1128,7 @@ class TestCliWritesTheFile:
         # Silent about a prompt it could not read — and still reads it at run time.
         assert "System prompt:" not in source
         assert "no system prompt set" not in source
-        assert "decimalai.agent_config(AGENT_NAME)" in source
+        assert "support = agent_config(AGENT_NAME)" in source
         # Said out loud, because a silently missing comment is indistinguishable
         # from an agent that has no prompt.
         assert "Could not read" in result.output
@@ -1469,26 +1459,17 @@ class TestConsistencyWithFrontendSnippets:
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
     def test_same_shape_as_the_snippet(self, framework):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
-        # One init(), one instrument() carrying the loader — the shape the
-        # dashboard snippets settled on 2026-08-22. One deliberate difference
-        # (scaffold.py, "Three differences are intentional"): the snippets name
-        # the agent on instrument(), the templates on init(), which is the same
-        # binding — init()'s name is the one every instrument() falls back to.
         init_calls = calls(tree, "init")
         assert len(init_calls) == INIT_CALLS[framework]
         assert all(kwarg_reads(c, "agent_name", "AGENT_NAME") for c in init_calls)
         inst = calls(tree, "instrument")
-        if framework in LOAD_AGENT_FRAMEWORKS:
-            # The agent_config() shape (openai-agents 0.18, pydantic-ai 0.19), which
-            # the dashboard snippet adopts with each release: no instrument() at
-            # all, one agent_config(AGENT_NAME).
-            assert inst == []
-            (load,) = calls(tree, "agent_config")
-            assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
-            return
-        assert len(inst) == 1
-        assert not has_kwarg(inst[0], "agent_name")
-        assert kwarg(inst[0], "enable_skill_loader") is True
+        # The agent_config() shape (openai-agents 0.18 … langchain 0.25), which the
+        # dashboard snippet adopts with each release: no instrument() at all, one
+        # agent_config(AGENT_NAME).
+        assert framework in LOAD_AGENT_FRAMEWORKS
+        assert inst == []
+        (load,) = calls(tree, "agent_config")
+        assert len(load.args) == 1 and reads(load.args[0], "AGENT_NAME")
 
 
 def test_a_non_gemini_model_is_refused_for_adk():

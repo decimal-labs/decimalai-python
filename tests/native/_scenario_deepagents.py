@@ -1,16 +1,16 @@
 """Deep Agents native-mode scenarios (child side; no assertions).
 
 The documented native mode: ``decimalai.init(langchain=True)`` (the LangChain adapter
-traces the graph, and its skill router is on), then
+traces the graph; since 0.25 that is all it does), then
 ``create_deep_agent(model, **decimalai.deepagents.skills(backend=...))``. The model is
 ``tests.native_loaders.stubs.deepagents_model.ScriptedModel``: each step reads what the
 agent was shown (the skills listing in the system prompt, a tool result) and acts on it,
 using only paths the listing gave it.
 
 ``column`` is the native column's scenario (``column.py`` describes the shape).
-``checks`` runs a Deep Agents agent and a plain LangGraph agent side by side with the
-router live and a skill to route, and a pinned skill, and returns what each model call was
-shown.
+``checks`` runs a Deep Agents agent and a plain LangGraph agent side by side with skills in
+the workspace, a pinned skill, and a Deep Agents agent that also has ``agent_config()``'s
+middleware, and returns what each model call was shown and what each run logged.
 """
 
 from __future__ import annotations
@@ -162,13 +162,15 @@ def column(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Three runs with the router live and a skill to route: a Deep Agents agent built
-    with the pointer helper alone (its default backend), a plain LangGraph agent, and the
-    Deep Agents agent again with the target pinned. Each makes one model call."""
+    """Five runs with skills in the workspace: a Deep Agents agent built with the pointer
+    helper alone (its default backend), a plain LangGraph agent, the Deep Agents agent again
+    with the target pinned, and twice a Deep Agents agent that also has ``agent_config()``'s
+    middleware. Each makes one model call; ``warned`` is what a run logged at WARNING."""
     import logging
 
     import decimalai.deepagents
     from deepagents import create_deep_agent
+    from decimalai.langchain import agent_config
     from langchain_core.messages import HumanMessage
     from langgraph.graph import END, START, MessagesState, StateGraph
 
@@ -192,15 +194,22 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
         return [str(m.content)[:200] for m in messages
                 if (getattr(m, "additional_kwargs", None) or {}).get("decimalai_injected")]
 
+    def logged_run(fn) -> List[str]:
+        before = len(logs)
+        s.run(fn)
+        return [line for line in logs[before:] if line.startswith("WARNING")]
+
     # 1. Deep Agents, through the pointer helper with its default backend.
     da_model = _model([lambda m: final("done")])
     agent = create_deep_agent(model=da_model, **decimalai.deepagents.skills())
-    s.run(lambda run: agent.invoke({"messages": [{"role": "user", "content": USER}]}))
+    warned = logged_run(lambda run: agent.invoke({"messages": [{"role": "user", "content": USER}]}))
     seen = da_model.seen_requests[0] if da_model.seen_requests else []
     out["deepagents"] = {"injected": injected(seen), "listed": listed_names(seen),
-                         "backend": type(decimalai.deepagents.skills()["backend"]).__name__}
+                         "backend": type(decimalai.deepagents.skills()["backend"]).__name__,
+                         "warned": warned}
 
-    # 2. The control: a plain LangGraph agent in the same process, same router.
+    # 2. The control: a plain LangGraph agent in the same process. Nothing reaches its model
+    # either, and it is the run the adapter tells so: its skills come from nowhere.
     plain_model = _model([lambda m: final("done")])
 
     def call_model(state):
@@ -211,9 +220,9 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
     builder.add_edge(START, "model_turn")
     builder.add_edge("model_turn", END)
     graph = builder.compile()
-    s.run(lambda run: graph.invoke({"messages": [HumanMessage(content=USER)]}))
+    warned = logged_run(lambda run: graph.invoke({"messages": [HumanMessage(content=USER)]}))
     seen = plain_model.seen_requests[0] if plain_model.seen_requests else []
-    out["plain"] = {"injected": injected(seen)}
+    out["plain"] = {"injected": injected(seen), "warned": warned}
 
     # 3. A pinned skill: the middleware appends its body to the conversation itself,
     # without the model asking. The body arrives with the frontmatter cut off.
@@ -225,6 +234,22 @@ def checks(ctx: Dict[str, Any]) -> Dict[str, Any]:
     out["pinned"] = {"messages": [str(m.content)[:120] for m in seen
                                   if (getattr(m, "additional_kwargs", None) or {}).get(
                                       "lc_source") == "pinned_skill"]}
+
+    # 4. Deep Agents' skills and agent_config()'s middleware in one agent, two runs. Deep
+    # Agents puts a user's middleware before its skills middleware, so ours runs first.
+    s.probe.register_agent("both-lists", system_prompt="You answer refund questions.",
+                           skills=[dict(CONFORMANCE_SKILLS[0])])
+    support = agent_config("both-lists")
+    both_model = _model([lambda m: final("done"), lambda m: final("done")])
+    both = create_deep_agent(model=both_model, middleware=[support.middleware],
+                             **decimalai.deepagents.skills())
+    warned = [logged_run(lambda run: both.invoke({"messages": [{"role": "user", "content": USER}]}))
+              for _ in range(2)]
+    seen = both_model.seen_requests[0] if both_model.seen_requests else []
+    # Deep Agents' skills middleware rebuilds the system message our marker was on, so the
+    # agent's prompt is looked for as text.
+    out["both"] = {"warned": warned, "listed": listed_names(seen),
+                   "prompt_shown": "You answer refund questions." in _system_text(seen)}
 
     result = s.result()
     out["traces"] = [r["traces"] for r in result["runs"]]

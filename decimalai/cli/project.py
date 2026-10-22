@@ -19,10 +19,8 @@ from decimalai.agent_checks import (
 from .scaffold import env_vars, install_command, normalize_model, provider_key
 
 
-def render_project(agent_name: str, skills: list[dict[str, Any]], model: str | None,
-                   base_url: str, agent_id: str | None = None) -> dict[str, str]:
-    model = normalize_model("langchain", model or "gpt-5.4-2026-03-05")
-    required_key = provider_key("langchain", model)
+def support_bindings(skills: list[dict[str, Any]]) -> dict[str, str]:
+    """{Support skill slug: the agent's skill name for it}; exactly one each, or ValueError."""
     bindings = {}
     for slug in SUPPORT_SKILLS:
         matches = list({s["skill_name"] for s in skills
@@ -30,6 +28,14 @@ def render_project(agent_name: str, skills: list[dict[str, Any]], model: str | N
         if len(matches) != 1:
             raise ValueError(f"Support checks need exactly one selected {slug} skill; found {len(matches)}.")
         bindings[slug] = matches[0]
+    return bindings
+
+
+def render_project(agent_name: str, skills: list[dict[str, Any]], model: str | None,
+                   base_url: str, agent_id: str | None = None) -> dict[str, str]:
+    model = normalize_model("langchain", model or "gpt-5.4-2026-03-05")
+    required_key = provider_key("langchain", model)
+    bindings = support_bindings(skills)
     definition = check_definition(bindings)
     source = f'''"""Support draft agent. Run directly or import run(question) in your service."""
 from __future__ import annotations
@@ -43,12 +49,12 @@ from dotenv import load_dotenv
 load_dotenv()
 import decimalai
 from decimalai._support_policy import draft_reply_violation
-from decimalai.langchain import CallbackHandler, instrument
+from decimalai.langchain import CallbackHandler, agent_config, instrument
 from decimalai.schema.trace import RunTrace
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 AGENT_NAME = {agent_name!r}
 MODEL = {model!r}
@@ -68,10 +74,16 @@ def observe(trace: RunTrace) -> None:
         trace_observer(trace)
 
 
-# The check and your service use this same model, prompt, skill loader and run().
-# agent_name names the agent for instrument() below too; AGENT_NAME is its only copy.
+# The check and your service use this same model, prompt, skills and run().
+# Tracing, with the check's observer; AGENT_NAME is the agent's only copy.
 decimalai.init(base_url=BASE_URL, agent_name=AGENT_NAME)
-support = decimalai.agent_config(AGENT_NAME)
+instrument(on_trace=observe)
+# The agent's prompt and skills, as one middleware. `decimalai init --project` set its
+# three Support skills to "always include", so every run gets their full text.
+support = agent_config(AGENT_NAME)
+# The saved prompt: it opens the system message the middleware composes, which the
+# checks hash and look for in the model's input. CAPABILITY_CONTEXT below ends it.
+SYSTEM_PROMPT = support.prompt or ""
 CAPABILITY_CONTEXT = (
     "Runtime capabilities: You may perform actions only through the tools actually provided. "
     "Skill instructions describe workflows; they do not grant access to tools. Never claim an "
@@ -100,12 +112,19 @@ CAPABILITY_CONTEXT = (
       "If a requested action is unavailable, say so; do not infer that verification or completing "
       "another process will enable it unless the supplied facts explicitly establish that link."
 )
-SYSTEM_PROMPT = "\\n\\n".join(part for part in (support.prompt, CAPABILITY_CONTEXT) if part)
-# Skills may assume tools this application lacks. Repeat the actual constraints
-# after their guidance, while retaining the full skill bodies for trace evidence.
-instrument(enable_skill_loader=True, skill_body_top_k=3,
-           priority_skills={[bindings[SUPPORT_SKILLS[1]]]!r}, on_trace=observe,
-           runtime_policy=CAPABILITY_CONTEXT)
+
+
+@wrap_model_call
+def capability_policy(request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
+    # Skills may assume tools this application lacks: the actual constraints end the
+    # system message DecimalAI composed. Its marker stays, so tracing still reads it
+    # as DecimalAI's text, not a prompt of yours that changed.
+    system = request.system_message
+    text = system.text if system is not None else ""
+    marker = dict(system.additional_kwargs) if system is not None else {{}}
+    policy = SystemMessage(content=f"{{text}}\\n\\n{{CAPABILITY_CONTEXT}}" if text else CAPABILITY_CONTEXT,
+                           additional_kwargs=marker)
+    return handler(request.override(system_message=policy))
 # Keep generation settings explicit for the tested default and GPT-4.1 overrides.
 model_options = {{"temperature": 0}} if MODEL.startswith(("gpt-4.1", "openai:gpt-4.1")) else {{}}
 if MODEL in ("gpt-5.4-2026-03-05", "openai:gpt-5.4-2026-03-05"):
@@ -135,8 +154,9 @@ def check_draft(request: ModelRequest, handler: Callable[[ModelRequest], ModelRe
     raise RuntimeError("Draft validation ended without a result.")
 
 
+# Outermost first: DecimalAI's system message and load_skill, then the constraints, then the guard.
 agent = create_agent(init_chat_model(MODEL, **model_options), tools=TOOLS,
-                     system_prompt=SYSTEM_PROMPT, middleware=[check_draft])
+                     middleware=[support.middleware, capability_policy, check_draft])
 
 
 def run(question: str) -> str:

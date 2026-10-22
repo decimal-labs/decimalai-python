@@ -525,8 +525,9 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
     the narrower and permanent fact this set records. `crewai` joined on
     2026-10-08 the same way, on the commit that shipped its rail (a
     before_llm_call hook): graded on C8/C13/C14, and no load_skill tool.
-    `adk` left with 0.20, when `agent_config()` gave it a load_skill tool, and
-    `anthropic` with 0.23 the same way.
+    `adk` left with 0.20, when `agent_config()` gave it a load_skill tool,
+    `anthropic` with 0.23 the same way, and `langchain` with 0.25, when its
+    prompt-injection loader was removed for `agent_config()`'s middleware.
     """
     from tests.conformance.drivers import all_drivers
 
@@ -535,7 +536,7 @@ def test_every_rail_driver_that_declares_no_loader_says_why() -> None:
         for d in all_drivers()
         if not d.capabilities.model_can_load_skill_bodies
     }
-    assert set(off) == {"langchain", "crewai"}, off
+    assert set(off) == {"crewai"}, off
     for name, reason in off.items():
         assert "prompt-injection" in reason, name
         assert "load_skill" in reason, name
@@ -752,7 +753,7 @@ def test_no_trace_at_all_fails_rather_than_passing_vacuously_on_delivery() -> No
 
 # ── D1: a framework limit must prove itself, on this run ─────────────────────
 
-REFUSAL = "enable_load_skill_tool is not supported on the langchain adapter"
+REFUSAL = "enable_load_skill_tool is not supported on the crewai adapter"
 
 
 def _limited_driver() -> Any:
@@ -761,8 +762,8 @@ def _limited_driver() -> Any:
 
     return _delivery_driver(**{
         TOOL_LOADED: FrameworkLimit(
-            reason="an invoke-layer patch owns no tool loop.",
-            adapter_module="decimalai/langchain.py",
+            reason="a before_llm_call hook registers no tool.",
+            adapter_module="decimalai/crewai.py",
             refusal_marker=REFUSAL,
         )
     })
@@ -773,7 +774,7 @@ def test_a_framework_limit_is_granted_only_with_the_adapters_own_refusal() -> No
 
     r = contract.grade_delivery(_delivery_obs(
         [_sys(MENU)], TOOL_LOADED,
-        logs=[f"decimalai.langchain: {REFUSAL} (invoke-layer patch)"],
+        logs=[f"decimalai.crewai: {REFUSAL} (before_llm_call hook)"],
         driver=_limited_driver(),
     ))
     assert r.status == contract.NA
@@ -802,7 +803,7 @@ def test_a_framework_limit_fails_when_the_channel_quietly_worked_anyway() -> Non
 
     r = contract.grade_delivery(_delivery_obs(
         [_sys(MENU), _tool(SENTINEL_BODY)], TOOL_LOADED,
-        logs=[f"decimalai.langchain: {REFUSAL}"],
+        logs=[f"decimalai.crewai: {REFUSAL}"],
         driver=_limited_driver(),
     ))
     assert r.status == contract.FAIL

@@ -2,14 +2,16 @@
 
 Two defects from the 2026-10-13 framework-integration audit, both silent:
 
-1. **The documented one-liner delivered no skills.** The quickstart teaches
+1. **The documented one-liner delivered no skills.** The quickstart taught
    `decimalai.init(langchain=True)` (and `crewai=True`, `adk=True`). That form
    called the adapter's `instrument()` with the skill loader OFF, so a user who
    followed the docs got good traces and zero skills, with nothing anywhere
-   saying so. The flag form now turns the loader on; `skills=False` keeps the
-   tracing-only install for anyone who wants it. `openai_agents=True` is the
-   exception since 0.18: it traces only, skills come from `agent_config()`, and
-   the first such init() says so.
+   saying so. The flag form then turned the loader on; `skills=False` keeps the
+   tracing-only install for anyone who wants it. `openai_agents=True` has been
+   the exception since 0.18 and `langchain=True` since 0.25: they trace only,
+   skills come from `agent_config()`, and neither is silent about it (the first
+   `openai_agents=True` init says so; a LangChain run without the middleware
+   says so once).
 
 2. **Re-init kept the previous org's router.** `init()` rebuilds the trace
    client and drops the prompt cache, because a re-init means a different key,
@@ -78,48 +80,57 @@ def _counter(monkeypatch, module: Any, name: str) -> List[int]:
 def langchain_adapter(monkeypatch):
     """The real LangChain adapter, minus its process-wide side effects.
 
-    `register_configure_hook` has no unregister and `_install_skill_loader`
-    rebinds `BaseChatModel.invoke` for the whole process, so both are stubbed;
-    everything `instrument()` decides — including whether to install the
-    loader — is the real code.
+    `register_configure_hook` has no unregister, so it is stubbed; everything
+    `instrument()` decides is the real code. Returns the module and a function
+    naming the `BaseChatModel` methods rebound since: the skill loader the flag
+    form installed through 0.24 rebound `invoke` for the whole process.
     """
     pytest.importorskip("langchain_core")
+    import inspect
+
     import langchain_core.tracers.context as lc_ctx
+    from langchain_core.language_models.chat_models import BaseChatModel
 
     import decimalai.langchain as lc
     import decimalai.skills as skills_mod
 
     _keep(
         monkeypatch, lc,
-        "_installed", "_skill_loader_installed", "_install_agent_name",
+        "_installed", "_install_agent_name", "_say_runs_get_no_skills",
         "_explicit_manifest_config", "_evals", "_builtin_evals_enabled",
-        "_skill_body_top_k", "_priority_skills", "_runtime_policy",
     )
     monkeypatch.setattr(lc, "_installed", False)
+    monkeypatch.setattr(lc, "_say_runs_get_no_skills", False)
     monkeypatch.setattr(lc_ctx, "register_configure_hook", lambda *a, **k: None)
     # This machine's own ~/.claude/skills must not be uploaded by a unit test.
     monkeypatch.setattr(skills_mod, "discover_skills", lambda *a, **k: [])
-    loader = _counter(monkeypatch, lc, "_install_skill_loader")
-    return lc, loader
+
+    def methods() -> dict:
+        return {k: v for k, v in vars(BaseChatModel).items() if inspect.isfunction(v)}
+
+    before = methods()
+    return lc, lambda: sorted(k for k, v in methods().items() if before.get(k) is not v)
 
 
 class TestFlagFormDeliversSkills:
-    def test_langchain_flag_installs_the_skill_loader(self, langchain_adapter):
-        lc, loader = langchain_adapter
+    def test_langchain_flag_traces_only(self, langchain_adapter):
+        """Since 0.25 an agent's prompt and skills come from `agent_config()`'s
+        middleware, so the flag installs tracing and patches no LangChain class. A
+        run without the middleware is told so, once."""
+        lc, rebound = langchain_adapter
         _init(langchain=True, agent_name="support")
-        assert loader == [1], (
-            "init(langchain=True) installed tracing without the skill loader — "
-            "the documented one-liner delivers zero skills"
-        )
+        assert lc._installed is True
         assert lc._install_agent_name == "support"
+        assert lc._say_runs_get_no_skills is True
+        assert rebound() == []
 
-    def test_langchain_flag_with_skills_false_is_tracing_only(
-        self, langchain_adapter
-    ):
-        lc, loader = langchain_adapter
+    def test_langchain_flag_with_skills_false_says_nothing(self, langchain_adapter):
+        """`skills=False` is the same install, and says you trace only on purpose."""
+        lc, rebound = langchain_adapter
         _init(langchain=True, agent_name="support", skills=False)
-        assert loader == []
         assert lc._installed is True, "skills=False must still install tracing"
+        assert lc._say_runs_get_no_skills is False
+        assert rebound() == []
 
     @pytest.fixture
     def openai_agents_flag(self, monkeypatch):
@@ -231,16 +242,18 @@ class TestFlagFormDeliversSkills:
         assert {key: vars(key[0])[key[1]] for key in before} == before, "the Anthropic SDK was patched"
 
     @pytest.mark.parametrize("skills, authority, reads_disk", [
-        (True, None, False),       # router is the skills channel: no disk sync
+        (True, None, False),       # agent_config() is the skills channel: no disk sync
         (True, "harness", True),   # asked for disk explicitly: kept
-        (False, None, True),       # tracing only: the pre-change behaviour
+        (False, None, False),      # tracing only reads no more (it did through 0.24)
+        (False, "harness", True),
     ])
-    def test_the_loader_decides_disk_sync_the_way_instrument_does(
+    def test_the_flag_form_reads_local_skills_only_under_the_harness_authority(
         self, langchain_adapter, monkeypatch, tmp_path,
         skills, authority, reads_disk,
     ):
-        """Turning the loader on moves the flag form onto the same disk_sync
-        default `instrument(enable_skill_loader=True)` has always had."""
+        """As `openai_agents=True` has since 0.18: a LangChain agent's skills come
+        from DecimalAI, so the project's SKILL.md files are read (and uploaded)
+        only when asked, whatever `skills=` says."""
         import decimalai.skills as skills_mod
 
         # The harness case is allowed to pull skills down; never into the repo.
@@ -256,21 +269,23 @@ class TestFlagFormDeliversSkills:
 
     def test_auto_trace_env_is_the_flag_form(self, langchain_adapter, monkeypatch):
         """`DECIMAL_AUTO_TRACE=langchain` is documented as the env spelling of
-        `init(langchain=True)`, so it delivers skills too."""
-        lc, loader = langchain_adapter
+        `init(langchain=True)`, so it installs the same."""
+        lc, rebound = langchain_adapter
         monkeypatch.setenv("DECIMAL_API_KEY", KEY_A)
         monkeypatch.setenv("DECIMAL_BASE_URL", URL)
         monkeypatch.setenv("DECIMAL_AUTO_TRACE", "langchain")
         decimalai._auto_init_from_env()
-        assert loader == [1]
+        assert lc._installed is True and lc._say_runs_get_no_skills is True
+        assert rebound() == []
 
     def test_disabled_installs_nothing_whatever_skills_says(
         self, langchain_adapter
     ):
-        lc, loader = langchain_adapter
+        lc, rebound = langchain_adapter
         _init(langchain=True, enabled=False, skills=True)
-        assert loader == []
         assert lc._installed is False
+        assert lc._say_runs_get_no_skills is False
+        assert rebound() == []
 
     @pytest.mark.parametrize("bad", [[{"name": "x"}], "yes", 1, None])
     def test_skills_takes_a_bool(self, bad):

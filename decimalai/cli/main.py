@@ -122,6 +122,29 @@ def _get_past_admission_aborts(http, path):
     return resp
 
 
+def _set_always_include(api_key, base_url, agent_name, names):
+    """Set the agent's ``names`` to always include, or stop with what went wrong."""
+    from .._client import DecimalAIClient, DecimalAPIError
+
+    client = DecimalAIClient(api_key=api_key, base_url=base_url)
+    try:
+        for name in names:
+            try:
+                client.set_always_include(agent_name, name)
+            except DecimalAPIError as exc:
+                if exc.status_code in (404, 405) and "not assigned" not in str(exc):
+                    raise click.ClickException(
+                        "This backend has no always-include skills yet (PUT /api/v1/agents/{agent}/"
+                        "skills/{skill}/always-include), which the Support project's checks need. "
+                        f"Update the backend, or point --base-url somewhere current ({base_url})."
+                    ) from exc
+                raise click.ClickException(
+                    f"Could not set {name} to always include on {agent_name}: {exc}") from exc
+    finally:
+        client.close()
+    click.echo(f"Set {agent_name}'s skills {', '.join(names)} to always include: every run gets their full text.")
+
+
 def _http_die(exc, base_url):
     """Turn a failed platform call into the right one-line diagnosis.
 
@@ -361,16 +384,22 @@ def _scaffold_agent_file(
     if project_dir:
         from pathlib import Path
 
-        from .project import render_project, write_project
+        from .project import render_project, support_bindings, write_project
 
         try:
             if prompt_unreadable or prompt is None or not prompt.system_prompt:
                 raise ValueError("Support project checks require a readable, nonempty agent prompt.")
             files = render_project(agent_name, skills, model, base_url, agent_id=prompt.agent_id)
+            always = list(support_bindings(skills).values())
             if dry_run:
                 for name, content in files.items():
                     click.echo(f"\n--- {name} ---\n{content}")
+                click.echo(f"\nWould set {agent_name}'s skills {', '.join(always)} to always include.")
             else:
+                # The checks need these skills' full text in every run, not left to the
+                # model to load: the agent's "always include" setting (D-C). Before any
+                # file is written, so a backend without it leaves nothing half made.
+                _set_always_include(resolved_key, base_url, agent_name, always)
                 write_project(Path(project_dir), files)
                 click.echo(f"Created {project_dir}: agent, Support checks, dependencies and instructions.")
                 click.echo(f"Open {project_dir}/README.md, then run python check_agent.py in that directory.")

@@ -239,8 +239,8 @@ class TestInstrumentDefaults:
         import decimalai.langchain as lc
 
         for attr in (
-            "_installed", "_install_agent_name", "_skill_body_top_k", "_priority_skills",
-            "_runtime_policy", "_evals", "_builtin_evals_enabled", "_explicit_manifest_config",
+            "_installed", "_install_agent_name", "_evals", "_builtin_evals_enabled",
+            "_explicit_manifest_config",
         ):
             monkeypatch.setattr(lc, attr, getattr(lc, attr))
         monkeypatch.setattr(lc._global_handler, "on_trace", lc._global_handler.on_trace)

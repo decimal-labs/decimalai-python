@@ -1,7 +1,7 @@
 """The generated file EXECUTES — not just parses.
 
 `tests/test_cli_init_scaffold.py` proves the template is valid Python and that
-`enable_skill_loader=True` and the agent name are really there. That is the
+its `agent_config()` pieces and the agent name are really there. That is the
 cheap half. It cannot catch the expensive half: a template that compiles fine
 while calling an `instrument()` keyword the adapter does not accept, importing
 a symbol that moved, or constructing an `Agent(...)` whose signature changed.
@@ -13,10 +13,9 @@ SUBPROCESS, with exactly one thing stubbed: the LLM call. Everything else is
 the real code path — the real imports, the real `instrument()`, the real
 `Agent(...)` / `init_chat_model(...)`, the real entry point.
 
-A subprocess and not an in-process exec, because `instrument()` is a
-process-wide install: it monkey-patches `BaseChatModel.invoke` (langchain) and
-registers a global trace processor (every framework, `agent_config()` on
-openai-agents included). Running that inside pytest would leak those into every
+A subprocess and not an in-process exec, because tracing is a process-wide
+install: LangChain's callback hook and OpenAI's global trace processor, which
+`agent_config()` turns on. Running that inside pytest would leak those into every
 test that came after it.
 
 `decimalai.init()` is the one other stub. It is not what is under test here,
@@ -316,57 +315,51 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 _sent = []
 
-# A REAL BaseChatModel subclass, not a duck-typed object.
-#
-# The skill rail works by monkey-patching BaseChatModel.invoke. A plain class
-# that merely defines its own `invoke` never inherits that patch, so the
-# injection code never runs and `_sent` captures the template's messages
-# BEFORE any skill routing. That is exactly what this file used to do, and it
-# is why a rail that delivered nothing at all kept the whole suite green.
-# Overriding `_generate` (the abstract leaf) instead leaves `invoke` — and
-# therefore the patch — on the call path.
+
+# A REAL BaseChatModel subclass that binds tools, as a provider's does: the agent
+# config's middleware hands every model call the system message and load_skill,
+# and create_agent binds them. It asks for each skill it is offered once, then answers.
 class _Fake(BaseChatModel):
     @property
     def _llm_type(self):
         return "fake"
 
+    def bind_tools(self, tools, **kwargs):
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        return self.bind(tools=[t if isinstance(t, dict) else convert_to_openai_tool(t)
+                                for t in tools], **kwargs)
+
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        _sent.append(messages)   # what the model was ACTUALLY handed, post-injection
+        tools = [t["function"]["name"] for t in kwargs.get("tools") or []]
+        _sent.append({"messages": list(messages), "tools": tools})
+        if "load_skill" in tools and not any(getattr(m, "type", None) == "tool" for m in messages):
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="", tool_calls=[
+                {"name": "load_skill", "args": {"name": "restocking-policy"}, "id": "call_skill"}]))])
         return ChatResult(generations=[
             ChatGeneration(message=AIMessage(content="stubbed answer"))
         ])
 _stack.enter_context(patch("langchain.chat_models.init_chat_model", return_value=_Fake()))
 """,
         "probe": """
-import decimalai.langchain as adapter
-print("LOADER:", adapter._skill_loader_installed)
-print("BOUND:", adapter._install_agent_name)
-
-# The messages the model was called with. The prompt has to arrive AS a system
-# message and the question has to stay last: the skills rail reads the trailing
-# human turn to route, and providers reject a system message after one.
-_msgs = _sent[-1]
-# The rail injects its own system messages after the caller's leading system
-# run, so "the first system message" is no longer the same thing as "the
-# agent's prompt". Filter the rail's out by their headings — otherwise a
-# no-prompt agent looks like it has one, and the assertion that a no-prompt
-# agent sends NO invented instructions silently stops testing anything.
-_system = [
-    m for m in _msgs
-    if getattr(m, "type", None) == "system"
-    and not str(getattr(m, "content", "")).lstrip().startswith(
-        ("## Available Skills", "## Skill:")
-    )
-]
-print("PROMPT_SEEN:", _system[0].content if _system else "<none>")
-print("LAST_TURN:", getattr(_msgs[-1], "type", None))
-
-# THE CANARY. Every message the model was handed, concatenated. The skill's
-# body is only in here if the rail DELIVERED it — a menu row carries the
-# skill's name and description and never its body.
-_all = "\\n".join(str(getattr(m, "content", "")) for m in _msgs)
-print("SKILL_OFFERED:", "restocking-policy" in _all)
+# What the model was handed, call by call. The first call's system message is the
+# agent config's: the agent's prompt, then its skill list.
+_first = _sent[0]["messages"] if _sent else []
+_system = str(_first[0].content) if _first and getattr(_first[0], "type", None) == "system" else ""
+_prompt = _system.split("## Available Skills")[0].strip()
+print("PROMPT_SEEN:", _prompt or "<none>")
+# The question stays the last turn of the first call.
+print("LAST_TURN:", getattr(_first[-1], "type", None) if _first else None)
+# The skills reach this agent only through the middleware: the list in its system
+# message and the load_skill tool.
+print("LOADER:", bool(_sent) and "load_skill" in _sent[0]["tools"])
+print("TURNS:", len(_sent))
+# The agent the runs are filed under: the config the template built.
+print("BOUND:", _mod["support"].name)
+_results = [str(m.content) for c in _sent for m in c["messages"] if getattr(m, "type", None) == "tool"]
+_all = "\\n".join([_system] + _results)
+print("SKILL_OFFERED:", "restocking-policy" in _system)
 print("SKILL_BODY_DELIVERED:", "23.5% restocking fee" in _all)
+print("BODY_IN_TOOL_RESULT:", any("23.5% restocking fee" in r for r in _results))
 """,
     },
 }
@@ -392,8 +385,9 @@ BODY_CHANNEL_OBSERVABLE = {
         "owns the loop, so the body should have come back as a tool result mid-turn."
     ),
     "langchain": (
-        "On an adapter with no tool loop, prompt injection is the only body "
-        "channel."
+        "agent_config()'s middleware gives every model call a real load_skill tool and "
+        "create_agent owns the loop, so the body should have come back as a tool result "
+        "mid-turn."
     ),
     "pydantic-ai": (
         "agent_config()'s capability hands the Agent a real load_skill tool and "
@@ -537,9 +531,7 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     assert "INIT: True" in out and "FLUSH: True" in out, out
 
     # The load-bearing one: the skills rail did not merely parse, it is ON.
-    # Through `instrument(enable_skill_loader=True)` (langchain) the adapter
-    # accepted it and the loader is INSTALLED; through agent_config()
-    # (openai-agents, pydantic-ai, anthropic) load_skill was in the model's
+    # Through agent_config() (every template) load_skill was in the model's
     # first request.
     # A template that passes an argument the adapter silently ignores, or
     # builds an Agent without agent_config()'s pieces, would satisfy every AST
@@ -548,7 +540,7 @@ def test_generated_file_executes(framework, prompt, tmp_path):
 
     # And the name reached the adapter, so traces file against the agent the
     # user configured rather than an auto-detected one. The template names it
-    # only on `init(agent_name=AGENT_NAME)`; this is the adapter reading it back.
+    # only on `agent_config(AGENT_NAME)`; this is the adapter reading it back.
     assert f"BOUND: {AGENT}" in out, out
 
     # The prompt: read for THIS agent, and actually delivered to the model.
@@ -598,6 +590,10 @@ def test_generated_file_executes(framework, prompt, tmp_path):
     # after any human/AI turn.
     if framework == "langchain":
         assert "LAST_TURN: human" in out, out
+        # Two model calls (ask for the body, answer with it), and the body came back
+        # as load_skill's tool result.
+        assert "TURNS: 2" in out, out
+        assert "BODY_IN_TOOL_RESULT: True" in out, out
 
     # Exactly one DecimalAI processor. Two would mean every span is sent
     # twice — the failure `init(openai_agents=True)` plus `instrument()`
@@ -662,7 +658,7 @@ with _stack:
 """
 
 
-@pytest.mark.parametrize("framework", sorted(f for f in RUNTIMES if f != "langchain"))
+@pytest.mark.parametrize("framework", sorted(RUNTIMES))
 def test_generated_file_runs_without_a_decimalai_key(framework, tmp_path):
     spec = RUNTIMES[framework]
     if not _have(spec["requires"]):
@@ -728,7 +724,7 @@ def test_generated_file_runs_without_a_decimalai_key(framework, tmp_path):
 #: makes the whole suite flaky under load, which is worse than slow.
 SLOW_TIMEOUT = 300
 
-TOOL_SEAM = "TOOLS: list = []"
+TOOL_SEAM = "TOOLS: list = [lookup_order]"
 
 #: A fact only the TOOL can supply — not in the prompt, not in the skill body,
 #: not in the model stub's own vocabulary. It reaches the transcript only if
@@ -756,8 +752,7 @@ _sent = []
 
 
 class _Fake(BaseChatModel):
-    """A real BaseChatModel subclass, so the skills rail's `invoke` patch is
-    still on the call path (see the sibling stub for why that matters)."""
+    """A real BaseChatModel subclass that binds tools, as a provider's does."""
 
     @property
     def _llm_type(self):
@@ -766,20 +761,24 @@ class _Fake(BaseChatModel):
     def bind_tools(self, tools, **kwargs):
         from langchain_core.utils.function_calling import convert_to_openai_tool
         return self.bind(
-            tools=[convert_to_openai_tool(t) for t in tools], **kwargs
+            tools=[t if isinstance(t, dict) else convert_to_openai_tool(t) for t in tools],
+            **kwargs
         )
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         _sent.append(messages)
-        bound = kwargs.get("tools") or []
+        bound = [t["function"]["name"] for t in kwargs.get("tools") or []]
         results = [m for m in messages if getattr(m, "type", None) == "tool"]
         if bound and not results:
             # EXACTLY the shape that broke the old template: tool_calls, and
-            # content is the empty string.
+            # content is the empty string. The skill first, so the order's
+            # result is the last one back.
+            calls = [{"name": "order_status", "args": {"order_id": "7"}, "id": "call_1"}]
+            if "load_skill" in bound:
+                calls.insert(0, {"name": "load_skill", "args": {"name": "restocking-policy"},
+                                 "id": "call_0"})
             return ChatResult(generations=[ChatGeneration(message=AIMessage(
-                content="",
-                tool_calls=[{"name": "order_status",
-                             "args": {"order_id": "7"}, "id": "call_1"}],
+                content="", tool_calls=calls,
             ))])
         return ChatResult(generations=[ChatGeneration(message=AIMessage(
             content="Status: " + (str(results[-1].content) if results
