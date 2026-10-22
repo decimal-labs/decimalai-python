@@ -369,6 +369,8 @@ class Workspace:
         self.policies = {"newer_wins", "local_wins", "remote_wins", "remote_wins_on_conflict"}
         #: skill name -> the body DecimalAI has, changed there: the sync pulls it
         self.changed_on_decimalai: dict = {}
+        #: refuse every sync (a 422 that is not about the policy)
+        self.sync_refused = False
 
     # the DecimalAIClient methods agent_config() calls
     def get_agent_prompt(self, agent_name, version=None, **kwargs):
@@ -413,9 +415,12 @@ class Workspace:
 
     def sync(self, body):
         self.synced.append(body)
-        if body["conflict_policy"] not in self.policies:
-            raise SkillRouterError("422 Unprocessable Entity", status_code=422, detail={
-                "errors": [{"field": "body.conflict_policy", "message": "Input should be ..."}]})
+        if body["conflict_policy"] not in self.policies or self.sync_refused:
+            # What SkillRouter._request raises for the platform's 422 envelope: the
+            # message only ("detail"), not the field list ("details") that names the cause.
+            raise SkillRouterError(
+                "SkillRouter request failed (422): POST /api/v1/skills/sync — Request validation failed",
+                status_code=422, detail="Request validation failed")
         actions = []
         for item in body["skills"]:
             theirs = self.changed_on_decimalai.get(item["name"])
@@ -568,7 +573,9 @@ def test_a_skill_that_cannot_be_copied_is_said_and_left_to_the_person(world, mon
     with_key(monkeypatch, workspace)
     decimalai.agent_config("order-support")
     err = capsys.readouterr().err
-    assert "could not assign acme/refund-policy (402 linked-skill cap reached)" in err
+    assert ("agent 'order-support': could not copy acme/refund-policy (402 linked-skill cap "
+            "reached) onto it. Add it with `decimalai skills add <name>` or on the agent's page "
+            "in the dashboard.") in err
     link = world.project / ".decimal/link.toml"
     assert link.exists() and '"acme/refund-policy"' not in link.read_text(), "only what was copied"
     workspace.assign_error = AssertionError("a start never assigns")
@@ -586,6 +593,19 @@ def test_a_platform_from_before_the_new_conflict_rule_is_synced_with_newer_wins(
     decimalai.agent_config("order-support")
     assert [s["conflict_policy"] for s in workspace.synced] == ["remote_wins_on_conflict", "newer_wins"]
     assert keyless.read_link(None)["assigned"]["order-support"] == {"refund-tone": "authored"}
+
+
+def test_a_sync_refused_for_another_reason_is_said_after_one_retry(world, monkeypatch, capsys):
+    own(world)
+    capsys.readouterr()
+    workspace = Workspace()
+    workspace.sync_refused = True
+    with_key(monkeypatch, workspace)
+    decimalai.agent_config("order-support")
+    assert [s["conflict_policy"] for s in workspace.synced] == ["remote_wins_on_conflict", "newer_wins"]
+    err = capsys.readouterr().err
+    assert "could not copy refund-tone (SkillRouter request failed (422)" in err
+    assert keyless.read_link(None)["assigned"]["order-support"] == {}
 
 
 def test_a_skill_you_wrote_that_decimalai_changed_is_left_as_decimalai_has_it(world, monkeypatch, capsys):

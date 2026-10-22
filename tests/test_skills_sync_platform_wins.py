@@ -126,8 +126,11 @@ def test_a_pull_of_a_file_you_did_not_edit_keeps_no_copy(project):
 def test_a_platform_from_before_the_rule_is_asked_again_with_newer_wins(project):
     client = MagicMock()
     client._http.post.side_effect = [
-        response({"details": {"errors": [{"field": "conflict_policy", "message": "Input should be"}]}},
-                 status=422, text='{"error":"conflict_policy: Input should be ..."}'),
+        # The platform's 422 envelope, as api.decimal.ai answered it on 2026-10-22.
+        response({}, status=422, text=(
+            '{"detail":"Request validation failed","code":"validation_error","details":{"errors":'
+            '[{"field":"body.conflict_policy","message":"Input should be \'newer_wins\', '
+            '\'local_wins\' or \'remote_wins\'"}]}}')),
         response({"actions": [{"name": "refund-tone", "action": "pulled", "body_markdown": THEIRS,
                                "version_number": 3}]}),
     ]

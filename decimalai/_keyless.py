@@ -784,9 +784,12 @@ def _assign(router: Any, agent_name: str, todo: Mapping[str, _Wanted]
 
 
 def _say_failed(agent_name: str, failed: Sequence[str]) -> None:
+    """Name what the one-time copy could not put on the agent. Nothing retries it: the
+    agent's skills live on DecimalAI from now on, so the person adds it there."""
     if failed:
-        _say(f"agent {agent_name!r}: could not assign {'; '.join(failed)}. The next run "
-             "tries again; or assign it from the agent's Skills tab in the dashboard.")
+        _say(f"agent {agent_name!r}: could not copy {'; '.join(failed)} onto it. Add "
+             f"{'it' if len(failed) == 1 else 'them'} with `decimalai skills add <name>` or on "
+             "the agent's page in the dashboard.")
 
 
 def _own(project: Any) -> Dict[str, Dict[str, Any]]:
@@ -813,8 +816,11 @@ def sync_authored(router: Any, items: List[Dict[str, Any]], **kwargs: Any) -> Di
 
     ``conflict_policy="remote_wins_on_conflict"`` (with the checkout's ``install_id``):
     a body only this checkout changed is uploaded; one the platform changed is not
-    overwritten. A platform from before that policy answers 422, and is asked again with
-    ``newer_wins``, which it has always taken.
+    overwritten. A platform from before that policy answers 422, and is asked once more
+    with ``newer_wins``, which it has always taken. Any 422 is asked again: the error the
+    router raises keeps only the envelope's message ("Request validation failed"), not
+    the field it names, and a request refused for another reason is refused again, with
+    that second error raised.
     """
     from .skill_router import SkillRouterError
 
@@ -822,8 +828,7 @@ def sync_authored(router: Any, items: List[Dict[str, Any]], **kwargs: Any) -> Di
         return router.sync_skills(items, conflict_policy="remote_wins_on_conflict",
                                   response_mode="diff", **kwargs)
     except SkillRouterError as exc:
-        if getattr(exc, "status_code", None) != 422 or "conflict_policy" not in str(
-                getattr(exc, "detail", "") or exc):
+        if getattr(exc, "status_code", None) != 422:
             raise
     return router.sync_skills(items, conflict_policy="newer_wins", response_mode="diff", **kwargs)
 
