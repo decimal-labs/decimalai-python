@@ -141,6 +141,11 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
     skill_name = "adk-live-settlement-procedure"
 
     decimalai.init(api_key=h.API_KEY, base_url=h.BACKEND_URL, enabled=True)
+    # agent_config() reads the agent's saved prompt, so the agent has to exist, and it has
+    # to exist BEFORE the sync: a sync naming a `live-` agent that does not exist adds the
+    # skill to no agent (the platform keeps those names for test fixtures and will not make
+    # one), and this test then passed only because the skill was offered to every agent.
+    h.create_agent(agent_name, _INSTRUCTION)
     router = SkillRouter(
         api_key=h.API_KEY, base_url=h.BACKEND_URL, agent_name=agent_name,
     )
@@ -157,11 +162,10 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
         }],
         author=f"live-adk/{agent_name}",
         conflict_policy="local_wins",
-        # On this agent only: new skills are opt-in on the platform since 2026-10-22.
         agent_name=agent_name,
+        # Only the agents it is added to, for a backend that does not have it yet.
+        offer_scope="restricted",
     )
-    # agent_config() reads the agent's saved prompt, so the agent has to exist.
-    h.create_agent(agent_name, _INSTRUCTION)
 
     # ── The negative control runs FIRST, so a leak cannot be explained away
     #    as contamination from the positive run's session.

@@ -306,6 +306,11 @@ _RUNNERS = {
 def _seed_agent(agent_name: str) -> None:
     from decimalai.skill_router import SkillRouter
 
+    # The agent first: agent_config() reads its saved prompt, and a sync naming an agent
+    # that does not exist yet makes it, except a `live-` name, which the platform keeps
+    # for test fixtures. That sync adds the skill to no agent (added_to_agent None), and
+    # the cell then passed only because the skill was offered to every agent.
+    h.create_agent(agent_name, _INSTRUCTION)
     router = SkillRouter(api_key=h.API_KEY, base_url=h.BACKEND_URL, agent_name=agent_name)
     router.sync_skills(
         [{
@@ -320,11 +325,11 @@ def _seed_agent(agent_name: str) -> None:
         }],
         author=f"live-binding/{agent_name}",
         conflict_policy="local_wins",
-        # On this agent only: new skills are opt-in per agent on the platform since 2026-10-22.
         agent_name=agent_name,
+        # Only the agents it is added to. Left out, the platform offered it to every agent in
+        # the workspace (seen 2026-10-22: offer_scope "workspace" on the local backend).
+        offer_scope="restricted",
     )
-    # agent_config() reads the agent's saved prompt, so the agent has to exist with one.
-    h.create_agent(agent_name, _INSTRUCTION)
 
 
 @pytest.mark.live_llm
