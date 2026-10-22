@@ -202,6 +202,24 @@ class ConversationRecord:
         )
 
 
+def new_skills_block(prefix: str, names: List[str]) -> str:
+    """The rows of ``prefix``'s skill table naming ``names``, as a block for the user turn.
+
+    For a later message of a conversation whose list is cut: the skills its own decision picked
+    that the conversation has not shown. They go in a user turn, never the system text, which a
+    conversation keeps.
+    """
+    rows = []
+    for line in prefix.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if line.lstrip().startswith("|") and cells and cells[0] in names:
+            rows.append(line.strip())
+    if not rows:
+        rows = [f"| {name} | |" for name in names]
+    return ("More skills you can load with load_skill for this message:\n\n"
+            "| Skill | Description |\n|-------|-------------|\n" + "\n".join(rows))
+
+
 class MissingPromptVariable(KeyError):
     """The saved prompt has a ``{{variable}}`` the run does not supply a value for."""
 

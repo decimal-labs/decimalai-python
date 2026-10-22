@@ -238,6 +238,15 @@ _call_scope_ctx: ContextVar[Optional[str]] = ContextVar(
     "decimalai_skill_router_call_scope_langchain", default=None,
 )
 
+#: The ``agent_config()`` agent the model call starting NOW belongs to:
+#: ``{"agent", "prompt", "template"}``. Set by its middleware around each model call
+#: (``decimalai._langchain_config``); the handler files the run's trace under that agent,
+#: puts its prompt record on the trace, and declares the saved template as the
+#: manifest's prompt instead of the text the model saw.
+_config_agent_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "decimalai_langchain_config_agent", default=None,
+)
+
 
 def _open_call_rails() -> tuple:
     """Start ONE model call's skills rails, and return the reset tokens.
@@ -1529,6 +1538,9 @@ _install_agent_name: Optional[str] = None
 # "otel-agent", "claude-agent").
 DEFAULT_AGENT_NAME = "langchain-agent"
 
+#: How long a trace waits for an ``agent_config()`` run's background routing decision.
+_LATE_DECISION_WAIT_S = 3.0
+
 
 def _publish_handler(
     agent_name: Optional[str], register_configure_hook: Any,
@@ -1973,6 +1985,7 @@ class _RunState:
         "skills_delivered_versions",
         "routing_id", "router_injected",
         "native_loads", "native_skills", "native_listing", "skill_reads",
+        "config_agent_name", "config_prompt",
     )
 
     def __init__(
@@ -2048,6 +2061,10 @@ class _RunState:
         # differently-named parallel chains all landed on one agent and the
         # other two had no traces at all.
         self.detected_agent_name: Optional[str] = None
+        #: The ``agent_config()`` agent whose middleware ran this run's model calls, and
+        #: its prompt record (version, hash, variable names) for the trace.
+        self.config_agent_name: Optional[str] = None
+        self.config_prompt: Optional[Dict[str, Any]] = None
 
         self.trace_id: UUID = uuid4()
         self.spans: Dict[UUID, TraceSpan] = {}
@@ -2401,6 +2418,16 @@ class CallbackHandler(_CallbackBase):
         call_scope = _call_scope_ctx.get()
         if call_scope:
             state.rail_scopes.add(call_scope)
+
+        config_agent = _config_agent_ctx.get()
+        if isinstance(config_agent, dict) and config_agent.get("agent") and state.config_agent_name is None:
+            state.config_agent_name = str(config_agent["agent"])
+            state.config_prompt = config_agent.get("prompt")
+            template = config_agent.get("template")
+            if isinstance(template, str) and template and "system" not in state.seen_prompts:
+                # The saved prompt as written: the same on every run, where the text the
+                # model saw changes with each message's skill list and variables.
+                state.seen_prompts["system"] = template
 
         routing_id = _routing_id_ctx.get()
         if routing_id and state.routing_id is None:
@@ -2772,7 +2799,8 @@ class CallbackHandler(_CallbackBase):
         in one place so the two cannot drift apart again.
         """
         detected = state.detected_agent_name if state is not None else None
-        return self._explicit_agent_name or detected or _install_agent_name
+        configured = state.config_agent_name if state is not None else None
+        return self._explicit_agent_name or configured or detected or _install_agent_name
 
     def _routing_agent_name(self, parent_run_id: Optional[UUID]) -> Optional[str]:
         """The name the run that owns ``parent_run_id`` will be traced under.
@@ -3303,6 +3331,16 @@ class CallbackHandler(_CallbackBase):
         #    is worse than no number, and activation is the rung the product
         #    claim rests on.
         scopes = _run_scopes(state)
+        if state.config_agent_name and state.routing_id is None:
+            # An agent_config() run that showed its local copy records its own decision in
+            # the background: wait briefly for it, as ADK's plugin does.
+            from ._langchain_config import late_decision
+
+            for scope in scopes:
+                late = late_decision(scope, _LATE_DECISION_WAIT_S)
+                if late:
+                    state.routing_id = late
+                    break
         (
             scoped_routing_id, scoped_offered, scoped_delivered, scoped_loaded, scoped_versions,
         ) = _drain_scoped_router_rails(scopes, include_versions=True)
@@ -3422,7 +3460,7 @@ class CallbackHandler(_CallbackBase):
             ended_at=datetime.now(timezone.utc),
             user_input_preview=state.user_input_preview,
             final_output_preview=state.final_output_preview,
-            spans=list(state.spans.values()),
+            spans=self._spans_with_prompt_record(state),
             llm_calls=list(state.llm_calls.values()),
             active_skills=active_skills_list,
             # THIS agent's manifest. A single process-global slot stamped
@@ -3447,6 +3485,17 @@ class CallbackHandler(_CallbackBase):
         if state.native_loads:
             state.native_loads.apply(trace)
         return trace
+
+    @staticmethod
+    def _spans_with_prompt_record(state: _RunState) -> List[TraceSpan]:
+        """The run's spans, carrying its agent_config() prompt record as attributes."""
+        spans = list(state.spans.values())
+        if state.config_agent_name and isinstance(state.config_prompt, dict):
+            from ._agent_binding import attach_prompt_records
+
+            record = {**state.config_prompt, "decimal_agent": state.config_agent_name}
+            attach_prompt_records(spans, {state.config_agent_name: record})
+        return spans
 
     def _attach_tool_calls(self, state: _RunState) -> None:
         """Hang each ToolCallRecord off the model turn that requested it.
@@ -3823,6 +3872,74 @@ _global_handler = CallbackHandler(auto_send=True)
 _decimal_callback_var: ContextVar[Optional[CallbackHandler]] = ContextVar(
     "decimal_langchain_callback", default=_global_handler,
 )
+
+
+def agent_config(
+    agent_name: str,
+    *,
+    fallback: Optional[str] = None,
+    on_unavailable: str = "continue",
+) -> Any:
+    """Pull an agent's prompt and skills from DecimalAI, as a LangChain middleware.
+
+    ::
+
+        from langchain.agents import create_agent
+        from decimalai.langchain import agent_config
+
+        support = agent_config("support", fallback=BASE_PROMPT)
+        agent = create_agent("openai:gpt-5.4-mini", tools=[lookup_order],
+                             middleware=[support.middleware])
+        agent.invoke({"messages": [{"role": "user", "content": question}]}, context=customer)
+
+    Reads the agent's saved prompt here and keeps a local copy, re-read in the background
+    at most once a minute. Each invocation is routed on its user message: the agent's first
+    run before its first model call, later runs from the local copy while their decision is
+    recorded in the background, and every run of an agent with more skills than fit the
+    list. ``{{variables}}`` are filled from the run's ``context=`` (attributes or dict keys).
+    A thread keeps its first message's system text and ``load_skill`` definition (Claude
+    rejects a changed one once a thinking block is in the history); a later message's new
+    skills go into the conversation as a tagged human message. A hand-built graph uses the
+    config's ``system_message(messages, context=...)`` and ``tools`` instead. Tracing is
+    ``decimalai.init(langchain=True)``. Initializes the SDK from ``DECIMAL_API_KEY`` when
+    ``decimalai.init()`` has not been called.
+
+    With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
+    ``init(load_skill_tool=False)``), every run is routed and the text of the skills picked
+    for it goes into the system text instead (``inject_skill_body``).
+
+    With no API key and no ``init()``, the agent runs keyless, as
+    :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each run lists
+    the project's skills and public registry matches, and nothing is traced. With a key, an
+    agent the workspace has no agent by is created.
+
+    Args:
+        agent_name: The agent's name in DecimalAI.
+        fallback: The system prompt to use when the agent has no saved prompt, when no API
+            key is set, or when DecimalAI cannot be reached at startup. Put your code's
+            prompt here rather than in ``create_agent(system_prompt=...)``.
+        on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI never
+            returned them, and the run's record says so; ``"fail"`` raises before the
+            model call instead.
+
+    Raises:
+        ImportError: LangChain 1.x (``create_agent`` and its middleware) is not installed.
+        ValueError: ``on_unavailable`` is neither ``"continue"`` nor ``"fail"``.
+    """
+    if on_unavailable not in ("continue", "fail"):
+        raise ValueError("on_unavailable must be 'continue' or 'fail'")
+    try:
+        import langchain.agents.middleware  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "decimalai.langchain.agent_config() needs LangChain 1.x (create_agent and its "
+            'middleware). Install it with: pip install "decimalai[langchain]"'
+        ) from exc
+    from ._agent import _open_prompt
+    from ._langchain_config import LangChainAgentConfig
+
+    prompt = _open_prompt(agent_name, fallback)
+    return LangChainAgentConfig(prompt, fallback=fallback, on_unavailable=on_unavailable)
 
 
 def _preview(obj: Any, max_len: int = 2000) -> str:

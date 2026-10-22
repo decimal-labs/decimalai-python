@@ -67,6 +67,7 @@ from typing import Any, Dict, List, NoReturn, Optional, Tuple
 from uuid import uuid4
 
 from ._agent_binding import AgentBinding, ConversationRecord, _in_thread
+from ._agent_binding import new_skills_block as _new_skills_block
 from .skill_router import _load_routing_id_ctx
 
 logger = logging.getLogger("decimalai.anthropic")
@@ -746,19 +747,6 @@ class Run:
             if otel_token is not None:
                 otel_context.detach(otel_token)
         return text, _is_error(text)
-
-
-def _new_skills_block(prefix: str, names: List[str]) -> Optional[str]:
-    """The rows of ``prefix``'s skill table naming ``names``, as a block for the user turn."""
-    rows = []
-    for line in prefix.splitlines():
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if line.lstrip().startswith("|") and cells and cells[0] in names:
-            rows.append(line.strip())
-    if not rows:
-        rows = [f"| {name} | |" for name in names]
-    return ("More skills you can load with load_skill for this message:\n\n"
-            "| Skill | Description |\n|-------|-------------|\n" + "\n".join(rows))
 
 
 def _result_block(tool_use_id: Any, text: str, error: bool) -> Dict[str, Any]:
