@@ -402,5 +402,9 @@ class TestRealAdkParentLink:
         else:
             pending_submit.assert_called_once()
             assert [trace.manifest_id for trace in sent] == ["registered-manifest-id"] * 2
+            # Handled, so one line and no traceback.
+            refused = [r for r in caplog.records if "could not register" in r.getMessage()]
+            assert len(refused) == 1 and refused[0].exc_info is None
+            assert "offline refusal" in refused[0].getMessage()
         payloads = _posted(sent)
         assert all(payload["parent_trace_id"] == parent_id for payload in payloads)

@@ -1546,7 +1546,13 @@ def _plugin_class() -> Any:
                         len(snapshot.components),
                     )
                 except Exception as exc:
-                    logger.warning("Failed to register ADK manifest, continuing", exc_info=True)
+                    # One line: an unreachable platform is handled, not a crash.
+                    logger.warning(
+                        "decimalai: could not register %s's manifest (%s: %s); its traces "
+                        "are held and retried in the background.",
+                        agent, type(exc).__name__, str(exc)[:200],
+                    )
+                    logger.debug("ADK manifest registration for %s failed", agent, exc_info=True)
                     _manifest_ids[agent] = snapshot.id
                     # Hand the send side something to retry WITH, so the trace is held
                     # rather than posted under an id the platform never stored.

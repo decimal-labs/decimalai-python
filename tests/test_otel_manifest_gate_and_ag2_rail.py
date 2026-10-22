@@ -242,15 +242,22 @@ def test_a_turn_that_observes_nothing_keeps_the_populated_manifest(_sdk):
     assert second.manifest_id == first.manifest_id
 
 
-def test_a_failed_registration_is_retried_on_the_next_trace(_sdk):
+def test_a_failed_registration_is_retried_on_the_next_trace(_sdk, caplog):
     """The fallback id is a client-side uuid the backend has never seen, and it
     rejects an unknown manifest_id exactly like a missing one — so a cached
     failure would turn one blip into permanent trace loss."""
+    import logging
+
     from decimalai.otel import DecimalSpanExporter
 
     _sdk._client.register_manifest.side_effect = RuntimeError("backend down")
     exporter = DecimalSpanExporter(agent_name="ag2-agent")
-    _export(exporter, _ag2_turn(0x450, ["search"]))
+    with caplog.at_level(logging.WARNING, logger="decimalai"):
+        _export(exporter, _ag2_turn(0x450, ["search"]))
+    # Handled, so one line and no traceback.
+    loud = [r for r in caplog.records if "manifest" in r.getMessage()]
+    assert len(loud) == 1 and loud[0].exc_info is None, [r.getMessage() for r in loud]
+    assert "ag2-agent" in loud[0].getMessage() and "backend down" in loud[0].getMessage()
 
     _sdk._client.register_manifest.side_effect = (
         lambda snapshot: {"manifest_id": "recovered"}

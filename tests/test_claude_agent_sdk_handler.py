@@ -285,6 +285,24 @@ class TestManifest:
         cfg._client.register_manifest.assert_called_once()
         assert trace.manifest_id == "man_test"
 
+    def test_a_refused_registration_is_one_warning_line(self, caplog, monkeypatch):
+        """DecimalAI unreachable is handled (the trace is held and retried), so
+        it is one line, not a traceback; the traceback is at DEBUG."""
+        import logging
+
+        import decimalai._config as cfg
+        cfg._client.register_manifest.side_effect = ConnectionError("[Errno 61] Connection refused")
+        held = []  # the held trace's background retry ladder is not what this tests
+        monkeypatch.setattr(cfg, "submit_trace_pending_manifest", lambda *a: held.append(a))
+        opts = FakeOptions(model="claude-haiku-4-5", system_prompt="Be brief.", allowed_tools=["search"])
+        with caplog.at_level(logging.DEBUG, logger="decimalai"):
+            _drive(_full_run_messages(), agent_name="cas-offline", options=opts)
+        loud = [r for r in caplog.records if r.levelno >= logging.WARNING and "manifest" in r.getMessage()]
+        assert len(loud) == 1, [r.getMessage() for r in loud]
+        assert loud[0].exc_info is None and "\n" not in loud[0].getMessage()
+        assert "cas-offline" in loud[0].getMessage() and "Connection refused" in loud[0].getMessage()
+        assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
+
     def test_manifest_registered_from_init_data(self):
         """When no options are supplied, model + tools fall back to the init
         SystemMessage data."""

@@ -343,14 +343,14 @@ def read_prompt(
             cached, fetched_at = entry
             age = time.monotonic() - fetched_at
             logger.warning(
-                "decimalai: platform unreachable reading %r's prompt (%s) — serving the "
+                "decimalai: platform unreachable reading the prompt of %r (%s) — serving the "
                 "cached copy, %.0fs old.",
                 agent_name, exc, age,
             )
             return replace(cached, is_fallback=True, stale_age_seconds=age)
         if fallback is not None:
             logger.warning(
-                "decimalai: platform unreachable reading %r's prompt (%s) and nothing "
+                "decimalai: platform unreachable reading the prompt of %r (%s) and nothing "
                 "cached — using the fallback prompt.",
                 agent_name, exc,
             )

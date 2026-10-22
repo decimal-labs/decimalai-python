@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -599,8 +600,9 @@ def test_a_conversation_resumes_from_its_state_in_another_process(platform):
         assert run.system == system and run.tool_params == tools
     with pytest.raises(ValueError, match="not both"):
         second_process.conversation(state=saved, variables=SAM)
-    with pytest.raises(ValueError, match="agent"):
+    with pytest.raises(ValueError, match="belongs to agent 'billing', not to 'support'") as refused:
         second_process.conversation(state={**saved, "agent": "billing"})
+    assert not re.search(r"'\w+''s", str(refused.value))  # no possessive on a quoted name
 
 
 def test_a_cut_list_conversation_routes_each_message_and_shows_new_skills_in_its_user_turn(

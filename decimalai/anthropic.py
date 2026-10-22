@@ -907,8 +907,8 @@ class AnthropicAgentConfig(AgentBinding):
                 raise ValueError("a resumed conversation keeps the values it started with; "
                                  "pass state= or variables=, not both")
             if isinstance(state, dict) and state.get("agent") != self.name:
-                raise ValueError(f"this conversation state is agent {state.get('agent')!r}'s, "
-                                 f"not {self.name!r}'s")
+                raise ValueError(f"this conversation state belongs to agent {state.get('agent')!r}, "
+                                 f"not to {self.name!r}")
             record = ConversationRecord.from_state(state, self.name)
             if record is None:
                 raise ValueError("state= takes a Conversation.state from this version of decimalai")

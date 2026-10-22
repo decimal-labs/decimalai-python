@@ -1016,9 +1016,12 @@ def _maybe_register_manifest(state: _RunState) -> Optional[str]:
             # Leave this agent's hash unset so the next trace retries; a
             # transient blip must not permanently stop it declaring a manifest.
             logger.warning(
-                "Failed to register Claude Agent SDK manifest for %s, continuing",
-                agent, exc_info=True,
+                "decimalai: could not register %s's manifest (%s: %s); its traces "
+                "are held and retried in the background.",
+                agent, type(exc).__name__, str(exc)[:200],
             )
+            logger.debug("Claude Agent SDK manifest registration for %s failed", agent,
+                         exc_info=True)
             # Hand the send side something to retry WITH. Without it the trace goes
             # out with no manifest_id at all and a strict backend answers 400
             # "manifest_id is required" — the same loss the other adapters took under

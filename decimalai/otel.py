@@ -1024,9 +1024,12 @@ class _ManifestRegistry:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Failed to register manifest from OTel spans for agent %s",
-                    agent_name, exc_info=True,
+                    "decimalai: could not register %s's manifest from OTel spans "
+                    "(%s: %s); the next trace retries.",
+                    agent_name, type(exc).__name__, str(exc)[:200],
                 )
+                logger.debug("OTel manifest registration for %s failed", agent_name,
+                             exc_info=True)
                 _config._sender.record_manifest_error(exc)
                 # Forget the hash so the NEXT trace retries. The fallback id
                 # below is a client-side uuid the backend has never seen, and

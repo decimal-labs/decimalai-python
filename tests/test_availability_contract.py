@@ -84,6 +84,16 @@ class TestLoadAgentSurvivesAnOutage:
         assert cfg.prompt_version is None
         assert read_prompt("bot", fallback="You are a returns agent.").is_fallback is True
 
+    def test_the_outage_warning_quotes_the_agent_name_cleanly(self, caplog):
+        """It printed `'bot''s prompt`: a possessive after a quoted name."""
+        _reset_prompt_cache()
+        decimalai.init(api_key="dai_sk_t", base_url=UNREACHABLE, verify=False)
+        with caplog.at_level("WARNING", logger="decimalai"):
+            read_prompt("bot", fallback="You are a returns agent.")
+        (message,) = [r.getMessage() for r in caplog.records if "unreachable" in r.getMessage()]
+        assert "the prompt of 'bot'" in message
+        assert "''s" not in message
+
     def test_without_a_fallback_it_still_fails_closed(self):
         """Fail-closed is deliberate: substituting a prompt nobody wrote makes
         the agent follow invented instructions and look fine doing it."""
