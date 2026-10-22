@@ -35,7 +35,9 @@ tool calls and sub-agents, and the root agent's manifest (model, instruction, to
 sub-agents). An invocation whose agent was given ``agent_config()``'s instruction is filed
 under that DecimalAI agent and carries the prompt version, its variable names and the
 skills offered and loaded. Nothing in ADK is patched: the plugin goes where ADK puts
-plugins, ``App(plugins=[...])``, so only the runners built from that app are traced.
+plugins, ``App(plugins=[...])``, so only the runners built from that app are traced. It is
+the one line ADK adds to ``agent_config()``: a run of an agent config by a runner without
+it is not traced, and logs one warning per agent saying so.
 
 Native mode: ADK's own skill loader
 -----------------------------------
@@ -754,6 +756,15 @@ def _record_adk(run_key: Optional[str], fields: Dict[str, Any]) -> bool:
                 # whose instruction is resolved first.
                 state.decimal_agent = prompt["decimal_agent"]
     return True
+
+
+#: Said once per agent when an agent config's run finds no DecimalAIPlugin tracing it:
+#: `_record_adk` drops the record, and nothing else would say so.
+_UNTRACED = (
+    "this run is not traced, so its prompt version and skills are recorded nowhere: no "
+    "DecimalAIPlugin is in the App that ran it. Add one: App(name=..., root_agent=..., "
+    "plugins=[DecimalAIPlugin()]), from decimalai.adk."
+)
 
 
 def _note_adk_pending(run_key: Optional[str], pending: Any) -> None:
@@ -1577,6 +1588,7 @@ def DecimalAIPlugin(  # noqa: N802 — factory presents as a class for ergonomic
     """Construct a DecimalAI ADK plugin, for ``App(..., plugins=[DecimalAIPlugin()])``.
 
     Every invocation of a runner built from that app becomes one DecimalAI trace.
+    An ``agent_config()`` agent run without it is not traced, and says so once.
 
     Args:
         agent_name: The DecimalAI agent the traces are filed under. Default: the
@@ -1866,7 +1878,16 @@ class ADKAgentConfig(AgentBinding):
         return None
 
     def _record(self, **fields: Any) -> bool:
-        return _record_adk(_RUN.get(), fields)
+        kept = _record_adk(_RUN.get(), fields)
+        if not kept and "prompt" in fields:
+            # The run's own record, made as its instruction is composed, and no plugin is
+            # tracing its invocation. A late background decision or load finds its run gone
+            # too, but carries no prompt. With tracing off the plugin records nothing either.
+            from ._config import _is_enabled
+
+            if _is_enabled():
+                self._warn_once(fields.get("agent"), _UNTRACED)
+        return kept
 
     def _note_pending(self, run_key: Optional[str], pending: Any) -> None:
         _note_adk_pending(run_key, pending)
@@ -1939,7 +1960,8 @@ def agent_config(
     every one of an agent with more skills than fit the list. ``{{variables}}`` are
     filled from the session's state (attributes or dict keys). Traces come from
     :func:`DecimalAIPlugin` in ``App(plugins=[...])``: an invocation of this agent is
-    filed under ``support.name`` with its prompt version and its skills. Initializes
+    filed under ``support.name`` with its prompt version and its skills. A run by a
+    runner without the plugin is not traced and logs one warning saying so. Initializes
     the SDK from ``DECIMAL_API_KEY`` when ``decimalai.init()`` has not been called.
 
     With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or

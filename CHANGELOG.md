@@ -83,6 +83,15 @@ and patch releases are fixes.
   "adaptive"}})`: the effort makes the Agents SDK send thinking back, and LiteLLM 1.83 would
   otherwise turn it into `budget_tokens`, which Claude 5.x refuses.
 
+### Changed: a Google ADK run without `DecimalAIPlugin` says it is not traced
+
+- `App(plugins=[DecimalAIPlugin()])` stays the one line ADK adds to `agent_config()`: the plugin is
+  what makes an invocation a trace, and `agent_config()` does not install it. A run of an
+  `agent_config()` agent by a runner without the plugin used to drop its record (prompt version,
+  skills) without a word; it now logs one warning per agent that names the line to add. Nothing
+  is said with tracing switched off (`init(enabled=False)`) or for a keyless agent, which sends
+  nothing anyway.
+
 ### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
 
 - For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an

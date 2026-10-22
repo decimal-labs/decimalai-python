@@ -178,6 +178,46 @@ def test_another_tool_named_load_skill_gets_no_decimal_skills(platform, caplog):
     assert platform.menu_calls() == []
 
 
+def untraced_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "is not traced" in r.getMessage()]
+
+
+def test_a_run_without_the_plugin_says_once_that_it_is_not_traced(platform, caplog):
+    """`App(plugins=[DecimalAIPlugin()])` is ADK's one extra line. Without it the run's record
+    (prompt version, skills) is dropped, and one warning per agent says so."""
+    support = adk.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.adk"):
+        for _ in range(2):
+            assert run(support, model("answer"), "Hi")[0] == "done"
+    (warning,) = untraced_warnings(caplog)
+    assert warning.startswith("DecimalAI (support_agent): this run is not traced")
+    assert "plugins=[DecimalAIPlugin()]" in warning
+
+
+def test_a_run_with_the_plugin_or_with_tracing_off_does_not_warn(platform, monkeypatch, caplog):
+    import decimalai._config as cfg
+    from decimalai._config import DecimalConfig
+
+    traces = []
+    switched_off = adk.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.adk"):
+        run(adk.agent_config("support"), model("answer"), "Hi", traces=traces)
+        assert len(traces) == 1
+        # The kill switch: the plugin would trace nothing either, so there is nothing to add.
+        monkeypatch.setattr(cfg, "_config", DecimalConfig(api_key="dai_sk_test", base_url=BASE, enabled=False))
+        run(switched_off, model("answer"), "Hi")
+    assert untraced_warnings(caplog) == []
+
+
+def test_a_late_record_with_no_prompt_does_not_warn(platform, caplog):
+    """A background decision can land after its invocation ended and find no run; only the
+    run's own record, made as its instruction is composed, means no plugin is tracing it."""
+    support = adk.agent_config("support")
+    with caplog.at_level(logging.WARNING, logger="decimalai.adk"):
+        binding.AgentBinding._stamp_routing(support, "an-ended-invocation", "routing-1")
+    assert untraced_warnings(caplog) == []
+
+
 def test_init_enabled_false_stops_skills_but_not_the_prompt(platform, monkeypatch):
     import decimalai._config as cfg
 
