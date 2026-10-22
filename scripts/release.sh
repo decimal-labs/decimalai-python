@@ -30,10 +30,11 @@ NAME="decimalai"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Which providers the live gate exercises. Defaults to google because the OpenAI
-# test key is quota-blocked; set RELEASE_GATE_PROVIDERS="google openai" once it
-# has quota.
-PROVIDERS="${RELEASE_GATE_PROVIDERS:-google}"
+# Which providers the live gate exercises: OpenAI and Anthropic, the two funded keys.
+# The Gemini key is out of prepaid credit (HTTP 402 since 2026-09-29), and its cells
+# fail rather than skip; set RELEASE_GATE_PROVIDERS="openai anthropic google" once it
+# is funded.
+PROVIDERS="${RELEASE_GATE_PROVIDERS:-openai anthropic}"
 # The live-gate harness (clean-room wheel + real-model matrix) is maintainer-only
 # tooling that lives outside this repo — no default path, point the env var at
 # your checkout. Unset means gate 3 cannot run; see the check below.

@@ -241,16 +241,17 @@ Once Actions works again, the run is a genuine no-op because the version already
 
 ## Providers the live gate exercises
 
-By default the gate runs **Google/Gemini only**, because the OpenAI test key is currently quota-blocked.
-To include OpenAI once it has quota:
+By default the gate runs **OpenAI and Anthropic**, the two funded keys. The Gemini key is out of
+prepaid credit (HTTP 402 since 2026-09-29) and its cells fail rather than skip, so it is left out.
+Add it once it is funded:
 
 ```bash
-RELEASE_GATE_PROVIDERS="google openai" ./scripts/release.sh
+RELEASE_GATE_PROVIDERS="openai anthropic google" ./scripts/release.sh
 ```
 
-Provider-native frameworks are only tested against their own model (e.g. `openai_agents` → OpenAI,
-`adk` → Gemini); generic frameworks are tested against both. So a Gemini-only run does not exercise the
-OpenAI-native lanes — use `"google openai"` for a full release when the key is available.
+Provider-native frameworks are only tested against their own model (`openai_agents` → OpenAI,
+`claude_agent_sdk` → Anthropic, `adk` → Gemini); generic frameworks are tested against every provider
+in the run. Every release since 0.22.1 ran with `--providers openai anthropic`.
 
 ## Skipping the live gate
 
