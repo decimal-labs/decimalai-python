@@ -13,6 +13,16 @@ Agents SDK is patched, and no other agent in the process is affected::
         tools=[lookup_order, *support.tools],   # + load_skill
     )
 
+A Claude chat (through LiteLLM) keeps its first run's instructions and ``load_skill``
+definition when its runs share one ``RunConfig(group_id=...)``, the Agents SDK's chat
+thread id: Claude rejects a turn whose instructions or tools changed since a thinking block
+in its history was made, so a prompt saved mid-chat reaches the next chat. Another process
+continues it from ``support.conversation(group_id).state``::
+
+    chat = support.conversation(thread_id, state=saved)    # saved: None on the first turn
+    result = await Runner.run(agent, items, run_config=RunConfig(group_id=chat.id))
+    saved = chat.state
+
 Tracing every run (what ``agent_config`` also registers, and all ``init(openai_agents=True)`` does)::
 
     import decimalai
@@ -1378,6 +1388,59 @@ def instrument(
 #: `getattr` default telling "the SDK has no `turn_input`" from "it is empty".
 _NO_TURN_INPUT = object()
 
+#: Claude conversations one config remembers in this process, newest last.
+_MAX_CONVERSATIONS = 1024
+
+
+def _current_group_id() -> Optional[str]:
+    """The ``RunConfig(group_id=...)`` of the run active here, or None.
+
+    The Agents SDK's own name for a chat thread ("to link multiple traces from the
+    same conversation"), and the one a run shows its instructions function: its
+    trace's. A run with tracing disabled runs under a ``NoOpTrace``, which carries none.
+    """
+    try:
+        from agents.tracing import get_current_trace
+
+        group_id = getattr(get_current_trace(), "group_id", None)
+    except Exception:
+        return None
+    return group_id.strip() if isinstance(group_id, str) and group_id.strip() else None
+
+
+_load_skill_tool_cls: Any = None
+_load_skill_tool_lock = threading.Lock()
+
+
+def _load_skill_tool_class() -> Any:
+    """The ``FunctionTool`` behind ``support.tools``, built once (the Agents SDK is optional).
+
+    Its parameters are its run's own: the Agents SDK reads ``params_json_schema`` when it
+    builds each model request, inside the run, and gets the names that run was shown
+    (a conversation's, on a Claude chat), whatever the agent's list is by then. One run
+    replays its thinking between tool calls and a chat replays it between runs, and
+    Claude rejects a request whose tools changed since. Outside a run it is the agent's
+    whole list, as the config last stored it.
+    """
+    global _load_skill_tool_cls
+    with _load_skill_tool_lock:
+        if _load_skill_tool_cls is None:
+            from agents import FunctionTool
+
+            class LoadSkillTool(FunctionTool):
+                @property  # type: ignore[override]
+                def params_json_schema(self) -> Dict[str, Any]:
+                    config = self.__dict__.get("_decimalai_config")
+                    schema = config._run_tool_schema() if config is not None else None
+                    return schema if schema is not None else self.__dict__.get("_decimalai_schema", {})
+
+                @params_json_schema.setter
+                def params_json_schema(self, value: Dict[str, Any]) -> None:
+                    self.__dict__["_decimalai_schema"] = value
+
+            _load_skill_tool_cls = LoadSkillTool
+        return _load_skill_tool_cls
+
 
 def _require_agents_sdk() -> None:
     """Fail before any setup or network call when the Agents SDK is missing."""
@@ -1417,6 +1480,13 @@ class OpenAIAgentConfig(AgentBinding):
         agent = Agent(name=support.name, instructions=support.instructions,
                       tools=[lookup_order, *support.tools])
 
+    On Claude, the runs of one chat keep its first run's instructions and
+    ``load_skill``: give them one ``RunConfig(group_id=...)``, the Agents SDK's chat
+    thread id. Claude rejects a turn whose instructions or tools changed since a
+    thinking block in its history was made (HTTP 400, "bound to a different
+    conversation"), so a newer saved prompt or skill list reaches the next chat, not
+    an open one. :meth:`conversation` carries a chat to another process.
+
     Attributes:
         name: The agent's canonical DecimalAI name.
         instructions: Pass as ``Agent(instructions=...)``. OpenAI calls it before
@@ -1431,6 +1501,8 @@ class OpenAIAgentConfig(AgentBinding):
 
     def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        #: Claude conversations this process has seen: (group id, agent) -> record.
+        self._chats: "OrderedDict[Tuple[str, Optional[str]], Any]" = OrderedDict()
         self.load_skill = self._build_tool()
         self.tools: List[Any] = [self.load_skill]
 
@@ -1451,28 +1523,27 @@ class OpenAIAgentConfig(AgentBinding):
         return state["text"]
 
     def _warn_if_claude_replays_thinking(self, context: Any, agent: Any) -> None:
-        """Say once when a Claude chat sends thinking back: a saved prompt would break it.
+        """Say once when a Claude chat sends thinking back with no conversation to keep.
 
         Claude rejects a turn whose system prompt or tools changed since a thinking
         block in its history was made (HTTP 400, "bound to a different conversation").
-        These instructions follow the newest saved prompt and skill list on every run,
-        and the Agents SDK gives them no conversation to keep them per chat by.
+        A chat whose runs share a ``group_id`` keeps its first run's; one without
+        follows the newest saved prompt and skill list on every run.
         """
-        model = getattr(agent, "model", None)
-        if not is_claude(model if isinstance(model, str) else getattr(model, "model", None)):
+        if _current_group_id() is not None or not is_claude(_agent_model_name(agent)):
             return
         items = getattr(context, "turn_input", None)
         if not isinstance(items, list) or not any(
                 isinstance(item, dict) and item.get("type") == "reasoning" for item in items):
             return
         self._warn_once(agent, (
-            "this Claude chat sends earlier turns' thinking back, and Claude rejects a turn whose "
-            "instructions or tools changed since (HTTP 400, \"bound to a different "
-            "conversation\"). These instructions follow the newest saved prompt and skill list on "
-            "every run, so a prompt saved in DecimalAI breaks open chats. Leave "
-            "ModelSettings.reasoning unset (thinking is then not sent back), or set Anthropic's "
-            "thinking.block_binding.prefix_mismatch_behavior=\"drop_block\" (beta "
-            "thinking-binding-controls-2026-08-01) to drop the stale blocks instead."))
+            "this Claude chat sends earlier turns' thinking back, and its runs share no group_id, "
+            "so each run's instructions and load_skill follow the newest saved prompt and skill "
+            "list. Claude rejects a turn whose instructions or tools changed since (HTTP 400, "
+            "\"bound to a different conversation\"), so a prompt saved in DecimalAI would break "
+            "this chat. Give its runs one RunConfig(group_id=...) (its thread id): a chat then "
+            "keeps its first run's instructions and load_skill. A run with tracing disabled shows "
+            "no group_id."))
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
@@ -1508,6 +1579,74 @@ class OpenAIAgentConfig(AgentBinding):
     def _serve_load(self, name: str) -> str:
         return _handle_load_skill(name, agent_name=self.name)
 
+    def _conversation(self, context: Any, agent: Any) -> Any:
+        """A later run of a Claude chat: what the chat's first run kept, found by its group id."""
+        group_id = _current_group_id()
+        if group_id is None or not is_claude(_agent_model_name(agent)):
+            return None
+        with self._lock:
+            return self._chats.get((group_id, self._agent_label(agent)))
+
+    def _keep_conversation(self, context: Any, agent: Any, run_key: Optional[str], record: Any) -> None:
+        group_id = _current_group_id()
+        if group_id is None or not is_claude(_agent_model_name(agent)):
+            return
+        self._remember_chat((group_id, self._agent_label(agent)), record)
+
+    def _remember_chat(self, key: Tuple[str, Optional[str]], record: Any) -> None:
+        with self._lock:
+            self._chats[key] = record
+            self._chats.move_to_end(key)
+            while len(self._chats) > _MAX_CONVERSATIONS:
+                self._chats.popitem(last=False)
+
+    def _run_tool_schema(self) -> Optional[Dict[str, Any]]:
+        """``load_skill``'s parameters for the run active here, or None outside one."""
+        state = self._run_state(_current_run_key())
+        if state is None:
+            return None
+        return self._tool_schema(list(state.get("tool_names") or []))
+
+    # ── a chat across processes ─────────────────────────────
+    def conversation(self, group_id: str, *, state: Optional[Dict[str, Any]] = None) -> "AgentsConversation":
+        """The chat whose runs carry ``RunConfig(group_id=group_id)``, to carry it to another process.
+
+        ::
+
+            chat = support.conversation(thread_id, state=saved)   # saved: None on its first turn
+            result = await Runner.run(agent, items, run_config=RunConfig(group_id=chat.id))
+            saved = chat.state                                   # store it beside the chat's history
+
+        On Claude, a chat's runs keep its first run's instructions and ``load_skill``
+        definition, in the process that served it. A server whose next turn may land
+        elsewhere stores :attr:`AgentsConversation.state` with the history; passing it
+        back as ``state=`` makes this process's runs of the chat use it.
+
+        Args:
+            group_id: The chat's ``RunConfig(group_id=...)``.
+            state: An earlier :attr:`AgentsConversation.state` of this chat.
+
+        Raises:
+            ValueError: ``group_id`` is empty, or ``state`` is not a state of this agent's
+                chat from this version of decimalai.
+        """
+        from ._agent_binding import ConversationRecord
+
+        if not isinstance(group_id, str) or not group_id.strip():
+            raise ValueError("conversation() takes the chat's group_id, a non-empty string")
+        group_id = group_id.strip()
+        if state is not None:
+            kept = state.get("agents") if isinstance(state, dict) else None
+            records = {label: ConversationRecord.from_state(value, self.name)
+                       for label, value in kept.items()} if isinstance(kept, dict) else {}
+            if (not records or state.get("id") != group_id
+                    or any(record is None for record in records.values())):
+                raise ValueError(f"state= takes an AgentsConversation.state of agent {self.name!r}'s "
+                                 f"chat {group_id!r} from this version of decimalai")
+            for label, record in records.items():
+                self._remember_chat((group_id, label or None), record)
+        return AgentsConversation(self, group_id)
+
     def _message(self, context: Any, agent: Any) -> Optional[str]:
         """The customer's latest message, which routing ranks the skills on.
 
@@ -1540,7 +1679,7 @@ class OpenAIAgentConfig(AgentBinding):
     # ── the load_skill tool ─────────────────────────────────
     def _build_tool(self) -> Any:
         try:
-            from agents import FunctionTool
+            tool_class = _load_skill_tool_class()
         except ImportError:
             raise ImportError(
                 "agent_config() needs the OpenAI Agents SDK: "
@@ -1555,7 +1694,7 @@ class OpenAIAgentConfig(AgentBinding):
                 name = ""
             return await self._load(name)
 
-        tool = FunctionTool(
+        tool = tool_class(
             name=_TOOL_NAME,
             description=LOAD_SKILL_TOOL_DESCRIPTION,
             params_json_schema=self._tool_schema([]),
@@ -1563,6 +1702,7 @@ class OpenAIAgentConfig(AgentBinding):
             strict_json_schema=True,
             is_enabled=self._tool_enabled,
         )
+        tool.__dict__["_decimalai_config"] = self
         setattr(tool, _SKILL_TOOL_AGENT_ATTR, self.name)
         return tool
 
@@ -1610,6 +1750,40 @@ class OpenAIAgentConfig(AgentBinding):
 
 
 
+class AgentsConversation:
+    """A Claude chat of one agent: its runs share ``RunConfig(group_id=id)``.
+
+    Made by :meth:`OpenAIAgentConfig.conversation`. What a chat keeps is the
+    ``ConversationRecord`` every DecimalAI binding shares (``decimalai._agent_binding``):
+    its first run's instructions and ``load_skill`` definition, per agent of the run.
+
+    Attributes:
+        id: The chat's group id.
+    """
+
+    def __init__(self, config: OpenAIAgentConfig, group_id: str) -> None:
+        self._config = config
+        self.id = group_id
+
+    def __repr__(self) -> str:
+        return f"AgentsConversation(agent={self._config.name!r}, id={self.id!r})"
+
+    @property
+    def state(self) -> Optional[Dict[str, Any]]:
+        """JSON-ready, to store beside the chat's history; None before its first run here.
+
+        Pass it back as ``support.conversation(chat_id, state=...)`` in any process.
+        """
+        config = self._config
+        with config._lock:
+            kept = {label: record for (group_id, label), record in config._chats.items()
+                    if group_id == self.id}
+        if not kept:
+            return None
+        return {"id": self.id,
+                "agents": {label or "": record.to_state(config.name) for label, record in kept.items()}}
+
+
 def agent_config(
     agent_name: str,
     *,
@@ -1646,6 +1820,11 @@ def agent_config(
     ``init(load_skill_tool=False)``), every run is routed on its message and the
     text of the skills picked for it goes into the instructions instead
     (``inject_skill_body``, on by default once the tool is off).
+
+    On Claude, runs that share a ``RunConfig(group_id=...)`` (one chat) keep the
+    first run's instructions and ``load_skill`` definition, as Claude requires once a
+    thinking block is in the history; a newer saved prompt or skill list reaches the
+    next chat. :meth:`OpenAIAgentConfig.conversation` carries a chat to another process.
 
     With no API key and no ``init()``, the agent runs keyless, as
     :func:`decimalai.agent_config` describes: its ``fallback`` is the prompt, each

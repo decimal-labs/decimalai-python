@@ -150,6 +150,12 @@ OpenAI SDK is patched and other agents in the process are untouched. Each run is
 prompt version and the skills offered, loaded and delivered. `init(openai_agents=True)` (or
 `instrument()`) traces runs and changes no agent; skills come only from `agent_config()`.
 
+On Claude (through LiteLLM), give a chat's runs one `RunConfig(group_id=...)`, its thread id: they
+keep the first run's instructions and `load_skill` definition, because Claude rejects a turn whose
+instructions or tools changed since a thinking block in its history was made (HTTP 400); a newer
+saved prompt reaches the next chat. `support.conversation(group_id, state=...)` and `chat.state`
+carry a chat to another process.
+
 ### Pydantic AI
 
 ```python

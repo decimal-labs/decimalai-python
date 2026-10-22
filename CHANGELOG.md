@@ -52,6 +52,31 @@ and patch releases are fixes.
 - `decimalai init --framework pydantic-ai` writes no `init()` and no `Agent.instrument_all()`, like
   the other `agent_config()` templates.
 
+### Changed: an OpenAI Agents chat on Claude keeps its instructions and `load_skill`
+
+- Runs that share a `RunConfig(group_id=...)`, the Agents SDK's chat thread id, on a Claude model
+  (through LiteLLM) keep the first run's instructions and `load_skill` definition, byte for byte,
+  as the Pydantic AI, Google ADK, Anthropic and LangChain bindings already do for a conversation.
+  Claude rejects a turn whose instructions or tools changed since a thinking block in its history
+  was made (HTTP 400, "The block is bound to a different conversation"), so a prompt saved in the
+  dashboard mid-chat used to break the chat's next turn; it now reaches the next chat. Each message
+  is still routed, for the record; a chat whose skill list was cut keeps its first decision.
+- `support.conversation(group_id, state=saved)` and `chat.state` carry a chat to another process
+  (store the state beside the chat's history), as `decimalai.anthropic`'s conversations do.
+- A run's `load_skill` parameters are now its own: the names the run (or its chat) was shown, read
+  when each model request is built, so a skill list that changes mid-run or mid-chat no longer
+  changes a tool Claude already saw. Outside a run, `support.load_skill.params_json_schema` is the
+  agent's whole list, as before.
+- The workaround the docs gave (`ModelSettings.reasoning` unset, or Anthropic's `drop_block`) and
+  its warning are gone. A Claude chat that sends thinking back with no `group_id` (or with tracing
+  disabled, which hides it) gets one warning naming `RunConfig(group_id=...)`.
+- Checked live on `claude-haiku-5-5` through LiteLLM 1.83 (the one LiteLLM that installs beside
+  openai 3): a thinking chat across a prompt change, where turn 2 keeps its first instructions and
+  gets 200, and the same history under freshly composed instructions gets 400. On Claude 5.x the
+  chat passes `ModelSettings(reasoning=Reasoning(effort=...), extra_args={"thinking": {"type":
+  "adaptive"}})`: the effort makes the Agents SDK send thinking back, and LiteLLM 1.83 would
+  otherwise turn it into `budget_tokens`, which Claude 5.x refuses.
+
 ### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
 
 - For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an

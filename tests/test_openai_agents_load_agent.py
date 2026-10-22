@@ -154,10 +154,14 @@ class ScriptedModel(Model):
 
     def __init__(self, steps):
         self.steps, self.instructions, self.tools, self.inputs = list(steps), [], [], []
+        #: Each request's tool parameters, read when the request was made (as a model does).
+        self.schemas: list = []
 
     async def get_response(self, system_instructions, input, model_settings, tools, *args, **kwargs):
         self.instructions.append(system_instructions)
         self.tools.append({t.name: t for t in tools})
+        self.schemas.append({t.name: json.loads(json.dumps(getattr(t, "params_json_schema", None)))
+                             for t in tools})
         self.inputs.append(list(input) if isinstance(input, list) else input)
         step = self.steps.pop(0)
         if step == "answer":
@@ -611,14 +615,124 @@ REPLAYED_THINKING = [
 ]
 
 
-def test_a_claude_chat_that_sends_thinking_back_is_warned_once(decimal, caplog):
+def _enum(schemas, n=0):
+    return schemas[n]["load_skill"]["properties"]["name"].get("enum")
+
+
+def _save_prompt(fake, support, text, version):
+    """A version saved in the dashboard, and the config's local copy re-read."""
+    fake.prompt = {"system_prompt": text, "version_number": version, "content_hash": str(version) * 64}
+    support._refresh_prompt()
+
+
+def test_a_claude_chat_keeps_its_first_runs_instructions_and_load_skill(decimal):
+    """Runs sharing a RunConfig(group_id=...) on Claude: a prompt saved and a skill removed
+    mid-chat reach the next chat, not this one (Claude 400s on a changed system or tool
+    once thinking is in the history). Each message is still routed, for the record."""
+    from agents import RunConfig
+
     support = oa.agent_config("support")
-    agent = build(support, ClaudeModel(["answer", "answer"]))
+    model = ClaudeModel(["answer", "answer", "answer"])
+    agent = build(support, model)
+    chat = RunConfig(group_id="thread-1")
+    Runner.run_sync(agent, "My keyboard arrived cracked.", run_config=chat)
+    _save_prompt(decimal, support, "Be brief.", 3)
+    decimal.skills = ["damaged-item"]
+    support._route_run(None, [], "anything")  # the local copy follows
+
+    Runner.run_sync(agent, REPLAYED_THINKING, run_config=chat)
+    assert model.instructions[1] == model.instructions[0], "Claude rejects a changed system prompt"
+    assert model.instructions[0].startswith(BASE)
+    assert _enum(model.schemas, 1) == _enum(model.schemas, 0) == ["damaged-item", "order-support"]
+    assert list(decimal.queries.values())[-1] == "Where is my order?", "still routed, for the record"
+
+    Runner.run_sync(agent, "Hello", run_config=RunConfig(group_id="thread-2"))  # a new chat
+    assert model.instructions[2].startswith("Be brief.")
+    assert _enum(model.schemas, 2) == ["damaged-item"]
+
+
+def test_a_claude_chat_without_a_group_id_follows_the_newest_prompt_and_says_so_once(decimal, caplog):
+    support = oa.agent_config("support")
+    model = ClaudeModel(["answer", "answer"])
+    agent = build(support, model)
     with caplog.at_level(logging.WARNING, logger="decimalai"):
+        Runner.run_sync(agent, "My keyboard arrived cracked.")
+        _save_prompt(decimal, support, "Be brief.", 3)
         Runner.run_sync(agent, REPLAYED_THINKING)
-        Runner.run_sync(agent, REPLAYED_THINKING)
+    assert model.instructions[1].startswith("Be brief.")
     warned = [r.getMessage() for r in caplog.records if "bound to a different conversation" in r.getMessage()]
-    assert len(warned) == 1 and "ModelSettings.reasoning" in warned[0] and "drop_block" in warned[0]
+    assert len(warned) == 1 and "RunConfig(group_id=...)" in warned[0]
+    assert "drop_block" not in warned[0], "no workaround: the group id is the fix"
+
+
+def test_on_other_models_a_group_id_leaves_each_run_on_the_newest_prompt(decimal):
+    from agents import RunConfig
+
+    support = oa.agent_config("support")
+    model = ScriptedModel(["answer", "answer"])
+    agent = build(support, model)
+    chat = RunConfig(group_id="thread-1")
+    Runner.run_sync(agent, "My keyboard arrived cracked.", run_config=chat)
+    _save_prompt(decimal, support, "Be brief.", 3)
+    Runner.run_sync(agent, "Where is my order?", run_config=chat)
+    assert model.instructions[1].startswith("Be brief.")
+
+
+def test_a_claude_chat_carries_to_another_process_through_its_state(decimal):
+    from agents import RunConfig
+
+    support = oa.agent_config("support")
+    model = ClaudeModel(["answer", "answer"])
+    chat = support.conversation("thread-1")
+    assert chat.state is None, "nothing kept before its first run"
+    Runner.run_sync(build(support, model), "My keyboard arrived cracked.",
+                    run_config=RunConfig(group_id=chat.id))
+    saved = json.loads(json.dumps(chat.state))
+    assert saved["id"] == "thread-1" and saved["agents"]["support"]["prompt"]["version"] == 2
+
+    decimal.prompt = {"system_prompt": "Be brief.", "version_number": 3, "content_hash": "3" * 64}
+    elsewhere = oa.agent_config("support")  # another worker, which read version 3
+    resumed = elsewhere.conversation("thread-1", state=saved)
+    Runner.run_sync(build(elsewhere, model), REPLAYED_THINKING, run_config=RunConfig(group_id=resumed.id))
+    assert model.instructions[1] == model.instructions[0]
+    assert _enum(model.schemas, 1) == _enum(model.schemas, 0)
+
+
+def test_conversation_refuses_another_chats_or_agents_state(decimal):
+    from agents import RunConfig
+
+    support = oa.agent_config("support")
+    chat = support.conversation("thread-1")
+    Runner.run_sync(build(support, ClaudeModel(["answer"])), "Hi", run_config=RunConfig(group_id="thread-1"))
+    with pytest.raises(ValueError, match="thread-2"):
+        support.conversation("thread-2", state=chat.state)
+    other = oa.agent_config("billing")
+    with pytest.raises(ValueError, match="billing"):
+        other.conversation("thread-1", state=chat.state)
+    with pytest.raises(ValueError, match="group_id"):
+        support.conversation("  ")
+    with pytest.raises(ValueError, match="state="):
+        support.conversation("thread-1", state=["not", "a", "state"])
+
+
+def test_a_runs_load_skill_keeps_the_names_it_was_shown_when_the_list_changes_mid_run(decimal):
+    """One Claude run replays its thinking between tool calls, so a decision landing mid-run
+    (the agent's list changed) must not change the tool its next request carries."""
+    support = oa.agent_config("support")
+
+    @function_tool
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        support._store_menu(stable_menu(["damaged-item"]), ["damaged-item"], "rt_late", False)
+        return "delivered"
+
+    model = ClaudeModel([LOOKUP, "answer"])
+    agent = Agent(name=support.name, instructions=support.instructions,
+                  tools=[lookup_order, *support.tools], model=model)
+    Runner.run_sync(agent, QUESTION)
+    assert _enum(model.schemas, 1) == _enum(model.schemas, 0) == ["damaged-item", "order-support"]
+    assert support.load_skill.params_json_schema["properties"]["name"]["enum"] == ["damaged-item"], \
+        "outside a run, the agent's whole list as it now stands"
 
 
 @pytest.mark.parametrize("model, items", [
