@@ -833,6 +833,19 @@ def sync_authored(router: Any, items: List[Dict[str, Any]], **kwargs: Any) -> Di
     return router.sync_skills(items, conflict_policy="newer_wins", response_mode="diff", **kwargs)
 
 
+def kept_off_agent(result: Mapping[str, Any], names: Sequence[str]) -> List[str]:
+    """Of ``names`` (synced with ``agent_name``), the ones the platform did not put on the agent.
+
+    The sync's ``added`` list names what went on the agent. A skill missing from it was synced
+    but stays off: one deleted on DecimalAI (a sync never brings it back) or a failed add. A
+    platform that answers without ``added`` (from before 2026-10-22) is taken at its word.
+    """
+    if not isinstance(result.get("added"), list):
+        return []
+    added = {n for n in result["added"] if isinstance(n, str)}
+    return [n for n in names if n not in added]
+
+
 def _upload(project: Any, router: Any, agent_name: str, own: Mapping[str, Dict[str, Any]]
             ) -> Tuple[Dict[str, str], List[str], List[str], Dict[str, str]]:
     """Upload the skills you wrote and add them to the agent, in one sync:
@@ -863,6 +876,7 @@ def _upload(project: Any, router: Any, agent_name: str, own: Mapping[str, Dict[s
         return {}, [], [f"{', '.join(sorted(own))} ({why})"], {}
     failed_names = {f.get("name") for f in result.get("failures") or [] if isinstance(f, dict)}
     actions = {a.get("name"): a for a in result.get("actions") or [] if isinstance(a, dict)}
+    off = set(kept_off_agent(result, [i["name"] for i in items if i["name"] not in failed_names]))
     done: Dict[str, str] = {}
     labels: List[str] = []
     failed: List[str] = []
@@ -873,6 +887,10 @@ def _upload(project: Any, router: Any, agent_name: str, own: Mapping[str, Dict[s
         action = actions.get(name) or {}
         if name in failed_names or action.get("action") == "failed":
             failed.append(f"{folder} (upload failed)")
+            continue
+        if name in off:
+            failed.append(f"{folder} (uploaded, but DecimalAI did not add it to the agent: a "
+                          f"skill named {name} may be deleted there)")
             continue
         done[folder] = AUTHORED
         if action.get("action") == "pulled":

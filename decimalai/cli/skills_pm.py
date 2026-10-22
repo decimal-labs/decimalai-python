@@ -317,6 +317,11 @@ def _upload_to_agent(project: Any, router: Any, name: str, agent: str) -> None:
         click.echo(f"  ✗ could not upload {name}: "
                    f"{action.get('error') or result.get('failures')}", err=True)
         raise SystemExit(int(ExitCode.PROBLEMS))
+    if _keyless.kept_off_agent(result, [items[0]["name"]]):
+        click.echo(f"  ✗ {name} was uploaded, but DecimalAI did not add it to agent {agent!r}: "
+                   f"a skill named {items[0]['name']} may be deleted there. Restore it on "
+                   "DecimalAI, or rename your skill's folder and name.", err=True)
+        raise SystemExit(int(ExitCode.PROBLEMS))
     if action.get("action") == "pulled":
         body_hash = skillfmt.body_sha256(action.get("body_markdown") or "")
         click.echo(f"  ✓ added {name} to agent {agent!r} on DecimalAI, with DecimalAI's copy: "

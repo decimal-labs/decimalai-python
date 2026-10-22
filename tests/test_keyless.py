@@ -371,6 +371,8 @@ class Workspace:
         self.changed_on_decimalai: dict = {}
         #: refuse every sync (a 422 that is not about the policy)
         self.sync_refused = False
+        #: skills deleted on DecimalAI: a sync finds them by name and leaves them off the agent
+        self.deleted: set = set()
 
     # the DecimalAIClient methods agent_config() calls
     def get_agent_prompt(self, agent_name, version=None, **kwargs):
@@ -432,7 +434,7 @@ class Workspace:
         names = [a["name"] for a in actions]
         return {"status": "ok", "created": len(names), "updated": 0, "unchanged": 0, "pulled": 0,
                 "failures": [], "actions": actions, "added_to_agent": body.get("agent_name"),
-                "added": names, "kept_off": []}
+                "added": [n for n in names if n not in self.deleted], "kept_off": []}
 
 
 def with_key(monkeypatch, workspace):
@@ -624,6 +626,24 @@ def test_a_skill_you_wrote_that_decimalai_changed_is_left_as_decimalai_has_it(wo
     assert ("refund-tone in .agents/skills does not match DecimalAI's copy, which agent "
             "'order-support' uses: run `decimalai skills sync` to sync it (a change made on "
             "DecimalAI wins).") in capsys.readouterr().err
+
+
+def test_a_skill_you_wrote_that_is_deleted_on_decimalai_is_not_claimed_as_copied(world, monkeypatch, capsys):
+    """A sync finds a deleted skill by its name and never brings it back, so it stays off the
+    agent: the copy says so, and link.toml does not record it as given (found live 2026-10-22)."""
+    own(world)
+    capsys.readouterr()
+    workspace = Workspace()
+    workspace.deleted.add("refund-tone")
+    with_key(monkeypatch, workspace)
+    decimalai.agent_config("order-support")
+    err = capsys.readouterr().err
+    assert "copied refund-tone" not in err
+    assert ("could not copy refund-tone (uploaded, but DecimalAI did not add it to the agent: a "
+            "skill named refund-tone may be deleted there) onto it") in err
+    link = keyless.read_link(None)
+    assert link["assigned"]["order-support"] == {}
+    assert "uploaded" not in link
 
 
 def test_a_registry_skill_edited_on_disk_is_named_when_the_agent_connects(world, monkeypatch, capsys):

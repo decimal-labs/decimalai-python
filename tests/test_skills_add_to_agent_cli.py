@@ -59,8 +59,9 @@ def registry(monkeypatch):
 
 @pytest.fixture
 def platform(monkeypatch):
-    """What the SkillRouter asked the platform: assignments and syncs."""
-    asked = {"assigned": [], "synced": []}
+    """What the SkillRouter asked the platform: assignments and syncs. Names in
+    ``asked["deleted"]`` are synced but left off the agent, as a deleted skill is."""
+    asked = {"assigned": [], "synced": [], "deleted": set()}
 
     def request(self, method, path, json=None, params=None, **kwargs):
         body = json
@@ -69,7 +70,8 @@ def platform(monkeypatch):
             names = [s["name"] for s in body["skills"]]
             return {"status": "ok", "created": len(names), "failures": [],
                     "actions": [{"name": n, "action": "created", "new_version_number": 1} for n in names],
-                    "added_to_agent": body.get("agent_name"), "added": names, "kept_off": []}
+                    "added_to_agent": body.get("agent_name"),
+                    "added": [n for n in names if n not in asked["deleted"]], "kept_off": []}
         assert method == "POST" and "/skills/" in path, (method, path)
         asked["assigned"].append((path, dict(params or {})))
         return {"status": "ok", "action": "assigned"}
@@ -168,6 +170,16 @@ def test_a_skill_you_wrote_is_uploaded_and_added_to_the_connected_agent(project,
     assert link["assigned"]["order-support"] == {"refund-tone": "authored"}
     assert link["uploaded"] == {"refund-tone": _authored.body_hash(project, "refund-tone")}
     assert manifest(project) == "", "the project's list is not where the agent's skills live now"
+
+
+def test_a_skill_you_wrote_that_decimalai_keeps_off_the_agent_is_an_error(project, platform):
+    connect(project)
+    platform["deleted"].add("refund-tone")
+    result = run("add", "refund-tone", key="dai_sk_test")
+    assert result.exit_code == 1
+    assert "refund-tone was uploaded, but DecimalAI did not add it to agent 'order-support'" \
+        in result.output
+    assert "assigned" not in (_keyless.read_link(project) or {}), "nothing recorded as given"
 
 
 def test_without_a_key_a_connected_project_says_where_the_skills_live(project):
