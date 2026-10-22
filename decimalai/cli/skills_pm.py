@@ -486,8 +486,9 @@ def skills_remove(name, force, directory):
     project = Project.at(directory) if directory else Project.find()
     agents = [a for a in (_keyless.read_link(project) or {}).get("agents") or []
               if isinstance(a, str)]
-    still = (f"  • agent{'s' if len(agents) > 1 else ''} {', '.join(sorted(agents))} keep it on "
-             "DecimalAI: remove it from an agent in the dashboard." if agents else None)
+    still = (f"  • agent{'s' if len(agents) > 1 else ''} {', '.join(sorted(agents))} "
+             f"{'keep' if len(agents) > 1 else 'keeps'} it on DecimalAI: remove it from an agent "
+             "in the dashboard." if agents else None)
     if name in _authored.listed(project) and name not in _authored.managed(project):
         try:
             _authored.remove(project, name)

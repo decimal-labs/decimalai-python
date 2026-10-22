@@ -213,5 +213,5 @@ def test_remove_in_a_connected_project_says_the_agents_keep_the_skill(project):
     connect(project)
     result = run("remove", "refund-tone")
     assert result.exit_code == 0, result.output
-    assert "agent order-support keep it on DecimalAI: remove it from an agent in the dashboard" \
+    assert "agent order-support keeps it on DecimalAI: remove it from an agent in the dashboard" \
         in result.output
