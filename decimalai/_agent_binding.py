@@ -42,6 +42,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("decimalai")
@@ -139,15 +140,19 @@ class ConversationRecord:
             decision that first showed it. A load names that decision: the
             platform serves a public-registry skill only to a load whose decision
             offered it.
+        experiment: The first run was routed while the agent ran an experiment, so the
+            conversation is one unit of it: later runs and their loads name ``routing_id``'s
+            decision (its arm) and are not routed again.
     """
 
     __slots__ = ("text", "names", "tool", "tool_names", "cut", "routing_id", "prompt",
-                 "delivered", "unavailable", "pasted", "menu", "shown")
+                 "delivered", "unavailable", "pasted", "menu", "shown", "experiment")
 
     def __init__(self, *, text: str, names: List[str], tool: bool, tool_names: List[str],
                  cut: bool, routing_id: Optional[str], prompt: Optional[Dict[str, Any]],
                  delivered: List[str], unavailable: Optional[str], pasted: bool,
-                 menu: str = "", shown: Optional[Dict[str, Optional[str]]] = None) -> None:
+                 menu: str = "", shown: Optional[Dict[str, Optional[str]]] = None,
+                 experiment: bool = False) -> None:
         self.text = text
         self.names = names
         self.tool = tool
@@ -161,6 +166,7 @@ class ConversationRecord:
         self.menu = menu if text.endswith(menu) else ""
         self.shown: Dict[str, Optional[str]] = (
             dict(shown) if shown is not None else {name: routing_id for name in names})
+        self.experiment = bool(experiment)
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, ConversationRecord) and all(
@@ -174,6 +180,7 @@ class ConversationRecord:
             "skills_cut": self.cut, "routing_id": self.routing_id, "prompt": self.prompt,
             "delivered": self.delivered, "skills_unavailable": self.unavailable,
             "pasted": self.pasted, "skills_menu": self.menu, "skills_shown": self.shown,
+            "experiment": self.experiment,
         })
 
     @classmethod
@@ -191,6 +198,7 @@ class ConversationRecord:
             menu=state.get("skills_menu") if isinstance(state.get("skills_menu"), str) else "",
             shown=({str(k): (v if isinstance(v, str) else None) for k, v in state["skills_shown"].items()}
                    if isinstance(state.get("skills_shown"), Mapping) else None),
+            experiment=bool(state.get("experiment")),
         )
 
 
@@ -338,6 +346,9 @@ class AgentBinding:
         #: No API key and no ``init()``: the project's skills and the registry's,
         #: served by `decimalai._keyless`, and nothing recorded (no run is sent).
         self._keyless = bool(getattr(prompt, "keyless", False))
+        #: The agent's running experiment, as the last routing answer named it (skills-first
+        #: Phase 3), or None. While one runs, every run routes first, so its arm is its own.
+        self._experiment: Optional[Dict[str, Any]] = None
 
     # ── the seams a framework supplies ───────────────────────
     def _router(self) -> Any:
@@ -528,7 +539,8 @@ class AgentBinding:
         with self._lock:
             # Pasted skill text depends on the message, so such a run is always
             # routed for its own.
-            route_now = inject or not self._menu_loaded or (self._menu_truncated and query is not None)
+            route_now = (inject or not self._menu_loaded or (self._menu_truncated and query is not None)
+                         or self._experiment is not None)
             unavailable = self._menu_unavailable
         return None, {"key": key, "query": query, "tool": tool, "inject": inject,
                       "route_now": route_now, "unavailable": unavailable}
@@ -541,8 +553,9 @@ class AgentBinding:
         routed: Optional[Tuple[str, List[str]]] = None
         delivered: List[str] = []
         versions: List[Dict[str, str]] = []
+        run_prompt = None
         if routed_result is not None:
-            prefix, offered, routing_id, truncated, delivered, versions = routed_result
+            prefix, offered, routing_id, truncated, delivered, versions, run_prompt = routed_result
             if inject:
                 # This message's skill text is no other run's local copy.
                 unavailable = None if (prefix or routing_id) else (
@@ -554,8 +567,9 @@ class AgentBinding:
             if prefix or routing_id:
                 routed = (prefix, list(offered))  # this run's own menu
         if routed is None:
-            delivered, versions = [], []
+            delivered, versions, run_prompt = [], [], None
         with self._lock:
+            experiment = self._experiment is not None and routed is not None
             # Otherwise the local copy: the last good menu, whatever was asked.
             menu = routed or (("", []) if inject else (self._menu_prefix, list(self._menu_names)))
             state = {
@@ -564,8 +578,13 @@ class AgentBinding:
                 "text": None, "tool": tool,
                 # The load_skill names for the whole run: a decision landing mid-run
                 # must not change a tool the model already saw (one Claude run
-                # replays its thinking between tool calls). A cut list names none.
-                "tool_names": [] if self._menu_truncated else list(menu[1]),
+                # replays its thinking between tool calls). A cut list names none,
+                # and so does a run in an experiment: the platform checks the name
+                # against the run's own decision (a held-out skill is refused).
+                "tool_names": [] if (self._menu_truncated or experiment) else list(menu[1]),
+                # Skills-first Phase 3: a prompt split's prompt for this run, and whether the
+                # run was routed for its own arm.
+                "run_prompt": run_prompt, "experiment": experiment,
                 "cut": bool(self._menu_truncated), "pasted": inject,
                 # A skill whose text is already in the instructions is not sent again.
                 "loaded": set(delivered) if tool else set(),
@@ -592,7 +611,7 @@ class AgentBinding:
             # run's own decision, ranked on its message, before the model call.
             try:
                 routed_result = await _in_thread(
-                    self._route, run_key, plan["query"], plan["inject"],
+                    self._route, run_key, plan["query"], plan["inject"], "this_run",
                 )
             except Exception:
                 self._log.debug("skill routing failed (non-fatal)", exc_info=True)
@@ -606,7 +625,7 @@ class AgentBinding:
         routed_result = None
         if plan["route_now"]:
             try:
-                routed_result = self._route(run_key, plan["query"], plan["inject"])
+                routed_result = self._route(run_key, plan["query"], plan["inject"], "this_run")
             except Exception:
                 self._log.debug("skill routing failed (non-fatal)", exc_info=True)
         return self._finish_run(run_key, plan, routed_result)
@@ -621,6 +640,15 @@ class AgentBinding:
         with self._lock:
             prompt = self._prompt
         template = self._template()
+        run_prompt = state.get("run_prompt")
+        if run_prompt and isinstance(run_prompt.get("content"), str):
+            # A prompt split's B arm: this run uses the version its decision named, and its trace
+            # says so. The agent's own prompt (what manifests declare) is untouched.
+            template = run_prompt["content"]
+            prompt = SimpleNamespace(
+                system_prompt=template, version_number=run_prompt.get("version"),
+                content_hash=run_prompt.get("content_hash"), is_fallback=False, keyless=False,
+            )
         text = template
         menu = ""
         if template_variables(template):
@@ -646,7 +674,7 @@ class AgentBinding:
             tool_names=list(state.get("tool_names") or []), cut=bool(state.get("cut")),
             routing_id=state["routing_id"], prompt=copy.deepcopy(prompt_record),
             delivered=list(state["delivered"]), unavailable=state["unavailable"],
-            pasted=bool(state.get("pasted")), menu=menu,
+            pasted=bool(state.get("pasted")), menu=menu, experiment=bool(state.get("experiment")),
         )
         state["conversation"] = record
         try:
@@ -678,8 +706,11 @@ class AgentBinding:
 
         self._refresh_prompt_if_stale()  # for the next conversation
         query = self._message(context, agent)
-        routed = self._routed_continuation(context, agent) if record.cut else None
-        routing_id = record.routing_id if (record.cut and routed is None) else None
+        # A conversation in an experiment is one unit of it: every message keeps the first
+        # decision (its arm), whatever the list's shape, and is not routed again.
+        keeps_decision = record.cut or record.experiment
+        routed = self._routed_continuation(context, agent) if (record.cut and not record.experiment) else None
+        routing_id = record.routing_id if (keeps_decision and routed is None) else None
         state: Dict[str, Any] = {
             "query": query, "route_now": False, "routing_id": routing_id, "prefix": "",
             "names": list(record.names), "unavailable": record.unavailable, "text": record.text,
@@ -706,11 +737,11 @@ class AgentBinding:
         )
         if _disabled_by_init() or not record.names:
             return state
-        if record.cut and routed is not None:
+        if record.cut and not record.experiment and routed is not None:
             # Routed on its own message already; the router named that decision for
             # this run's loads, and the framework records it.
             state["routed"] = routed
-        elif record.cut:
+        elif keeps_decision:
             router = self._skill_router()
             remember = getattr(router, "_remember_run_routing", None)
             if run_key is not None and routing_id and callable(remember):
@@ -736,13 +767,20 @@ class AgentBinding:
     # ── the local copy ──────────────────────────────────────
     def _route(
         self, scope: Optional[str], query: Optional[str] = None, inject: bool = False,
-    ) -> Tuple[str, List[str], Optional[str], bool, List[str], List[Dict[str, str]]]:
+        mark: Optional[str] = None,
+    ) -> Tuple[str, List[str], Optional[str], bool, List[str], List[Dict[str, str]], Optional[Dict[str, Any]]]:
         """One routing decision: (menu text, offered names, routing id, menu was
-        cut, skills whose text it pasted in, and their versions). Text is pasted
-        in only with ``inject``."""
+        cut, skills whose text it pasted in, their versions, and a prompt split's
+        prompt for this run). Text is pasted in only with ``inject``.
+
+        ``mark`` (skills-first Phase 3): ``"this_run"`` when the answer shapes the run
+        that asked (a route-first call), ``"capable"`` for a background call. Only a
+        ``this_run`` call can get an experiment's arm; either one learns whether the
+        agent runs an experiment, which switches every later run to routing first.
+        """
         router = self._skill_router()
         if router is None:
-            return "", [], None, False, [], []
+            return "", [], None, False, [], [], None
         from ._skill_witness import copy_delivered_versions
         from .skill_router import (
             _release_scoped_routing_rail,
@@ -754,10 +792,19 @@ class AgentBinding:
         # A version witness an earlier, failed build left in this context must not
         # be read as this build's (on the synchronous path the context is the caller's).
         consume_last_delivered_versions()
+        from .skill_router import consume_last_experiment, consume_last_run_prompt
+
+        consume_last_experiment()
+        consume_last_run_prompt()
         try:
-            prefix, _tail, routing_id = router.build_prompt_parts(
-                query, agent_name=self.name, inject_body=inject, scope=scope,
-            )
+            if self._keyless or mark is None:
+                prefix, _tail, routing_id = router.build_prompt_parts(
+                    query, agent_name=self.name, inject_body=inject, scope=scope,
+                )
+            else:
+                prefix, _tail, routing_id = router.build_prompt_parts(
+                    query, agent_name=self.name, inject_body=inject, scope=scope, experiments=mark,
+                )
         except Exception:
             consume_last_delivered_versions()
             raise
@@ -768,9 +815,15 @@ class AgentBinding:
         # Drained either way, so nothing leaks into a later call.
         delivered = _clean_names(consume_last_delivered_names())
         versions = copy_delivered_versions(consume_last_delivered_versions())
+        experiment = consume_last_experiment()
+        run_prompt = consume_last_run_prompt()
+        if mark is not None and not self._keyless and (prefix or routing_id):
+            # A marked answer says whether the agent runs an experiment: named, or not.
+            with self._lock:
+                self._experiment = experiment
         if not inject:
             delivered, versions = [], []
-        return prefix or "", offered, routing_id, truncated, delivered, versions
+        return prefix or "", offered, routing_id, truncated, delivered, versions, run_prompt
 
     def _store_menu(
         self, prefix: str, offered: List[str], routing_id: Optional[str], truncated: bool,
@@ -795,7 +848,9 @@ class AgentBinding:
     def _route_run(self, run_key: Optional[str], shown: List[str], query: Optional[str]) -> None:
         """Background: this run's own decision on its message, and a fresh copy."""
         try:
-            prefix, offered, routing_id, truncated, _delivered, _versions = self._route(run_key, query)
+            prefix, offered, routing_id, truncated, _delivered, _versions, _run_prompt = self._route(
+                run_key, query, mark="capable",
+            )
         except Exception:
             self._log.debug("background skill routing failed (non-fatal)", exc_info=True)
             return
@@ -891,7 +946,21 @@ class AgentBinding:
             return repeat
         await self._name_this_runs_decision(run_key, state)
         result = await _in_thread(self._serve, name)
+        result = self._word_for_run(name, state, result)
         self._mark_loaded(name, state, result)
+        return result
+
+    @staticmethod
+    def _word_for_run(name: str, state: Optional[Dict[str, Any]], result: Any) -> Any:
+        """In an experiment, a refused load says the skill isn't this run's, not that it doesn't exist.
+
+        The platform refuses a held-out skill to its run's routing id (a 404, like a missing
+        name). Telling the model the skill doesn't exist invites a guessed name.
+        """
+        if (state is not None and state.get("experiment") and isinstance(result, str)
+                and result.startswith("load_skill: no skill named")):
+            return (f"load_skill: {name!r} isn't available for this run. Proceed without it, "
+                    "and don't try another name for it.")
         return result
 
     def _load_sync(self, name: str, state: Optional[Dict[str, Any]] = None) -> str:
@@ -910,6 +979,7 @@ class AgentBinding:
                 self._log.debug("this run's routing decision is not in yet", exc_info=True)
         self._name_latest_decision(run_key)
         result = self._serve(name)
+        result = self._word_for_run(name, state, result)
         self._mark_loaded(name, state, result)
         return result
 

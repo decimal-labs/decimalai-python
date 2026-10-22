@@ -967,7 +967,8 @@ class AnthropicAgentConfig(AgentBinding):
         from ._config import _disabled_by_init
 
         tool, _inject = self._channels()
-        return record.cut and record.tool and tool and not _disabled_by_init()
+        # A conversation in an experiment keeps its first decision (its arm) for every message.
+        return record.cut and record.tool and tool and not _disabled_by_init() and not record.experiment
 
     def _route_later_run(self, run_key: str, ctx: Dict[str, Any]) -> Any:
         """This message's own decision, for a conversation whose list is cut (or None)."""
@@ -976,7 +977,7 @@ class AnthropicAgentConfig(AgentBinding):
         except Exception:
             self._log.debug("skill routing failed (non-fatal)", exc_info=True)
             return None
-        prefix, offered, routing_id, truncated, _delivered, _versions = routed
+        prefix, offered, routing_id, truncated, _delivered, _versions, _run_prompt = routed
         self._store_menu(prefix, offered, routing_id, truncated)
         return routed
 

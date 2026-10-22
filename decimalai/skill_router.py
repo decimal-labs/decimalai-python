@@ -67,6 +67,32 @@ _last_menu_truncated_ctx: ContextVar[Optional[bool]] = ContextVar(
 )
 
 
+# Skills-first Phase 3 (experiments): what the most recent routing answer said about the agent's
+# running experiment ({"id", "kind"}, or None when it names none), and a prompt split's prompt for
+# THIS run ({"version", "content", "content_hash"}, only on a B decision). Same ContextVar rails
+# as the names above: one router serves concurrent runs.
+_last_experiment_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "decimalai_skill_router_last_experiment", default=None,
+)
+_last_run_prompt_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "decimalai_skill_router_last_run_prompt", default=None,
+)
+
+
+def consume_last_experiment() -> Optional[Dict[str, Any]]:
+    """Read + clear the running experiment the last routing answer named (None: none named)."""
+    value = _last_experiment_ctx.get()
+    _last_experiment_ctx.set(None)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def consume_last_run_prompt() -> Optional[Dict[str, Any]]:
+    """Read + clear a prompt split's prompt for this run (None: the run uses the agent's prompt)."""
+    value = _last_run_prompt_ctx.get()
+    _last_run_prompt_ctx.set(None)
+    return dict(value) if isinstance(value, dict) else None
+
+
 def consume_last_menu_truncated() -> Optional[bool]:
     """Read + clear whether the last routed menu was cut to fit (None: unknown)."""
     value = _last_menu_truncated_ctx.get()
@@ -2013,6 +2039,7 @@ class SkillRouter:
         agent_name: Optional[str] = None,
         force_refresh: bool = False,
         scope: Optional[str] = None,
+        experiments: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fetch the full skill menu from the platform.
 
@@ -2036,7 +2063,8 @@ class SkillRouter:
         # full-menu path (query=None) each run now fetches its own menu instead
         # of reusing a process-wide one. Unscoped callers pass None and keep
         # exactly today's key and call volume.
-        cache_key = (category, project_id, effective_agent, scope or "")
+        # `experiments` is part of the key: an answer marked for this run carries its arm.
+        cache_key = (category, project_id, effective_agent, scope or "", experiments or "")
         if not force_refresh:
             cached = self._menu_cache.get(cache_key)
             if cached is not None:
@@ -2049,6 +2077,11 @@ class SkillRouter:
             params["project_id"] = project_id
         if effective_agent:
             params["agent_name"] = effective_agent
+        if experiments:
+            # "this_run": the answer shapes the run that asked, so it may get an experiment's arm.
+            # "capable": a call that can route first but isn't this run's. See `experiments=`
+            # on GET /skills/menu.
+            params["experiments"] = experiments
 
         try:
             result = self._request("GET", "/api/v1/skills/menu", params=params)
@@ -2071,6 +2104,7 @@ class SkillRouter:
         category: Optional[str] = None,
         include_attachments: bool = True,
         agent_name: Optional[str] = None,
+        experiments: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Smart routing: semantic search + performance re-ranking.
 
@@ -2099,6 +2133,8 @@ class SkillRouter:
             payload["agent_name"] = effective_agent
         if category:
             payload["category"] = category
+        if experiments:
+            payload["experiments"] = experiments
 
         try:
             return self._request("POST", "/api/v1/skills/route", json=payload)
@@ -2109,6 +2145,7 @@ class SkillRouter:
 
     def _fallback_menu(
         self, route_failure: str, *, category: Optional[str], agent_name: Optional[str],
+        experiments: Optional[str] = None,
     ) -> Dict[str, Any]:
         """This agent's menu, unranked, in place of a route that cannot be used.
 
@@ -2123,6 +2160,8 @@ class SkillRouter:
             params["category"] = category
         if agent_name:
             params["agent_name"] = agent_name
+        if experiments:
+            params["experiments"] = experiments
         try:
             menu = self._request(
                 "GET", "/api/v1/skills/menu", params=params,
@@ -2961,6 +3000,7 @@ class SkillRouter:
         inject_body: Optional[bool] = None,
         scope: Optional[str] = None,
         _want_parts: bool = False,
+        experiments: Optional[str] = None,
     ) -> tuple[str, Optional[str]]:
         """Return ``(prompt_fragment, routing_id)`` — the primitive every adapter calls.
 
@@ -3060,13 +3100,17 @@ class SkillRouter:
             # so they cannot share a cache slot without one silently
             # overwriting the other's rails.
             bool(_want_parts),
+            # An answer marked for this run carries its experiment arm.
+            experiments or "",
         )
 
         if not bypass_cache:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, menu_truncated) = cached
+                 delivered_versions, menu_truncated, experiment, run_prompt) = cached
+                _last_experiment_ctx.set(dict(experiment) if experiment else None)
+                _last_run_prompt_ctx.set(dict(run_prompt) if run_prompt else None)
                 # The hit re-offers the same decision, so this run's loads name
                 # it — the cache key carries the scope, so the miss filed it
                 # under this run already unless the bounded store evicted it.
@@ -3109,6 +3153,8 @@ class SkillRouter:
         _last_delivered_versions_ctx.set(None)
         _last_split_parts_ctx.set(None)
         _last_menu_truncated_ctx.set(None)
+        _last_experiment_ctx.set(None)
+        _last_run_prompt_ctx.set(None)
 
         # How long the routing call took: a failure is cached only when
         # retrying it would cost the turn that time again (see below).
@@ -3116,7 +3162,8 @@ class SkillRouter:
         if query and self.strategy in ("auto", "semantic") and _route_paused(self.base_url, self.api_key):
             # A route failed moments ago and the menu answered: go straight to
             # the menu until the pause ends (see `_ROUTE_PAUSE_S`).
-            result = self._fallback_menu("route_paused", category=category, agent_name=effective_agent)
+            result = self._fallback_menu("route_paused", category=category, agent_name=effective_agent,
+                                         experiments=experiments)
         elif query and self.strategy in ("auto", "semantic"):
             try:
                 result = self.smart_route(
@@ -3129,6 +3176,7 @@ class SkillRouter:
                     # Disk export fetches attachments through its own routes.
                     include_attachments=False,
                     agent_name=effective_agent,  # pass the per-call override through
+                    experiments=experiments,
                 )
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment smart_route failed: %s", e)
@@ -3136,7 +3184,8 @@ class SkillRouter:
                           "degraded_reason": _empty_menu_reason(e)}
             failure = result.get("degraded_reason") if _routing_call_failed(result) else None
             if failure in _MENU_FALLBACK_REASONS:
-                fallback = self._fallback_menu(failure, category=category, agent_name=effective_agent)
+                fallback = self._fallback_menu(failure, category=category, agent_name=effective_agent,
+                                               experiments=experiments)
                 if not _routing_call_failed(fallback):
                     logger.warning(
                         "Skill routing failed (%s); this turn gets the agent's skills unranked, "
@@ -3146,7 +3195,8 @@ class SkillRouter:
                     result = fallback
         else:
             try:
-                result = self.get_menu(category=category, agent_name=effective_agent, scope=scope)
+                result = self.get_menu(category=category, agent_name=effective_agent, scope=scope,
+                                       experiments=experiments)
             except SkillRouterError as e:
                 logger.warning("build_prompt_fragment get_menu failed: %s", e)
                 result = {"skills": [], "prompt_fragment": "", "strategy": "none",
@@ -3156,6 +3206,11 @@ class SkillRouter:
 
         fragment = result.get("prompt_fragment", "") or ""
         routing_id = result.get("routing_id")
+        # Skills-first Phase 3: the agent's running experiment, and a split's prompt for this run.
+        experiment = result.get("experiment") if isinstance(result.get("experiment"), dict) else None
+        run_prompt = result.get("prompt") if isinstance(result.get("prompt"), dict) else None
+        _last_experiment_ctx.set(dict(experiment) if experiment else None)
+        _last_run_prompt_ctx.set(dict(run_prompt) if run_prompt else None)
         # Expose the offered skill names via a contextvar so
         # framework adapters can stamp them onto RunTrace.skills_offered_in_prompt
         # without having to extend this method's return signature.
@@ -3353,7 +3408,7 @@ class SkillRouter:
             self._fragment_cache.set(
                 cache_key,
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
-                 delivered_versions, menu_truncated),
+                 delivered_versions, menu_truncated, experiment, run_prompt),
                 ttl_seconds=_UNSCOPED_FAILURE_TTL_S if failure_only and not scope else None,
             )
         return fragment, routing_id
@@ -3401,6 +3456,7 @@ class SkillRouter:
         bypass_cache: bool = False,
         inject_body: Optional[bool] = None,
         scope: Optional[str] = None,
+        experiments: Optional[str] = None,
     ) -> tuple[str, str, Optional[str]]:
         """Return ``(prefix, tail, routing_id)`` — the cacheable split.
 
@@ -3421,7 +3477,7 @@ class SkillRouter:
         fragment, routing_id = self.build_prompt_fragment(
             query, agent_name=agent_name, category=category, top_k=top_k,
             bypass_cache=bypass_cache, inject_body=inject_body, scope=scope,
-            _want_parts=True,
+            _want_parts=True, experiments=experiments,
         )
         parts = _last_split_parts_ctx.get()
         if parts is None:

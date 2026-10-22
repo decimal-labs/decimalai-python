@@ -4,6 +4,36 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### New: agents can take part in experiments (skill holdouts and prompt splits)
+
+- An `agent_config()` agent (`decimalai`, `openai_agents`, `pydantic_ai`, `adk`, `anthropic`) whose
+  DecimalAI agent runs an experiment routes every run before its model call, and marks that call
+  `experiments=this_run`. The platform then decides the run's arm in the same call (no extra
+  request): a held-out skill is left out of that run's list, or a prompt split's B arm gets its
+  prompt in the answer. Before, a run showed the previous run's decision and routed its own in the
+  background, so an arm would have landed one run late. Background calls are marked
+  `experiments=capable`, which is how an agent learns an experiment started. When answers stop
+  naming one, runs go back to routing in the background.
+- While an experiment runs, `load_skill` names no skills (the platform checks the name against the
+  run's own decision), and a refused load tells the model the skill "isn't available for this run"
+  rather than that it doesn't exist.
+- A prompt split's B run uses the prompt its decision names, and its trace records that version
+  (`decimal.prompt.version`). The agent's own prompt, which manifests declare, is unchanged, so a
+  split doesn't re-register a manifest on every run.
+- A conversation that starts during an experiment keeps its first decision for every message: one
+  conversation is one unit of the experiment.
+- Not taking part (they get the agent's configured setup): keyless runs, native skill loaders and
+  `claude_agent_sdk`, `SkillRouter` used directly, and the LangChain and CrewAI skill loaders,
+  whose runs can make several routing decisions.
+
+### Changed: skills syncs and boot syncs (from the Phase 2 work)
+
+- `sync_skills(agent_name=, add_to_agent="all" | "unless_removed", offer_scope=)`. The adapters'
+  boot sync uses `"unless_removed"`: every synced skill goes on the agent except one a person
+  removed on the dashboard. The OpenAI adapter's boot sync uses the name its traces carry.
+
 ## [0.24.1] — 2026-10-21
 
 ### Changed: a keyless run's message travels in the request body
