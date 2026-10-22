@@ -52,7 +52,8 @@ task calls and two semantic judge calls. It is separate from authenticated `init
 import decimalai
 decimalai.init(langchain=True)        # or openai_agents / llamaindex / claude_agent_sdk / crewai / ...
 support = agent_config("support")       # an agent's prompt and skills, from decimalai.openai_agents,
-                                      # .pydantic_ai, .adk or .anthropic; decimalai.agent_config for your own loop
+                                      # .pydantic_ai, .adk, .langchain, .anthropic or .openai (your own
+                                      # OpenAI loop); decimalai.agent_config for any other loop
 @decimalai.trace(agent_name="...")    # manual tracing for any framework
 decimalai.export_manifest(snapshot)   # → an agentversion manifest dict (works offline)
 ```

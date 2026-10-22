@@ -25,6 +25,7 @@ from anthropic import beta_async_tool, beta_tool  # noqa: E402
 
 import decimalai._agent as agent_mod  # noqa: E402
 import decimalai._agent_binding as binding  # noqa: E402
+import decimalai._provider_run as provider_run  # noqa: E402
 import decimalai.anthropic as da  # noqa: E402
 from decimalai._agent import SavedPrompt  # noqa: E402
 from decimalai._agent_binding import MissingPromptVariable  # noqa: E402
@@ -947,6 +948,10 @@ def traced(platform, monkeypatch):
         monkeypatch.setattr(providers, name, set())
     for name in ("_run_providers", "_explicitly_traced", "_openinference_provider"):
         monkeypatch.setattr(providers, name, {})
+    # An earlier test's init(otel=True) / init(crewai=True) leaves its provider here, and
+    # an exporter built while one is listed sends every trace, not only runs (as it should
+    # after a real init(otel=True)), so the test would grade another test's setup.
+    monkeypatch.setattr(otel, "_installed_providers", [])
     sent: list = []
     monkeypatch.setattr(otel.DecimalSpanExporter, "_send", lambda self, trace: sent.append(trace))
     monkeypatch.setattr(da, "_tracing_turned_on", False)
@@ -1220,8 +1225,8 @@ def test_a_flush_waits_for_the_runs_closed_before_it_and_leaves_later_ones_to_th
         def add_done_callback(self, fn):
             pass
 
-    monkeypatch.setattr(da, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
-    monkeypatch.setattr(da, "_register_drain_at_exit", lambda: None)
+    monkeypatch.setattr(provider_run, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
+    monkeypatch.setattr(provider_run, "_register_drain_at_exit", lambda: None)
     before, during = FakeRun("before"), FakeRun("during")
     da._finish_later(before, Never(), 1)
     threading.Timer(0.1, lambda: da._finish_later(during, Never(), 1)).start()
@@ -1229,8 +1234,8 @@ def test_a_flush_waits_for_the_runs_closed_before_it_and_leaves_later_ones_to_th
     da._drain_finishing(timeout=0.4)
     assert time.monotonic() - started < 1.0
     assert ended == ["before"], "a run closed during the flush keeps its own timer"
-    with da._finishing_lock:
-        da._finishing.discard(during)
+    with provider_run._finishing_lock:
+        provider_run._finishing.discard(during)
 
 
 def test_a_claude_call_under_the_apps_own_span_outside_a_run_is_not_sent(traced):
@@ -1351,8 +1356,8 @@ def test_at_exit_the_drain_waits_for_runs_other_threads_close_during_it(monkeypa
     import threading
 
     ended: list = []
-    monkeypatch.setattr(da, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
-    monkeypatch.setattr(da, "_register_drain_at_exit", lambda: None)
+    monkeypatch.setattr(provider_run, "_EXIT_WAITS_FOR_ROUTING_S", 30.0)
+    monkeypatch.setattr(provider_run, "_register_drain_at_exit", lambda: None)
     before, during = _FinishingRun("before", ended), _FinishingRun("during", ended)
     da._finish_later(before, _NeverDecided(), 1)
     threading.Timer(0.1, lambda: da._finish_later(during, _NeverDecided(), 1)).start()
@@ -1365,9 +1370,9 @@ def test_the_drain_is_registered_for_exit_as_the_exit_drain(monkeypatch):
 
     registered = []
     monkeypatch.setattr(threading, "_register_atexit", registered.append, raising=False)
-    da._register_drain_at_exit()
+    provider_run._register_drain_at_exit()
     (drain,) = registered
-    assert drain.func is da._drain_finishing and drain.keywords == {"at_exit": True}
+    assert drain.func is provider_run._drain_finishing is da._drain_finishing and drain.keywords == {"at_exit": True}
 
 
 def test_interpreter_exit_ends_a_run_still_waiting_for_its_decision(tmp_path):

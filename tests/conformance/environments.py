@@ -103,6 +103,10 @@ DRIVER_ENVS: Dict[str, FrozenSet[str]] = {
     "openai-agents": _OPENAI3,      # openai-agents needs openai>=3
     "pydantic-ai": _OPENAI3,        # pydantic-ai-slim[openai] needs openai>=3
     "anthropic": _OPENAI3,
+    # The raw OpenAI SDK, on whichever major version is installed: openai 3 here, and
+    # openai 2 (what LiteLLM and CrewAI pin) in the other, where it proves the module
+    # works for the code that is stuck on openai<3.
+    "openai": _BOTH,
     "claude-agent-sdk": _OPENAI3,
     "crewai": _OPENAI2,             # crewai pins openai<3
     # google-adk itself installs in either environment, but the driver's stub

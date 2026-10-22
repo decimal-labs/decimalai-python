@@ -132,14 +132,14 @@ def _flush_otel_pipelines() -> None:
     which runs during ``threading._shutdown()``, before any plain ``atexit``
     handler.
     """
-    # First the Anthropic runs that closed while a routing decision was still in
-    # flight: their trace is sent when the run span ends, at most a few seconds on.
-    anthropic = sys.modules.get(f"{__name__}.anthropic")
-    if anthropic is not None:
+    # First the Anthropic and OpenAI runs that closed while a routing decision was still
+    # in flight: their trace is sent when the run span ends, at most a few seconds on.
+    provider_runs = sys.modules.get(f"{__name__}._provider_run")
+    if provider_runs is not None:
         try:
-            anthropic._drain_finishing()
+            provider_runs._drain_finishing()
         except Exception:  # noqa: BLE001 — flushing must never raise into the caller
-            logger.debug("Anthropic run drain failed", exc_info=True)
+            logger.debug("provider run drain failed", exc_info=True)
     crewai = sys.modules.get(f"{__name__}.crewai")
     if crewai is not None:
         try:

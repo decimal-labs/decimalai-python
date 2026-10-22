@@ -382,6 +382,39 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "`messages.create()` loop), one trace per run, nothing patched (0.23+)",
     ),
     Framework(
+        key="openai",
+        title="OpenAI SDK (with `agent_config(...)`)",
+        cli_label="The OpenAI SDK",
+        module="decimalai.openai",
+        entry_point="`agent_config(name)`",
+        # `init(openai=True)` traces every OpenAI call in the process; agent_config()
+        # turns the same tracing on for the calls made inside its runs, so it needs no flag.
+        init_flag=None,
+        init_flag_note="— (no flag; `agent_config()` traces its runs, `openai=True` every call)",
+        extra="openai",
+        # The template is a hand-written Chat Completions tool loop: the SDK has no
+        # loop of its own for it, and that loop is the most common agent on GitHub.
+        scaffold=TEMPLATE,
+        install='pip install "decimalai[openai]"',
+        env_vars=("DECIMAL_API_KEY", "OPENAI_API_KEY"),
+        default_model=DEFAULT_MODEL,
+        capability=Capability(
+            tier="Supported",
+            # What the exporter registers from the traced requests: the model and each
+            # tool, by name. Not the system text: a run's prompt is the saved one, whose
+            # version each trace names, filled and followed by the skill list.
+            manifest="✅ partial (model, tools; the prompt by its saved version)",
+            schema_depth="Names only",
+            handoffs="—",
+            skills_rail="`load_skill` tool",
+        ),
+        use_for="OpenAI SDK — `agent_config(name)`; each `support.run(question)` gives "
+                "`run.system` (the prompt, then the skill list), `run.message` and `load_skill` "
+                "in `run.tools` for a Chat Completions loop (`run.response_tools` for the "
+                "Responses API), answered by `run.tool_result(call)`; one trace per run, "
+                "nothing patched (0.25+)",
+    ),
+    Framework(
         key="llamaindex",
         title="LlamaIndex",
         cli_label="LlamaIndex",

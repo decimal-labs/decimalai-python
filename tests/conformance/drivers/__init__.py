@@ -617,6 +617,9 @@ DRIVER_MODULES: Tuple[str, ...] = (
     # capture every OpenAI Agents run a SECOND time, as one extra trace per
     # LLM call, and grade that driver on traffic its adapter never sent.
     "pydantic_ai",
+    # The raw OpenAI SDK turns on that same instrumentor (init(openai=True), and
+    # decimalai.openai.agent_config() for its runs), so it goes last too.
+    "openai_sdk",
 )
 
 #: The frameworks the product ADVERTISES, as slugs derived from the capability
@@ -640,6 +643,8 @@ ADVERTISED_SNAPSHOT: frozenset = frozenset({
     # The capability table's Anthropic Messages API row, new with
     # decimalai.anthropic.agent_config() (0.23).
     "anthropic-messages-api",
+    # The OpenAI SDK row, new with decimalai.openai.agent_config() (0.25).
+    "openai-sdk",
     "llamaindex",
     "crewai",
     "generic-otel",

@@ -32,6 +32,7 @@ The core install is deliberately thin (tracing, CLI, manifests, skills). Framewo
 ```bash
 pip install "decimalai[langchain]"       # LangChain (add [langgraph] for LangGraph)
 pip install "decimalai[openai-agents]"   # OpenAI Agents SDK
+pip install "decimalai[openai]"          # OpenAI SDK: your own Chat Completions / Responses loop
 pip install "decimalai[anthropic]"       # Anthropic Messages API
 pip install "decimalai[all]"             # every framework adapter (not [evals]; see below)
 ```
@@ -200,6 +201,46 @@ trace, filed under the DecimalAI agent with its prompt version and the skills of
 delivered; a runner built without it is not traced. Nothing in ADK is patched. An agent that carries
 ADK's own `SkillToolset` gets no DecimalAI skills.
 
+### OpenAI SDK (Chat Completions and Responses API)
+
+```python
+from openai import OpenAI
+from decimalai.openai import agent_config
+
+client = OpenAI()
+support = agent_config("support", fallback=BASE_PROMPT)   # reads DECIMAL_API_KEY
+
+with support.run(question, variables=customer) as run:
+    messages = [{"role": "system", "content": run.system}, run.message]
+    while True:
+        reply = client.chat.completions.create(
+            model="gpt-5.4-mini", messages=messages,
+            tools=[*my_tools, *run.tools],          # + load_skill
+        ).choices[0].message
+        messages.append(reply)
+        if not reply.tool_calls:
+            break
+        for call in reply.tool_calls:
+            messages.append(run.tool_result(call) or my_tool_result(call))
+answer = reply.content
+```
+
+The same shape as the Anthropic module below: one run is one user message, opening it routes the
+skill list on that message, fills the prompt's variables (`{{name}}`) from `variables=` and starts the
+run's trace, and closing it sends the trace, filed under the DecimalAI agent with its prompt version
+and the skills offered and loaded. `run.system` is the system message's text, `run.message` the user
+turn, `run.tools` the `load_skill` tool in Chat Completions' shape, and `run.tool_result(call)`
+answers a `load_skill` call with its `tool` message (`None` for your own tools). On the Responses
+API pass `instructions=run.system`, `input=[run.message]` and `tools=[*my_tools, *run.response_tools]`;
+`run.tool_result(call)` answers a `function_call` item with its `function_call_output`. Send
+`instructions` with every request: a `previous_response_id` does not carry them over. The tools are
+plain dicts and calls are read as the SDK returns them or as dicts, so an OpenAI-compatible endpoint
+or LiteLLM's `completion()` takes the same run; only calls made through an `openai` client are traced.
+`async with` and `await run.atool_result(call)` serve `AsyncOpenAI`, and `support.conversation()` keeps
+a chat's system text and tool fixed, as on Anthropic. `agent_config()` turns on OpenAI tracing
+(OpenInference's instrumentor, installed by `decimalai[openai]`) for its runs only;
+`init(openai=True)` traces every OpenAI call.
+
 ### Anthropic Messages API
 
 ```python
@@ -281,9 +322,11 @@ text = run.load_skill(tool_input["name"])
 
 Each `support.run()` is one run, routed on its message the way an OpenAI Agents run is, with the
 prompt's variables (`{{name}}`) filled from `variables=`. A run serves its own `load_skill` calls,
-from any thread. `support.prompt` is the saved prompt as written, for code that wants only the text. On the Anthropic Messages API use
-`decimalai.anthropic.agent_config()` ([above](#anthropic-messages-api)): Anthropic reads a tool's
-schema from `input_schema`, and `tool_spec` gives it as `parameters`.
+from any thread. `support.prompt` is the saved prompt as written, for code that wants only the text. On the OpenAI SDK
+use `decimalai.openai.agent_config()` ([above](#openai-sdk-chat-completions-and-responses-api)), which hands
+the tool over in OpenAI's shapes and traces each run with no other setup; on the Anthropic Messages
+API use `decimalai.anthropic.agent_config()` ([above](#anthropic-messages-api)): Anthropic reads a
+tool's schema from `input_schema`, and `tool_spec` gives it as `parameters`.
 
 `init(crewai=True)` installs the same thing as `decimalai.crewai.instrument(agent_name=..., enable_skill_loader=True)`. Use one or the other, not both. `init(langchain=True)` traces only.
 
@@ -479,6 +522,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | `decimalai.adk` | ✅ | ✅ | from `agent_config()`: `instruction` carries the skill list, `tools` the `load_skill` tool; routed once per invocation on its message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.crewai` | ✅ | ❌ injection-only | inserted after CrewAI's system prompt by a `before_llm_call` hook (crewai>=1.15.27), routed on the task description; `enable_load_skill_tool` accepted but dormant (warns) |
 | `decimalai.anthropic` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Tool Runner) or `run.tool_params` (`messages.create`) the `load_skill` tool; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
+| `decimalai.openai` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Chat Completions) or `run.response_tools` (Responses API) the `load_skill` tool, answered by `run.tool_result(call)`; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
 
@@ -561,6 +605,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
 | Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])` (tracing: `init(otel=True)` + `Agent.instrument_all()`) |
 | Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
+| OpenAI SDK (Chat Completions / Responses API) | ✅ | `agent_config(name)` from `decimalai.openai`, one `support.run(message)` per user message; traces its own runs |
 | LlamaIndex | ✅ | `init(llamaindex=True)` |
 | CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
 | Generic (any framework) | ✅ | `@decimalai.trace()` |

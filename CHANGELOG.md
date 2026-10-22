@@ -6,6 +6,30 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
+
+- For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an
+  agent is built. `support = agent_config("support")`, then one run per user message:
+  `with support.run(question, variables=customer) as run:` gives `run.system` (the saved prompt,
+  filled, then the skill list), `run.message` (the user turn), `run.tools` (`load_skill` as a Chat
+  Completions tool) and `run.response_tools` (the same tool for the Responses API, strict). Answer
+  each tool call with `run.tool_result(call) or your_own(call)`: it returns the `tool` message (Chat
+  Completions) or the `function_call_output` item (Responses API) for a `load_skill` call, and
+  `None` for any other tool. `run.load_skill(name)` gives the text alone.
+- Each run is one trace, filed under the agent, with no other setup: `agent_config()` turns OpenAI
+  tracing on for the calls made inside its runs (only those), as the Anthropic module does. Until
+  now, raw OpenAI code used `decimalai.agent_config()`, translated `run.tool_spec` itself, and
+  needed `init(openai=True)`, `agent_run()` and an extra package for its runs to reach a trace.
+- `async with` and `await run.atool_result(call)` for `AsyncOpenAI`; `support.conversation()` keeps
+  a chat's system text and tool the same for every message, and `chat.state` resumes it. The tools
+  are plain dicts and calls are read as SDK objects or dicts, so OpenAI-compatible endpoints and
+  LiteLLM's `completion()` take the same run (their calls carry the run's record, untraced unless
+  made through an `openai` client).
+- `decimalai init --framework openai` writes the agent as a Chat Completions tool loop with an
+  example tool, keyless like the other templates.
+- The `[openai]` extra now installs `openinference-instrumentation-openai` beside `openai`, so
+  `init(openai=True)` and the module's tracing need no second install line.
+
 ### New: LangChain's `agent_config()`, a `create_agent` middleware (the skill loader is gone)
 
 - `decimalai.langchain.agent_config("support")` returns the agent's prompt and skills as one

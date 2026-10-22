@@ -156,11 +156,11 @@ PROVIDER_FLAG_DRIVERS: Dict[str, str] = {
     # init(anthropic=True) is providers.instrument(anthropic=True) — the
     # OpenInference Anthropic instrumentor routed through DecimalSpanExporter.
     "anthropic": "anthropic",
-    # init(openai=True) is the same rail for the `openai` SDK. The Pydantic AI
-    # driver's documented setup IS `instrument() + init(openai=True)` (Pydantic
-    # AI does no tracing of its own), so that driver exercises this flag end to
-    # end on every run.
-    "openai": "pydantic-ai",
+    # init(openai=True) is the same rail for the `openai` SDK: the raw OpenAI
+    # driver's tracing half is that flag around a Chat Completions loop. (The
+    # Pydantic AI driver's documented setup pairs init(openai=True) with its
+    # capability, so it exercises the flag too.)
+    "openai": "openai",
     # init(google=True) has no driver: the hermetic tier needs a stub that
     # speaks the provider's wire format, and google.genai's client has no
     # base_url seam to point at one the way `openai` and `anthropic` do. This is
@@ -325,28 +325,47 @@ contract is wrong — fix contract.py so every framework gets the fix.
 # ── the guards ───────────────────────────────────────────────────────────────
 
 
-def test_advertised_snapshot_matches_docs() -> None:
+def test_advertised_snapshot_matches_docs(tmp_path, monkeypatch) -> None:
     """The vendored advertised list is what the docs actually advertise.
 
     Skips when the docs repo is not beside this one — which is the normal case
     in GitHub Actions. The two guards below do not skip, and between them cover
     every way a framework can be added from inside this repo.
+
+    The docs describe a release, not this tree: main runs ahead of one (0.25's
+    raw OpenAI row landed before 0.25 shipped). So the docs table is held to the
+    capability table of the release the docs' changelog names
+    (tests/test_frameworks_registry.py, `_documented_registry`), and the snapshot
+    to this tree's: a row added since that release is in the snapshot, with its
+    driver, before the docs show it.
     """
     if not DOCS_FRAMEWORKS.exists():
         pytest.skip(f"docs repo not on disk at {DOCS_FRAMEWORKS}")
+    from decimalai import _frameworks as registry
+    from tests.test_frameworks_registry import DOCS_CHANGELOG, _documented_registry
+
     from_docs = advertised_from_docs(DOCS_FRAMEWORKS.read_text())
     assert from_docs, "could not parse the capability table out of frameworks.mdx"
+    documented, source = _documented_registry(DOCS_CHANGELOG, tmp_path, monkeypatch)
+    released = advertised_from_docs(documented.render_block("capability-table"))
+    assert from_docs == released, (
+        f"the docs capability table is not {source}'s: only in the docs "
+        f"{sorted(from_docs - released)}, only in the release {sorted(released - from_docs)}. "
+        "In decimalai-docs run `python3 scripts/check_generated_framework_tables.py --write`."
+    )
+    from_docs = advertised_from_docs(registry.render_block("capability-table"))
     only_docs = sorted(from_docs - set(ADVERTISED_SNAPSHOT))
     only_snap = sorted(set(ADVERTISED_SNAPSHOT) - from_docs)
     assert from_docs == set(ADVERTISED_SNAPSHOT), (
-        "the docs capability table and drivers.ADVERTISED_SNAPSHOT disagree.\n"
-        f"  only in the docs table:  {only_docs}\n"
-        f"  only in the snapshot:    {only_snap}\n"
+        "this tree's capability table (decimalai/_frameworks.py) and "
+        "drivers.ADVERTISED_SNAPSHOT disagree.\n"
+        f"  only in the table:     {only_docs}\n"
+        f"  only in the snapshot:  {only_snap}\n"
         "\n"
-        "If the docs gained a row, that framework now needs a conformance driver: "
+        "If the table gained a row, that framework now needs a conformance driver: "
         "add it to ADVERTISED_SNAPSHOT and create tests/conformance/drivers/<name>.py "
         "(the next guard prints the full recipe).\n"
-        "If a row was REMOVED from the docs, drop the slug from ADVERTISED_SNAPSHOT "
+        "If a row was REMOVED from the table, drop the slug from ADVERTISED_SNAPSHOT "
         "and from the driver's covers= — a driver for something the product no "
         "longer advertises is dead weight."
     )
@@ -1030,6 +1049,9 @@ OBSERVER_SURFACES: Dict[str, str] = {
     # on_trace, come from agent_config().
     "anthropic": "decimalai.anthropic:agent_config",
     "pydantic-ai": "decimalai.pydantic_ai",
+    # The raw OpenAI SDK module has no instrument(): a run, and its on_trace, come from
+    # agent_config(), as on Anthropic.
+    "openai": "decimalai.openai:agent_config",
 }
 
 

@@ -10,6 +10,12 @@ Each cell builds the agent the way ``decimalai init`` and the docs build it:
     anthropic_messages-anthropic  with support.run(q) as run: the Tool Runner with run.system, run.tools
     neutral-openai                decimalai.agent_config(): run.system, run.tool_spec and
                                   run.load_skill() in a hand-written chat-completions loop
+    openai_chat-openai            decimalai.openai.agent_config(): with support.run(q) as run:
+                                  a Chat Completions loop with run.system, run.message,
+                                  run.tools and run.tool_result(call), as `decimalai init
+                                  --framework openai` writes it
+    openai_responses-openai       the same run on the Responses API: instructions=run.system,
+                                  run.response_tools, previous_response_id
     adk-openai                    LlmAgent(model=LiteLlm("openai/..."), instruction=support.instruction,
                                   tools=[*support.tools]); runs only in the openai2 environment,
                                   because litellm pins openai<3 (skips elsewhere)
@@ -92,6 +98,8 @@ _CELLS = [
     pytest.param("openai_agents", "openai", id="openai_agents-openai"),
     pytest.param("pydantic_ai", "openai", id="pydantic_ai-openai"),
     pytest.param("neutral", "openai", id="neutral-openai"),
+    pytest.param("openai_chat", "openai", id="openai_chat-openai"),
+    pytest.param("openai_responses", "openai", id="openai_responses-openai"),
     pytest.param("adk", "openai", id="adk-openai"),
     pytest.param("langchain", "openai", id="langchain-openai"),
     pytest.param("langchain", "anthropic", id="langchain-anthropic"),
@@ -125,12 +133,12 @@ def _unpatch() -> None:
     for cls in _openinference_instrumentors():
         if cls().is_instrumented_by_opentelemetry:
             cls().uninstrument()
-    try:
-        import decimalai.anthropic as anthropic_module
-        # So the next agent_config() turns Anthropic tracing on again.
-        anthropic_module._tracing_turned_on = False
-    except ImportError:
-        pass
+    for name in ("decimalai.anthropic", "decimalai.openai"):
+        try:
+            # So the next agent_config() turns its provider's tracing on again.
+            __import__(name, fromlist=["_tracing_turned_on"])._tracing_turned_on = False
+        except ImportError:
+            pass
     try:
         from pydantic_ai import Agent
         Agent.instrument_all(False)
@@ -253,6 +261,63 @@ def _neutral(provider: str, model: str, agent_name: str, *, skills: bool) -> str
     return ""
 
 
+def _openai_chat(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
+    openai = pytest.importorskip("openai")
+    client = openai.OpenAI()
+    if not skills:
+        # A call outside a run: nothing traces it (the instrumentors are off).
+        return client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": _INSTRUCTION},
+                      {"role": "user", "content": _QUERY}],
+        ).choices[0].message.content or ""
+
+    from decimalai.openai import agent_config
+
+    # As `decimalai init --framework openai` writes it: no init() line, since agent_config()
+    # traces its own runs, and the loop inside the run's `with` block.
+    support = agent_config(agent_name)
+    with support.run(_QUERY) as run:
+        messages: list = [{"role": "system", "content": run.system}, run.message]
+        for _ in range(4):
+            reply = client.chat.completions.create(model=model, messages=messages,
+                                                   tools=[*run.tools]).choices[0].message
+            messages.append(reply)
+            if not reply.tool_calls:
+                return reply.content or ""
+            for call in reply.tool_calls:
+                messages.append(run.tool_result(call) or {
+                    "role": "tool", "tool_call_id": call.id, "content": "No such tool."})
+    return ""
+
+
+def _openai_responses(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
+    openai = pytest.importorskip("openai")
+    client = openai.OpenAI()
+    if not skills:
+        return client.responses.create(model=model, instructions=_INSTRUCTION,
+                                       input=_QUERY).output_text or ""
+
+    from decimalai.openai import agent_config
+
+    support = agent_config(agent_name)
+    with support.run(_QUERY) as run:
+        response = client.responses.create(model=model, instructions=run.system,
+                                           input=[run.message], tools=[*run.response_tools])
+        for _ in range(4):
+            calls = [item for item in response.output if item.type == "function_call"]
+            if not calls:
+                break
+            # A previous_response_id does not carry instructions over: send them again.
+            response = client.responses.create(
+                model=model, instructions=run.system, previous_response_id=response.id,
+                tools=[*run.response_tools],
+                input=[run.tool_result(call) or {"type": "function_call_output",
+                                                 "call_id": call.call_id, "output": "No such tool."}
+                       for call in calls])
+    return response.output_text or ""
+
+
 def _adk(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
     pytest.importorskip("google.adk")
     pytest.importorskip(
@@ -323,6 +388,8 @@ _RUNNERS = {
     "pydantic_ai": _pydantic_ai,
     "anthropic_messages": _anthropic_messages,
     "neutral": _neutral,
+    "openai_chat": _openai_chat,
+    "openai_responses": _openai_responses,
     "adk": _adk,
 }
 

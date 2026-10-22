@@ -26,7 +26,8 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    their side. Nothing is injected: `agent_config()` returns the prompt and the
    skills together, and the file hands both to its own agent — on langchain as
    `create_agent(middleware=[support.middleware])` (0.25+), on anthropic to the
-   SDK's Tool Runner, one run per question.
+   SDK's Tool Runner and on openai to the file's own Chat Completions loop, one
+   run per question.
 
    `agent_config()` runs at process start, so the no-redeploy property survives:
    edit the prompt in the dashboard, restart, done. And when an agent has NO
@@ -37,8 +38,8 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    NONE of the agent's skills fails silently, and that is the whole reason the
    scaffold is worth shipping. No generated file turns a loader on any more:
    the langchain (0.25+), openai-agents (0.18+), pydantic-ai (0.19+), adk
-   (0.20+) and anthropic (0.23+) files' skills reach the model only through the
-   `agent_config()` pieces they pass to their agent, and
+   (0.20+), anthropic (0.23+) and openai (0.25+) files' skills reach the model
+   only through the `agent_config()` pieces they pass to their agent, and
    `tests/test_cli_init_scaffold.py` fails the build if one stops. Until 0.25
    the langchain file called `instrument(enable_skill_loader=True)`, which
    patched every chat model in the process.
@@ -85,8 +86,9 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    /agents/<name>", which is a promise about the file it just wrote. The
    langchain and openai-agents adapters keep it themselves — their
    `agent_config()` installs a callback handler / a trace processor — and so does
-   `decimalai.anthropic.agent_config()`, which turns on Anthropic tracing for the
-   calls made inside its runs. `decimalai.pydantic_ai`
+   `decimalai.anthropic.agent_config()` and `decimalai.openai.agent_config()`,
+   which turn on their provider's tracing for the calls made inside their runs.
+   `decimalai.pydantic_ai`
    deliberately does not: its `agent_config()` capability ships the prompt, the
    skills and the run BOUNDARY (one DecimalAI run span per run) and leaves the
    span content to Pydantic AI's own instrumentation or a provider instrumentor. `init()` with no flags installs no
@@ -132,7 +134,7 @@ SIX THINGS THIS TEMPLATE EXISTS TO GET RIGHT
    that opened with `decimalai.init(agent_name=AGENT_NAME)` died on that line
    for anyone who ran it without the key: a teammate's clone, a CI job, a
    shell that never loaded `.env`. The `agent_config()` templates (openai-agents,
-   pydantic-ai, adk, anthropic) therefore call no `init()`: with a key,
+   pydantic-ai, adk, anthropic, openai) therefore call no `init()`: with a key,
    `agent_config()` initializes the SDK from the environment itself and turns
    its framework's tracing on (ADK's through `DecimalAIPlugin()`), and the name
    it is given is the one its traces are filed under. Pydantic AI's exporter is
@@ -172,6 +174,10 @@ share is identical, deliberately:
     `system=turn.system` and `tools=[*TOOLS, *turn.tools]`. No init():
     `agent_config()` traces its own runs, and `init(anthropic=True)` would also
     trace every other Anthropic call in the process.
+  * openai: the same, around the file's own `client.chat.completions.create`
+    loop: the system message `turn.system`, `turn.message`,
+    `tools=[*TOOLS, *turn.tools]`, and `turn.tool_result(call)` before the file's
+    own tools answer a call. No init(), for the same reason (`init(openai=True)`).
 
 One difference is intentional. The openai-agents snippet awaits
 `Runner.run(...)` because it is being pasted into an async app, while the
@@ -181,20 +187,23 @@ WHY ONLY THESE FRAMEWORKS
 -------------------------
 A scaffold that silently delivers no skills is worse than no scaffold, so a
 framework is only offered here if its adapter has a prompt seam the skill
-loader can use. Six adapters have one: `enable_skill_loader` on one (crewai)
-and an agent config on five (langchain, openai_agents, pydantic_ai, adk,
-anthropic). The rest — llamaindex, claude_agent_sdk,
+loader can use. Seven adapters have one: `enable_skill_loader` on one (crewai)
+and an agent config on six (langchain, openai_agents, pydantic_ai, adk,
+anthropic, openai). The rest — llamaindex, claude_agent_sdk,
 autogen/otel — trace and version but have no loader, and generating a file for
 them would hand someone a program that looks correct and quietly ignores every
 skill they picked. `--framework` names the reason rather than printing a bare
 "invalid choice".
 
-Of the six, five are scaffolded. `crewai` is the holdout, and that one IS
+Of the seven, six are scaffolded. `crewai` is the holdout, and that one IS
 "nobody got to it yet": its loader shipped on 2026-10-08, ahead of a template.
 `anthropic` was one until 0.23, for a different reason: its adapter patched one
 `messages.create()` call and owned no tool loop, so a generated file would have
 been a hand-rolled while-loop this template had to invent. `agent_config()` now
 gives each run a `load_skill` tool, and the SDK's own Tool Runner is the loop.
+The openai file (0.25) does write its own loop, on purpose: a hand-written Chat
+Completions tool loop is the most common agent there is, and the one the docs
+teach, so the template is that loop rather than an invented shape.
 """
 
 from __future__ import annotations
@@ -1023,12 +1032,131 @@ def _render_anthropic(
     ]
 
 
+def _render_openai(
+    agent_name: str, model: str, base_url: Optional[str]
+) -> List[str]:
+    # The run's handle is `turn`, not `run`: inside `def run(...)`, `as run:`
+    # would rebind the function's own name.
+    return [
+        *_import_lines(
+            ["import json", "import os"],
+            ["import decimalai",
+             "from decimalai.openai import agent_config",
+             "from openai import OpenAI"],
+            base_url),
+        "",
+        "# Any model your OpenAI key can reach. OpenAI() also reads OPENAI_BASE_URL, so",
+        "# an OpenAI-compatible endpoint (Azure, a local server) works the same way.",
+        f"MODEL = {_py(model)}",
+        *_agent_name_lines(agent_name, load_agent_routes=True),
+        "# The loop's cap on model calls for one question. Loading a skill takes one",
+        "# call of its own; raise it if your agent chains many tools.",
+        "MAX_TURNS = 20",
+        "",
+        *_key_guard_lines("openai", model),
+        *_agent_config_lines([
+            "# This agent's prompt and skills, one run per question. Nothing is injected",
+            "# behind your back: run() below passes both to the model.",
+            "#   turn.system  the prompt saved in the dashboard, then the list of this",
+            "#                agent's skills. Re-read at most once a minute, so a prompt",
+            "#                saved in the dashboard reaches a run within a minute, with",
+            "#                no redeploy. {{placeholders}} in it are filled from",
+            "#                support.run(..., variables=...).",
+            "#   turn.tools   the load_skill tool the model reads a skill with, which",
+            "#                turn.tool_result(call) answers.",
+            "# Each run is one trace, filed under AGENT_NAME: agent_config() traces the",
+            "# OpenAI calls made inside it. With no prompt saved, the agent gets only the",
+            "# skill list: nothing this file made up. Pass agent_config(AGENT_NAME,",
+            "# fallback=...) to supply one.",
+        ]),
+        "",
+        "client = OpenAI()",
+        "",
+        "",
+        "def lookup_order(order_id: str) -> str:",
+        "    \"\"\"Look up an order's status by its id.\"\"\"",
+        "    # An example. Replace it with a call to your own system.",
+        "    return f\"Order {order_id}: shipped, arriving in two days.\"",
+        "",
+        "",
+        "# Your tools: what the model is shown, and the function that answers each.",
+        "# DecimalAI adds load_skill.",
+        "TOOLS: list = [{",
+        "    \"type\": \"function\",",
+        "    \"function\": {",
+        "        \"name\": \"lookup_order\",",
+        "        \"description\": \"Look up an order's status by its id.\",",
+        "        \"parameters\": {",
+        "            \"type\": \"object\",",
+        "            \"properties\": {\"order_id\": {\"type\": \"string\",",
+        "                                         \"description\": \"The order id, for example A1001.\"}},",
+        "            \"required\": [\"order_id\"],",
+        "        },",
+        "    },",
+        "}]",
+        "FUNCTIONS = {\"lookup_order\": lookup_order}",
+        "",
+        "",
+        "def run(question: str) -> str:",
+        "    \"\"\"One question: call the model and its tools until it answers.",
+        "",
+        "    The question is sent with no earlier messages. For a chat, keep one",
+        "    support.conversation() per chat instead: its system text and tools stay",
+        "    the same for every message, so its requests share one cached prefix.",
+        "    \"\"\"",
+        "    # Make the model calls inside the `with` block: the run's trace closes with it.",
+        "    with support.run(question) as turn:",
+        "        messages = [{\"role\": \"system\", \"content\": turn.system}, turn.message]",
+        "        for _ in range(MAX_TURNS):",
+        "            reply = client.chat.completions.create(",
+        "                model=MODEL,",
+        "                messages=messages,",
+        "                # Your own tools go first; DecimalAI adds load_skill.",
+        "                tools=[*TOOLS, *turn.tools],",
+        "            ).choices[0].message",
+        "            messages.append(reply)",
+        "            if not reply.tool_calls:",
+        "                return reply.content or \"\"",
+        "            for call in reply.tool_calls:",
+        "                # turn.tool_result() answers load_skill, and returns None for",
+        "                # your own tools, which FUNCTIONS answers.",
+        "                answer = turn.tool_result(call)",
+        "                if answer is None:",
+        "                    function = FUNCTIONS.get(call.function.name)",
+        "                    try:",
+        "                        # The model can ask for a tool the prompt names but this",
+        "                        # file does not define; saying so lets it carry on.",
+        "                        output = (str(function(**json.loads(call.function.arguments or \"{}\")))",
+        "                                  if function else f\"There is no tool named {call.function.name!r}.\")",
+        "                    except Exception as exc:  # the model sees the error and can try again",
+        "                        output = f\"Error: {exc}\"",
+        "                    answer = {\"role\": \"tool\", \"tool_call_id\": call.id, \"content\": output}",
+        "                messages.append(answer)",
+        "    # The model kept calling tools without answering. Usually it is chasing a",
+        "    # tool the prompt names but this file does not define: check the Tools line",
+        "    # in your system prompt against TOOLS above.",
+        "    return (",
+        "        f\"[{AGENT_NAME}] stopped after {MAX_TURNS} model calls without an \"",
+        "        \"answer. See the comment in run().\"",
+        "    )",
+        "",
+        "",
+        'if __name__ == "__main__":',
+        '    print(run("What can you help me with?"))',
+        "    # Short-lived scripts exit before the background sender drains. With a key,",
+        "    # agent_config() registers an atexit flush; this makes it explicit. Without",
+        "    # one there is nothing to send, and this does nothing.",
+        "    decimalai.flush()",
+    ]
+
+
 _RENDERERS = {
     "langchain": _render_langchain,
     "openai-agents": _render_openai_agents,
     "pydantic-ai": _render_pydantic_ai,
     "adk": _render_adk,
     "anthropic": _render_anthropic,
+    "openai": _render_openai,
 }
 
 #: What the user has to install and export for the generated file to run.

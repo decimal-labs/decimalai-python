@@ -193,6 +193,7 @@ class TestTemplateIsCode:
             "pydantic-ai": "decimalai.pydantic_ai",
             "adk": "decimalai.adk",
             "anthropic": "decimalai.anthropic",
+            "openai": "decimalai.openai",
         }[framework]
         assert expected in mods, f"{framework} must import {expected}"
 
@@ -200,9 +201,16 @@ class TestTemplateIsCode:
     def test_has_one_entry_point_and_one_example_call(self, framework):
         tree = parse(render_agent_file(AGENT, framework, SKILLS))
         # A decorated function is a tool the file defines (the anthropic
-        # template's example @beta_tool), not a way into the agent.
+        # template's example @beta_tool), not a way into the agent; so is one the
+        # file registers as a tool's implementation (the openai template's
+        # FUNCTIONS = {"lookup_order": lookup_order}).
+        registered = {v.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "FUNCTIONS" for t in n.targets)
+                      and isinstance(n.value, ast.Dict)
+                      for v in n.value.values if isinstance(v, ast.Name)}
         funcs = [n.name for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and not n.decorator_list]
+                 if isinstance(n, ast.FunctionDef) and not n.decorator_list
+                 and n.name not in registered]
         assert funcs == ["run"], f"expected exactly one entry point, got {funcs}"
         # A bare `run(...)` is the example call; `asyncio.run(...)` (the adk
         # template's event-loop bridge) is an attribute call, not the entry point.
@@ -229,6 +237,7 @@ class TestTemplateIsCode:
         "pydantic-ai": "openai:gpt-5-mini",
         "adk": "gemini-2.5-pro",
         "anthropic": "claude-sonnet-5-5",
+        "openai": "gpt-5-mini",
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -302,10 +311,11 @@ class TestTemplateIsCode:
 #: file's own agent (openai-agents since 0.18, pydantic-ai since 0.19, adk since 0.20,
 #: anthropic's Tool Runner since 0.23, langchain's create_agent middleware since 0.25).
 #: Every template is one now.
-LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic")
+LOAD_AGENT_FRAMEWORKS = ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic", "openai")
 #: How many init() calls each template makes. The agent_config() templates make none
 #: (scaffold.py point 5), except pydantic-ai's exporter, made only with a key.
-INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0}
+INIT_CALLS = {"langchain": 0, "openai-agents": 0, "pydantic-ai": 1, "adk": 0, "anthropic": 0,
+              "openai": 0}
 
 
 def _support_attr(node: ast.AST, attr: str) -> bool:
@@ -352,6 +362,8 @@ class TestSkillLoaderIsOn:
         # agent_config() traces its own runs; anthropic=True would widen that to every
         # Anthropic call in the process, which a one-agent file has no use for.
         "anthropic": None,
+        # The same for openai=True and the OpenAI calls.
+        "openai": None,
     }
 
     @pytest.mark.parametrize("framework", SUPPORTED_FRAMEWORKS)
@@ -423,6 +435,36 @@ class TestSkillLoaderIsOn:
         assert [ast.unparse(e) for e in plugins.elts] == ["DecimalAIPlugin()"]
         (runner,) = calls(tree, "InMemoryRunner")
         assert [kw.arg for kw in runner.keywords] == ["app"]
+
+    def test_openai_hands_each_run_to_its_chat_completions_loop(self):
+        """The OpenAI SDK has no loop of its own for Chat Completions, so the file writes
+        the one the docs teach: the prompt, the skill list and load_skill reach the model
+        only because run() opens `support.run(question)`, sends `turn.system` and
+        `turn.message`, offers `*turn.tools` after the file's own, and answers each call
+        with `turn.tool_result(call)` first, all inside the `with` block. A call made
+        after the block is untraced, and its load misses the run's record."""
+        tree = parse(render_agent_file(AGENT, "openai", SKILLS))
+        assert calls(tree, "instrument") == []
+        (load,) = calls(tree, "agent_config")
+        holder = next(n for n in tree.body if isinstance(n, ast.Assign) and n.value is load)
+        assert [t.id for t in holder.targets] == ["support"]
+        (run_fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"]
+        (block,) = [n for n in ast.walk(run_fn) if isinstance(n, ast.With)]
+        (item,) = block.items
+        assert _support_attr(item.context_expr.func, "run")
+        assert [ast.unparse(a) for a in item.context_expr.args] == ["question"]
+        handle = item.optional_vars.id
+        assert handle != "run", "`as run:` inside def run() rebinds the function's own name"
+        inside = ast.Module(body=block.body, type_ignores=[])
+        (create,) = calls(inside, "create")
+        assert ast.unparse(create.func) == "client.chat.completions.create"
+        keywords = {kw.arg: kw.value for kw in create.keywords}
+        assert [ast.unparse(e) for e in keywords["tools"].elts] == ["*TOOLS", f"*{handle}.tools"]
+        assert reads(keywords["model"], "MODEL")
+        source = ast.unparse(inside)
+        assert f"{{'role': 'system', 'content': {handle}.system}}, {handle}.message" in source
+        (answered,) = calls(inside, "tool_result")
+        assert ast.unparse(answered.func) == f"{handle}.tool_result"
 
     def test_anthropic_hands_each_run_to_the_tool_runner(self):
         """Nothing patches the Anthropic SDK since 0.21: the prompt, the skill list and
@@ -1039,6 +1081,17 @@ class TestCliWritesTheFile:
         assert 'pip install "decimalai[anthropic]"' in result.output
         assert 'export ANTHROPIC_API_KEY="..."' in result.output
         assert "OPENAI_API_KEY" not in result.output
+
+    def test_openai_next_steps_name_the_extra_and_the_openai_key(self, tmp_path, monkeypatch):
+        """`decimalai[openai]` carries the OpenAI SDK and the tracing agent_config() turns on;
+        a bare `pip install decimalai openai` runs the file and traces nothing."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        result = _run_cli([AGENT, "--api-key", "dai_sk_x", "--framework", "openai"])
+        assert result.exit_code == 0, result.output
+        assert 'pip install "decimalai[openai]"' in result.output
+        assert 'export OPENAI_API_KEY="..."' in result.output
+        assert "ANTHROPIC_API_KEY" not in result.output
 
     @pytest.mark.parametrize("framework", ["adk", "pydantic-ai"])
     def test_an_extra_this_python_cannot_install_is_said_out_loud(

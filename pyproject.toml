@@ -124,10 +124,10 @@ dependencies = [
 # AgentMiddleware, before_agent / wrap_model_call, PrivateStateAttr), from 1.4.5. It
 # brings langgraph into a tracing-only install too.
 langchain = ["langchain>=1.4.5", "langchain-core>=1.6.10"]
-# The provider SDK the init(openai=True) one-liner instruments. decimalai code
-# never imports `openai`; this extra exists so `pip install "decimalai[openai]"`
-# co-installs it.
-openai = ["openai>=3.30.0"]
+# Runtime extra for the OpenAI SDK (decimalai.openai.agent_config()): the SDK, and the
+# OpenInference instrumentor that agent_config() turns on to trace its runs and that
+# init(openai=True) uses to trace every call. Floored at the releases the suite runs.
+openai = ["openai>=3.30.0", "openinference-instrumentation-openai>=0.1.65"]
 openai-agents = ["openai-agents>=0.23.1"]
 # Runtime extra for the native Claude Agent SDK integration
 # (decimalai.init(claude_agent_sdk=True)).

@@ -38,14 +38,15 @@ DOCS_CHANGELOG = REPO_ROOT.parent / "decimalai-docs" / "changelog.mdx"
 #: the registry. Equal by value, on purpose: a registry edit made for the docs or the
 #: dashboard must not change what `decimalai init` does. When a change IS meant (a
 #: framework gains a template), change this snapshot in the same commit. Anthropic
-#: gained one in 0.23.
+#: gained one in 0.23, the raw OpenAI SDK in 0.25.
 SCAFFOLD_BEFORE = {
     "DEFAULT_MODEL": "gpt-4o-mini",
     "_FRAMEWORK_DEFAULT_MODELS": {
         "pydantic-ai": "openai:gpt-4o-mini", "adk": "gemini-3.5-flash",
         "anthropic": "claude-haiku-5-5",
     },
-    "SUPPORTED_FRAMEWORKS": ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic"),
+    "SUPPORTED_FRAMEWORKS": ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic",
+                             "openai"),
     "UNSCAFFOLDED_WITH_SEAM": {"crewai": "CrewAI"},
     "NO_PROMPT_SEAM": {
         "llamaindex": "LlamaIndex",
@@ -59,6 +60,7 @@ SCAFFOLD_BEFORE = {
         "pydantic-ai": 'pip install "decimalai[pydantic-ai]"',
         "adk": 'pip install "decimalai[adk]"',
         "anthropic": 'pip install "decimalai[anthropic]"',
+        "openai": 'pip install "decimalai[openai]"',
     },
     "EXTRA_MIN_PYTHON": {"adk": (3, 11), "pydantic-ai": (3, 11)},
     "ENV_VARS": {
@@ -67,6 +69,7 @@ SCAFFOLD_BEFORE = {
         "pydantic-ai": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
         "adk": ("DECIMAL_API_KEY", "GOOGLE_API_KEY"),
         "anthropic": ("DECIMAL_API_KEY", "ANTHROPIC_API_KEY"),
+        "openai": ("DECIMAL_API_KEY", "OPENAI_API_KEY"),
     },
 }
 
@@ -126,7 +129,7 @@ def test_init_framework_help_reads_the_scaffold_list():
 
     help_text = next(p.help for p in init.params if p.name == "framework")
     assert help_text == ("Framework to generate for: langchain (default), openai-agents, "
-                         "pydantic-ai, adk or anthropic")
+                         "pydantic-ai, adk, anthropic or openai")
     for key in scaffold.SUPPORTED_FRAMEWORKS:
         assert key in help_text
 

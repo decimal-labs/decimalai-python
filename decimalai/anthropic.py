@@ -56,9 +56,7 @@ to give an agent skills; an agent that uses both shows the model two lists.
 
 from __future__ import annotations
 
-import asyncio
 import copy
-import functools
 import logging
 import threading
 import time
@@ -68,6 +66,17 @@ from uuid import uuid4
 
 from ._agent_binding import AgentBinding, ConversationRecord, _in_thread
 from ._agent_binding import new_skills_block as _new_skills_block
+
+# A closed run's span waits for its routing decision there, shared with decimalai.openai's
+# runs, so one decimalai.flush() drains both. The names stay importable from here.
+from ._provider_run import (  # noqa: F401 - re-exported under their old names
+    _drain_finishing,
+    _enclosing_trace_id,
+    _event_loop_running,
+    _finish_later,
+    _is_error,
+    open_run_span,
+)
 from .skill_router import _load_routing_id_ctx
 
 logger = logging.getLogger("decimalai.anthropic")
@@ -75,10 +84,6 @@ logger = logging.getLogger("decimalai.anthropic")
 #: The run whose ``with`` block is open in this context. The background routing
 #: and a load's scope read it; a tool sets it around its own call.
 _RUN: "ContextVar[Optional[str]]" = ContextVar("decimalai_anthropic_run", default=None)
-
-#: How long a closed run's trace waits for a routing decision still in flight.
-#: The wait is off the caller's path: the block exits at once.
-_EXIT_WAITS_FOR_ROUTING_S = 3.0
 
 #: ``agent_config(cache_control=...)``'s default: one breakpoint on the system text.
 _DEFAULT_CACHE_CONTROL: Dict[str, Any] = {"type": "ephemeral"}
@@ -151,103 +156,11 @@ def _turn_on_tracing() -> None:
         _tracing_turned_on = True
 
 
-def _enclosing_trace_id() -> Optional[str]:
-    """The live ``decimalai.start_trace()`` context's id, or None (never a wrong parent)."""
-    try:
-        from .generic import _get_current_trace
-
-        ctx = _get_current_trace()
-        return ctx.get_trace_id() if ctx is not None else None
-    except Exception:
-        return None
-
-
 def _tool_use_parts(block: Any) -> Tuple[Any, Any, Any]:
     """(name, input, id) of a ``tool_use`` block, as an SDK object or a plain dict."""
     if isinstance(block, dict):
         return block.get("name"), block.get("input"), block.get("id")
     return getattr(block, "name", None), getattr(block, "input", None), getattr(block, "id", None)
-
-
-def _is_error(text: str) -> bool:
-    """Whether a load's answer is a refusal rather than a skill (or a repeat notice)."""
-    return not (text.startswith("## Skill:") or "already loaded earlier in this run" in text)
-
-
-def _event_loop_running() -> bool:
-    """Whether this thread is running async code: asyncio's loop, or trio's (via sniffio)."""
-    try:
-        asyncio.get_running_loop()
-        return True
-    except RuntimeError:
-        pass
-    try:
-        import sniffio
-
-        sniffio.current_async_library()
-        return True
-    except Exception:
-        return False
-
-
-# ── runs whose trace is still finishing ──────────────────────
-
-_finishing: set = set()
-_finishing_lock = threading.Lock()
-_finishing_done = threading.Condition(_finishing_lock)
-_drain_registered = False
-
-
-def _finish_later(run: "Run", pending: Any, end_ns: int) -> None:
-    """End ``run``'s span once its routing decision is in, or after the wait: off the caller's path."""
-    global _drain_registered
-    with _finishing_lock:
-        _finishing.add(run)
-        if not _drain_registered:
-            _drain_registered = True
-            _register_drain_at_exit()
-
-    def finish(*_args: Any) -> None:
-        run._end(end_ns)
-        with _finishing_lock:
-            _finishing.discard(run)
-            _finishing_done.notify_all()
-
-    timer = threading.Timer(_EXIT_WAITS_FOR_ROUTING_S, finish)
-    timer.daemon = True
-    timer.start()
-    pending.add_done_callback(finish)
-
-
-def _drain_finishing(timeout: float = _EXIT_WAITS_FOR_ROUTING_S + 0.5, *, at_exit: bool = False) -> None:
-    """Wait for closed runs whose trace is still waiting on a decision; end the rest now.
-
-    ``decimalai.flush()`` calls it, so a short script reports on traces that exist.
-    """
-    deadline = time.monotonic() + timeout
-    with _finishing_lock:
-        # A flush waits for the runs closed before it: a run another thread closes
-        # meanwhile keeps its own timer, so a flush neither ends it early nor waits
-        # on a stream of new ones. At exit no timer will fire, so every run counts.
-        waiting = _finishing if at_exit else set(_finishing)
-        while waiting & _finishing and time.monotonic() < deadline:
-            _finishing_done.wait(timeout=max(0.0, deadline - time.monotonic()))
-        left = list(waiting & _finishing)
-    for run in left:
-        run._end(run._exit_ns or time.time_ns())
-        with _finishing_lock:
-            _finishing.discard(run)
-
-
-def _register_drain_at_exit() -> None:
-    """Drain during ``threading._shutdown()``, before the OTel pipelines shut down (see otel)."""
-    drain = functools.partial(_drain_finishing, at_exit=True)
-    try:
-        threading._register_atexit(drain)  # type: ignore[attr-defined]
-    except Exception:
-        import atexit
-
-        atexit.register(drain)
 
 
 # ── a conversation ───────────────────────────────────────────
@@ -413,35 +326,10 @@ class Run:
             self._config._log.debug("could not link the run's trace", exc_info=True)
 
     def _start_span(self) -> None:
-        """The run's span: a new trace of its own, linked to any span already open."""
-        try:
-            from opentelemetry import context as otel_context
-            from opentelemetry import trace as trace_api
-
-            from . import otel, providers
-        except ImportError:
-            return
-        name = self._config.name
-        try:
-            # The provider this process's Anthropic calls are traced on, so the
-            # calls nest under the run (not whichever provider was attached last).
-            provider = providers._run_provider("anthropic") or trace_api.get_tracer_provider()
-            current = trace_api.get_current_span().get_span_context()
-            links = [trace_api.Link(current)] if current.is_valid else None
-            attributes = {
-                otel._GENAI_OPERATION: otel._INVOKE_AGENT, otel._GENAI_AGENT_NAME: name,
-                otel._DECIMAL_AGENT_NAME: name, otel.SESSION_ID_ATTRIBUTE: self._conversation.id,
-            }
-            # A new root, not a child of whatever is open (a web server's request
-            # span, another run): one run, one trace.
-            span = provider.get_tracer(otel.RUN_TRACER).start_span(
-                otel.RUN_SPAN_NAME, context=otel_context.Context(), attributes=attributes, links=links)
-            self._span = span
-            self._otel_ctx = trace_api.set_span_in_context(span, otel_context.get_current())
-            self._tokens.append((otel_context, otel_context.attach(self._otel_ctx)))
-            self._tokens.append((otel._active_agent_name, otel._active_agent_name.set(name)))
-        except Exception:
-            self._config._log.debug("could not start the run's span", exc_info=True)
+        """The run's span: a new trace of its own, on the provider Anthropic calls are traced on."""
+        self._span, self._otel_ctx, tokens = open_run_span(
+            "anthropic", self._config.name, self._conversation.id)
+        self._tokens.extend(tokens)
 
     def _exit(self, exc_type: Any, exc: Any) -> None:
         with self._lock:
