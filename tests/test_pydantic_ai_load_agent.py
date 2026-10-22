@@ -213,6 +213,36 @@ def test_agent_config_alone_traces_a_run_with_pydantic_ais_own_spans(traced):
                for s in spans.get_finished_spans())
 
 
+def test_a_streamed_run_is_one_trace_too(traced):
+    """run_stream(): the capability's run span still wraps the whole run, streamed model call
+    included, so the trace is one, rooted in it."""
+    import asyncio
+
+    import decimalai.otel as otel
+
+    _provider, sent, spans = traced
+
+    async def stream(messages, info):
+        yield "streamed "
+        yield "answer"
+
+    support = pai.agent_config("support")
+    agent = Agent(FunctionModel(stream_function=stream), name=support.name, capabilities=[support],
+                  deps_type=dict)
+
+    async def go():
+        async with agent.run_stream("Hi", deps=SAM) as result:
+            return await result.get_output()
+
+    assert asyncio.run(go()) == "streamed answer"
+    (trace,) = sent
+    assert trace.agent_name == "support" and len(trace.llm_calls) == 1
+    finished = spans.get_finished_spans()
+    assert _names(finished)[otel.RUN_SPAN_NAME] is None
+    root = next(s for s in finished if s.name == otel.RUN_SPAN_NAME)
+    assert all(s.end_time <= root.end_time for s in finished), "nothing in the run ends after its root"
+
+
 def test_only_its_runs_are_instrumented_and_sent(traced):
     """Another Pydantic AI agent in the process is not instrumented (no global switch), and
     the app's own spans on the shared provider stay in the process."""
