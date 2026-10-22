@@ -50,7 +50,13 @@ and patch releases are fixes.
   and `load_skill` where you list `support`, so instructions keep your order, and the run span
   outermost, around Pydantic AI's `Instrumentation`.
 - `decimalai init --framework pydantic-ai` writes no `init()` and no `Agent.instrument_all()`, like
-  the other `agent_config()` templates.
+  the other `agent_config()` templates. So the documented file starts with DecimalAI unreachable:
+  `init(otel=True)` verified the key at startup and raised `DecimalConfigError` before
+  `agent_config(fallback=...)` could run its fallback.
+- `agent_config(..., on_trace=...)` gets each run's finished trace before it is sent, and a run
+  inside `decimalai.start_trace()` is filed as that trace's child (`parent_trace_id`), so a load the
+  router also logs on the enclosing trace is credited once — as `decimalai.anthropic` and
+  `decimalai.openai` runs do. The conformance matrix now grades Pydantic AI's C15 and C16.
 
 ### Changed: an OpenAI Agents chat on Claude keeps its instructions and `load_skill`
 

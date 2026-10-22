@@ -1048,7 +1048,8 @@ OBSERVER_SURFACES: Dict[str, str] = {
     # Anthropic's instrument() is a stub that raises since 0.23: a run, and its
     # on_trace, come from agent_config().
     "anthropic": "decimalai.anthropic:agent_config",
-    "pydantic-ai": "decimalai.pydantic_ai",
+    # Pydantic AI's instrument() went in 0.19: a run, and its on_trace, come from agent_config().
+    "pydantic-ai": "decimalai.pydantic_ai:agent_config",
     # The raw OpenAI SDK module has no instrument(): a run, and its on_trace, come from
     # agent_config(), as on Anthropic.
     "openai": "decimalai.openai:agent_config",

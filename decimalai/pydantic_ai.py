@@ -334,17 +334,30 @@ class _RunTrace:
     Opened on DecimalAI's tracer provider for these runs, with the conversation's id as
     the trace's session. A run whose routing decision is still in flight when it ends
     keeps its span open until the decision lands, off the run's path (at most a few
-    seconds, `_provider_run`), so its trace carries the decision.
+    seconds, `_provider_run`), so its trace carries the decision. Inside
+    ``decimalai.start_trace()`` the trace is filed as that trace's child, and an
+    ``agent_config(on_trace=...)`` observer gets it before it is sent.
     """
 
-    def __init__(self, agent_name: str, conversation_id: Optional[str]) -> None:
-        from ._provider_run import open_run_span
+    def __init__(self, agent_name: str, conversation_id: Optional[str], on_trace: Any = None) -> None:
+        from ._provider_run import _enclosing_trace_id, open_run_span
 
         self._lock = threading.Lock()
         self._ended = False
         self._exit_ns: Optional[int] = None
         self._span, _context, self._tokens = open_run_span(
             None, agent_name, conversation_id or "", tracer_provider=_run_tracer_provider)
+        try:
+            trace_id = self._span.get_span_context().trace_id if self._span is not None else 0
+            parent = _enclosing_trace_id()
+            if trace_id and (parent or on_trace is not None):
+                from .otel import record_run_link
+
+                # Inside decimalai.start_trace(), the run's trace is that trace's child, so a
+                # load the router also logs there is credited once.
+                record_run_link(trace_id, parent_trace_id=parent, on_trace=on_trace)
+        except Exception:  # noqa: BLE001 — linking must never cost the run
+            logger.debug("could not link the run's trace", exc_info=True)
 
     def close(self, state: Optional[Dict[str, Any]], error: Optional[BaseException]) -> None:
         import time
@@ -402,8 +415,10 @@ class _PydanticAIBinding(AgentBinding):
     _log = logger
     _VALUES_HINT = "Pass them as the run's deps=..., as attributes or dict keys."
 
-    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
+    def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str,
+                 on_trace: Any = None) -> None:
         super().__init__(prompt, fallback=fallback, on_unavailable=on_unavailable)
+        self._on_trace = on_trace
         self._toolset = self._build_toolset()
 
     def __repr__(self) -> str:
@@ -463,7 +478,8 @@ class _PydanticAIBinding(AgentBinding):
         """The run, inside DecimalAI's run span: a trace of its own, filed under the agent."""
         run_key = getattr(ctx, "run_id", None)
         token = _RUN.set(run_key)
-        trace = _RunTrace(self.name, getattr(ctx, "conversation_id", None)) if self._traced() else None
+        trace = (_RunTrace(self.name, getattr(ctx, "conversation_id", None), self._on_trace)
+                 if self._traced() else None)
         error: Optional[BaseException] = None
         try:
             return await handler()
@@ -639,8 +655,10 @@ def _config_class() -> Any:
                     name: The agent's canonical DecimalAI name.
                 """
 
-                def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str) -> None:
-                    _PydanticAIBinding.__init__(self, prompt, fallback=fallback, on_unavailable=on_unavailable)
+                def __init__(self, prompt: Any, *, fallback: Optional[str], on_unavailable: str,
+                             on_trace: Any = None) -> None:
+                    _PydanticAIBinding.__init__(self, prompt, fallback=fallback, on_unavailable=on_unavailable,
+                                                on_trace=on_trace)
                     part_id = "decimalai-" + self.name.replace(":", "-")
                     CombinedCapability.__init__(self, capabilities=[
                         _RunSpan(self, part_id + "-run"), _Skills(self, part_id)])
@@ -674,6 +692,7 @@ def agent_config(
     *,
     fallback: Optional[str] = None,
     on_unavailable: str = "continue",
+    on_trace: Any = None,
 ) -> Any:
     """Pull an agent's prompt and skills from DecimalAI, as a Pydantic AI capability.
 
@@ -701,7 +720,8 @@ def agent_config(
     its own sets it up first), sending only DecimalAI runs. A run the app instruments
     itself (``Agent.instrument_all()``, Logfire) keeps its instrumentation, and one
     whose model's SDK ``init(openai=True)`` (or ``anthropic=``, ``google=``) traces is
-    not instrumented twice.
+    not instrumented twice. A run inside ``decimalai.start_trace()`` is filed as that
+    trace's child (its ``parent_trace_id``).
 
     With the ``load_skill`` tool switched off (``DECIMALAI_LOAD_SKILL_TOOL=0`` or
     ``init(load_skill_tool=False)``), every run is routed and the text of the skills
@@ -721,6 +741,8 @@ def agent_config(
         on_unavailable: ``"continue"`` (default) runs without skills when DecimalAI
             never returned them, and the run's record says so; ``"fail"`` raises
             before the model request instead.
+        on_trace: Called with each run's finished trace before it is sent (on the
+            exporter's thread; an exception in it is logged, never raised).
 
     Raises:
         ImportError: Pydantic AI is not installed.
@@ -734,7 +756,8 @@ def agent_config(
     from ._agent import _open_prompt
 
     prompt = _open_prompt(agent_name, fallback)
-    config = _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable)
+    config = _config_class()(prompt, fallback=fallback, on_unavailable=on_unavailable,
+                             on_trace=on_trace)
     if not prompt.keyless:  # keyless runs are traced nowhere
         _turn_on_tracing()
     return config

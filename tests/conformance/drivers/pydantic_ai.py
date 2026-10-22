@@ -37,6 +37,7 @@ from . import (
     StubTurn,
     fanout_threads,
     stub_script,
+    trace_observer,
     tool_result,
     user_message,
 )
@@ -76,7 +77,8 @@ def _tool(ctx: Ctx) -> Any:
     return lookup
 
 
-def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None, named: bool = True) -> Any:
+def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None, named: bool = True,
+           on_trace: Any = None) -> Any:
     """The documented snippet: this agent's ``agent_config()`` capability on the
     developer's own ``Agent``. ``configs`` shares one config per agent name, as a
     module-level one would be."""
@@ -86,7 +88,8 @@ def _agent(ctx: Ctx, *, configs: Optional[Dict[str, Any]] = None, named: bool = 
 
     configs = {} if configs is None else configs
     if ctx.agent_name not in configs:
-        configs[ctx.agent_name] = agent_config(ctx.agent_name)
+        configs[ctx.agent_name] = (agent_config(ctx.agent_name, on_trace=on_trace) if on_trace
+                                   else agent_config(ctx.agent_name))
     support = configs[ctx.agent_name]
     return Agent(
         _model(),
@@ -165,6 +168,17 @@ def run_error(ctx: Ctx) -> Any:
     return _go((ctx, _agent(ctx)))
 
 
+def run_nested(ctx: Ctx) -> Any:
+    """One run with the suite's observer as ``agent_config(on_trace=...)``.
+
+    The harness runs this inside a ``decimalai.start_trace()`` of its own; the
+    run reads the enclosing trace when its span opens, which is where its parent
+    link is recorded.
+    """
+    _setup(ctx)
+    return _go((ctx, _agent(ctx, on_trace=trace_observer(ctx))))
+
+
 def run_concurrent(ctxs: Sequence[Ctx]) -> Any:
     configs: Dict[str, Any] = {}
     pairs = []
@@ -229,6 +243,7 @@ DRIVER = Driver(
     run_skills=run_skills,
     run_unnamed=run_unnamed,
     run_conversation=run_conversation,
+    run_nested=run_nested,
     loads_agent_from_platform=True,
     capabilities=Capabilities(
         has_tools=True,
@@ -236,17 +251,8 @@ DRIVER = Driver(
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=False,
-        has_invocation_observer=False,
+        has_invocation_observer=True,
         reasons={
-            "has_invocation_observer": (
-                "decimalai/pydantic_ai.py hands its caller no run: agent_config() takes "
-                "no on_trace, so C15 has no observer to grade. Its traces are built on "
-                "the OTel rail, which links a run to an enclosing decimalai.start_trace() "
-                "only where an adapter recorded that link when the run started "
-                "(decimalai/crewai.py does; this adapter does not), so C16 is N/A with "
-                "C15. A known gap: a run wrapped in start_trace() ships unlinked, and a "
-                "routed delivery is credited on both traces."
-            ),
             "supports_degenerate": (
                 "a Pydantic AI run always makes a model request, so there is no "
                 "degenerate run (one with no model call) for a manifest to be "

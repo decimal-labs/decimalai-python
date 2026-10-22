@@ -386,6 +386,86 @@ def test_init_enabled_false_stops_the_runs_tracing(traced, monkeypatch):
     assert spans.get_finished_spans() == () and sent == []
 
 
+def test_on_trace_gets_each_runs_finished_trace(traced):
+    """agent_config(on_trace=...): the observer gets a copy of each run's trace before it is
+    sent, as decimalai.anthropic's and decimalai.openai's do; an observer that raises costs
+    neither the run nor its trace."""
+    import inspect
+
+    param = inspect.signature(pai.agent_config).parameters["on_trace"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is None
+    _provider, sent, _spans = traced
+    seen = []
+    support = pai.agent_config("support", on_trace=seen.append)
+    agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    (trace,) = sent
+    (observed,) = seen
+    assert observed.id == trace.id and observed is not trace and observed.agent_name == "support"
+
+    def boom(trace):
+        raise RuntimeError("observer bug")
+
+    sent.clear()
+    agent_with(pai.agent_config("support", on_trace=boom), Model("answer")).run_sync("Hi", deps=SAM)
+    assert len(sent) == 1
+
+
+def test_a_run_inside_start_trace_is_filed_as_its_child(traced):
+    """The router also logs a load on the caller's enclosing decimalai.start_trace() (the
+    fleet wraps every session in one), and the platform drops that duplicate credit only
+    for a LINKED child: the run's trace names the enclosing trace as its parent."""
+    from decimalai.generic import start_trace
+
+    _provider, sent, _spans = traced
+    support = pai.agent_config("support")
+    with start_trace(agent_name="session", auto_send=False) as outer:
+        agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    (trace,) = sent
+    assert trace.parent_trace_id == outer.get_trace_id()
+    sent.clear()
+    agent_with(support, Model("answer")).run_sync("Hi", deps=SAM)
+    (trace,) = sent
+    assert trace.parent_trace_id is None, "outside any trace, a run stays a root"
+
+
+def test_with_decimalai_unreachable_at_startup_the_fallback_runs_with_no_init(tmp_path):
+    """A key in the environment, DecimalAI down, and the documented file, which calls no init()
+    (CUJ 51 step 6c): import-time auto-init does not verify the key, so
+    agent_config(fallback=...) starts on the fallback and the run completes. Through 0.24 the
+    documented file called init(otel=True), whose key check raised DecimalConfigError before
+    agent_config() was reached."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = tmp_path / "agent.py"
+    script.write_text(
+        "from pydantic_ai import Agent\n"
+        "from pydantic_ai.messages import ModelResponse, TextPart\n"
+        "from pydantic_ai.models.function import FunctionModel\n"
+        "from decimalai.pydantic_ai import agent_config\n"
+        "seen = []\n"
+        "def model(messages, info):\n"
+        "    seen.append(info.instructions)\n"
+        "    return ModelResponse(parts=[TextPart('ok')])\n"
+        "support = agent_config('support', fallback='FALLBACK PROMPT')\n"
+        "agent = Agent(FunctionModel(model), name=support.name, capabilities=[support])\n"
+        "print(agent.run_sync('Hi').output, '|', support.prompt_source, '|', seen[0])\n"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "PYDANTIC_AI_NO_BANNER": "1",
+        "DECIMAL_API_KEY": "dai_sk_unreachable_startup", "DECIMAL_BASE_URL": "http://127.0.0.1:9",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+    }
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          cwd=tmp_path, timeout=120, env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    output, source, instructions = (part.strip() for part in proc.stdout.strip().split("|"))
+    assert output == "ok" and source == "fallback (unreachable)"
+    assert instructions.startswith("FALLBACK PROMPT")
+
+
 def test_instructions_keep_the_developers_order_of_capabilities(platform):
     """The run span is outermost; the prompt and list stay where the developer listed them."""
     from dataclasses import dataclass

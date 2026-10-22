@@ -103,8 +103,6 @@ DECLARED_NA: Dict[str, str] = {
     # takes on_trace, so the observer and the parent link are graded.
     "openai-agents:C15": "has_invocation_observer",
     "openai-agents:C16": "has_invocation_observer",
-    "pydantic-ai:C15": "has_invocation_observer",
-    "pydantic-ai:C16": "has_invocation_observer",
     "llamaindex:C15": "has_invocation_observer",
     "llamaindex:C16": "has_invocation_observer",
     "generic-otel:C15": "has_invocation_observer",
@@ -137,7 +135,10 @@ DECLARED_NA: Dict[str, str] = {
 # on_trace, where the removed instrument() patch had neither.
 # Lowered 32 -> 31 on 2026-10-22: LangChain's C13b is graded, now that agent_config()'s
 # middleware gives the model a load_skill tool.
-NA_BUDGET = 31
+# Lowered 31 -> 29 on 2026-10-23: Pydantic AI's C15 and C16 are graded. Its agent_config()
+# takes on_trace and links a run under decimalai.start_trace(), now that its run span is
+# DecimalAI's own root.
+NA_BUDGET = 29
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
