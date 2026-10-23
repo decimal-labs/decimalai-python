@@ -966,7 +966,7 @@ def agents_apply_pack(agent_name, pack, keep_prompt, no_starters, skill_refs, dr
             click.echo(f"  Nothing to apply: {agent_name} already has this.")
             return
         if review.get("next_version_number"):
-            click.echo(f"    Writes version {review['next_version_number']} on the Versions page.")
+            click.echo(f"    Writes setup v{review['next_version_number']} on the agent's Versions page.")
         if dry_run:
             click.echo("")
             click.echo("  Dry run: nothing was changed.")
@@ -1000,7 +1000,7 @@ def agents_apply_pack(agent_name, pack, keep_prompt, no_starters, skill_refs, dr
 
     saved = next((d for d in result.get("applied") or [] if d.get("op") == "set_prompt_text"), None)
     version = (result.get("version") or {}).get("number")
-    click.echo(f"  ✓ Applied the {pack_name} pack to {agent_name}" + (f" (version {version})" if version else ""))
+    click.echo(f"  ✓ Applied the {pack_name} pack to {agent_name}" + (f" (setup v{version})" if version else ""))
     if saved and saved.get("action") == "created":
         served = "" if saved.get("served") else " — not served: the agent is pinned to an older version"
         click.echo(f"    Prompt: saved as v{saved.get('version_number')}{served}")
