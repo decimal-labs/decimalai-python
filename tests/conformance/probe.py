@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import socket
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -437,6 +438,40 @@ class Recorded:
         return 200 <= self.status < 300
 
 
+# ── The listening socket, shared by every stub in the suite ──────────────────
+
+
+class StubHTTPServer(ThreadingHTTPServer):
+    """The server every hermetic stub in this suite listens with.
+
+    The probe, the stub model services (``drivers/_openai_wire.py``,
+    ``drivers/_gemini_wire.py``, the Anthropic driver's) and the journey's model
+    all answer real sockets on 127.0.0.1, and the concurrency phase opens
+    ``harness.CONCURRENCY`` clients against one of them at the same instant.
+
+    ``ThreadingHTTPServer`` keeps ``socketserver``'s listen backlog of FIVE: at
+    most five finished handshakes may wait for the accept loop. One thread runs
+    that loop, so on a busy machine it is not scheduled before the burst arrives,
+    and every connection past the fifth overflows the queue. macOS answers that
+    with a reset (``ConnectError: [Errno 54] Connection reset by peer``); the
+    drivers' clients run with ``max_retries=0``, so the lane's first model call
+    fails, the SDK honestly files an errored trace with one failed call, and C9
+    grades the lane as one that lost its own prompt. That was the intermittent
+    ``openai-C9`` red of 2026-10-23: 8 runs in 10 at a load average of about 12,
+    on every commit, green on an idle machine. A failure the harness manufactures
+    reads as an adapter defect, which is the one thing this suite must never do.
+
+    The kernel caps the backlog at ``somaxconn`` regardless, so asking for
+    ``socket.SOMAXCONN`` costs nothing. Here, not in a module of its own, because
+    ``scripts/pypi_smoke.py`` loads this file by path and it must keep importing
+    nothing but the standard library. ``tests/test_conformance_stub_servers.py``
+    holds every stub to it.
+    """
+
+    request_queue_size = socket.SOMAXCONN
+    daemon_threads = True
+
+
 class Probe:
     """A real HTTP server standing in for the DecimalAI ingest API."""
 
@@ -475,7 +510,7 @@ class Probe:
         self.install_rows: List["InstallRow"] = []
         self.install_keys: Dict[str, str] = {}
         self._lock = threading.RLock()
-        self._server: Optional[ThreadingHTTPServer] = None
+        self._server: Optional[StubHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     # ── lifecycle ────────────────────────────────────────────
@@ -538,8 +573,7 @@ class Probe:
             def do_DELETE(self) -> None:  # noqa: N802
                 self._handle("DELETE")
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = StubHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return self

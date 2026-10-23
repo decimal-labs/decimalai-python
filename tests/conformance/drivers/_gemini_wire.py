@@ -20,9 +20,10 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..probe import StubHTTPServer
 from . import Ctx, StubTurn, stub_script
 
 #: google-genai requires *a* key to build a client. Nothing on the far end reads it.
@@ -44,7 +45,7 @@ class GeminiWire:
     def __init__(self) -> None:
         self._lanes: Dict[str, _Lane] = {}
         self._lock = threading.RLock()
-        self._server: Optional[ThreadingHTTPServer] = None
+        self._server: Optional[StubHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> "GeminiWire":
@@ -67,8 +68,7 @@ class GeminiWire:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = StubHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return self

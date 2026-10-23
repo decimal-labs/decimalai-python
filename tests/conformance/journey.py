@@ -62,7 +62,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -85,7 +85,7 @@ from .drivers import StubTurn, _importable
 from .drivers.anthropic import _message_payload as _anthropic_payload
 from .harness import Phase
 from .isolation import CONFORMANCE_SKILLS, body_sentinel, jobs
-from .probe import Probe, Recorded
+from .probe import Probe, Recorded, StubHTTPServer
 
 # ── the fixture ──────────────────────────────────────────────────────────────
 
@@ -361,7 +361,7 @@ class JourneyModel:
         self.unknown_tool = unknown_tool
         self.requests: List[Dict[str, Any]] = []
         self._lock = threading.RLock()
-        self._server: Optional[ThreadingHTTPServer] = None
+        self._server: Optional[StubHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     # ── lifecycle ────────────────────────────────────────────
@@ -386,8 +386,7 @@ class JourneyModel:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = StubHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return self

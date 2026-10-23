@@ -80,10 +80,11 @@ import asyncio
 import json
 import threading
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from ..delivery import INJECTED
+from ..probe import StubHTTPServer
 from . import (
     SYSTEM_PROMPT,
     Capabilities,
@@ -357,8 +358,7 @@ def _start_provider(
             self.end_headers()
             self.wfile.write(data)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = True
+    server = StubHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     host, port = server.server_address[:2]
     return server, f"http://{host}:{port}"
