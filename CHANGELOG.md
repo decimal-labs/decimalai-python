@@ -4,7 +4,7 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.25.1] — 2026-10-23
 
 ### Changed: a skill the SDK creates reaches only the agents you add it to
 
@@ -22,6 +22,14 @@ and patch releases are fixes.
 - The LangChain and OpenAI Agents boot sync (`instrument(disk_sync=True)`) with no agent named still
   uploads the skills you wrote, and logs one warning when it created any: they are on no agent until
   the agent is named (the next boot adds them) or they are added on the dashboard.
+
+### Fixed: a block-scalar description is its text, not `>-`
+
+- A `description: >-` (or `|`, `>`, with `+`/`-` chomping and an indentation digit) read by the
+  SDK's simple frontmatter reader, used when `skillevaluation` is not installed and for frontmatter
+  the full YAML reader refuses, kept the marker as the value and dropped the text below it, so a
+  sync posted `>-` as the skill's description. It now reads as the platform reads it: `|` keeps line
+  breaks, `>` folds them, and the keys after it still read.
 
 ## [0.25.0] — 2026-10-23
 
