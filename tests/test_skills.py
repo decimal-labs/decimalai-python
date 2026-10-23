@@ -15,6 +15,7 @@ from decimalai.skills import (
     _split_frontmatter,
     _skill_appears_in_text,
     _hash_content,
+    _parse_simple_yaml,
 )
 
 
@@ -373,6 +374,55 @@ class TestYamlValues:
         assert any("YAML" in r.getMessage() for r in caplog.records), [
             r.getMessage() for r in caplog.records
         ]
+
+
+class TestBlockScalarsInTheSimpleReader:
+    """`description: >-` holds its text on the indented lines below. The simple reader (the
+    fallback for frontmatter YAML rejects, and the reader without skillevaluation) used to
+    keep the header `>-` as the description and drop the text: 17 skills on the platform
+    showed `>-` in their agents' menus (found 2026-10-23). It now reads them as YAML does,
+    and as the platform's own parser does."""
+
+    @pytest.mark.parametrize("frontmatter, expected", [
+        ("description: >-\n  Use when the user\n  asks about tickets.", "Use when the user asks about tickets."),
+        ("description: >\n  Use when the user\n  asks about tickets.", "Use when the user asks about tickets."),
+        ("description: |\n  Line one.\n  Line two.", "Line one.\nLine two."),
+        ("description: |-\n  Line one.\n\n  Line three.", "Line one.\n\nLine three."),
+        ("description: >\n  First paragraph\n  goes on.\n\n  Second one.", "First paragraph goes on.\nSecond one."),
+        ("description: |+\n  Kept.\n", "Kept.\n"),
+        ("description: >2-\n    Indented by four,\n    read from two.", "  Indented by four,   read from two."),
+        ("description: >-  # a comment\n  Text.", "Text."),
+    ])
+    def test_a_block_scalar_is_its_text(self, frontmatter, expected):
+        assert _parse_simple_yaml(frontmatter)["description"] == expected
+
+    def test_the_keys_after_a_block_scalar_still_read(self):
+        result = _parse_simple_yaml(
+            "name: triage\ndescription: >-\n  Use when: a ticket arrives\n  and needs a queue.\n"
+            "category: ops\nmetadata:\n  version: 1.2"
+        )
+        assert result == {
+            "name": "triage",
+            "description": "Use when: a ticket arrives and needs a queue.",
+            "category": "ops",
+            "metadata": {"version": "1.2"},
+        }
+
+    def test_an_empty_block_scalar_is_empty_not_its_header(self):
+        assert _parse_simple_yaml("description: >-\nname: x") == {"description": "", "name": "x"}
+
+    def test_a_skill_whose_yaml_falls_back_keeps_its_folded_description(self, tmp_path):
+        """`key: value: more` elsewhere is not YAML, so the whole frontmatter takes the
+        simple reader: that is how a `>-` reached the platform."""
+        path = _write_skill(
+            tmp_path, "triage",
+            "name: triage\ndescription: >-\n  Pick the queue a ticket\n  belongs to.\n"
+            "category: Use when: support",
+        )
+        result = parse_skill_md(str(path))
+        assert result["description"] == "Pick the queue a ticket belongs to."
+        fm, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm["description"] == "Pick the queue a ticket belongs to."  # what `skills sync` posts
 
 
 # ── discover_skills ───────────────────────────────────────

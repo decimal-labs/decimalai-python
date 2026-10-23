@@ -1002,19 +1002,74 @@ def _taxonomy(frontmatter: Dict[str, Any]) -> Dict[str, Optional[str]]:
     }
 
 
+# A YAML block-scalar header: `|` or `>`, then a chomping and an indentation indicator in either
+# order (`>-`, `|+`, `>2`, `|2-`), as `description: >-` opens a description on the lines below.
+_BLOCK_SCALAR_RE = re.compile(r"^([|>])([0-9]?)([+-]?)([0-9]?)\s*(?:#.*)?$")
+
+
+def _read_block_scalar(
+    lines: List[str], start: int, style: str, explicit_indent: int, chomp: str,
+) -> Tuple[str, int]:
+    """A top-level block scalar's text, and the index of the first line after it.
+
+    The block owns every following line that is blank or indented. ``|`` keeps the line
+    breaks; ``>`` folds a single break into a space and keeps a blank line as a break. Only
+    ``+`` keeps a trailing newline: these are one-line display fields. The platform reads
+    frontmatter the same way (``skillmd_parser._consume_block_scalar``), so a SKILL.md says
+    the same thing on both sides.
+    """
+    i, raw = start, []
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            break                          # back at column 0: the next key
+        raw.append(line)
+        i += 1
+    while raw and not raw[-1].strip():
+        raw.pop()
+    if not raw:
+        return "", i
+    indent = explicit_indent or min(len(x) - len(x.lstrip(" \t")) for x in raw if x.strip())
+    body = [x[indent:] if len(x) >= indent else x.lstrip() for x in raw]
+    if style == "|":
+        value = "\n".join(body)
+    else:
+        value = ""
+        for n, ln in enumerate(body):
+            if n == 0:
+                value = ln
+            elif not ln.strip():
+                value += "\n"
+            elif not body[n - 1].strip():
+                value += ln
+            else:
+                value += " " + ln
+    if chomp == "+":
+        return value + "\n", i
+    return value.rstrip("\n"), i
+
+
 def _parse_simple_yaml(yaml_str: str) -> Dict[str, Any]:
     """Parse simple key: value YAML without external deps.
 
-    Handles basic scalar values and simple nested maps (metadata block).
-    Not a full YAML parser — sufficient for SKILL.md frontmatter. It is the
-    fallback for frontmatter that is not valid YAML, and the reader when
-    skillevaluation is not installed.
+    Handles basic scalar values, block scalars (``description: >-`` with its text on the
+    indented lines below) and simple nested maps (metadata block). Not a full YAML parser,
+    but sufficient for SKILL.md frontmatter. It is the fallback for frontmatter that is not
+    valid YAML, and the reader when skillevaluation is not installed.
+
+    Before 2026-10-23 it stored a block scalar's header as the value (``description: >-``
+    read as ``">-"``) and dropped its text: 17 skills on the platform had ``>-`` as the
+    description their agents' menus showed.
     """
     result: Dict[str, Any] = {}
     current_key = None
     current_map: Optional[Dict[str, str]] = None
 
-    for line in yaml_str.split("\n"):
+    lines = yaml_str.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -1035,7 +1090,14 @@ def _parse_simple_yaml(yaml_str: str) -> Dict[str, Any]:
             current_key = match.group(1)
             value = match.group(2).strip()
             current_map = None
-            if value:
+            block = _BLOCK_SCALAR_RE.match(value)
+            if block:
+                style, indent_a, chomp, indent_b = block.groups()
+                result[current_key], i = _read_block_scalar(
+                    lines, i, style, int(indent_a or indent_b or 0), chomp,
+                )
+                current_key = None  # its indented lines were its text, not a nested map
+            elif value:
                 result[current_key] = value.strip('"').strip("'")
             else:
                 result[current_key] = None  # Will be replaced if nested map follows
