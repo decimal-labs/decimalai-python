@@ -36,3 +36,16 @@ def test_the_boot_sync_names_its_agent_and_never_undoes_a_removal(module):
         f"{module}: the boot sync must send add_to_agent='unless_removed', or every restart re-adds "
         "skills removed from the agent on the dashboard"
     )
+
+
+@pytest.mark.parametrize("module", ["langchain.py", "openai_agents.py"])
+def test_a_boot_sync_that_names_no_agent_says_so(module):
+    """With no agent named (agent_name is None), the skills a boot sync creates are on no
+    agent: the adapter must call the helper that says so once (skill_router)."""
+    tree = ast.parse((PKG / module).read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_note_boot_sync_without_agent"
+    ]
+    assert len(calls) == 1, f"{module}: the boot sync never says its new skills are on no agent"

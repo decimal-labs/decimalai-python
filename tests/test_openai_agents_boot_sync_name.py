@@ -7,6 +7,8 @@ skills, and the agent the traces named got none.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 agents = pytest.importorskip("agents")
@@ -65,3 +67,15 @@ def test_with_no_other_name_the_agents_own_name_is_used(synced, monkeypatch):
     _named(monkeypatch, None)
     oa.instrument(agent=agents.Agent(name="assistant", instructions="Help."), skills=[SKILL], disk_sync=True)
     assert [c["agent_name"] for c in synced] == ["assistant"]
+
+
+def test_with_no_name_at_all_the_skills_still_sync_and_it_says_they_are_on_no_agent(
+        synced, monkeypatch, caplog):
+    """No init name, no agent_name=, no Agent: the sync names no agent, so the skills it creates
+    are opt-in and on none, and one warning says so."""
+    _named(monkeypatch, None)
+    monkeypatch.setattr(sr_mod, "_warned_boot_sync_without_agent", False)
+    with caplog.at_level(logging.WARNING, logger="decimalai.skill_router"):
+        oa.instrument(skills=[SKILL], disk_sync=True)
+    assert [c["agent_name"] for c in synced] == [None]
+    assert [r for r in caplog.records if "reach no agent" in r.getMessage()]

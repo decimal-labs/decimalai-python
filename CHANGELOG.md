@@ -4,6 +4,25 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Changed: a skill the SDK creates reaches only the agents you add it to
+
+- `SkillRouter.create_skill()`, `sync_skills()` and `fork()` default to `offer_scope="restricted"` and
+  always send it, so a new skill goes on the agent you name (`agent_name=`) and no other, whatever the
+  platform's own default for a request that says nothing (every agent, for an API key, until its
+  contract step). Pass `offer_scope="workspace"` for every agent. Skills that already exist keep
+  theirs. Through 0.25.0 these sent nothing unless asked. `skills benchmark`'s sync sends it too.
+- `decimalai skills sync` takes `--to-agent NAME`, as `skills add` does (every synced skill goes on
+  that agent, made if it doesn't exist yet, except one someone removed from it on the dashboard),
+  and `--offer-scope restricted|workspace`. It names what went on the agent and what was left off, says
+  when the agent could not be made, and says when the skills it created are on no agent.
+  `--dry-run` says which agents new skills would reach.
+- `sync_to_platform()` takes `agent_name=` and `offer_scope=` the same way.
+- The LangChain and OpenAI Agents boot sync (`instrument(disk_sync=True)`) with no agent named still
+  uploads the skills you wrote, and logs one warning when it created any: they are on no agent until
+  the agent is named (the next boot adds them) or they are added on the dashboard.
+
 ## [0.25.0] — 2026-10-23
 
 ### Changed: an agent's skills live in one place: the project's list before a key, DecimalAI after

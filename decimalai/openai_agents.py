@@ -1275,7 +1275,11 @@ def instrument(
 
             def _sync_skills_background(sync_name: Optional[str]):
                 try:
-                    from .skill_router import SkillRouter, _sync_up_items
+                    from .skill_router import (
+                        SkillRouter,
+                        _note_boot_sync_without_agent,
+                        _sync_up_items,
+                    )
                     from .skills import _with_local_timestamps
 
                     items, managed = _sync_up_items(_with_local_timestamps(resolved_skills))
@@ -1309,6 +1313,10 @@ def instrument(
                         agent_name=sync_name,
                         add_to_agent="unless_removed",
                     )
+                    if not sync_name:
+                        # New skills are opt-in: with no agent named, the ones this sync
+                        # creates are on none, and that has to be said.
+                        _note_boot_sync_without_agent(result)
                     synced = result.get("synced", 0)
                     created = result.get("created", 0)
                     logger.info(

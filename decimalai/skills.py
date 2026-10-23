@@ -1205,6 +1205,8 @@ def sync_to_platform(
     include_global: bool = False,
     author: Optional[str] = None,
     conflict_policy: str = "newer_wins",
+    agent_name: Optional[str] = None,
+    offer_scope: str = "restricted",
 ) -> Dict[str, Any]:
     """Discover local SKILL.md files and push them to the platform.
 
@@ -1232,6 +1234,13 @@ def sync_to_platform(
             (git-aware timestamps decide; never blind-clobber a newer remote
             edit). Pass ``"local_wins"`` for CI where the repo is the source of
             truth, or ``"remote_wins"`` to never overwrite.
+        agent_name: Add the synced skills to this agent, made if it doesn't exist
+            yet, except one a person removed from it on the dashboard. Without it, a
+            skill this sync creates is on no agent until you add it to one (unless
+            ``offer_scope="workspace"``).
+        offer_scope: Which agents get the skills this sync creates (existing skills
+            keep theirs): ``"restricted"`` (the default), only the agents you add
+            them to; ``"workspace"``, every agent in the org.
 
     Returns:
         Summary dict with created, updated, unchanged counts.
@@ -1308,6 +1317,9 @@ def sync_to_platform(
         conflict_policy=conflict_policy,
         install_id=install_id,
         install_label=install_label,
+        agent_name=agent_name,
+        add_to_agent="unless_removed" if agent_name else None,
+        offer_scope=offer_scope,
     )
 
     logger.info(

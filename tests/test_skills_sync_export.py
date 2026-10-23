@@ -119,8 +119,9 @@ class TestSkillRouterForkAndUse:
         mock_export.assert_not_called()
         assert out["skill"]["name"] == "pdf"
 
-    def test_fork_says_which_agents_get_the_copy_only_when_asked(self):
-        """`offer_scope` rides as a query param (new skills are opt-in since 2026-10-22)."""
+    def test_fork_always_says_which_agents_get_the_copy(self):
+        """`offer_scope` rides as a query param, "restricted" when the caller says nothing
+        (new skills are opt-in since 2026-10-22, whatever the platform's silent default)."""
         router = self._router()
         seen = []
 
@@ -134,7 +135,8 @@ class TestSkillRouterForkAndUse:
             router.fork("pdf")
             router.fork("pdf", offer_scope="restricted")
             router.fork("pdf", new_name="my-pdf", offer_scope="workspace")
-        assert seen == [None, {"offer_scope": "restricted"}, {"new_name": "my-pdf", "offer_scope": "workspace"}]
+        assert seen == [{"offer_scope": "restricted"}, {"offer_scope": "restricted"},
+                        {"new_name": "my-pdf", "offer_scope": "workspace"}]
 
     def test_use_posts_to_use_endpoint_not_fork(self):
         """use() resolves the registry skill then POSTs /use (a linked pointer, no fork)."""

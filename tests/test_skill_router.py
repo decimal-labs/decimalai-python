@@ -103,7 +103,8 @@ class TestSkillRouter:
         with patch.object(router, "_request", return_value={"status": "ok", "created": 1}) as mock_req:
             result = router.sync_skills(skills, author="test-user")
             # SDK defaults: local_wins (repo IS the source of truth in CI)
-            # + summary response mode (no body bytes needed in the response).
+            # + summary response mode (no body bytes needed in the response)
+            # + new skills only on the agents they are added to (D1).
             mock_req.assert_called_once_with(
                 "POST",
                 "/api/v1/skills/sync",
@@ -112,6 +113,7 @@ class TestSkillRouter:
                     "conflict_policy": "local_wins",
                     "response_mode": "summary",
                     "author": "test-user",
+                    "offer_scope": "restricted",
                 },
             )
             assert result["created"] == 1
@@ -173,7 +175,7 @@ class TestSkillRouterCRUD:
 
     def test_create_skill(self):
         router = self._router()
-        with patch.object(router, "_request", return_value={"skill_id": "x"}) as mock:
+        with patch.object(router, "_request", return_value={"skill_id": "x", "offer_scope": "restricted"}) as mock:
             result = router.create_skill(
                 "test-skill", "A test", "# Body",
                 category="dev", trigger_phrases=["test it"],
@@ -227,10 +229,16 @@ class TestSkillRouterCRUD:
             mock.assert_called_once()
             assert mock.call_args[1]["json"]["offer_scope"] == "restricted"
             assert result == reply
-        with patch.object(router, "_request", return_value={"skill_id": "x"}) as mock:
+        # Said even when the caller says nothing, so a skill reaches the same agents whatever
+        # the platform's own default for a silent create (opt-in since D1's contract step).
+        with patch.object(router, "_request", return_value={"skill_id": "x", "offer_scope": "restricted"}) as mock:
             router.create_skill("s", "d", "# Body")
             mock.assert_called_once()
-            assert "offer_scope" not in mock.call_args[1]["json"]
+            assert mock.call_args[1]["json"]["offer_scope"] == "restricted"
+        with patch.object(router, "_request", return_value={"skill_id": "x", "offer_scope": "workspace"}) as mock:
+            router.create_skill("s", "d", "# Body", offer_scope="workspace")
+            mock.assert_called_once()
+            assert mock.call_args[1]["json"]["offer_scope"] == "workspace"
 
     def test_create_skill_offer_scope_on_an_older_backend(self):
         """An older backend ignores the field and does not echo it, so the SDK
@@ -255,7 +263,7 @@ class TestSkillRouterCRUD:
             result = router.create_skill("s", "d", "# Body", agent_name="support")
             mock.assert_called_once()
             assert mock.call_args[1]["json"]["agent_name"] == "support"
-            assert "offer_scope" not in mock.call_args[1]["json"]
+            assert mock.call_args[1]["json"]["offer_scope"] == "restricted"
             assert result == reply
 
     def test_create_skill_for_an_agent_on_an_older_backend(self):
@@ -272,12 +280,15 @@ class TestSkillRouterCRUD:
         assert mock.call_args_list[1][1]["json"] == {"offer_scope": "restricted"}
         assert result["offer_scope"] == "restricted" and result["added_to_agent"] == "support"
 
-    def test_sync_skills_says_who_gets_new_skills_only_when_asked(self):
+    def test_sync_skills_always_says_who_gets_new_skills(self):
+        """A sync that names nothing still sends "restricted": its new skills reach the same
+        agents (none, until added) whatever the platform's default for a silent sync."""
         router = self._router()
         with patch.object(router, "_request", return_value={"status": "ok"}) as mock:
             router.sync_skills([{"name": "a", "body_markdown": "# A"}])
             body = mock.call_args[1]["json"]
-            assert "offer_scope" not in body and "agent_name" not in body and "add_to_agent" not in body
+            assert body["offer_scope"] == "restricted"
+            assert "agent_name" not in body and "add_to_agent" not in body
             router.sync_skills([{"name": "a", "body_markdown": "# A"}], offer_scope="workspace")
             assert mock.call_args[1]["json"]["offer_scope"] == "workspace"
             router.sync_skills([{"name": "a", "body_markdown": "# A"}], agent_name="support", add_to_agent="unless_removed")

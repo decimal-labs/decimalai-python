@@ -1342,6 +1342,35 @@ def _backup_before_pull(target: Path, name: str) -> Optional[Path]:
         return None
 
 
+def _new_skills_reach(agent_name: Optional[str], offer_scope: str) -> str:
+    """Which agents a skill `skills sync` creates reaches, said in words."""
+    if offer_scope == "workspace":
+        return "every agent in your organization"
+    if agent_name:
+        return f"{agent_name} (and any agent you add them to)"
+    return "no agent until you add them to one (--to-agent NAME)"
+
+
+def _echo_sync_agent(result: dict, agent_name: Optional[str], offer_scope: str, *, created: int) -> None:
+    """After a sync: what went on the agent, or where the skills it created are offered."""
+    if agent_name and result.get("agent_not_found"):
+        why = result.get("agent_problem") or "no agent could be made under that name"
+        click.echo(f"  ✗ Not added to {agent_name}: {why}", err=True)
+    elif agent_name and result.get("added_to_agent"):
+        added = result.get("added") or []
+        if added:
+            click.echo(f"  ✓ On {result['added_to_agent']}: {', '.join(added)}")
+        kept_off = result.get("kept_off") or []
+        if kept_off:
+            click.echo(f"  • Left off {result['added_to_agent']} (removed there; add it back on the "
+                       f"agent's page): {', '.join(kept_off)}")
+    if created and offer_scope == "restricted" and not agent_name:
+        click.echo(
+            f"  • New skills reach only the agents you add them to; these {created} are on none yet.\n"
+            "    → decimalai skills sync --to-agent NAME   (or add them on the agent's page)"
+        )
+
+
 @skills.command("sync")
 @click.argument("skills_dir", type=click.Path(exists=True, file_okay=False), required=False)
 @click.option(
@@ -1355,14 +1384,29 @@ def _backup_before_pull(target: Path, name: str) -> Optional[Path]:
     default=False,
     help="Walk and hash but don't POST. Useful for previewing what would change.",
 )
+@click.option(
+    "--to-agent", "agent_name", metavar="NAME",
+    help="Add the synced skills to this agent (made if it doesn't exist yet), except one "
+         "someone removed from it there.",
+)
+@click.option(
+    "--offer-scope", type=click.Choice(["restricted", "workspace"]), default="restricted",
+    show_default=True,
+    help="Which agents get a skill this sync creates: only the agents you add it to, "
+         "or every agent in the organization. Existing skills keep theirs.",
+)
 @common_options
-def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
+def skills_sync(skills_dir, apply_pulls, dry_run, agent_name, offer_scope, api_key, base_url):
     """Sync the SKILL.md files you wrote with your organization on DecimalAI.
 
     Without SKILLS_DIR: every SKILL.md under ./skills, and each skill you wrote that
     .decimal/skills.toml lists under [authored] (`decimalai skills add <name>`), in its
     folder in .agents/skills. With SKILLS_DIR: every SKILL.md under it. A folder
     `decimalai skills add` installed from the registry is never sent.
+
+    A skill this sync creates reaches only the agents you add it to: name one with
+    --to-agent (`--to-agent support-agent`), or add it on the agent's page later. Pass
+    --offer-scope workspace for every agent in the organization instead.
 
     Each skill's instructions are compared with DecimalAI's copy and with what this
     checkout last synced:
@@ -1412,6 +1456,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
         click.echo("  --dry-run: skipping POST")
         for entry in skills_payload:
             click.echo(f"    • {entry['name']:<40s}  hash={entry['content_hash'][:12]}")
+        click.echo(f"  New skills would reach: {_new_skills_reach(agent_name, offer_scope)}")
         return
 
     # Stamp this checkout's install identity so the backend records a per-install
@@ -1435,7 +1480,15 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
                 "skills": skills_payload,
                 "conflict_policy": policy,
                 "response_mode": "diff",
+                # Always said, so a new skill reaches the same agents whatever the
+                # platform's own default for a sync that says nothing.
+                "offer_scope": offer_scope,
             }
+            if agent_name:
+                sync_body["agent_name"] = agent_name
+                # A skill someone took off the agent on the dashboard stays off: a sync
+                # run again (in CI, say) must not undo that.
+                sync_body["add_to_agent"] = "unless_removed"
             if install_id:
                 sync_body["install_id"] = install_id
                 if identity.get("install_label"):
@@ -1500,6 +1553,7 @@ def skills_sync(skills_dir, apply_pulls, dry_run, api_key, base_url):
         click.echo(f"    ~ {item.get('name')} (metadata only — no new version)")
     for item in by_action["failed"]:
         click.echo(f"    ✗ {item.get('name')}: {item.get('error')}", err=True)
+    _echo_sync_agent(result, agent_name, offer_scope, created=len(by_action["created"]))
 
     pulled = by_action["pulled"]
     if pulled and apply_pulls:
@@ -2003,6 +2057,8 @@ def skills_benchmark(skill_dir, api_key, base_url, model, runs, trials):
                 }
             ],
             "conflict_policy": "local_wins",  # benchmark always pushes local
+            # A skill created only to benchmark it is offered to no agent until you add it.
+            "offer_scope": "restricted",
         }
         eval_yaml_path = base / "eval.yaml"
         if eval_yaml_path.exists():

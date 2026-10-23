@@ -454,11 +454,13 @@ If you already have SKILL.md files (from `npx skills add`, your team's repo, or 
 
 ```python
 import decimalai
-decimalai.init(api_key="dai_sk_...")
+decimalai.init(api_key="dai_sk_...", agent_name="support-agent")
 
 from decimalai.openai_agents import instrument
-instrument()  # Scans .claude/skills/, .agents/skills/, etc. → syncs the ones you wrote to the dashboard
+instrument(disk_sync=True)  # Scans .claude/skills/, .agents/skills/, etc. → syncs the ones you wrote onto support-agent
 ```
+
+A new skill reaches only the agents you add it to, so name the agent: `decimalai skills sync --to-agent support-agent` does the same from the command line, and a sync that names none leaves the skills it creates on no agent.
 
 Supports 32 agent runtimes: Claude Code, Cursor, Copilot, Windsurf, Continue, and more.
 
@@ -476,7 +478,8 @@ results = router.search("code review security")
 # Link a skill into your workspace (no copy): your agents are offered it, and it tracks the author's updates
 router.use("pdf")
 
-# Take an editable copy, only if you intend to change it
+# Take an editable copy, only if you intend to change it: it replaces the original on the agents
+# that had it, and reaches others when you add it to them (offer_scope="workspace": every agent)
 router.fork("pdf")
 ```
 
