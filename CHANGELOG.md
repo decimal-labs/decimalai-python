@@ -4,6 +4,26 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### New: `decimalai agents apply-pack`, a role pack on an agent that already exists
+
+- A pack applied only when an agent was created (`agents create --pack`); an agent that already
+  existed could not take one. `decimalai agents apply-pack AGENT PACK` makes the pack's starter
+  prompt the agent's next prompt version (the earlier ones stay on the Prompt tab) and adds its
+  starter skills; skills already on the agent stay. It is one change on the agent's Versions
+  page, the same Review & apply the dashboard runs.
+- It shows what changes first and asks (`--yes` skips the question, `--dry-run` changes nothing),
+  then lists the starter's `<blanks>` to fill in on the Prompt tab. Your code doesn't change:
+  `agent_config()` reads the new prompt and skills on its next run.
+- `--keep-prompt` adds only the skills, `--no-starters` takes only the prompt, `--skill` adds more.
+  A skill DecimalAI refuses (blocked, or past your plan's skill limit) is left out and named, and
+  the rest applies. An agent pinned to an older prompt version keeps its pin, and the command
+  says the new text is saved but not served.
+- New client methods behind it: `DecimalAIClient.preview_agent_setup()` and `apply_agent_setup()`.
+  Needs a DecimalAI backend with Review & apply's `set_prompt_text` change (decimal.ai has it
+  once the platform ships).
+
 ## [0.25.0] — 2026-10-23
 
 ### Changed: an agent's skills live in one place: the project's list before a key, DecimalAI after

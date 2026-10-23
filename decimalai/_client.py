@@ -1014,6 +1014,48 @@ class DecimalAIClient:
         resp = self._request_with_retry("POST", "/api/v1/agents", json=body)
         return cast(CreateAgentResponse, resp.json())
 
+    def preview_agent_setup(self, agent_name: str, changes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """What applying ``changes`` to an agent would do — the dashboard's Review, writing nothing.
+
+        ``changes`` are Review & apply ops, e.g. ``{"op": "add_skill", "skill_id": ...}`` or
+        ``{"op": "set_prompt_text", "pack": "support"}``. A change that can't be made comes back
+        as its ``problem`` (and in ``problems``), not as an error. Pass the result's
+        ``base_fingerprint`` to :meth:`apply_agent_setup` so a change made meanwhile is refused.
+
+        Raises:
+            DecimalAPIError: 404 when there is no such agent, 422 for a malformed change.
+        """
+        quoted = urllib.parse.quote(str(agent_name), safe="")
+        resp = self._request_with_retry(
+            "POST", f"/api/v1/agents/{quoted}/setup/preview", json={"changes": changes}, idempotent=True,
+        )
+        return cast(Dict[str, Any], resp.json())
+
+    def apply_agent_setup(
+        self,
+        agent_name: str,
+        changes: List[Dict[str, Any]],
+        *,
+        base_fingerprint: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply ``changes`` to an agent in one transaction, recorded as one config version.
+
+        Raises:
+            DecimalAPIError: 409 when the agent changed since ``base_fingerprint`` was read,
+                422 when a change can't be made (nothing is applied), 403 without the editor role.
+        """
+        quoted = urllib.parse.quote(str(agent_name), safe="")
+        body: Dict[str, Any] = {"changes": changes}
+        if base_fingerprint is not None:
+            body["base_fingerprint"] = base_fingerprint
+        if note is not None:
+            body["note"] = note
+        # Not `idempotent=True`: a 500 may have applied. With a base_fingerprint, a replay after a
+        # 502/504 that did land answers 409 (the fingerprint moved) instead of applying twice.
+        resp = self._request_with_retry("POST", f"/api/v1/agents/{quoted}/setup/apply", json=body)
+        return cast(Dict[str, Any], resp.json())
+
     def get_agent_prompt(
         self,
         agent_name: str,
