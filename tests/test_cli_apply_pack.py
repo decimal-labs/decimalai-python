@@ -102,8 +102,8 @@ def test_it_reviews_then_applies_the_pack_by_slug_with_the_reviewed_fingerprint(
     out = result.output
     assert "Prompt: v2 → v3, the Support starter prompt (2 lines)" in out
     assert "Skills: 2 added, 1 already on the agent" in out and "+ reply-format" in out
-    assert "Writes version 4 on the Versions page." in out
-    assert "✓ Applied the Support pack to order-support (version 4)" in out
+    assert "Writes setup v4 on the agent's Versions page." in out
+    assert "✓ Applied the Support pack to order-support (setup v4)" in out
     assert "Prompt: saved as v3" in out
     # The blanks the reader fills next, and where.
     assert "<product>" in out and "<only what your code attaches>" in out
