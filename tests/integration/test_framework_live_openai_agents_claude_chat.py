@@ -21,15 +21,17 @@ THE ENVIRONMENT
 ---------------
 ``openai-agents`` needs ``openai>=3`` and LiteLLM's current releases pin ``openai<3``, so neither
 of the SDK's two test environments holds both: today ``openai-agents[litellm]`` installs LiteLLM
-1.83.0, the one release that fits beside openai 3. Run this file in a venv built for it::
+1.83.0, the one release that fits beside openai 3. The ``openai-agents-litellm-tests`` extra
+names that set. Run this file in a venv built from it::
 
     uv venv -p 3.12 .venv-agents-litellm
-    uv pip install -p .venv-agents-litellm/bin/python -e ".[openai-agents,test-toolchain]" \\
-        "openai-agents[litellm]"
+    uv pip install -p .venv-agents-litellm/bin/python -e ".[openai-agents-litellm-tests]"
     RUN_LIVE_LLM_TESTS=1 ANTHROPIC_API_KEY=... .venv-agents-litellm/bin/python -m pytest \\
         tests/integration/test_framework_live_openai_agents_claude_chat.py -s
 
-It skips elsewhere (no LiteLLM).
+It skips elsewhere (no LiteLLM). The release gate runs it the same way, in a venv it builds from
+that extra under its own locks with litellm pinned (platform ``release_gate``, the Claude chat
+leg), and reads the model and the request count from the line this file prints at the end.
 
 THINKING ON CLAUDE 5.x
 ----------------------
@@ -138,7 +140,7 @@ def _reset_sdk():
 @pytest.fixture(scope="module", autouse=True)
 def _report_spend():
     yield
-    print(f"\nAnthropic requests sent by {__name__.rsplit('.', 1)[-1]}: {_SPENT[0]} "
+    print(f"\nAnthropic requests sent by {__name__.rsplit('.', 1)[-1]} ({MODEL}): {_SPENT[0]} "
           f"(budget {REQUEST_BUDGET})")
 
 

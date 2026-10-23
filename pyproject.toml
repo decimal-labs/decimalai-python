@@ -228,6 +228,17 @@ live-llm-tests = [
     "anthropic>=1.13.0",
     "langchain-anthropic>=1.7.6",
 ]
+# The live OpenAI Agents chat on Claude through LiteLLM
+# (tests/integration/test_framework_live_openai_agents_claude_chat.py). openai 3 world,
+# and a world of its own: openai-agents needs openai>=3, and LiteLLM 1.83.0 is the one
+# LiteLLM release that installs beside it (every later one pins openai<3), so neither
+# test environment holds both. The release gate builds a venv from this extra under its
+# locks, with litellm pinned there, not here (platform release_gate, the Claude chat leg).
+# Install with: pip install -e ".[openai-agents-litellm-tests]"
+openai-agents-litellm-tests = [
+    "decimalai[test-toolchain]",
+    "openai-agents[litellm]>=0.23.1",
+]
 # The live CrewAI OTEL test (tests/integration/test_framework_live_crewai.py):
 # CrewAI on Gemini. OPENAI 2 WORLD (crewai pins openai<3), and a world of its own:
 # crewai's `google-genai` extra pins google-genai~=1.65.0, which google-adk and
