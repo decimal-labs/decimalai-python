@@ -814,6 +814,209 @@ def agents_create(agent_name, pack, prompt_file, skill_refs, no_starters, descri
     click.echo("")
 
 
+def _error_body(exc) -> dict:
+    """The JSON body of a failed call, or {} — Review & apply's 4xx detail is an object."""
+    try:
+        body = exc.response.json()
+    except Exception:  # noqa: BLE001 — a non-JSON error body has no detail to read
+        return {}
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return detail if isinstance(detail, dict) else {"message": detail} if detail else {}
+
+
+def _prompt_blanks(text: str) -> list:
+    """The `<angle-bracket blanks>` a starter prompt leaves for the user to fill, in order."""
+    import re
+
+    return list(dict.fromkeys(re.findall(r"<[^<>\n]{1,120}>", text or "")))
+
+
+@agents.command("apply-pack")
+@click.argument("agent_name")
+@click.argument("pack")
+@click.option("--keep-prompt", is_flag=True, default=False,
+              help="Add the pack's starter skills and leave the agent's prompt as it is.")
+@click.option("--no-starters", is_flag=True, default=False,
+              help="Take the pack's starter prompt but none of its starter skills.")
+@click.option("--skill", "skill_refs", multiple=True, metavar="SLUG",
+              help="Also add a skill: one of yours or a public registry skill, by name, slug or id. Repeatable.")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what applying would do, and change nothing.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, default=False, help="Apply without asking first.")
+@common_options
+def agents_apply_pack(agent_name, pack, keep_prompt, no_starters, skill_refs, dry_run, assume_yes,
+                      api_key, base_url):
+    """Apply a role pack to an agent that already exists.
+
+    \b
+    Examples:
+        $ decimalai agents apply-pack order-support support
+        $ decimalai agents apply-pack order-support support --dry-run
+        $ decimalai agents apply-pack triage support --keep-prompt
+
+    The pack's starter prompt becomes the agent's next prompt version (the
+    old ones stay on the Prompt tab) and its starter skills are added; skills
+    already on the agent stay. It is one change on the agent's Versions page.
+    Your code doesn't change: agent_config() reads the new prompt and skills
+    on its next run. Fill in the starter's <blanks> on the Prompt tab.
+    """
+    import httpx
+
+    from .._client import DecimalAPIError
+
+    if keep_prompt and no_starters and not skill_refs:
+        raise click.UsageError("--keep-prompt with --no-starters leaves nothing to apply.")
+
+    dashboard = _dashboard_url(base_url)
+    quoted_name = urllib.parse.quote(agent_name, safe="")
+    client = _make_client(api_key, base_url)
+    try:
+        # The pack's starter set as this workspace's create form offers it (same trust filter).
+        resp = _get_past_admission_aborts(
+            client._http, f"/api/v1/registry/packs/{urllib.parse.quote(pack, safe='')}?skill_limit=8",
+        )
+        if resp.status_code == 404:
+            try:
+                detail = resp.json().get("detail")
+            except Exception:  # noqa: BLE001 — a non-JSON 404 still means "no such pack"
+                detail = None
+            click.echo(f"  ✗ {detail or f'Unknown pack {pack!r}.'}", err=True)
+            raise SystemExit(1)
+        resp.raise_for_status()
+        data = resp.json()
+        pack_slug = data.get("slug") or pack
+        pack_name = data.get("name") or pack_slug
+        skill_ids = []
+        if not no_starters:
+            skill_ids = [s["id"] for s in data.get("starter_skills") or [] if s.get("id")]
+            missing = data.get("starter_skills_missing") or []
+            if missing:
+                click.echo(f"  ⚠ {len(missing)} of this pack's starter skills are unavailable right now "
+                           f"and won't be added: {', '.join(missing)}")
+        unresolved = []
+        for ref in skill_refs:
+            sid = _resolve_skill_id(client._http, ref)
+            if sid is None:
+                unresolved.append(ref)
+            elif sid not in skill_ids:
+                skill_ids.append(sid)
+        if unresolved:
+            for ref in unresolved:
+                click.echo(f"  ✗ No skill named {ref!r} in your workspace or the public registry.", err=True)
+            click.echo(f"    Browse skills at {dashboard}/skills. Nothing was changed.")
+            raise SystemExit(1)
+
+        changes = [] if keep_prompt else [{"op": "set_prompt_text", "pack": pack_slug}]
+        changes += [{"op": "add_skill", "skill_id": sid} for sid in skill_ids]
+        try:
+            review = client.preview_agent_setup(agent_name, changes)
+        except DecimalAPIError as e:
+            if e.status_code == 404:
+                click.echo(f"  ✗ No agent named {agent_name!r} in this workspace.", err=True)
+                click.echo(f"    Create one from the pack instead: decimalai agents create {agent_name} "
+                           f"--pack {pack_slug}")
+                raise SystemExit(1)
+            if e.status_code == 422:
+                click.echo(f"  ✗ {_error_body(e).get('message') or e.server_detail or e}", err=True)
+                raise SystemExit(1)
+            raise
+
+        # Skills already on the agent change nothing; a skill the server refuses (blocked, the
+        # plan's skill limit) would refuse the whole apply, so it is left out and named.
+        by_id = {c.get("skill_id"): c for c in review.get("changes") or [] if c.get("op") == "add_skill"}
+        already = [c for c in by_id.values() if c.get("was_on_list") and not c.get("problem")]
+        refused = [c for c in by_id.values() if c.get("problem")]
+        added = [c for c in by_id.values() if not c.get("was_on_list") and not c.get("problem")]
+        prompt_change = next((c for c in review.get("changes") or [] if c.get("op") == "set_prompt_text"), None)
+        if prompt_change is not None and prompt_change.get("problem"):
+            click.echo(f"  ✗ {prompt_change['problem']}", err=True)
+            raise SystemExit(1)
+        text = review.get("prompt_text") or {}
+        prompt_diff = next((d for d in review.get("diff") or [] if d.get("type") == "prompt_version"), None)
+
+        click.echo("")
+        click.echo(f"  Apply the {pack_name} pack to {agent_name}:")
+        if keep_prompt:
+            click.echo("    Prompt: unchanged (--keep-prompt)")
+        elif text and text.get("before") == text.get("after"):
+            click.echo(f"    Prompt: already the {pack_name} starter, unchanged")
+        else:
+            lines = len((text.get("after") or "").splitlines())
+            frm = ((prompt_diff or {}).get("from") or {}).get("version_number")
+            to = ((prompt_diff or {}).get("to") or {}).get("version_number")
+            step = f"v{frm} → v{to}" if frm and to else (f"v{to}" if to else "a new version")
+            click.echo(f"    Prompt: {step}, the {pack_name} starter prompt ({lines} lines)")
+        if added:
+            click.echo(f"    Skills: {len(added)} added" + (f", {len(already)} already on the agent" if already else ""))
+            for c in added:
+                click.echo(f"      + {c.get('skill')}")
+        elif skill_ids:
+            click.echo(f"    Skills: all {len(already)} already on the agent")
+        for c in refused:
+            click.echo(f"    ✗ Left out: {c['problem']}")
+        for note in review.get("notes") or []:
+            click.echo(f"    ⚠ {note}")
+
+        apply_changes = [c for c in changes if c.get("op") != "add_skill"
+                         or not by_id.get(c["skill_id"], {}).get("problem")]
+        # "noop" is about what the agent receives. New text while the agent is pinned changes
+        # nothing it receives, yet is still saved as a version (the note above says so).
+        new_text = bool(text) and text.get("before") != text.get("after")
+        if review.get("noop") and not new_text:
+            click.echo("")
+            click.echo(f"  Nothing to apply: {agent_name} already has this.")
+            return
+        if review.get("next_version_number"):
+            click.echo(f"    Writes version {review['next_version_number']} on the Versions page.")
+        if dry_run:
+            click.echo("")
+            click.echo("  Dry run: nothing was changed.")
+            return
+        click.echo("")
+        if not assume_yes and not click.confirm("  Apply it?", default=False):
+            click.echo("  Nothing was changed.")
+            raise SystemExit(1)
+
+        try:
+            result = client.apply_agent_setup(
+                agent_name, apply_changes, base_fingerprint=review.get("base_fingerprint"),
+                note=f"Applied the {pack_name} pack",
+            )
+        except DecimalAPIError as e:
+            body = _error_body(e)
+            if e.status_code == 409:
+                click.echo(f"  ✗ {body.get('message') or e.server_detail}", err=True)
+                click.echo(f"    Run `decimalai agents apply-pack {agent_name} {pack_slug}` again to review it.")
+                raise SystemExit(1)
+            if e.status_code in (403, 422):
+                click.echo(f"  ✗ {body.get('message') or e.server_detail or e}", err=True)
+                for problem in body.get("problems") or []:
+                    click.echo(f"    ✗ {problem}", err=True)
+                raise SystemExit(1)
+            raise
+    except httpx.HTTPError as e:
+        _http_die(e, base_url)
+    finally:
+        client.close()
+
+    saved = next((d for d in result.get("applied") or [] if d.get("op") == "set_prompt_text"), None)
+    version = (result.get("version") or {}).get("number")
+    click.echo(f"  ✓ Applied the {pack_name} pack to {agent_name}" + (f" (version {version})" if version else ""))
+    if saved and saved.get("action") == "created":
+        served = "" if saved.get("served") else " — not served: the agent is pinned to an older version"
+        click.echo(f"    Prompt: saved as v{saved.get('version_number')}{served}")
+    if added:
+        click.echo(f"    Skills added: {len(added)}")
+    blanks = _prompt_blanks(text.get("after")) if saved else []
+    click.echo("")
+    if blanks:
+        click.echo("  Next, fill in the starter's blanks on the Prompt tab:")
+        for b in blanks:
+            click.echo(f"    {b}")
+    click.echo("  Your code doesn't change: agent_config() reads the new prompt and skills on its next run.")
+    click.echo(f"  → {dashboard}/agents/{quoted_name}/prompt")
+    click.echo("")
+
+
 @cli.group()
 def traces():
     """Trace commands."""
