@@ -4,7 +4,62 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
-## [Unreleased]
+## [0.25.0] — 2026-10-23
+
+### Changed: an agent's skills live in one place: the project's list before a key, DecimalAI after
+
+- Without a DecimalAI key, an agent uses only the skills its project lists in
+  `.decimal/skills.toml`: registry skills under `[skills]` that the lock installed, and skills you
+  wrote, under the new `[authored]` table (`decimalai skills add <folder>` lists a folder in
+  `.agents/skills`). A folder there that the file does not list (a Codex or Cursor skill, say) is
+  left out, and named once. The registry is never searched with a run's message: 0.24's
+  per-message search, its relevance cutoff and adding a registry skill when the model loaded it
+  are gone, so a keyless run sends nothing at all.
+- The first keyed run of an agent copies the list onto it once: registry skills are assigned at
+  the lock's versions, and skills you wrote are uploaded and added. `.decimal/link.toml` records
+  what was copied (a project 0.24 connected reads as having copied everything its file listed). A
+  skill the copy could not give the agent is named, with how to add it; the copy is not retried.
+  After that the agent's skills live on DecimalAI, and a run never changes them: a later start
+  reads local files only, and says once when `skills.toml` lists a skill the agent was not given
+  (or at another version), or when a skill you wrote no longer matches DecimalAI's copy.
+- `decimalai skills add` in a connected project (or with the new `--to-agent NAME`) puts the skill
+  on the agent on DecimalAI instead of the file: a registry skill is assigned (pinned with `@N`,
+  else following the latest), a skill you wrote is uploaded and added, and `link.toml` records it.
+  When DecimalAI keeps an uploaded skill off the agent (a skill of that name may be deleted
+  there), the CLI and the first keyed run say so instead of reporting it added.
+  `decimalai skills remove <folder>` takes a skill you wrote off the list (its folder stays); in a
+  connected project it says the agent keeps the skill on DecimalAI.
+- `decimalai skills sync` lets DecimalAI's copy win when a skill was edited both there and
+  locally, and first copies your file to `.decimal/backup/sync-<time>/<name>/SKILL.md`; with no
+  directory it also syncs the listed skills you wrote, and records the synced text so runs stop
+  naming it. A platform without that rule answers 422, and the sync (and the first keyed run's
+  upload) asks again with the newer edit winning.
+
+### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
+
+- For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an
+  agent is built. `support = agent_config("support")`, then one run per user message:
+  `with support.run(question, variables=customer) as run:` gives `run.system` (the saved prompt,
+  filled, then the skill list), `run.message` (the user turn), `run.tools` (`load_skill` as a Chat
+  Completions tool) and `run.response_tools` (the same tool for the Responses API, strict). Answer
+  each tool call with `run.tool_result(call) or your_own(call)`: it returns the `tool` message (Chat
+  Completions) or the `function_call_output` item (Responses API) for a `load_skill` call, and
+  `None` for any other tool. `run.load_skill(name)` gives the text alone.
+- Each run is one trace, filed under the agent, with no other setup: `agent_config()` turns OpenAI
+  tracing on for the calls made inside its runs (only those), as the Anthropic module does. Until
+  now, raw OpenAI code used `decimalai.agent_config()`, translated `run.tool_spec` itself, and
+  needed `init(openai=True)`, `agent_run()` and an extra package for its runs to reach a trace.
+- `async with` and `await run.atool_result(call)` for `AsyncOpenAI`; `support.conversation()` keeps
+  a chat's system text and tool the same for every message, and `chat.state` resumes it. The tools
+  are plain dicts and calls are read as SDK objects or dicts, so OpenAI-compatible endpoints and
+  LiteLLM's `completion()` take the same run (their calls carry the run's record, untraced unless
+  made through an `openai` client).
+- The config is an `OpenAISDKAgentConfig`, so `print(support)` tells it apart from the OpenAI
+  Agents module's `OpenAIAgentConfig`.
+- `decimalai init --framework openai` writes the agent as a Chat Completions tool loop with an
+  example tool, keyless like the other templates.
+- The `[openai]` extra now installs `openinference-instrumentation-openai` beside `openai`, so
+  `init(openai=True)` and the module's tracing need no second install line.
 
 ### New: `decimalai.google_genai.agent_config()`, for your own Gemini calls (`google-genai`)
 
@@ -23,11 +78,43 @@ and patch releases are fixes.
 - The new `[google-genai]` extra installs `google-genai` and the instrumentor. The conformance
   matrix grades it (and `init(google=True)`, which had no driver) against a stub of
   `generateContent`.
+- Checked live on `gemini-3.5-flash` (2026-10-23, keyless), with a skill holding a token made
+  for the run, which is the only way to answer the question: a control without `agent_config()`
+  does not answer it, and a chat whose automatic function calling runs `run.tools` and a
+  hand-written `generate_content` loop over `run.tool_params` and `run.tool_result` both do. The
+  traced, keyed path is graded against the stub.
 
-### Changed: `decimalai.openai`'s config is `OpenAISDKAgentConfig`
+### Changed (breaking): LangChain agents get their prompt and skills from `agent_config()`, a `create_agent` middleware
 
-- It was `OpenAIAgentConfig`, the name the OpenAI Agents SDK module's config already had, so
-  `print(support)` could not tell the two apart. Unreleased, so nothing else moves.
+- `decimalai.langchain.agent_config("support")` returns the agent's prompt and skills as one
+  middleware: `create_agent(model, tools=[...], middleware=[support.middleware])`. Every model
+  call gets a system message (the saved prompt, filled from the run's `context=`, then the
+  agent's skill list) and a `load_skill` tool; the model reads a skill's full text with it, as a
+  tool result. Its runs are traced (it turns LangChain tracing on, like the other bindings) and
+  filed under the agent, with their prompt record.
+- A thread (a `thread_id`, with a checkpointer) keeps its first message's system message and
+  `load_skill` definition, in its private state, for every later message. Claude rejects a
+  changed system prompt once a thinking block is in the history, and an unchanged prefix is what
+  a prompt cache reuses; a prompt saved mid-chat reaches the next thread. A later message whose
+  skill list is cut to fit is routed on its own text, and the skills it picks that the thread has
+  not shown arrive as one tagged human message after the user's.
+- A hand-built LangGraph graph uses `support.system_message(messages, context=...)` (or
+  `asystem_message`) and `support.tools`.
+- It warns when `create_agent(system_prompt=)` is also set (pass your code's prompt as
+  `agent_config(..., fallback=...)`), when another tool is named `load_skill`, when Deep Agents'
+  skills run beside it, and on an async run on Python 3.10 (its trace leaves the model calls out).
+- **Removed:** the skill loader that patched `BaseChatModel.invoke`/`ainvoke`/`stream`/`astream`,
+  and `instrument()`'s `enable_skill_loader`, `enable_load_skill_tool`, `skill_body_top_k`,
+  `priority_skills` and `runtime_policy` (passing one raises `TypeError`).
+  `decimalai.init(langchain=True)` and `instrument()`
+  trace only; the first traced run with no `agent_config()` middleware says so, once
+  (`init(langchain=True, skills=False)` silences it). `instrument()` reads and uploads local
+  `SKILL.md` files only when asked (`disk_sync=True`, `skill_dirs=`, or the harness authority), as
+  the OpenAI Agents adapter does.
+- The `[langchain]` extra now installs `langchain` (create_agent and its middleware) beside
+  `langchain-core`, which brings `langgraph` with it.
+- `decimalai init`'s LangChain template is the middleware, with an example tool and no
+  `init()`; it runs keyless like the other templates.
 
 ### Changed: Pydantic AI's `agent_config()` traces its runs with no other line
 
@@ -37,8 +124,9 @@ and patch releases are fixes.
   first), sending only DecimalAI runs, and each run of the capability is instrumented with Pydantic
   AI's own `Instrumentation`, for that run alone: its model calls and its tool calls, results
   included, for any provider. Other agents in the process are not instrumented.
-- A run is a trace of its own, rooted in DecimalAI's run span and linked to the span open when it
-  started (a web request's, say), as an Anthropic or OpenAI run is. A conversation's runs carry its
+- A run (`run_stream()` included) is a trace of its own, rooted in DecimalAI's run span and linked
+  to the span open when it started (a web request's, say), as an Anthropic or OpenAI run is. A
+  conversation's runs carry its
   `conversation_id` as the trace's session. A later run whose routing decision is still in flight
   when it ends keeps its trace open until the decision lands (a few seconds at most, off the run's
   path; `decimalai.flush()` waits for it), so the trace carries it, as on the other bindings.
@@ -48,7 +136,8 @@ and patch releases are fixes.
   `init(openai=True)` (or `anthropic=True`, `google=True`) traces is not instrumented again.
 - `support` is now two capabilities in one, which Pydantic AI places apart: the prompt, skill list
   and `load_skill` where you list `support`, so instructions keep your order, and the run span
-  outermost, around Pydantic AI's `Instrumentation`.
+  outermost, around Pydantic AI's `Instrumentation`. `support.get_toolset()` is still
+  `load_skill`'s toolset.
 - `decimalai init --framework pydantic-ai` writes no `init()` and no `Agent.instrument_all()`, like
   the other `agent_config()` templates. So the documented file starts with DecimalAI unreachable:
   `init(otel=True)` verified the key at startup and raised `DecimalConfigError` before
@@ -92,61 +181,6 @@ and patch releases are fixes.
   is said with tracing switched off (`init(enabled=False)`) or for a keyless agent, which sends
   nothing anyway.
 
-### New: `decimalai.openai.agent_config()`, for your own OpenAI SDK loop
-
-- For code that calls OpenAI's Chat Completions or Responses API itself, the most common way an
-  agent is built. `support = agent_config("support")`, then one run per user message:
-  `with support.run(question, variables=customer) as run:` gives `run.system` (the saved prompt,
-  filled, then the skill list), `run.message` (the user turn), `run.tools` (`load_skill` as a Chat
-  Completions tool) and `run.response_tools` (the same tool for the Responses API, strict). Answer
-  each tool call with `run.tool_result(call) or your_own(call)`: it returns the `tool` message (Chat
-  Completions) or the `function_call_output` item (Responses API) for a `load_skill` call, and
-  `None` for any other tool. `run.load_skill(name)` gives the text alone.
-- Each run is one trace, filed under the agent, with no other setup: `agent_config()` turns OpenAI
-  tracing on for the calls made inside its runs (only those), as the Anthropic module does. Until
-  now, raw OpenAI code used `decimalai.agent_config()`, translated `run.tool_spec` itself, and
-  needed `init(openai=True)`, `agent_run()` and an extra package for its runs to reach a trace.
-- `async with` and `await run.atool_result(call)` for `AsyncOpenAI`; `support.conversation()` keeps
-  a chat's system text and tool the same for every message, and `chat.state` resumes it. The tools
-  are plain dicts and calls are read as SDK objects or dicts, so OpenAI-compatible endpoints and
-  LiteLLM's `completion()` take the same run (their calls carry the run's record, untraced unless
-  made through an `openai` client).
-- `decimalai init --framework openai` writes the agent as a Chat Completions tool loop with an
-  example tool, keyless like the other templates.
-- The `[openai]` extra now installs `openinference-instrumentation-openai` beside `openai`, so
-  `init(openai=True)` and the module's tracing need no second install line.
-
-### New: LangChain's `agent_config()`, a `create_agent` middleware (the skill loader is gone)
-
-- `decimalai.langchain.agent_config("support")` returns the agent's prompt and skills as one
-  middleware: `create_agent(model, tools=[...], middleware=[support.middleware])`. Every model
-  call gets a system message (the saved prompt, filled from the run's `context=`, then the
-  agent's skill list) and a `load_skill` tool; the model reads a skill's full text with it, as a
-  tool result. Its runs are traced (it turns LangChain tracing on, like the other bindings) and
-  filed under the agent, with their prompt record.
-- A thread (a `thread_id`, with a checkpointer) keeps its first message's system message and
-  `load_skill` definition, in its private state, for every later message. Claude rejects a
-  changed system prompt once a thinking block is in the history, and an unchanged prefix is what
-  a prompt cache reuses; a prompt saved mid-chat reaches the next thread. A later message whose
-  skill list is cut to fit is routed on its own text, and the skills it picks that the thread has
-  not shown arrive as one tagged human message after the user's.
-- A hand-built LangGraph graph uses `support.system_message(messages, context=...)` (or
-  `asystem_message`) and `support.tools`.
-- It warns when `create_agent(system_prompt=)` is also set (pass your code's prompt as
-  `agent_config(..., fallback=...)`), when another tool is named `load_skill`, when Deep Agents'
-  skills run beside it, and on an async run on Python 3.10 (its trace leaves the model calls out).
-- **Removed:** the skill loader that patched `BaseChatModel.invoke`/`ainvoke`/`stream`/`astream`,
-  and `instrument()`'s `enable_skill_loader`, `enable_load_skill_tool`, `skill_body_top_k`,
-  `priority_skills` and `runtime_policy`. `decimalai.init(langchain=True)` and `instrument()`
-  trace only; the first traced run with no `agent_config()` middleware says so, once
-  (`init(langchain=True, skills=False)` silences it). `instrument()` reads and uploads local
-  `SKILL.md` files only when asked (`disk_sync=True`, `skill_dirs=`, or the harness authority), as
-  the OpenAI Agents adapter does.
-- The `[langchain]` extra now installs `langchain` (create_agent and its middleware) beside
-  `langchain-core`, which brings `langgraph` with it.
-- `decimalai init`'s LangChain template is the middleware, with an example tool and no
-  `init()`; it runs keyless like the other templates.
-
 ### New: an agent's "always include" skills go into every run in full
 
 - A skill set to "always include" on the agent (in the dashboard, or with
@@ -160,12 +194,6 @@ and patch releases are fixes.
   none, and nothing changes.
 - `decimalai init --project` (the Support project) sets its three Support skills to always
   include, and its agent is the LangChain middleware; it needs a platform that has the setting.
-
-### Fixed: a run's prompt record no longer costs it its trace
-
-- A run whose agent has no span of its own name gets its `agent_config()` prompt record on a
-  `decimalai.prompt` span. That span had no start or end time, which the platform refuses, so the
-  whole trace was rejected. It now spans the run, under the run's root span.
 
 ### New: agents can take part in experiments (skill holdouts and prompt splits)
 
@@ -189,12 +217,52 @@ and patch releases are fixes.
 - Not taking part (they get the agent's configured setup): keyless runs, native skill loaders and
   `claude_agent_sdk`, `SkillRouter` used directly, and the CrewAI skill loader, whose runs can make
   several routing decisions.
+- DecimalAI does not start experiments yet. Until it does, no agent runs one, and runs route as
+  they did in 0.24.
 
-### Changed: skills syncs and boot syncs (from the Phase 2 work)
+### Changed: `decimalai init`'s files run without a DecimalAI key
 
-- `sync_skills(agent_name=, add_to_agent="all" | "unless_removed", offer_scope=)`. The adapters'
-  boot sync uses `"unless_removed"`: every synced skill goes on the agent except one a person
-  removed on the dashboard. The OpenAI adapter's boot sync uses the name its traces carry.
+- Every `agent_config()` template opened with `decimalai.init(agent_name=AGENT_NAME)`, and `init()`
+  raises without a key, so the file `decimalai init` wrote died on that line for anyone who ran it
+  without one (a teammate's clone, CI, a shell without `.env`), where `agent_config()` would have
+  run keyless. The `--framework` templates call no `init()`: with a key, `agent_config()`
+  initializes the SDK from the environment and turns its framework's tracing on (ADK's through
+  `DecimalAIPlugin()`), under the name it is given.
+- A non-default base URL, which `init(base_url=...)` carried, is set as `DECIMAL_BASE_URL` before
+  the `decimalai` import, where keyed and keyless runs both read it; a value you export wins.
+- The OpenAI Agents template gains an example `@function_tool` beside `*support.tools`.
+
+### Changed: OpenAI Agents traces carry the whole final answer; an unreachable DecimalAI no longer holds up exit
+
+- An OpenAI Agents run's trace carries its whole final answer (`final_output`, up to 20,000
+  characters) beside the 200-character preview, and evals (`trace_to_trace_data`, so
+  `batch_eval`) read it, so judges grade the answer rather than its first sentence and a half.
+  Other adapters' traces carry the preview, as before.
+- When DecimalAI cannot be reached, a failed manifest registration is one warning line naming the
+  agent and saying its traces are held and retried in the background (the traceback is at DEBUG),
+  in every adapter. Process exit no longer waits about 30 to 60 seconds per held trace: it waits
+  while sends complete, gives up on one that makes no progress for about 5 seconds, and says how
+  many traces were not sent.
+- Messages that quote an agent's name read cleanly ("reading the prompt of 'bot'", where it
+  printed `'bot''s prompt`).
+
+### Changed: skills you create or sync can name their agent
+
+- `SkillRouter.create_skill(agent_name=)` creates the skill opt-in (it reaches only the agents it
+  is added to) and puts it on that agent in one call; on an older platform the SDK restricts and
+  assigns it itself.
+- `SkillRouter.sync_skills(agent_name=, add_to_agent="all" | "unless_removed", offer_scope=)` and
+  `SkillRouter.fork(offer_scope=)`. The adapters' boot sync uses `"unless_removed"`: every synced skill goes
+  on the agent except one a person removed on the dashboard, so a second agent booting from the
+  same skills folder gets them too, and a removal survives a restart. The OpenAI Agents adapter's
+  boot sync uses the name its traces carry (it used the `Agent`'s own `name=`, which made a second
+  agent with the skills).
+
+### Fixed: a run's prompt record no longer costs it its trace
+
+- A run whose agent has no span of its own name gets its `agent_config()` prompt record on a
+  `decimalai.prompt` span. That span had no start or end time, which the platform refuses, so the
+  whole trace was rejected. It now spans the run, under the run's root span.
 
 ### Fixed: Pydantic AI traces show the skill text the model was given
 
