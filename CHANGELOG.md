@@ -24,6 +24,12 @@ and patch releases are fixes.
   Needs a DecimalAI backend with Review & apply's `set_prompt_text` change (decimal.ai has had it
   since 2026-10-23).
 
+### Fixed: `decimalai traces import --format` refuses a format it doesn't know
+
+- `--format` takes `auto`, `json` or `jsonl`. Anything else (`--format josn`) now stops with a
+  usage error before any request is sent; before, an unknown value was imported as JSON. Thanks to
+  @Doomguy-BFG9000 ([#24](https://github.com/decimal-labs/decimalai-python/pull/24)).
+
 ## [0.25.1] — 2026-10-23
 
 ### Changed: a skill the SDK creates reaches only the agents you add it to
