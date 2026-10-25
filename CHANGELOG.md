@@ -6,6 +6,39 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: `decimalai.evaluate()`, cases run through your agent and checked, setup against setup
+
+- `decimalai.evaluate(agent, "cases.jsonl", evals=[...])` runs each case once through an OpenAI
+  Agents SDK `Agent` built from `agent_config()`, runs your `@eval` checks on each run's trace, and
+  returns an `EvalReport`: `print()` it for each check's counts and the failures with their trace
+  links. `report.compare(other)` puts two setups side by side, with the cases whose outcome changed.
+  It counts; it does not call a difference an effect (a few cases, run once each, vary between runs
+  of one setup too). `await decimalai.evaluate_async(...)` is the same on a running event loop.
+- `prompt_version=4` runs every case on that saved prompt version instead of the served one, and
+  `exclude_skills=["refund-policy"]` leaves skills out (not listed, and `load_skill` refuses them).
+  Neither changes what production serves.
+- A case is a JSON object with an `input`; `id` names it, `context` goes to `Runner.run(context=...)`
+  (or pass `context=lambda case: ...` for a typed one), and every other field is yours: checks read
+  the row as `trace.case`. A check that raises is reported as an error on its case, never as a skip.
+- Each case is an evaluation run: its trace goes out once, with the checks' results attached, as
+  `source_type="evaluation"`, and DecimalAI keeps it out of the agent's own numbers (Home, Versions,
+  experiments).
+- `TraceData` gains `case`, `skills_offered` and `skills_loaded` (the skills listed to the model and
+  the ones it loaded with `load_skill`).
+
+### New: per-run overrides, `support.override(...)` and `run(prompt_version=, exclude_skills=)`
+
+- On OpenAI Agents, `with support.override(prompt_version=4) as trial:` around `Runner.run` makes the
+  runs inside use that version (or leave skills out, `exclude_skills=`); `trial.trace_id` and
+  `trial.trace_url` name the run's trace. On `decimalai.agent_config()`,
+  `support.run(message, prompt_version=4, exclude_skills=[...])`, with `run.trace_id` inside an
+  OpenTelemetry run. Both are evaluation runs, as above.
+- Fail closed: a run DecimalAI cannot confirm the override for does not start on the served setup.
+  It raises `decimalai.EvaluationNotApplied` for an unknown version or skill name (saying what the
+  agent has), no API key, an outage, or a DecimalAI backend from before evaluation runs.
+- Needs a DecimalAI backend that serves evaluation runs (`evaluation` on `GET /skills/menu` and
+  `POST /skills/route`).
+
 ### New: `decimalai agents apply-pack`, a role pack on an agent that already exists
 
 - A pack applied only when an agent was created (`agents create --pack`); an agent that already

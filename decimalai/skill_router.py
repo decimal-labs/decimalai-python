@@ -93,6 +93,34 @@ def consume_last_run_prompt() -> Optional[Dict[str, Any]]:
     return dict(value) if isinstance(value, dict) else None
 
 
+# An evaluation run (decimalai.evaluate(), `support.override(...)`): what the platform echoed of the
+# override the last routing call sent ({"prompt_version", "exclude_skills"}), or None when it echoed
+# nothing. A call that sent one and finds None was answered by a platform from before evaluation
+# runs, which served the agent's own setup instead.
+_last_evaluation_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "decimalai_skill_router_last_evaluation", default=None,
+)
+
+
+def consume_last_evaluation() -> Optional[Dict[str, Any]]:
+    """Read + clear the evaluation echo of the last routing answer (None: none echoed)."""
+    value = _last_evaluation_ctx.get()
+    _last_evaluation_ctx.set(None)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _evaluation_params(evaluation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """An evaluation run's request fields, the same on GET /skills/menu and POST /skills/route."""
+    if evaluation is None:
+        return {}
+    out: Dict[str, Any] = {"evaluation": True}
+    if evaluation.get("prompt_version") is not None:
+        out["prompt_version"] = int(evaluation["prompt_version"])
+    if evaluation.get("exclude_skills"):
+        out["exclude_skills"] = list(evaluation["exclude_skills"])
+    return out
+
+
 def consume_last_menu_truncated() -> Optional[bool]:
     """Read + clear whether the last routed menu was cut to fit (None: unknown)."""
     value = _last_menu_truncated_ctx.get()
@@ -2091,6 +2119,7 @@ class SkillRouter:
         force_refresh: bool = False,
         scope: Optional[str] = None,
         experiments: Optional[str] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fetch the full skill menu from the platform.
 
@@ -2100,6 +2129,10 @@ class SkillRouter:
         ``agent_name`` (falls back to the instance default) lets the platform's
         Use/Fork resolver scope the menu to one agent when enabled server-side;
         it's a no-op against older backends / when the resolver is off.
+
+        ``evaluation`` (``{"prompt_version", "exclude_skills"}``) asks for an
+        evaluation run's menu: never cached, and a failure raises
+        ``SkillRouterError`` instead of answering with an empty menu.
         """
         effective_agent = agent_name or self.agent_name
         # `scope` is the run this menu is for, and it is part of the key because
@@ -2116,7 +2149,7 @@ class SkillRouter:
         # exactly today's key and call volume.
         # `experiments` is part of the key: an answer marked for this run carries its arm.
         cache_key = (category, project_id, effective_agent, scope or "", experiments or "")
-        if not force_refresh:
+        if not force_refresh and evaluation is None:
             cached = self._menu_cache.get(cache_key)
             if cached is not None:
                 return cached
@@ -2133,17 +2166,20 @@ class SkillRouter:
             # "capable": a call that can route first but isn't this run's. See `experiments=`
             # on GET /skills/menu.
             params["experiments"] = experiments
+        params.update(_evaluation_params(evaluation))
 
         try:
             result = self._request("GET", "/api/v1/skills/menu", params=params)
         except SkillRouterError as e:
+            if evaluation is not None:
+                raise  # an evaluation run on the served setup would report on the wrong one
             # Graceful degradation: prompt assembly shouldn't break if the
             # platform is unreachable. Log loudly so callers can see *why*.
             logger.warning("get_menu failed, returning empty menu: %s", e)
             return {"skills": [], "prompt_fragment": "", "strategy": "none",
                     "degraded_reason": _empty_menu_reason(e)}
 
-        if result:
+        if result and evaluation is None:
             self._menu_cache.set(cache_key, result)
         return result or {"skills": [], "prompt_fragment": "", "strategy": "none"}
 
@@ -2156,6 +2192,7 @@ class SkillRouter:
         include_attachments: bool = True,
         agent_name: Optional[str] = None,
         experiments: Optional[str] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Smart routing: semantic search + performance re-ranking.
 
@@ -2170,6 +2207,7 @@ class SkillRouter:
             include_attachments: If True (default), includes script content
                 inline for skills that have multi-file bundles. Set to False
                 to reduce response size when you don't need bundled scripts.
+            evaluation: An evaluation run's override, as on :meth:`get_menu`.
         """
         payload: Dict[str, Any] = {
             "query": query,
@@ -2186,17 +2224,20 @@ class SkillRouter:
             payload["category"] = category
         if experiments:
             payload["experiments"] = experiments
+        payload.update(_evaluation_params(evaluation))
 
         try:
             return self._request("POST", "/api/v1/skills/route", json=payload)
         except SkillRouterError as e:
+            if evaluation is not None:
+                raise
             logger.warning("smart_route failed, returning empty: %s", e)
             return {"skills": [], "prompt_fragment": "", "strategy": "none",
                     "degraded_reason": _empty_menu_reason(e)}
 
     def _fallback_menu(
         self, route_failure: str, *, category: Optional[str], agent_name: Optional[str],
-        experiments: Optional[str] = None,
+        experiments: Optional[str] = None, evaluation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """This agent's menu, unranked, in place of a route that cannot be used.
 
@@ -2213,6 +2254,7 @@ class SkillRouter:
             params["agent_name"] = agent_name
         if experiments:
             params["experiments"] = experiments
+        params.update(_evaluation_params(evaluation))
         try:
             menu = self._request(
                 "GET", "/api/v1/skills/menu", params=params,
@@ -2222,6 +2264,8 @@ class SkillRouter:
                 admission_wait_s=0.0, read_retry_s=0.0,
             )
         except SkillRouterError as e:
+            if evaluation is not None:
+                raise
             logger.warning("skill routing failed (%s) and so did the menu fallback: %s", route_failure, e)
             return {"skills": [], "prompt_fragment": "", "strategy": "none",
                     "degraded_reason": _empty_menu_reason(e)}
@@ -3052,6 +3096,7 @@ class SkillRouter:
         scope: Optional[str] = None,
         _want_parts: bool = False,
         experiments: Optional[str] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, Optional[str]]:
         """Return ``(prompt_fragment, routing_id)`` — the primitive every adapter calls.
 
@@ -3121,6 +3166,11 @@ class SkillRouter:
                 budget this call resets is then kept per run, so two
                 concurrent runs sharing one router singleton no longer
                 overwrite each other's budget. See `load_skill`.
+            evaluation: An evaluation run's override (``{"prompt_version",
+                "exclude_skills"}``, either may be empty): sent with the
+                call, which is never cached and raises ``SkillRouterError``
+                when it fails rather than handing the run an empty menu.
+                ``consume_last_evaluation()`` then reads the platform's echo.
 
         Returns:
             ``(prompt_fragment, routing_id)``. ``routing_id`` is the
@@ -3155,7 +3205,7 @@ class SkillRouter:
             experiments or "",
         )
 
-        if not bypass_cache:
+        if not bypass_cache and evaluation is None:
             cached = self._fragment_cache.get(cache_key)
             if cached is not None:
                 (fragment, routing_id, offered_names, delivered_names, split_parts,
@@ -3208,6 +3258,7 @@ class SkillRouter:
         _last_experiment_ctx.set(None)
         _last_run_prompt_ctx.set(None)
         _last_always_include_ctx.set(None)
+        _last_evaluation_ctx.set(None)
 
         # How long the routing call took: a failure is cached only when
         # retrying it would cost the turn that time again (see below).
@@ -3216,7 +3267,7 @@ class SkillRouter:
             # A route failed moments ago and the menu answered: go straight to
             # the menu until the pause ends (see `_ROUTE_PAUSE_S`).
             result = self._fallback_menu("route_paused", category=category, agent_name=effective_agent,
-                                         experiments=experiments)
+                                         experiments=experiments, evaluation=evaluation)
         elif query and self.strategy in ("auto", "semantic"):
             try:
                 result = self.smart_route(
@@ -3230,15 +3281,18 @@ class SkillRouter:
                     include_attachments=False,
                     agent_name=effective_agent,  # pass the per-call override through
                     experiments=experiments,
+                    evaluation=evaluation,
                 )
             except SkillRouterError as e:
+                if evaluation is not None:
+                    raise
                 logger.warning("build_prompt_fragment smart_route failed: %s", e)
                 result = {"skills": [], "prompt_fragment": "", "strategy": "none",
                           "degraded_reason": _empty_menu_reason(e)}
             failure = result.get("degraded_reason") if _routing_call_failed(result) else None
             if failure in _MENU_FALLBACK_REASONS:
                 fallback = self._fallback_menu(failure, category=category, agent_name=effective_agent,
-                                               experiments=experiments)
+                                               experiments=experiments, evaluation=evaluation)
                 if not _routing_call_failed(fallback):
                     logger.warning(
                         "Skill routing failed (%s); this turn gets the agent's skills unranked, "
@@ -3249,8 +3303,10 @@ class SkillRouter:
         else:
             try:
                 result = self.get_menu(category=category, agent_name=effective_agent, scope=scope,
-                                       experiments=experiments)
+                                       experiments=experiments, evaluation=evaluation)
             except SkillRouterError as e:
+                if evaluation is not None:
+                    raise
                 logger.warning("build_prompt_fragment get_menu failed: %s", e)
                 result = {"skills": [], "prompt_fragment": "", "strategy": "none",
                           "degraded_reason": _empty_menu_reason(e)}
@@ -3266,6 +3322,8 @@ class SkillRouter:
         _last_run_prompt_ctx.set(dict(run_prompt) if run_prompt else None)
         always = _always_include_of(result)
         _last_always_include_ctx.set([dict(row) for row in always] or None)
+        echoed = result.get("evaluation") if evaluation is not None else None
+        _last_evaluation_ctx.set(dict(echoed) if isinstance(echoed, dict) else None)
         # Expose the offered skill names via a contextvar so
         # framework adapters can stamp them onto RunTrace.skills_offered_in_prompt
         # without having to extend this method's return signature.
@@ -3458,7 +3516,7 @@ class SkillRouter:
         _last_menu_truncated_ctx.set(menu_truncated)
 
         cache_failure = routing_failed and _failure_worth_caching(result, route_elapsed)
-        if fragment or routing_id or cache_failure:
+        if evaluation is None and (fragment or routing_id or cache_failure):
             failure_only = cache_failure and not (fragment or routing_id)
             self._fragment_cache.set(
                 cache_key,
@@ -3512,6 +3570,7 @@ class SkillRouter:
         inject_body: Optional[bool] = None,
         scope: Optional[str] = None,
         experiments: Optional[str] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Optional[str]]:
         """Return ``(prefix, tail, routing_id)`` — the cacheable split.
 
@@ -3532,7 +3591,7 @@ class SkillRouter:
         fragment, routing_id = self.build_prompt_fragment(
             query, agent_name=agent_name, category=category, top_k=top_k,
             bypass_cache=bypass_cache, inject_body=inject_body, scope=scope,
-            _want_parts=True, experiments=experiments,
+            _want_parts=True, experiments=experiments, evaluation=evaluation,
         )
         parts = _last_split_parts_ctx.get()
         if parts is None:

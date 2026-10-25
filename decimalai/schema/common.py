@@ -35,6 +35,9 @@ class SourceType(str, Enum):
     SYNTHETIC = "synthetic"
     DISTILLATION = "distillation"
     MANUAL = "manual"
+    #: An evaluation run (decimalai.evaluate(), an override block): its own prompt version or
+    #: skill list, kept out of the agent's own numbers.
+    EVALUATION = "evaluation"
 
 
 class CallRole(str, Enum):

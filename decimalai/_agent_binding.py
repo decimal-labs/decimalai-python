@@ -384,6 +384,9 @@ class AgentBinding:
         #: The agent's always-include skills (D-C), as the last routing answer listed them, with
         #: their text: fetched again only when the list or a version changes.
         self._always: Dict[str, Any] = {"key": None, "texts": [], "versions": []}
+        #: An evaluation run's own always-include texts, by run, from its routing answer to its
+        #: composed text: that answer never becomes the agent's copy (`decimalai._evaluation`).
+        self._run_always: "OrderedDict[Any, Tuple[List[Tuple[str, str]], List[Dict[str, str]]]]" = OrderedDict()
 
     # ── the seams a framework supplies ───────────────────────
     def _router(self) -> Any:
@@ -427,6 +430,13 @@ class AgentBinding:
 
     def _on_compose(self, agent: Any) -> None:
         """Called once per composed run, before its record is made."""
+
+    def _note_evaluation(self, run_key: Optional[str], trial: Any) -> None:
+        """This run is an evaluation run of ``trial`` (decimalai._evaluation): mark its trace.
+
+        Where a framework builds the run's trace, the trace goes out as ``source_type="evaluation"``
+        and ``trial`` gets its id.
+        """
 
     def _on_menu(self, names: List[str]) -> None:
         """The names ``load_skill`` should accept changed (empty: any name)."""
@@ -542,11 +552,20 @@ class AgentBinding:
                 state = self._runs.get(key)
             if state is not None:
                 return state, {}
-        try:
-            record = self._conversation(context, agent)
-        except Exception:  # noqa: BLE001 — a record we cannot read means compose afresh
-            self._log.debug("could not read the conversation's record (non-fatal)", exc_info=True)
-            record = None
+        from ._evaluation import EvaluationNotApplied, active
+
+        # An evaluation run (decimalai._evaluation) composes afresh: its setup is its own, so it
+        # neither continues a conversation nor leaves one for the next run to keep.
+        trial = active(self.name)
+        record = None
+        if trial is not None:
+            # Marked first, so a run that cannot be set up still goes out as an evaluation run.
+            self._note_evaluation(run_key, trial)
+        else:
+            try:
+                record = self._conversation(context, agent)
+            except Exception:  # noqa: BLE001 — a record we cannot read means compose afresh
+                self._log.debug("could not read the conversation's record (non-fatal)", exc_info=True)
         if record is not None:
             return self._continue_conversation(context, agent, run_key, key, record), {}
         self._refresh_prompt_if_stale()
@@ -557,6 +576,11 @@ class AgentBinding:
         # for agents built before it. The prompt read earlier still runs.
         switched_off = _disabled_by_init()
         blocked = None if switched_off else self._skills_blocked(agent, tool=tool, inject=inject)
+        if trial is not None and (self._keyless or switched_off or blocked):
+            why = ("no API key is set: prompt versions and the agent's skills live on DecimalAI"
+                   if self._keyless else "DecimalAI is switched off (init(enabled=False))"
+                   if switched_off else f"its skills are off ({blocked})")
+            raise EvaluationNotApplied(f"An evaluation run of {self.name!r} needs DecimalAI, and {why}.")
         if blocked:
             self._warn_once(agent, f"DecimalAI skills are off for this agent: {blocked}")
         if switched_off or blocked:
@@ -575,23 +599,29 @@ class AgentBinding:
             # Pasted skill text depends on the message, so such a run is always
             # routed for its own.
             route_now = (inject or not self._menu_loaded or (self._menu_truncated and query is not None)
-                         or self._experiment is not None)
+                         or self._experiment is not None or trial is not None)
             unavailable = self._menu_unavailable
         return None, {"key": key, "query": query, "tool": tool, "inject": inject,
-                      "route_now": route_now, "unavailable": unavailable}
+                      "route_now": route_now, "unavailable": unavailable, "evaluation": trial}
 
     def _finish_run(self, run_key: Optional[str], plan: Dict[str, Any], routed_result: Any) -> Dict[str, Any]:
         """The rest of preparing a run, from the plan and its routing result (or None)."""
         inject, tool, query = plan["inject"], plan["tool"], plan["query"]
         unavailable = plan["unavailable"]
+        trial = plan.get("evaluation")
         routing_id: Optional[str] = None
         routed: Optional[Tuple[str, List[str]]] = None
         delivered: List[str] = []
         versions: List[Dict[str, str]] = []
         run_prompt = None
+        run_cut = False
         if routed_result is not None:
             prefix, offered, routing_id, truncated, delivered, versions, run_prompt = routed_result
-            if inject:
+            run_cut = bool(truncated)
+            if trial is not None:
+                # This run's own list, which never becomes the agent's local copy.
+                unavailable = None
+            elif inject:
                 # This message's skill text is no other run's local copy.
                 unavailable = None if (prefix or routing_id) else (
                     "DecimalAI did not return this agent's skills")
@@ -604,9 +634,11 @@ class AgentBinding:
         if routed is None:
             delivered, versions, run_prompt = [], [], None
         with self._lock:
-            experiment = self._experiment is not None and routed is not None
-            # Otherwise the local copy: the last good menu, whatever was asked.
-            menu = routed or (("", []) if inject else (self._menu_prefix, list(self._menu_names)))
+            experiment = self._experiment is not None and routed is not None and trial is None
+            # Otherwise the local copy: the last good menu, whatever was asked. An evaluation run
+            # whose answer listed nothing shows nothing.
+            menu = routed or (("", []) if (inject or trial is not None) else (self._menu_prefix, list(self._menu_names)))
+            cut = run_cut if trial is not None else bool(self._menu_truncated)
             state = {
                 "query": query, "route_now": plan["route_now"], "routing_id": routing_id,
                 "prefix": menu[0], "names": menu[1], "unavailable": unavailable,
@@ -616,11 +648,14 @@ class AgentBinding:
                 # replays its thinking between tool calls). A cut list names none,
                 # and so does a run in an experiment: the platform checks the name
                 # against the run's own decision (a held-out skill is refused).
-                "tool_names": [] if (self._menu_truncated or experiment) else list(menu[1]),
+                "tool_names": [] if (cut or experiment) else list(menu[1]),
                 # Skills-first Phase 3: a prompt split's prompt for this run, and whether the
                 # run was routed for its own arm.
                 "run_prompt": run_prompt, "experiment": experiment,
-                "cut": bool(self._menu_truncated), "pasted": inject,
+                "cut": cut, "pasted": inject,
+                # An evaluation run (decimalai._evaluation): its trial, and its own always-include texts.
+                "evaluation": trial,
+                "run_always": self._run_always.pop(plan["key"], None) if trial is not None else None,
                 # A skill whose text is already in the instructions is not sent again.
                 "loaded": set(delivered) if tool else set(),
                 "delivered": delivered, "delivered_versions": versions,
@@ -649,10 +684,11 @@ class AgentBinding:
             # run's own decision, ranked on its message, before the model call.
             try:
                 routed_result = await _in_thread(
-                    self._route, run_key, plan["query"], plan["inject"], "this_run",
+                    self._route, run_key, plan["query"], plan["inject"], "this_run", plan["evaluation"],
+                    plan["key"],
                 )
-            except Exception:
-                self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+            except Exception as exc:
+                self._routing_failed(plan, exc)
         return self._finish_run(run_key, plan, routed_result)
 
     def _prepare_run_sync(self, context: Any, agent: Any, run_key: Optional[str]) -> Dict[str, Any]:
@@ -663,10 +699,27 @@ class AgentBinding:
         routed_result = None
         if plan["route_now"]:
             try:
-                routed_result = self._route(run_key, plan["query"], plan["inject"], "this_run")
-            except Exception:
-                self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+                routed_result = self._route(
+                    run_key, plan["query"], plan["inject"], "this_run", plan["evaluation"], plan["key"],
+                )
+            except Exception as exc:
+                self._routing_failed(plan, exc)
         return self._finish_run(run_key, plan, routed_result)
+
+    def _routing_failed(self, plan: Dict[str, Any], exc: BaseException) -> None:
+        """A run's own routing call failed: the run goes on without it, unless it is an evaluation run."""
+        from ._evaluation import EvaluationNotApplied
+
+        if plan.get("evaluation") is None:
+            self._log.debug("skill routing failed (non-fatal)", exc_info=True)
+            return
+        if isinstance(exc, EvaluationNotApplied):
+            raise exc
+        detail = getattr(exc, "detail", None)
+        reason = detail if isinstance(detail, str) and detail else str(exc)
+        raise EvaluationNotApplied(
+            f"DecimalAI could not set up this evaluation run of {self.name!r} "
+            f"({plan['evaluation'].override.label}): {reason}") from exc
 
     def _compose(self, context: Any, agent: Any, run_key: Optional[str], state: Dict[str, Any]) -> str:
         """The run's instructions: the prompt, filled, then its menu. Records the run."""
@@ -701,7 +754,8 @@ class AgentBinding:
         # The always-include skills (D-C): their full text in every run, but one this run's own
         # text already pasted. Part of the skill section, so a conversation keeps it with the list.
         always, always_versions = (
-            self._always_now(skip=state["delivered"]) if state.get("always_on") else ([], []))
+            self._always_now(skip=state["delivered"], run=state.get("run_always"))
+            if state.get("always_on") else ([], []))
         state["always_now"] = always
         if always:
             if self._ALWAYS_IN_SYSTEM:
@@ -731,10 +785,11 @@ class AgentBinding:
             pasted=bool(state.get("pasted")), menu=menu, experiment=bool(state.get("experiment")),
         )
         state["conversation"] = record
-        try:
-            self._keep_conversation(context, agent, run_key, record)
-        except Exception:  # noqa: BLE001 — keeping a record must never cost the run
-            self._log.debug("could not keep the conversation's record (non-fatal)", exc_info=True)
+        if state.get("evaluation") is None:
+            try:
+                self._keep_conversation(context, agent, run_key, record)
+            except Exception:  # noqa: BLE001 — keeping a record must never cost the run
+                self._log.debug("could not keep the conversation's record (non-fatal)", exc_info=True)
         if not state["route_now"]:
             # The local copy is this agent's whole menu, whatever was asked. The
             # run's own decision, ranked on its message, is recorded in the
@@ -821,7 +876,7 @@ class AgentBinding:
     # ── the local copy ──────────────────────────────────────
     def _route(
         self, scope: Optional[str], query: Optional[str] = None, inject: bool = False,
-        mark: Optional[str] = None,
+        mark: Optional[str] = None, trial: Any = None, run: Any = None,
     ) -> Tuple[str, List[str], Optional[str], bool, List[str], List[Dict[str, str]], Optional[Dict[str, Any]]]:
         """One routing decision: (menu text, offered names, routing id, menu was
         cut, skills whose text it pasted in, their versions, and a prompt split's
@@ -831,6 +886,10 @@ class AgentBinding:
         that asked (a route-first call), ``"capable"`` for a background call. Only a
         ``this_run`` call can get an experiment's arm; either one learns whether the
         agent runs an experiment, which switches every later run to routing first.
+
+        ``trial`` (decimalai._evaluation): an evaluation run's call, which asks for its own setup,
+        raises `EvaluationNotApplied` unless the platform confirms it, and leaves the agent's local
+        copies alone; its always-include texts are kept under ``run`` for `_finish_run`.
         """
         router = self._skill_router()
         if router is None:
@@ -848,6 +907,7 @@ class AgentBinding:
         consume_last_delivered_versions()
         from .skill_router import (
             consume_last_always_include,
+            consume_last_evaluation,
             consume_last_experiment,
             consume_last_run_prompt,
         )
@@ -855,8 +915,14 @@ class AgentBinding:
         consume_last_experiment()
         consume_last_run_prompt()
         consume_last_always_include()
+        consume_last_evaluation()
         try:
-            if self._keyless or mark is None:
+            if trial is not None:
+                prefix, _tail, routing_id = router.build_prompt_parts(
+                    query, agent_name=self.name, inject_body=inject, scope=scope,
+                    evaluation=trial.override.request(),
+                )
+            elif self._keyless or mark is None:
                 prefix, _tail, routing_id = router.build_prompt_parts(
                     query, agent_name=self.name, inject_body=inject, scope=scope,
                 )
@@ -877,7 +943,16 @@ class AgentBinding:
         experiment = consume_last_experiment()
         run_prompt = consume_last_run_prompt()
         always = consume_last_always_include()
-        if prefix or routing_id:
+        echo = consume_last_evaluation()
+        if trial is not None:
+            trial.override.check(echo, run_prompt)
+            texts, always_versions = self._always_texts(always)
+            with self._lock:
+                self._run_always[run] = (texts, always_versions)
+                while len(self._run_always) > _MAX_CONFIG_RUNS:
+                    self._run_always.popitem(last=False)
+            mark = None  # an evaluation answer says nothing about the agent's experiment
+        elif prefix or routing_id:
             # An answer: the agent's always-include list is as it says, none included.
             self._store_always(always)
         if mark is not None and not self._keyless and (prefix or routing_id):
@@ -894,24 +969,31 @@ class AgentBinding:
         with self._lock:
             if key == self._always["key"]:
                 return
-        texts: List[Tuple[str, str]] = []
-        versions: List[Dict[str, str]] = []
-        router = self._skill_router()
-        if rows and router is not None and callable(getattr(router, "always_include_texts", None)):
-            try:
-                texts, versions = router.always_include_texts(rows, agent_name=self.name)
-            except Exception:  # noqa: BLE001 - the next answer tries again
-                self._log.debug("could not fetch the always-include skills' text", exc_info=True)
-                return
+        try:
+            texts, versions = self._always_texts(rows)
+        except Exception:  # noqa: BLE001 - the next answer tries again
+            self._log.debug("could not fetch the always-include skills' text", exc_info=True)
+            return
         with self._lock:
             self._always = {"key": key, "texts": list(texts), "versions": [dict(v) for v in versions]}
 
-    def _always_now(self, skip: Any = ()) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
-        """The always-include texts and their versions now, but those named in ``skip``."""
+    def _always_texts(self, rows: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
+        """The text and versions of an answer's always-include rows (none without a router)."""
+        router = self._skill_router()
+        if not rows or router is None or not callable(getattr(router, "always_include_texts", None)):
+            return [], []
+        return router.always_include_texts(rows, agent_name=self.name)
+
+    def _always_now(self, skip: Any = (), run: Any = None) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]]]:
+        """The always-include texts and their versions now, but those named in ``skip``.
+
+        ``run``: an evaluation run's own ``(texts, versions)`` in place of the agent's.
+        """
         with self._lock:
-            texts = [(name, text) for name, text in self._always["texts"] if name not in skip]
+            all_texts, all_versions = run if run is not None else (self._always["texts"], self._always["versions"])
+            texts = [(name, text) for name, text in all_texts if name not in skip]
             names = {name for name, _text in texts}
-            versions = [dict(v) for v in self._always["versions"] if v.get("name") in names]
+            versions = [dict(v) for v in all_versions if v.get("name") in names]
         return texts, versions
 
     def _store_menu(
@@ -1046,8 +1128,8 @@ class AgentBinding:
         The platform refuses a held-out skill to its run's routing id (a 404, like a missing
         name). Telling the model the skill doesn't exist invites a guessed name.
         """
-        if (state is not None and state.get("experiment") and isinstance(result, str)
-                and result.startswith("load_skill: no skill named")):
+        if (state is not None and (state.get("experiment") or state.get("evaluation") is not None)
+                and isinstance(result, str) and result.startswith("load_skill: no skill named")):
             return (f"load_skill: {name!r} isn't available for this run. Proceed without it, "
                     "and don't try another name for it.")
         return result

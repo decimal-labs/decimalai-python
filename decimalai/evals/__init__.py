@@ -15,6 +15,9 @@ Usage::
     # Register with instrument()
     from decimalai.langchain import instrument
     instrument(agent_name="my-bot", evals=[check_citation])
+
+    # Or run a set of cases through an agent and check each run
+    report = decimalai.evaluate(agent, "cases.jsonl", evals=[check_citation])
 """
 
 from __future__ import annotations
@@ -145,6 +148,14 @@ class TraceData:
     active_skills: List[str] = field(default_factory=list)
     # Context for RAG evaluators (retrieved documents, source text, etc.)
     context: Optional[str] = None
+    # The case this run answered, under `decimalai.evaluate()`: its row from the cases file, the
+    # reader's own fields included. Empty outside evaluate().
+    case: Dict[str, Any] = field(default_factory=dict)
+    # The skills listed to the model (`skills_offered_in_prompt`) and the ones it loaded with
+    # load_skill (`skills_loaded_by_agent`). `active_skills` holds a loaded skill only when its
+    # body's version came back with it.
+    skills_offered: List[str] = field(default_factory=list)
+    skills_loaded: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -406,7 +417,12 @@ class DecimalEval:
         self, trace: TraceData
     ) -> List[Dict[str, Any]]:
         """Run the eval and return a list of score dicts for the API."""
-        coerced = self(trace)
+        return self._score_dicts(self(trace))
+
+    def _score_dicts(
+        self, coerced: Optional[Union[EvalResult, Dict[str, EvalResult]]]
+    ) -> List[Dict[str, Any]]:
+        """An already-coerced result as the API's score dicts."""
         if coerced is None:
             return []
 
@@ -668,6 +684,8 @@ def trace_to_trace_data(trace: Any) -> TraceData:
             for e in (d.get("active_skills") or [])
             if (e.get("name") if isinstance(e, dict) else e)
         ],
+        skills_offered=[n for n in (d.get("skills_offered_in_prompt") or []) if isinstance(n, str) and n],
+        skills_loaded=[n for n in (d.get("skills_loaded_by_agent") or []) if isinstance(n, str) and n],
     )
 
 
@@ -771,6 +789,15 @@ def batch_eval(
 # ── Re-exports for convenience ──────────────────────────────────
 # Users can import from decimalai.evals directly:
 #   from decimalai.evals import Relevance, json_valid, contains
+
+# evaluate(): cases run through an agent and checked
+from ._runner import (  # noqa: E402, F401
+    CaseResult,
+    Comparison,
+    EvalReport,
+    evaluate,
+    evaluate_async,
+)
 
 # Deterministic (always available)
 # LLM-powered (requires litellm)

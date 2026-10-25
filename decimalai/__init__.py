@@ -2118,6 +2118,7 @@ def load_hf_dataset(
 # Module-level client reference
 import decimalai._config as _cfg  # noqa: E402
 
+from ._evaluation import EvaluationNotApplied  # noqa: E402, F401
 from .decorators import tool  # noqa: E402, F401
 
 # Re-export eval adapters from new location — but wrap them so the
@@ -2129,7 +2130,11 @@ from .decorators import tool  # noqa: E402, F401
 # still available as `decimalai.evals.adapters.push_custom_scores` for
 # callers that want to pass their own client.
 from .evals import adapters as _adapters  # noqa: E402
-from .evals import batch_eval  # noqa: E402, F401
+from .evals import (  # noqa: E402, F401
+    batch_eval,
+    evaluate,
+    evaluate_async,
+)
 
 
 def push_custom_scores(
@@ -2281,6 +2286,9 @@ __all__ = [
     "push_langsmith_scores",
     "push_custom_scores",
     "batch_eval",
+    "evaluate",
+    "evaluate_async",
+    "EvaluationNotApplied",
 ]
 
 

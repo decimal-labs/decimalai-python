@@ -55,8 +55,9 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, NoReturn, Optional, Set, Tuple
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from ._agent_binding import AgentBinding, attach_prompt_records, is_claude
@@ -85,7 +86,7 @@ def _coerce_span_id(raw: Any) -> Optional[UUID]:
     except (ValueError, AttributeError):
         return uuid5(NAMESPACE_OID, s)
 
-from .schema.common import FinishReason, SpanType, Status
+from .schema.common import FinishReason, SourceType, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import (
     FINAL_OUTPUT_MAX_CHARS,
@@ -293,6 +294,8 @@ def _rails_for(run_key: str) -> Dict[str, Any]:
                 # Agent `name=` -> the prompt record `agent_config()` made for
                 # that agent on this run (version, variables, source).
                 "decimal_prompts": {},
+                # The evaluation trial this run belongs to (decimalai._evaluation), or None.
+                "evaluation": None,
             }
             _run_rails[run_key] = rail
             while len(_run_rails) > _RUN_RAILS_MAX:
@@ -1581,6 +1584,14 @@ class OpenAIAgentConfig(AgentBinding):
     def _on_compose(self, agent: Any) -> None:
         self._bind_agent_name(agent)
 
+    def _note_evaluation(self, run_key: Optional[str], trial: Any) -> None:
+        # Only a traced run is sent; an untraced one has no trace to mark or hand over.
+        if run_key is None or isinstance(run_key, _UntracedRunKey):
+            return
+        rail = _rails_for(run_key)
+        with _run_rails_lock:
+            rail["evaluation"] = trial
+
     def _on_menu(self, names: List[str]) -> None:
         self.load_skill.params_json_schema = self._tool_schema(names)
 
@@ -1614,6 +1625,41 @@ class OpenAIAgentConfig(AgentBinding):
         if state is None:
             return None
         return self._tool_schema(list(state.get("tool_names") or []))
+
+    # ── evaluation runs ─────────────────────────────────────
+    @contextmanager
+    def override(self, *, prompt_version: Optional[int] = None,
+                 exclude_skills: Optional[List[str]] = None) -> Iterator[Any]:
+        """Runs in this block use another saved prompt version, or leave skills out.
+
+        ::
+
+            with support.override(prompt_version=4, exclude_skills=["refund-policy"]) as trial:
+                result = await Runner.run(agent, "My mug arrived broken")
+            trial.trace_id    # that run's DecimalAI trace
+            trial.trace_url   # its page in the dashboard
+
+        What production serves does not change: each run in the block (async tasks started
+        in it included) asks DecimalAI for its own setup, and its skill list never becomes
+        this config's copy. The runs are evaluation runs, kept out of the agent's numbers.
+        :func:`decimalai.evaluate` runs every case of a set in one.
+
+        Args:
+            prompt_version: A saved version of the agent's prompt, used instead of the
+                served one.
+            exclude_skills: Skill names left off the list; ``load_skill`` refuses them too.
+
+        Raises:
+            ValueError: ``prompt_version`` is not a version number, or a skill name is empty.
+            decimalai.EvaluationNotApplied: from a run in the block, when DecimalAI cannot
+                give it this setup (an unknown version or skill name, no API key, an older
+                backend, an outage). The run does not start on the served setup instead.
+        """
+        from . import _evaluation
+
+        trial = _evaluation.Trial(_evaluation.Override.make(self.name, prompt_version, exclude_skills))
+        with _evaluation.block(trial):
+            yield trial
 
     # ── a chat across processes ─────────────────────────────
     def conversation(self, group_id: str, *, state: Optional[Dict[str, Any]] = None) -> "AgentsConversation":
@@ -1864,6 +1910,38 @@ def agent_config(
     if not prompt.keyless:  # keyless runs are traced nowhere
         _ensure_tracing()
     return config
+
+
+def _evaluation_target(agent: Any) -> Tuple[OpenAIAgentConfig, Any]:
+    """For :func:`decimalai.evaluate`: the ``agent_config()`` behind ``agent``, and how to run one case.
+
+    Found from the agent's ``load_skill`` tool or its instructions. Refuses an agent inside an
+    open ``agents.trace()``: its runs would end as part of that trace, not as one trace a case.
+    """
+    _require_agents_sdk()
+    config = next((getattr(tool, "_decimalai_config", None) for tool in (getattr(agent, "tools", None) or [])
+                   if isinstance(getattr(tool, "_decimalai_config", None), OpenAIAgentConfig)), None)
+    if config is None:
+        owner = getattr(getattr(agent, "instructions", None), "__self__", None)
+        config = owner if isinstance(owner, OpenAIAgentConfig) else None
+    if config is None:
+        raise TypeError(
+            f"evaluate() needs an Agent whose instructions come from agent_config(); "
+            f"{getattr(agent, 'name', 'this agent')!r} has neither agent_config().instructions nor "
+            "its load_skill tool. Build it as Agent(instructions=support.instructions, "
+            "tools=[..., *support.tools]).")
+    from agents import RunConfig, Runner
+    from agents.tracing import get_current_trace
+
+    if get_current_trace() is not None:
+        raise RuntimeError("evaluate() can't run inside an open agents.trace(): each case is its own trace")
+    _ensure_tracing()
+
+    async def run_case(case_input: Any, context: Any) -> Any:
+        return await Runner.run(agent, case_input, context=context,
+                                run_config=RunConfig(workflow_name=f"evaluate {config.name}"))
+
+    return config, run_case
 
 
 def load_agent(*args: Any, **kwargs: Any) -> NoReturn:
@@ -3062,26 +3140,18 @@ class DecimalTracingProcessor:
             except Exception:  # noqa: BLE001 - a trace without them beats no trace
                 logger.debug("native skill loads not applied (non-fatal)", exc_info=True)
 
-        try:
-            client = _config._get_client()
-            _agent = trace.agent_name
-            if _agent in _pending_manifests:
-                _config.submit_trace_pending_manifest(
-                    client, trace, lambda: _reregister_refused(_agent)
-                )
-            else:
-                _config._sender.submit(client.ingest_trace, trace)
-            logger.debug(
-                "Queued trace %s (%d spans, %d llm_calls, %d active_skills, manifest=%s) for agent %s",
-                trace.id,
-                len(trace.spans),
-                len(trace.llm_calls),
-                len(trace.active_skills),
-                trace.manifest_id or "none",
-                agent_name,
-            )
-        except Exception:
-            logger.exception("Failed to queue trace %s", trace.id)
+        # An evaluation run (decimalai._evaluation): marked, kept out of the agent's own numbers,
+        # and its trial gets the trace. evaluate() holds it to attach its checks' results, then
+        # sends it itself.
+        trial = run_rail.get("evaluation")
+        if trial is not None:
+            trace.source_type = SourceType.EVALUATION
+            try:
+                if trial._take(trace):
+                    return
+            except Exception:  # noqa: BLE001 - the trace still goes out
+                logger.debug("evaluation trial did not take the trace (non-fatal)", exc_info=True)
+        _submit_trace(trace)
 
     def _infer_skill_rungs(self, acc: _TraceAccumulator) -> None:
         """Infer OFFERED / DELIVERED for disk skills the SDK did not inject.
@@ -3229,6 +3299,32 @@ class DecimalTracingProcessor:
 
 
 # ── Utilities ──────────────────────────────────────────────
+
+
+def _submit_trace(trace: RunTrace) -> None:
+    """Queue one assembled trace for upload (after its agent's manifest, when that is pending)."""
+    from . import _config
+
+    try:
+        client = _config._get_client()
+        _agent = trace.agent_name
+        if _agent in _pending_manifests:
+            _config.submit_trace_pending_manifest(
+                client, trace, lambda: _reregister_refused(_agent)
+            )
+        else:
+            _config._sender.submit(client.ingest_trace, trace)
+        logger.debug(
+            "Queued trace %s (%d spans, %d llm_calls, %d active_skills, manifest=%s) for agent %s",
+            trace.id,
+            len(trace.spans),
+            len(trace.llm_calls),
+            len(trace.active_skills),
+            trace.manifest_id or "none",
+            trace.agent_name,
+        )
+    except Exception:
+        logger.exception("Failed to queue trace %s", trace.id)
 
 
 def _parse_iso(val: Optional[str]) -> Optional[datetime]:

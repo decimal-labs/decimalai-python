@@ -576,12 +576,13 @@ class Run:
     """
 
     def __init__(self, config: "AgentConfig", key: str, system: str,
-                 tool_names: List[str], shown: List[str]) -> None:
+                 tool_names: List[str], shown: List[str], trace_id: Optional[str] = None) -> None:
         self._config = config
         self._key = key
         self._system = system
         self._tool_names = tool_names
         self._shown = shown
+        self._trace_id = trace_id
 
     def __repr__(self) -> str:
         return f"Run(agent={self._config.name!r}, skills={self._shown!r})"
@@ -593,6 +594,13 @@ class Run:
         The skill list ends with one sentence naming the ``load_skill`` tool.
         """
         return self._system
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        """The DecimalAI trace an evaluation run is sent as (``prompt_version=`` or
+        ``exclude_skills=`` on :meth:`AgentConfig.run`), when it runs inside an OpenTelemetry
+        run (``decimalai.providers.agent_run()``); None otherwise."""
+        return self._trace_id
 
     @property
     def tool_spec(self) -> Dict[str, Any]:
@@ -676,7 +684,8 @@ class AgentConfig(AgentBinding):
             text = getattr(self._prompt, "system_prompt", None)
         return text if text is not None else self._fallback
 
-    def run(self, message: Optional[str] = None, *, variables: Any = None) -> Run:
+    def run(self, message: Optional[str] = None, *, variables: Any = None,
+            prompt_version: Optional[int] = None, exclude_skills: Optional[List[str]] = None) -> Run:
         """Start a run for one user message: route it and compose its system text.
 
         Args:
@@ -685,13 +694,28 @@ class AgentConfig(AgentBinding):
             variables: Values for the prompt's ``{{variables}}``, as attributes or
                 dict keys (``{{customer.name}}`` reads ``variables.customer.name``
                 or ``variables["customer"]["name"]``).
+            prompt_version: Run on this saved version of the prompt instead of the
+                served one. Makes the run an evaluation run: kept out of the
+                agent's numbers, and :attr:`Run.trace_id` names its trace.
+            exclude_skills: Leave these skills off the run's list; its
+                ``load_skill`` refuses them too. Also an evaluation run.
 
         Raises:
             MissingPromptVariable: the prompt needs a value ``variables`` lacks.
             RuntimeError: ``on_unavailable="fail"`` and DecimalAI never returned
                 this agent's skills.
+            ValueError: ``prompt_version`` is not a version number, or a skill name is empty.
+            decimalai.EvaluationNotApplied: DecimalAI could not give the run that
+                setup (an unknown version or skill, no API key, an older backend, an
+                outage); the run is not started on the served setup instead.
         """
-        return self._start(message, variables, None)
+        if prompt_version is None and not exclude_skills:
+            return self._start(message, variables, None)
+        from . import _evaluation
+
+        trial = _evaluation.Trial(_evaluation.Override.make(self.name, prompt_version, exclude_skills))
+        with _evaluation.block(trial):
+            return self._start(message, variables, None, trial)
 
     def conversation(self, *, variables: Any = None, state: Optional[Dict[str, Any]] = None) -> "Conversation":
         """One chat whose system text and ``load_skill`` stay the same for every message.
@@ -726,14 +750,16 @@ class AgentConfig(AgentBinding):
                                  "from this version of decimalai")
         return Conversation(self, variables, state)
 
-    def _start(self, message: Optional[str], variables: Any, chat: Optional["Conversation"]) -> Run:
+    def _start(self, message: Optional[str], variables: Any, chat: Optional["Conversation"],
+               trial: Any = None) -> Run:
         """One run: routed, composed (or the conversation's, reused), and its tool names."""
         key = f"run_{uuid4().hex}"
         context = {"message": message, "values": variables, "conversation": chat}
         state = self._prepare_run_sync(context, None, key)
         if state["text"] is None:
             state["text"] = self._compose(context, None, key, state)
-        return Run(self, key, state["text"], list(state.get("tool_names") or []), list(state["names"]))
+        return Run(self, key, state["text"], list(state.get("tool_names") or []), list(state["names"]),
+                   trace_id=trial.trace_id if trial is not None else None)
 
     # ── the seams AgentBinding asks for ─────────────────────
     def _router(self) -> Any:
@@ -754,6 +780,15 @@ class AgentConfig(AgentBinding):
 
     def _record(self, **fields: Any) -> bool:
         return _record_turn(fields)
+
+    def _note_evaluation(self, run_key: Optional[str], trial: Any) -> None:
+        # The OpenTelemetry run live now (if any) is sent as an evaluation run, under an id the
+        # run can name before the trace is assembled.
+        from .otel import mark_evaluation_run
+
+        trace_id = str(uuid4())
+        if mark_evaluation_run(trace_id):
+            trial._note(trace_id)
 
     def _serve_load(self, name: str) -> str:
         return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name)

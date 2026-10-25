@@ -61,7 +61,7 @@ _common_options = [
 
 
 def _dashboard_url(base_url: str) -> str:
-    """Frontend URL for follow-up links.
+    """Frontend URL for follow-up links (`decimalai._evaluation.dashboard_url`).
 
     Resolved in three steps because the bare `api.→app.` string-replace this
     used to do printed backend links (localhost:8000/skills/…) under local dev,
@@ -69,14 +69,9 @@ def _dashboard_url(base_url: str) -> str:
     wins when set; localhost backends map to the conventional :3000 frontend;
     the replace stays as the hosted-domain fallback.
     """
-    import os
+    from .._evaluation import dashboard_url
 
-    explicit = os.environ.get("DECIMAL_APP_URL") or os.environ.get("DECIMALAI_APP_URL")
-    if explicit:
-        return explicit.rstrip("/")
-    if "localhost" in base_url or "127.0.0.1" in base_url:
-        return "http://localhost:3000"
-    return base_url.replace("api.", "app.").replace("/api", "").rstrip("/")
+    return dashboard_url(base_url)
 
 def common_options(func):
     for option in reversed(_common_options):

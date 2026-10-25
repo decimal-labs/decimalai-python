@@ -44,10 +44,10 @@ from typing import (
     Sequence,
     Set,
 )
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ._skill_witness import copy_delivered_versions, merge_delivered_versions
-from .schema.common import FinishReason, SpanType, Status
+from .schema.common import FinishReason, SourceType, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
 
@@ -358,6 +358,28 @@ def record_skill_rail(
         # A run whose root span never reaches the exporter would sit here
         # forever. Same discipline as the pending-span buffer: bounded, oldest
         # evicted first.
+        while len(_skill_rails) > _SKILL_RAIL_MAX:
+            _skill_rails.popitem(last=False)
+    return True
+
+
+def mark_evaluation_run(trace_id: str) -> bool:
+    """The run live NOW is an evaluation run (decimalai._evaluation), sent as ``trace_id``.
+
+    Its trace goes out as ``source_type="evaluation"`` under that id, so the caller knows the
+    id before the trace is assembled. Returns False when no run is live (nothing will be sent).
+    """
+    key = current_run_key()
+    if key is None:
+        return False
+    with _skill_rails_lock:
+        rail = _skill_rails.get(key)
+        if rail is None:
+            rail = {"routing_id": None, "offered": [], "delivered": [], "loaded": [],
+                    "loaded_hashes": {}, "delivered_versions": []}
+            _skill_rails[key] = rail
+        # First mark wins: one OpenTelemetry run is one trace.
+        rail.setdefault("evaluation_trace_id", trace_id)
         while len(_skill_rails) > _SKILL_RAIL_MAX:
             _skill_rails.popitem(last=False)
     return True
@@ -1270,6 +1292,11 @@ class DecimalSpanExporter:
                     # measured lift back to the version that produced it.
                     # A name with no hash is not added: it would carry nothing
                     # the plain string in `skills_loaded_by_agent` does not.
+                    # An evaluation run (`mark_evaluation_run`): marked, under the id its
+                    # caller was handed.
+                    if rail.get("evaluation_trace_id"):
+                        run_trace.id = UUID(rail["evaluation_trace_id"])
+                        run_trace.source_type = SourceType.EVALUATION
                     digests = rail.get("loaded_hashes") or {}
                     if digests:
                         already = {
