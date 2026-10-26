@@ -22,6 +22,8 @@ Each cell builds the agent the way ``decimalai init`` and the docs build it:
     adk-openai                    LlmAgent(model=LiteLlm("openai/..."), instruction=support.instruction,
                                   tools=[*support.tools]); runs only in the openai2 environment,
                                   because litellm pins openai<3 (skips elsewhere)
+    adk-anthropic                 the same on Claude, through ADK's own AnthropicLlm (needs only
+                                  `anthropic`, so it runs in the openai3 environment)
     langchain-openai              create_agent("openai:...", middleware=[support.middleware])
     langchain-anthropic           the same, on Claude
     langgraph_stategraph-openai   a hand-built LangGraph StateGraph: the model node takes
@@ -34,7 +36,7 @@ generalizes.
 
 The release gate runs these cells in its provider lanes: each id carries the provider, and the
 lanes select by ``-k`` (``platform/release_gate/config.py``). ``adk-openai`` runs in the gate's
-openai2 leg.
+openai2 leg, ``adk-anthropic`` in its anthropic lane.
 
 WHAT MAKES IT NON-CIRCULAR
 --------------------------
@@ -109,6 +111,7 @@ _CELLS = [
     pytest.param("openai_responses", "openai", id="openai_responses-openai"),
     pytest.param("google_genai", "google", id="google_genai-google"),
     pytest.param("adk", "openai", id="adk-openai"),
+    pytest.param("adk", "anthropic", id="adk-anthropic"),
     pytest.param("langchain", "openai", id="langchain-openai"),
     pytest.param("langchain", "anthropic", id="langchain-anthropic"),
     pytest.param("langgraph_stategraph", "openai", id="langgraph_stategraph-openai"),
@@ -355,20 +358,27 @@ def _google_genai(provider: str, model: str, agent_name: str, *, skills: bool) -
 
 def _adk(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
     pytest.importorskip("google.adk")
-    pytest.importorskip(
-        "litellm",
-        reason="ADK on a non-Gemini model needs litellm, which pins openai<3: this cell runs in "
-               "the openai2 environment",
-    )
+    if provider == "anthropic":
+        pytest.importorskip("anthropic")
+    else:
+        pytest.importorskip(
+            "litellm",
+            reason="ADK on an OpenAI model needs litellm, which pins openai<3: this cell runs in "
+                   "the openai2 environment",
+        )
     from google.adk.agents import LlmAgent
     from google.adk.apps import App
-    from google.adk.models.lite_llm import LiteLlm
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
     from decimalai.adk import DecimalAIPlugin, agent_config
 
-    llm = LiteLlm(model=f"{provider}/{model}")
+    if provider == "anthropic":
+        llm = h.adk_model(provider, model)
+    else:
+        from google.adk.models.lite_llm import LiteLlm
+
+        llm = LiteLlm(model=f"{provider}/{model}")
     if skills:
         support = agent_config(agent_name)
         agent = LlmAgent(name=agent_name.replace("-", "_"), model=llm,

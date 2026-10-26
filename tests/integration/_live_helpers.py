@@ -38,12 +38,15 @@ API_KEY = os.environ.get("DECIMAL_API_KEY", "dai_sk_test_key_001")
 # files drift — bump this map deliberately when it does, like a lockfile.
 MODEL_TIERS = {
     # google/openai ids verified listed+callable against the live models API on
-    # 2026-05-30. The anthropic ids are from the current model card but NOT yet
-    # live-verified (no ANTHROPIC_API_KEY at authoring) — canary + bump like a
-    # lockfile once a key is available. budget = the cheap tier (Haiku, the
-    # cost analog of flash/mini); frontier = the flagship (Sonnet for anthropic —
-    # Opus is hard-blocked by _guard_no_opus to stop accidental high-cost spend).
-    "budget":   {"google": "gemini-3.5-flash", "openai": "gpt-5.4-mini", "anthropic": "claude-haiku-4-5-20251001"},
+    # 2026-05-30. budget = the cheap tier (Haiku, the cost analog of flash/mini);
+    # frontier = the flagship (Sonnet for anthropic — Opus is hard-blocked by
+    # _guard_no_opus to stop accidental high-cost spend).
+    # Budget anthropic is Claude Haiku 5.5 since 2026-10-26 (was Haiku 4.5): it
+    # thinks by default (adaptive, effort medium), so the lane's Claude cells run on
+    # a thinking model, and it is a tenth of Haiku 4.5's price. It answers HTTP 400
+    # to any non-default temperature/top_p/top_k ("`temperature` is deprecated for
+    # this model"), so no anthropic cell sets one.
+    "budget":   {"google": "gemini-3.5-flash", "openai": "gpt-5.4-mini", "anthropic": "claude-haiku-5-5"},
     # Flagship tier. google stays on stable 2.5-pro: the 3.x pro line is preview-only.
     "frontier": {"google": "gemini-2.5-pro",   "openai": "gpt-5.5",      "anthropic": "claude-sonnet-4-6"},  # NOT opus
 }
@@ -95,7 +98,9 @@ LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LLM_TESTS") == "1"
 # the OpenAI Agents SDK emits strict tool schemas Gemini's OpenAI-compat
 # endpoint rejects, and running it on Gemini would test a combination nobody
 # ships — so it stays OpenAI-only even though it can be coaxed to pass. ADK
-# is Gemini-native for the mirror reason.
+# is Gemini-native, and also ships its own Claude model class (AnthropicLlm,
+# which needs only `anthropic`), so it pairs with google and anthropic:
+# `adk_model()` builds the model each cell hands LlmAgent.
 #
 # anthropic is a first-class generic provider: Claude leads the agent-builder
 # audience (enterprise API $ + coding agents), so every generic framework runs
@@ -106,12 +111,29 @@ LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LLM_TESTS") == "1"
 ALL_PROVIDERS = ("google", "openai", "anthropic")
 FRAMEWORK_PROVIDERS = {
     "openai_agents": ("openai",),
-    "adk": ("google",),
+    "adk": ("google", "anthropic"),
     # The Claude Agent SDK is Anthropic's own agent framework (it drives the
     # Claude Code engine), so it pairs only with the anthropic provider — the
-    # mirror of adk↔google / openai_agents↔openai.
+    # mirror of openai_agents↔openai.
     "claude_agent_sdk": ("anthropic",),
 }
+
+
+def adk_model(provider: str, model: str, *, client=None):
+    """The ``model=`` an ADK ``LlmAgent`` takes for a matrix cell.
+
+    Gemini is a plain model id. Claude is ADK's own ``AnthropicLlm`` (the Anthropic
+    API, ANTHROPIC_API_KEY), passed as an object: a bare ``"claude-..."`` string
+    resolves to ADK's Vertex ``Claude`` class instead. ``client`` is an optional
+    ``anthropic.AsyncAnthropic`` for the cell to watch the raw responses through.
+    """
+    if provider == "google":
+        return model
+    if provider == "anthropic":
+        from google.adk.models.anthropic_llm import AnthropicLlm
+
+        return AnthropicLlm(model=model, client=client)
+    raise ValueError(f"no ADK model for provider {provider!r}")
 
 
 def matrix(framework: str, *, only: tuple[str, ...] | None = None) -> list:

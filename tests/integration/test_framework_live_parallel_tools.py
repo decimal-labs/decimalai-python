@@ -61,7 +61,7 @@ def test_langchain_parallel_tool_calls(provider, model):
     elif provider == "anthropic":
         pytest.importorskip("langchain_anthropic")
         from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(model=model, temperature=0)
+        llm = ChatAnthropic(model=model)
     else:
         pytest.importorskip("langchain_openai")
         from langchain_openai import ChatOpenAI

@@ -39,7 +39,8 @@ Pinned to ``claude-haiku-5-5``, as the Anthropic file is: case 3 needs adaptive 
 the file refuses to send more than ``REQUEST_BUDGET`` requests in one run.
 
 Marker: live_llm + skill_routing. Needs ``RUN_LIVE_LLM_TESTS=1`` and ``ANTHROPIC_API_KEY``;
-skips without them.
+skips without them. Every test's id ends in ``[anthropic]``, which is how the release gate's
+anthropic lane (``-k anthropic``, ``platform/release_gate/config.py``) selects them.
 """
 
 from __future__ import annotations
@@ -103,6 +104,13 @@ _SPENT = [0]
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True, params=[pytest.param("anthropic", id="anthropic")])
+def _provider(request):
+    """The provider as each test's id, as ``h.matrix`` gives the other live cells: nothing
+    else in this file's ids says anthropic, so without it no gate lane ran the file."""
+    return request.param
 
 
 @pytest.fixture(autouse=True)

@@ -1,4 +1,4 @@
-"""Live-LLM — a skill's BODY reaches a real Gemini-backed ADK agent's ANSWER.
+"""Live-LLM — a skill's BODY reaches a real ADK agent's ANSWER, on Gemini and on Claude.
 
 An agent built from ``decimalai.adk.agent_config()`` gets its saved prompt, the
 list of skills it may load, and a ``load_skill`` tool. This proves the whole
@@ -23,7 +23,11 @@ the token, the token leaked from somewhere other than the skill and the
 positive result means nothing — so the control failing to produce it is part
 of the proof, not a nicety.
 
-Marker: live_llm + adk. Needs a funded Gemini key and a reachable backend.
+ADK pairs with ``google`` and ``anthropic`` (the release gate's FRAMEWORK_PROVIDERS): on Claude
+the agent's model is ADK's own ``AnthropicLlm`` (``h.adk_model``).
+
+Marker: live_llm + adk. Needs the provider's key (GEMINI_API_KEY or ANTHROPIC_API_KEY) and a
+reachable backend.
 """
 
 from __future__ import annotations
@@ -78,7 +82,7 @@ def _adk_env() -> None:
     os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "0")
 
 
-def _run_agent(model: str, agent_name: str, *, skills: bool) -> str:
+def _run_agent(provider: str, model: str, agent_name: str, *, skills: bool) -> str:
     """One ADK invocation, traced by the plugin; returns the model's final text."""
     from google.adk.agents import LlmAgent
     from google.adk.apps import App
@@ -90,11 +94,12 @@ def _run_agent(model: str, agent_name: str, *, skills: bool) -> str:
     node = agent_name.replace("-", "_")
     if skills:
         support = agent_config(agent_name)
-        agent = LlmAgent(name=node, model=model, instruction=support.instruction,
-                         tools=[*support.tools])
+        agent = LlmAgent(name=node, model=h.adk_model(provider, model),
+                         instruction=support.instruction, tools=[*support.tools])
         plugin = DecimalAIPlugin()
     else:
-        agent = LlmAgent(name=node, model=model, instruction=_INSTRUCTION, tools=[])
+        agent = LlmAgent(name=node, model=h.adk_model(provider, model),
+                         instruction=_INSTRUCTION, tools=[])
         plugin = DecimalAIPlugin(agent_name=agent_name)
     runner = InMemoryRunner(app=App(name=_APP, root_agent=agent, plugins=[plugin]))
 
@@ -119,7 +124,7 @@ def _run_agent(model: str, agent_name: str, *, skills: bool) -> str:
 @pytest.mark.adk
 @pytest.mark.parametrize("provider, model", h.matrix("adk"))
 def test_adk_skill_body_reaches_the_models_answer(provider, model):
-    """``load_skill`` serves a body a real Gemini answer then quotes back."""
+    """``load_skill`` serves a body a real model's answer then quotes back."""
     h.require_key_for(provider)
     pytest.importorskip("google.adk")
     _adk_env()
@@ -170,14 +175,14 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
     # ── The negative control runs FIRST, so a leak cannot be explained away
     #    as contamination from the positive run's session.
     control_name = h.unique_agent("adk-skill-delivery-control")
-    control_text = _run_agent(model, control_name, skills=False)
+    control_text = _run_agent(provider, model, control_name, skills=False)
     assert _TOKEN not in control_text.upper(), (
         "the control answered with the token WITHOUT agent_config(), so the "
         "token reached the model by some other route and this test proves "
         f"nothing about delivery. Control answer: {control_text!r}"
     )
 
-    answer = _run_agent(model, agent_name, skills=True)
+    answer = _run_agent(provider, model, agent_name, skills=True)
 
     assert _TOKEN in answer.upper(), (
         "the agent was built from agent_config() and the model's answer does not "

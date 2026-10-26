@@ -60,7 +60,7 @@ def test_langchain_manifest_drift_triggers_regression_check(provider, model):
         pytest.importorskip("langchain_anthropic")
         from langchain_anthropic import ChatAnthropic
         def _make_llm():
-            return ChatAnthropic(model=model, temperature=0)
+            return ChatAnthropic(model=model)
     else:
         pytest.importorskip("langchain_openai")
         from langchain_openai import ChatOpenAI
