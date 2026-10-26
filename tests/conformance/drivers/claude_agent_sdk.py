@@ -37,6 +37,7 @@ import asyncio
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
 
+from ..delivery import INJECTED
 from . import (
     STUB_MODEL_NAME,
     SYSTEM_PROMPT,
@@ -71,6 +72,16 @@ def _stub_transport(frames: Sequence[Dict[str, Any]], *, fail_after: Optional[in
             self._ready = False
             self._prompt_seen = False
             self._sent = 0
+            self._mcp_waiting = False
+            self._after_mcp: List[Dict[str, Any]] = []
+            self._mcp_marker: Dict[str, Any] = {}
+
+        def _mcp(self, stage: str, payload: Dict[str, Any]) -> None:
+            self._queue.append({
+                "type": "control_request", "request_id": f"conformance_mcp_{stage}",
+                "request": {"subtype": "mcp_message", "server_name": "decimalai",
+                            "message": payload},
+            })
 
         async def connect(self) -> None:
             self._ready = True
@@ -94,17 +105,48 @@ def _stub_transport(frames: Sequence[Dict[str, Any]], *, fail_after: Optional[in
                     # The prompt landed — the "model" may now answer.
                     self._queue.extend(frames)
                     self._prompt_seen = True
+                elif message.get("type") == "control_response":
+                    response = message.get("response") or {}
+                    request_id = response.get("request_id")
+                    if request_id == "conformance_mcp_init":
+                        self._mcp("ready", {"jsonrpc": "2.0", "method": "notifications/initialized"})
+                    elif request_id == "conformance_mcp_ready":
+                        self._mcp("call", {
+                            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "load_skill", "arguments": {"name": self._mcp_marker["_skill"]}},
+                        })
+                    elif request_id == "conformance_mcp_call":
+                        result = (response.get("response") or {}).get("mcp_response") or {}
+                        self._queue.append({
+                            "type": "user", "session_id": self._mcp_marker["_session"],
+                            "message": {"role": "user", "content": [{
+                                "type": "tool_result", "tool_use_id": self._mcp_marker["_tool_id"],
+                                "content": (result.get("result") or {}).get("content") or str(result),
+                            }]},
+                        })
+                        self._queue.extend(self._after_mcp)
+                        self._mcp_waiting = False
                 self._wake.set()
 
         async def read_messages(self) -> Any:
             while True:
                 if not self._queue:
-                    if self._prompt_seen:
+                    if self._prompt_seen and not self._mcp_waiting:
                         return
                     await self._wake.wait()
                     self._wake.clear()
                     continue
                 frame = self._queue.pop(0)
+                if "_skill" in frame:
+                    self._mcp_marker = frame
+                    self._mcp_waiting = True
+                    self._after_mcp, self._queue = self._queue, []
+                    self._mcp("init", {
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                   "clientInfo": {"name": "conformance-cli", "version": "1"}},
+                    })
+                    continue
                 if fail_after is not None and self._sent >= fail_after:
                     raise DriverError("conformance: the CLI died mid-stream on purpose")
                 self._sent += 1
@@ -125,14 +167,15 @@ def _stub_transport(frames: Sequence[Dict[str, Any]], *, fail_after: Optional[in
     return _StubCLI()
 
 
-def _frames(ctx: Ctx, *, use_tool: bool = True, declare: bool = True) -> List[Dict[str, Any]]:
+def _frames(ctx: Ctx, *, use_tool: bool = True, declare: bool = True,
+            skill: Optional[str] = None, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """The shared stub script as stream-JSON, in the CLI's own wire shape.
 
     ``declare=False`` is the degenerate run: an init frame that announces no
     model and no tools, so ``ClaudeAgentOptions()`` plus this leaves the adapter
     nothing to build a manifest from.
     """
-    session = "conformance-" + uuid4().hex[:12]
+    session = session_id or "conformance-" + uuid4().hex[:12]
     init: Dict[str, Any] = {"type": "system", "subtype": "init", "session_id": session}
     if declare:
         init["model"] = STUB_MODEL_NAME
@@ -145,6 +188,8 @@ def _frames(ctx: Ctx, *, use_tool: bool = True, declare: bool = True) -> List[Di
         tool_use_id = f"toolu_conformance_{index}"
         if turn.tool_call:
             name, args = turn.tool_call
+            if skill is not None:
+                name, args = "mcp__decimalai__load_skill", {"name": skill}
             blocks.append({"type": "tool_use", "id": tool_use_id, "name": name, "input": args})
         if turn.content:
             blocks.append({"type": "text", "text": turn.content})
@@ -168,6 +213,11 @@ def _frames(ctx: Ctx, *, use_tool: bool = True, declare: bool = True) -> List[Di
                 },
             })
         if turn.tool_call:
+            if skill is not None:
+                frames.append({"_skill": skill, "_tool_id": tool_use_id, "_session": session})
+                total_in += turn.input_tokens
+                total_out += turn.output_tokens
+                continue
             _, args = turn.tool_call
             frames.append({
                 "type": "user",
@@ -263,19 +313,66 @@ def run_concurrent(ctxs: Sequence[Ctx]) -> Any:
     return asyncio.run(_all())
 
 
+async def _configured(ctx: Ctx, support: Any) -> List[Any]:
+    """The config tutorial, over the real SDK/control protocol and MCP server."""
+    skill = ctx.skills[0]["name"] if ctx.skills and ctx.delivery_mode != INJECTED else None
+    async with support.run(user_message(ctx)) as run:
+        return [message async for message in run.query(
+            options=_options(ctx), transport=_stub_transport(_frames(
+                ctx, skill=skill, session_id=getattr(support, "_session_id", None))),
+        )]
+
+
+def run_skills(ctxs: Sequence[Ctx]) -> Any:
+    from decimalai.claude_agent_sdk import agent_config
+
+    configs: Dict[str, Any] = {}
+    pairs = []
+    for ctx in ctxs:
+        if ctx.agent_name not in configs:
+            configs[ctx.agent_name] = agent_config(ctx.agent_name)
+        pairs.append((ctx, configs[ctx.agent_name]))
+
+    async def _all() -> List[Any]:
+        return list(await asyncio.gather(*(_configured(ctx, support) for ctx, support in pairs)))
+    return asyncio.run(_all())
+
+
+def run_unnamed(ctx: Ctx) -> Any:
+    from decimalai.claude_agent_sdk import agent_config
+    return asyncio.run(_configured(ctx, agent_config(ctx.agent_name)))
+
+
+def run_conversation(ctxs: Sequence[Ctx]) -> Any:
+    """The same config conversation, keeping the first prompt and native session."""
+    from decimalai.claude_agent_sdk import agent_config
+
+    async def _run() -> List[Any]:
+        chat = agent_config(ctxs[0].agent_name).conversation()
+        result = []
+        for ctx in ctxs:
+            result.append(await _configured(ctx, chat))
+        return result
+    return asyncio.run(_run())
+
+
 DRIVER = Driver(
     name="claude-agent-sdk",
     covers=frozenset({"claude-agent-sdk", "claude-code"}),
     requires=("claude_agent_sdk",),
     frameworks=("claude-agent-sdk",),
-    entrypoint="decimalai.claude_agent_sdk.trace_stream()",
+    entrypoint="decimalai.claude_agent_sdk.trace_stream() / agent_config(name).run(message).query()",
     run=run,
     run_concurrent=run_concurrent,
     run_error=run_error,
     run_degenerate=run_degenerate,
+    run_skills=run_skills,
+    run_unnamed=run_unnamed,
+    run_conversation=run_conversation,
+    loads_agent_from_platform=True,
     capabilities=Capabilities(
         has_tools=True,
-        has_skills_rail=False,
+        has_skills_rail=True,
         supports_concurrency=True,
         supports_error_path=True,
         supports_degenerate=True,
@@ -291,21 +388,6 @@ DRIVER = Driver(
                 "not this suite's opinion: test_coverage reads this flag off "
                 "instrument()'s own signature, so the commit that gives it on_trace "
                 "turns both items on."
-            ),
-            "has_skills_rail": (
-                "Claude Code loads skills from disk (.claude/skills/), not from a hosted "
-                "menu, and the docs say so in as many words: 'There is no hosted-routing "
-                "path on this integration… router-side effectiveness data isn't collected "
-                "for skills used this way.' A disk install produces no routing decision at "
-                "prompt-assembly time, so there is no routing_id and no offered set for a "
-                "trace to carry — the rail C8 grades does not exist here. The install side "
-                "(SkillRouter.install(agents=['claude-code']) writing SKILL.md) is a "
-                "filesystem operation this adapter never sees. It silences the "
-                "activation items (C13/C13b) for the same reason the docs give: a disk "
-                "skill produces no offered set, so nothing here could be joined to a "
-                "routing decision, and the adapter maps no Skill tool use onto an "
-                "activation today — recording one from prompt presence would be a "
-                "fabrication."
             ),
         },
     ),

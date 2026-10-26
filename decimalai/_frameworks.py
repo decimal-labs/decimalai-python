@@ -49,7 +49,7 @@ DEFAULT_MODEL = "gpt-4o-mini"
 # ── what `decimalai init` does with a framework ──────────────────────────────
 #: Its adapter has a prompt seam AND ``decimalai init`` has a template for it.
 TEMPLATE = "template"
-#: Its adapter carries ``enable_skill_loader``, but there is no template yet:
+#: Its adapter has a config/skill-loader seam, but there is no template yet:
 #: ``decimalai init`` says "not yet" (``scaffold.UNSCAFFOLDED_WITH_SEAM``).
 SEAM_NO_TEMPLATE = "seam-no-template"
 #: Its adapter has no prompt seam, so a generated file would trace and deliver none of
@@ -231,10 +231,10 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         title="Claude Agent SDK / Claude Code",
         cli_label="The Claude Agent SDK",
         module="decimalai.claude_agent_sdk",
-        entry_point="`instrument()` / `trace_stream()`",
+        entry_point="`agent_config(name)` / `trace_stream()`",
         init_flag="claude_agent_sdk",
         extra="claude-agent-sdk",
-        scaffold=NO_SEAM,
+        scaffold=SEAM_NO_TEMPLATE,
         install='pip install "decimalai[claude-agent-sdk]"',
         env_vars=("DECIMAL_API_KEY", "ANTHROPIC_API_KEY"),
         native_loaders=(
@@ -249,12 +249,12 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             manifest="✅ full (model, prompt, tools, subagents)",
             schema_depth="Names only",
             handoffs="✅ (subagents)",
-            # No prompt seam for the router; skills reach Claude through Claude Code's
-            # own loader (the native column), which is how they always did.
-            skills_rail="—",
+            skills_rail="`load_skill` MCP tool (`agent_config()`)",
         ),
-        use_for="Claude Agent SDK — wraps the `query()` stream; one trace per run; "
-                "`skills_plugin()` loads installed skills as a Claude Code plugin (0.16+)",
+        use_for="Claude Agent SDK — `agent_config(name)` gives each independent "
+                "`support.run(question)` its saved prompt and routed skills through "
+                "`run.query()`, with one trace and an MCP `load_skill` tool (0.27+); "
+                "`skills_plugin()` also loads installed skills as a Claude Code plugin (0.16+)",
     ),
     Framework(
         key="pydantic-ai",

@@ -47,10 +47,9 @@ SCAFFOLD_BEFORE = {
     },
     "SUPPORTED_FRAMEWORKS": ("langchain", "openai-agents", "pydantic-ai", "adk", "anthropic",
                              "openai", "google-genai"),
-    "UNSCAFFOLDED_WITH_SEAM": {"crewai": "CrewAI"},
+    "UNSCAFFOLDED_WITH_SEAM": {"claude-agent-sdk": "The Claude Agent SDK", "crewai": "CrewAI"},
     "NO_PROMPT_SEAM": {
         "llamaindex": "LlamaIndex",
-        "claude-agent-sdk": "The Claude Agent SDK",
         "autogen": "AutoGen / AG2",
         "otel": "The generic OpenTelemetry rail",
     },

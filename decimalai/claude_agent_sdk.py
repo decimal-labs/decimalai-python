@@ -16,7 +16,20 @@ while accumulating one DecimalAI :class:`RunTrace`, finalized when the stream
 ends. The wrapper is observability-only — it never alters or swallows the
 caller's messages, and an ingest failure never breaks the user's run.
 
-Simple path (global — every ``query()`` is traced)::
+Config path (saved prompt, routed skills and one trace)::
+
+    from claude_agent_sdk import ClaudeAgentOptions
+    from decimalai.claude_agent_sdk import agent_config
+
+    support = agent_config("support", fallback="You are a helpful agent.")
+    async with support.run(question) as run:
+        async for message in run.query(options=ClaudeAgentOptions(max_turns=6)):
+            print(message)
+
+An in-process chat uses ``support.conversation().run(question)`` instead: it
+keeps its first prompt and tool schema and resumes its own Claude session.
+
+Tracing-only path (global — every ``query()`` is traced)::
 
     import decimalai
     decimalai.init(claude_agent_sdk=True)   # or: from decimalai.claude_agent_sdk import instrument; instrument()
@@ -307,7 +320,7 @@ class _RunState:
         "llm_calls", "spans", "pending_tools", "transcript", "root_span",
         "saw_turn_usage", "turns", "generated",
         "status", "error_message", "session_id", "init_data", "options", "finalized",
-        "native", "skill_calls",
+        "native", "skill_calls", "config_run",
     )
 
     def __init__(
@@ -369,6 +382,7 @@ class _RunState:
         self.init_data: Dict[str, Any] = {}
         self.options = options
         self.finalized = False
+        self.config_run: Any = None
         # The skills Claude Code itself listed and delivered on this run.
         self.native = NativeLoads()
         # (skill, args) of each `Skill` call, newest last: the delivered body that
@@ -948,12 +962,15 @@ def _build_manifest(state: _RunState) -> Dict[str, Any]:
         info["model"] = {"name": str(model), "provider": "anthropic"}
 
     system_prompt = _opt(opts, "system_prompt")
+    if state.config_run is not None:
+        system_prompt = state.config_run._manifest_prompt
     if isinstance(system_prompt, str) and system_prompt.strip():
         info["prompts"] = {"system": system_prompt.strip()}
 
     tools = _opt(opts, "allowed_tools") or init.get("tools")
     if isinstance(tools, (list, tuple)):
-        entries = [{"name": str(t)} for t in tools if t]
+        entries = [{"name": str(t)} for t in tools if t and not (
+            state.config_run is not None and str(t) == "mcp__decimalai__load_skill")]
         if entries:
             info["tools"] = entries
 
@@ -1071,6 +1088,9 @@ def _finalize(state: _RunState) -> None:
         return
     state.finalized = True
 
+    if state.config_run is not None and state.config_run.config._keyless:
+        return
+
     from . import _config
     if not _config._is_enabled():
         return
@@ -1100,6 +1120,8 @@ def _finalize(state: _RunState) -> None:
             state.native.apply(trace)
         except Exception:  # noqa: BLE001 - a trace without them beats no trace
             logger.debug("claude_agent_sdk: native skill loads not applied", exc_info=True)
+        if state.config_run is not None:
+            state.config_run._apply(trace)
         _agent = trace.agent_name
         if _agent in _pending_manifests:
             _config.submit_trace_pending_manifest(
@@ -1153,6 +1175,7 @@ async def trace_stream(
     user_input: Optional[str] = None,
     parent_trace_id: Optional[str] = None,
     options: Any = None,
+    _config_run: Any = None,
 ) -> AsyncIterator[Any]:
     """Wrap a Claude Agent SDK message stream, emitting one DecimalAI RunTrace.
 
@@ -1175,6 +1198,9 @@ async def trace_stream(
         agent_name=agent_name, parent_trace_id=parent_trace_id,
         user_input=user_input, options=options,
     )
+    state.config_run = _config_run
+    if _config_run is not None:
+        state.user_input_preview = _preview(_config_run.message)
     try:
         async for message in stream:
             _ingest_message(state, message)
@@ -1270,9 +1296,19 @@ def instrument(agent_name: Optional[str] = None) -> None:
             options=kwargs.get("options"),
         )
 
+    patched_query.__decimalai_original__ = original_query  # type: ignore[attr-defined]
     claude_agent_sdk.query = patched_query  # type: ignore[assignment]
     _query_patched = True
     logger.info(
         "DecimalAI Claude Agent SDK tracing installed globally (agent_name=%s)",
         agent_name,
     )
+
+
+# Config is lazy about the provider dependency, like this tracing module.
+from ._claude_agent_config import (  # noqa: E402, F401
+    ClaudeAgentConfig,
+    Conversation,
+    Run,
+    agent_config,
+)

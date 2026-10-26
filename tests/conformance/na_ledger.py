@@ -72,10 +72,6 @@ DECLARED_NA: Dict[str, str] = {
     "generic-otel:C13": "has_skills_rail",
     "generic-otel:C13b": "has_skills_rail",
     "generic-otel:C14": "has_skills_rail",
-    "claude-agent-sdk:C8": "has_skills_rail",
-    "claude-agent-sdk:C13": "has_skills_rail",
-    "claude-agent-sdk:C13b": "has_skills_rail",
-    "claude-agent-sdk:C14": "has_skills_rail",
     # C18 (the agent routed for is the agent traced) and C19 (every
     # conversation turn routed) grade routing calls, and these three are never
     # routed. Added 2026-10-14 with the items; graded on all six rail drivers.
@@ -83,8 +79,6 @@ DECLARED_NA: Dict[str, str] = {
     "llamaindex:C19": "has_skills_rail",
     "generic-otel:C18": "has_skills_rail",
     "generic-otel:C19": "has_skills_rail",
-    "claude-agent-sdk:C18": "has_skills_rail",
-    "claude-agent-sdk:C19": "has_skills_rail",
     # No run that emits a trace without a model call, so there is no degenerate
     # form for a manifest to be fabricated from.
     "crewai:C7b": "supports_degenerate",
@@ -138,7 +132,9 @@ DECLARED_NA: Dict[str, str] = {
 # Lowered 31 -> 29 on 2026-10-23: Pydantic AI's C15 and C16 are graded. Its agent_config()
 # takes on_trace and links a run under decimalai.start_trace(), now that its run span is
 # DecimalAI's own root.
-NA_BUDGET = 29
+# Lowered 29 -> 23: Claude config now routes, delivers bodies through MCP and
+# keeps conversation turns routed; the six old no-rail exemptions are removed.
+NA_BUDGET = 23
 
 # ── delivery-axis N/As ───────────────────────────────────────────────────────
 
@@ -204,7 +200,7 @@ DECLARED_JOURNEY_NA: Dict[str, str] = {
     # --framework anthropic` writes a Tool Runner file (scaffold.py
     # `_render_anthropic`), and the journey stub speaks `POST /v1/messages`.
     "llamaindex:J1": "NO_PROMPT_SEAM",
-    "claude-agent-sdk:J1": "NO_PROMPT_SEAM",
+    "claude-agent-sdk:J1": "UNSCAFFOLDED_WITH_SEAM",
     # Moved from NO_PROMPT_SEAM on 2026-10-08: the adapter delivers skills now,
     # but `decimalai init` has no CrewAI template yet.
     "crewai:J1": "UNSCAFFOLDED_WITH_SEAM",
