@@ -600,6 +600,16 @@ def _loggable_turns(contents: list) -> list:
     return turns
 
 
+def gemini_output_tokens(usage_metadata) -> int | None:
+    """A Gemini call's billed output: the answer (``candidates_token_count``) plus the
+    thinking, which Gemini reports apart as ``thoughts_token_count``."""
+    candidates = getattr(usage_metadata, "candidates_token_count", None)
+    thoughts = getattr(usage_metadata, "thoughts_token_count", None)
+    if candidates is None and thoughts is None:
+        return None
+    return (candidates or 0) + (thoughts or 0)
+
+
 # ── Gemini call resilience: client-side timeout + optional throttle ──────────
 # The gate once hung ~10h on a native Gemini call that had NO client-side timeout
 # (a stuck socket). And the free-tier key rate-limits (429) under load. These give
@@ -723,7 +733,7 @@ def gemini_tool_loop(
             input=_loggable_turns(contents),
             output={"content": resp.text or ""},
             input_tokens=getattr(resp.usage_metadata, "prompt_token_count", None),
-            output_tokens=getattr(resp.usage_metadata, "candidates_token_count", None),
+            output_tokens=gemini_output_tokens(resp.usage_metadata),
         )
         cand = resp.candidates[0]
         func_calls = [p for p in (cand.content.parts or []) if getattr(p, "function_call", None)]

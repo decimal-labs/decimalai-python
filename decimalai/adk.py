@@ -234,6 +234,34 @@ def _map_finish_reason(raw: Any, has_tool_calls: bool) -> FinishReason:
     return FinishReason.STOP
 
 
+def _output_tokens(usage: Any) -> Optional[int]:
+    """Every output token a model call was billed for: the answer and the thinking.
+
+    ADK's usage is Gemini's shape, which keeps the two apart: ``candidates_token_count``
+    is the answer and ``thoughts_token_count`` the thinking, and both are billed as
+    output. ADK's AnthropicLlm takes the thinking out of Anthropic's ``output_tokens``
+    to fit that shape, so the candidates alone fall short on every model that thinks
+    (Claude Sonnet and Opus 5.5 always do, as do Gemini's thinking models).
+
+    ADK's LiteLlm does not split them: its ``candidates_token_count`` is LiteLLM's
+    ``completion_tokens``, which already holds the reasoning, and
+    ``thoughts_token_count`` repeats it. Its ``total_token_count`` is then prompt plus
+    candidates, and that is how the thinking is kept from being counted twice.
+    """
+    def _count(name: str) -> Optional[int]:
+        value = getattr(usage, name, None)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    candidates, thoughts = _count("candidates_token_count"), _count("thoughts_token_count")
+    if candidates is None and thoughts is None:
+        return None
+    total, prompt = _count("total_token_count"), _count("prompt_token_count")
+    if (thoughts and candidates is not None and total is not None and prompt is not None
+            and total == prompt + candidates + (_count("tool_use_prompt_token_count") or 0)):
+        return candidates
+    return (candidates or 0) + (thoughts or 0)
+
+
 def _function_calls_from_content(content: Any) -> List[Any]:
     """Every named ``function_call`` part of a genai Content, as the objects.
 
@@ -1214,7 +1242,7 @@ def _plugin_class() -> Any:
             usage = getattr(llm_response, "usage_metadata", None)
             if usage is not None:
                 rec.input_tokens = getattr(usage, "prompt_token_count", None)
-                rec.output_tokens = getattr(usage, "candidates_token_count", None)
+                rec.output_tokens = _output_tokens(usage)
             err_msg = getattr(llm_response, "error_message", None)
             if err_msg:
                 rec.status = Status.ERROR

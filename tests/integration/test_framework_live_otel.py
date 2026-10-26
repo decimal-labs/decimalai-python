@@ -97,7 +97,7 @@ def test_otel_exporter_ingests_real_gemini_run(provider, model):
                 )
                 llm_span.set_attribute(
                     "gen_ai.usage.output_tokens",
-                    getattr(um, "candidates_token_count", 0) or 0,
+                    h.gemini_output_tokens(um) or 0,
                 )
                 llm_span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
                 answer = resp.text or ""

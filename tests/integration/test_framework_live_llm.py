@@ -59,7 +59,7 @@ def _gemini_generic_loop(model: str, query: str) -> str:
             input=h._loggable_turns(contents),
             output={"content": resp.text or ""},
             input_tokens=getattr(resp.usage_metadata, "prompt_token_count", None),
-            output_tokens=getattr(resp.usage_metadata, "candidates_token_count", None),
+            output_tokens=h.gemini_output_tokens(resp.usage_metadata),
         )
         cand = resp.candidates[0]
         func_calls = [p for p in (cand.content.parts or []) if getattr(p, "function_call", None)]

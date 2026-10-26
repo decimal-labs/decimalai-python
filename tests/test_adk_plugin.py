@@ -50,7 +50,8 @@ def _flushed(mock: MagicMock) -> List[Any]:
     return [call.args[0] for call in mock.ingest_trace.call_args_list]
 
 
-def _agent(name: str) -> Any:
+def _agent(name: str, response: Any = None) -> Any:
+    """An agent whose model answers offline, with `response` (an LlmResponse) when given."""
     from google.adk.agents import LlmAgent
     from google.adk.models.base_llm import BaseLlm
     from google.adk.models.llm_response import LlmResponse
@@ -58,7 +59,8 @@ def _agent(name: str) -> Any:
 
     class OfflineLlm(BaseLlm):
         async def generate_content_async(self, llm_request, stream=False):
-            yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="offline answer")]))
+            yield response or LlmResponse(
+                content=types.Content(role="model", parts=[types.Part(text="offline answer")]))
 
     return LlmAgent(name=name, model=OfflineLlm(model="offline-stub"), instruction=CALLER_PROMPT)
 
@@ -74,12 +76,12 @@ async def _one_turn(runner: Any, text: str = "What fee applies to an opened box?
         pass
 
 
-def _runner(plugin: Any, name: str = "app_probe") -> Any:
+def _runner(plugin: Any, name: str = "app_probe", response: Any = None) -> Any:
     from google.adk.apps import App
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
 
-    return Runner(app=App(name=name, root_agent=_agent(name), plugins=[plugin]),
+    return Runner(app=App(name=name, root_agent=_agent(name, response), plugins=[plugin]),
                   session_service=InMemorySessionService())
 
 
@@ -157,6 +159,87 @@ def test_a_sync_run_links_its_parent_through_adks_own_context_copy(client):
     assert {t.user_input_preview: t.parent_trace_id for t in _flushed(client)} == {
         "hello": parent_id, "standalone": None,
     }
+
+
+def _traced_output_tokens(client: MagicMock, response: Any) -> Any:
+    """The output tokens the plugin records for one model call that answers `response`."""
+    import decimalai.adk as adk
+
+    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin(agent_name="tokens"), response=response)))
+    (trace,) = _flushed(client)
+    (call,) = trace.llm_calls
+    return call.output_tokens
+
+
+def _answer(usage: Any) -> Any:
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    return LlmResponse(content=types.Content(role="model", parts=[types.Part(text="answer")]),
+                       usage_metadata=usage)
+
+
+def test_a_model_calls_output_tokens_include_its_thinking(client):
+    """Gemini's usage keeps the thinking apart from the answer and bills both as output;
+    the call's output is their sum, not the answer alone (0.25.1 recorded 40 here)."""
+    from google.genai import types
+
+    assert _traced_output_tokens(client, _answer(types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=10, candidates_token_count=40, thoughts_token_count=80,
+        total_token_count=130,
+    ))) == 120
+
+
+def test_a_model_call_with_no_thinking_records_its_answer(client):
+    from google.genai import types
+
+    assert _traced_output_tokens(client, _answer(types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=10, candidates_token_count=7, total_token_count=17,
+    ))) == 7
+
+
+def test_a_claude_calls_output_tokens_are_what_anthropic_billed(client):
+    """ADK's AnthropicLlm subtracts the thinking from Anthropic's output_tokens (the billed
+    output) to fill candidates_token_count; the trace puts it back."""
+    pytest.importorskip("anthropic")
+    from anthropic.types import (
+        Message,
+        OutputTokensDetails,
+        TextBlock,
+        ThinkingBlock,
+        Usage,
+    )
+    from google.adk.models.anthropic_llm import message_to_generate_content_response
+
+    message = Message(
+        id="msg_1", type="message", role="assistant", model="claude-sonnet-5-5",
+        content=[ThinkingBlock(type="thinking", thinking="weighing it", signature="sig"),
+                 TextBlock(type="text", text="answer")],
+        stop_reason="end_turn", stop_sequence=None,
+        usage=Usage(input_tokens=10, output_tokens=120,
+                    output_tokens_details=OutputTokensDetails(thinking_tokens=80)),
+    )
+    response = message_to_generate_content_response(message)
+    assert response.usage_metadata.candidates_token_count == 40  # what 0.25.1 recorded
+    assert _traced_output_tokens(client, response) == message.usage.output_tokens == 120
+
+
+def test_a_litellm_calls_reasoning_is_not_counted_twice(client):
+    """ADK's LiteLlm keeps LiteLLM's completion_tokens, reasoning included, as
+    candidates_token_count and repeats the reasoning as thoughts_token_count."""
+    pytest.importorskip("litellm")
+    from google.adk.models.lite_llm import _model_response_to_generate_content_response
+    from litellm import ModelResponse
+
+    response = _model_response_to_generate_content_response(ModelResponse(
+        model="gpt-5",
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "answer"},
+                  "finish_reason": "stop"}],
+        usage={"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60,
+               "completion_tokens_details": {"reasoning_tokens": 30}},
+    ))
+    assert response.usage_metadata.thoughts_token_count == 30
+    assert _traced_output_tokens(client, response) == 50
 
 
 def test_the_process_wide_install_is_gone(client, monkeypatch, caplog):
