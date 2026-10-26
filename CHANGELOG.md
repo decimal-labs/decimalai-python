@@ -6,6 +6,24 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: `agent_config()` for the Claude Agent SDK
+
+- `from decimalai.claude_agent_sdk import agent_config`, then
+  `async with support.run(question) as run:` and
+  `async for message in run.query(options=ClaudeAgentOptions(...))`. Each run gets the agent's
+  saved prompt with its skill menu as the system prompt, and `load_skill` as an in-process MCP tool
+  (`mcp__decimalai__load_skill`), and records one trace. Your other options are kept as you pass
+  them (your MCP servers and allowed tools, the model, limits), and the options object is not
+  changed. The Claude Agent SDK had tracing and Claude Code's own disk loader
+  (`skills_plugin()`) before, but no routed skills.
+- `support.conversation().run(message)` keeps one chat's first prompt and tool schema and resumes
+  its own Claude session. `resume`, `session_id` and `continue_conversation` in your options are
+  refused, because they would restore a session under a different prompt; so is native `skills=`,
+  which would load the skills a second way.
+- With no API key and no `init()`, it runs keyless like every other binding: the `fallback=` prompt,
+  the skills `.decimal/skills.toml` lists read from disk, and nothing sent.
+- `decimalai init` has no Claude Agent SDK template yet; it says so.
+
 ### Fixed: timeouts and cancellation retain an error cause
 
 - Manual traces record cancellation as an error. Manual tracing and Google ADK retain the
