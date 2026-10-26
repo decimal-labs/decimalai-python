@@ -104,6 +104,7 @@ from ._agent_binding import (
 )
 from ._native import Load, NativeLoads, record
 from ._skill_witness import copy_delivered_versions
+from ._usage import anthropic_cache_split
 from .schema.common import CallRole, FinishReason, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
@@ -209,6 +210,11 @@ def _function_responses(content: Any) -> List[str]:
         else:
             out.append(_json_text(response))
     return [text for text in out if text]
+
+
+def _usage_int(usage: Any, name: str) -> Optional[int]:
+    value = getattr(usage, name, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _provider_for_model(model: Optional[str]) -> Optional[str]:
@@ -1243,6 +1249,15 @@ def _plugin_class() -> Any:
             if usage is not None:
                 rec.input_tokens = getattr(usage, "prompt_token_count", None)
                 rec.output_tokens = _output_tokens(usage)
+                if rec.provider == "anthropic":
+                    # ADK's AnthropicLlm folds the cache into prompt_token_count; it keeps the
+                    # read as cached_content_token_count and the write as
+                    # cache_creation_input_tokens. A Claude call keeps Anthropic's split.
+                    rec.input_tokens, rec.cache_read_tokens, rec.cache_creation_tokens = (
+                        anthropic_cache_split(
+                            rec.input_tokens,
+                            _usage_int(usage, "cached_content_token_count"),
+                            _usage_int(usage, "cache_creation_input_tokens")))
             err_msg = getattr(llm_response, "error_message", None)
             if err_msg:
                 rec.status = Status.ERROR

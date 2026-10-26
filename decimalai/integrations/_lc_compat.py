@@ -258,6 +258,31 @@ def extract_token_usage(response: Any) -> Tuple[Optional[int], Optional[int]]:
     return (input_tokens, output_tokens)
 
 
+def extract_cache_usage(response: Any) -> Tuple[Optional[int], Optional[int]]:
+    """``(cache_read, cache_creation)`` from the message's ``usage_metadata.input_token_details``,
+    each None when the model reported no such key.
+
+    The write is the sum of ``cache_creation`` and the per-TTL keys: langchain-anthropic copies
+    Anthropic's ``ephemeral_5m_input_tokens`` / ``ephemeral_1h_input_tokens`` in and then sets
+    ``cache_creation`` to 0 so the write is not counted twice. Both counts are already inside
+    ``usage_metadata.input_tokens``.
+    """
+    gen = _get_first_generation(response)
+    usage_meta = getattr(getattr(gen, "message", None), "usage_metadata", None) if gen else None
+    details = (usage_meta.get("input_token_details") if isinstance(usage_meta, dict)
+               else getattr(usage_meta, "input_token_details", None))
+    if not isinstance(details, dict):
+        return (None, None)
+
+    def _int(key: str) -> Optional[int]:
+        value = details.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    writes = [v for v in (_int("cache_creation"), _int("ephemeral_5m_input_tokens"),
+                          _int("ephemeral_1h_input_tokens")) if v is not None]
+    return (_int("cache_read"), sum(writes) if writes else None)
+
+
 # ── Model Name Extraction ──────────────────────────────────────
 
 def extract_model_name(invocation_params: Optional[Dict[str, Any]]) -> Optional[str]:

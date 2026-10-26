@@ -42,7 +42,7 @@ def _lookup_price_3(item: str) -> int:
 @pytest.mark.live_llm
 @pytest.mark.parallel_tools
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_parallel_tool_calls(provider, model):
+def test_langchain_parallel_tool_calls(provider, model, claude_bill):
     """LangChain agent fans out 3 tool calls in a single LLM step.
 
     Native Gemini (ChatGoogleGenerativeAI) supports parallel function calling,
@@ -88,6 +88,7 @@ def test_langchain_parallel_tool_calls(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="langchain parallel tools")
     h.assert_parallel_tool_calls(detail, min_parallel=2)
 
 

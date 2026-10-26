@@ -47,6 +47,7 @@ from typing import (
 from uuid import UUID, uuid4
 
 from ._skill_witness import copy_delivered_versions, merge_delivered_versions
+from ._usage import anthropic_cache_split
 from .schema.common import FinishReason, SourceType, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
 from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
@@ -108,20 +109,27 @@ _ALT_OUTPUT_TOKEN_KEYS = (
 # Two families of spelling, checked in that order:
 #   OpenInference (Arize) — what the provider instrumentors actually emit
 #     today; `cache_write` is Anthropic's cache CREATION, not a second read.
-#   GenAI semconv — what OTel-native instrumentations emit.
+#   GenAI semconv — what OTel-native instrumentations emit
+#     (`gen_ai.usage.cache_read.input_tokens` is the current spelling, and
+#     Pydantic AI's).
 #
-# Stored WITHOUT folding into input tokens, and the two providers disagree
-# about whether they are already inside the prompt count:
-#   Anthropic — additional to `input_tokens` (which is the uncached remainder)
+# LlmCallRecord keeps each provider's own convention:
+#   Anthropic — the cache counts are additional to `input_tokens`, which is
+#               the uncached remainder
 #   OpenAI    — `cached_tokens` is a SUBSET of `prompt_tokens`
-# so a provider-blind sum double-counts OpenAI. See LlmCallRecord's fields.
+# so a provider-blind sum double-counts OpenAI. The spans themselves put the
+# cache INSIDE the prompt count for both (OpenInference's anthropic
+# instrumentor adds it in; semconv defines it as part of input_tokens), so a
+# Claude call's input comes out of `anthropic_cache_split`.
 _CACHE_READ_TOKEN_KEYS = (
     "llm.token_count.prompt_details.cache_read",
+    "gen_ai.usage.cache_read.input_tokens",
     "gen_ai.usage.cache_read_input_tokens",
     "gen_ai.usage.cached_input_tokens",
 )
 _CACHE_CREATION_TOKEN_KEYS = (
     "llm.token_count.prompt_details.cache_write",
+    "gen_ai.usage.cache_creation.input_tokens",
     "gen_ai.usage.cache_creation_input_tokens",
 )
 
@@ -1873,6 +1881,9 @@ class DecimalSpanExporter:
         # keys off `is not None`, not truthiness, so the zero survives.
         cache_read_tokens = _get_int(attrs, *_CACHE_READ_TOKEN_KEYS)
         cache_creation_tokens = _get_int(attrs, *_CACHE_CREATION_TOKEN_KEYS)
+        if str(provider or "").lower() == "anthropic":
+            input_tokens, cache_read_tokens, cache_creation_tokens = anthropic_cache_split(
+                input_tokens, cache_read_tokens, cache_creation_tokens)
 
         latency_ms = None
         if started_at and ended_at:

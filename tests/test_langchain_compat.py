@@ -472,3 +472,67 @@ class TestCallbackRoundTrip:
         roles = [m["role"] for m in llm_call.rendered_input]
         assert roles == ["user", "assistant", "tool"]
         assert llm_call.rendered_input[2]["content"] == "Sunny 72F"
+
+
+# ── A Claude call keeps Anthropic's cache split ────────────────
+
+
+class TestClaudeCacheSplit:
+    """LangChain's ``usage_metadata.input_tokens`` includes the prompt cache, while Anthropic
+    bills its ``input_tokens`` (the uncached remainder), the cache read and the cache write
+    apart. LlmCallRecord keeps Anthropic's split for a Claude call. Recording LangChain's
+    total billed every cached token at the full input price (live, 2026-10-26: input 2861
+    recorded where Anthropic billed 17, plus 2844 as a cache write the trace did not carry).
+
+    The usage comes from langchain-anthropic's own converter, fed Anthropic ``Usage`` objects.
+    """
+
+    def _record(self, invocation_params: dict, usage_metadata: dict):
+        handler = CallbackHandler(agent_name="cache-split-agent")
+        chain_id, llm_id = uuid4(), uuid4()
+        handler.on_chain_start(serialized={"name": "Chain"}, inputs={"input": "q"}, run_id=chain_id)
+        handler.on_chat_model_start(
+            serialized={"name": "ChatAnthropic"}, messages=[[HumanMessage(content="q")]],
+            run_id=llm_id, parent_run_id=chain_id, invocation_params=invocation_params)
+        message = AIMessage(content="ready", usage_metadata=usage_metadata)
+        handler.on_llm_end(response=LLMResult(generations=[[ChatGeneration(message=message)]]),
+                           run_id=llm_id)
+        handler.on_chain_end(outputs={"output": "ready"}, run_id=chain_id)
+        return handler.get_completed_trace().llm_calls[0]
+
+    @staticmethod
+    def _langchain_anthropic_usage(**usage) -> dict:
+        types = pytest.importorskip("anthropic.types")
+        chat_models = pytest.importorskip("langchain_anthropic.chat_models")
+        return chat_models._create_usage_metadata(types.Usage(**usage))
+
+    CLAUDE = {"_type": "anthropic-chat", "model": "claude-haiku-5-5"}
+
+    def test_a_cache_write_reported_per_ttl(self):
+        """langchain-anthropic copies Anthropic's per-TTL write counts in and zeroes
+        ``cache_creation``, so the write is the sum of the three keys."""
+        types = pytest.importorskip("anthropic.types")
+        usage = self._langchain_anthropic_usage(
+            input_tokens=17, output_tokens=4, cache_read_input_tokens=0,
+            cache_creation_input_tokens=2845,
+            cache_creation=types.CacheCreation(ephemeral_5m_input_tokens=2845,
+                                               ephemeral_1h_input_tokens=0))
+        assert usage["input_tokens"] == 2862 and usage["input_token_details"]["cache_creation"] == 0
+
+        call = self._record(self.CLAUDE, usage)
+        assert (call.input_tokens, call.cache_read_tokens, call.cache_creation_tokens,
+                call.output_tokens) == (17, 0, 2845, 4)
+
+    def test_a_cache_read(self):
+        call = self._record(self.CLAUDE, self._langchain_anthropic_usage(
+            input_tokens=17, output_tokens=5, cache_read_input_tokens=2845,
+            cache_creation_input_tokens=0))
+        assert (call.input_tokens, call.cache_read_tokens, call.cache_creation_tokens) == (17, 2845, 0)
+
+    def test_an_openai_call_keeps_its_own_convention(self):
+        """OpenAI's cached tokens are a subset of its input, which stays whole."""
+        call = self._record({"_type": "openai-chat", "model": "gpt-5.4-mini"}, {
+            "input_tokens": 2115, "output_tokens": 300, "total_tokens": 2415,
+            "input_token_details": {"cache_read": 2048}})
+        assert call.input_tokens == 2115
+        assert call.cache_read_tokens is None and call.cache_creation_tokens is None

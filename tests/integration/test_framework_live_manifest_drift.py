@@ -39,7 +39,7 @@ SYSTEM_PROMPT_V2 = (
 @pytest.mark.live_llm
 @pytest.mark.manifest_drift
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_manifest_drift_triggers_regression_check(provider, model):
+def test_langchain_manifest_drift_triggers_regression_check(provider, model, claude_bill):
     """Two runs, same agent_name, different system prompts → two manifests +
     a regression-check that recognizes the second as a candidate."""
     h.require_key_for(provider)
@@ -106,7 +106,9 @@ def test_langchain_manifest_drift_triggers_regression_check(provider, model):
     h.flush_sdk_sender()
 
     # Both traces should land — proves both runs reached the backend.
-    h.poll_for_trace(agent_name, expected_count=2)
+    traces = h.poll_for_trace(agent_name, expected_count=2)
+    h.check_billed([c for t in traces[:2] for c in h.get_trace_detail(t["id"]).get("llm_calls") or []],
+                   claude_bill, what="langchain manifest drift, both runs")
 
     # ── Manifests: two distinct, different hashes ─────────────────────
     manifests = h.list_manifests(agent_name)

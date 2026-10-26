@@ -50,7 +50,7 @@ def _flushed(mock: MagicMock) -> List[Any]:
     return [call.args[0] for call in mock.ingest_trace.call_args_list]
 
 
-def _agent(name: str, response: Any = None) -> Any:
+def _agent(name: str, response: Any = None, model: str = "offline-stub") -> Any:
     """An agent whose model answers offline, with `response` (an LlmResponse) when given."""
     from google.adk.agents import LlmAgent
     from google.adk.models.base_llm import BaseLlm
@@ -62,7 +62,7 @@ def _agent(name: str, response: Any = None) -> Any:
             yield response or LlmResponse(
                 content=types.Content(role="model", parts=[types.Part(text="offline answer")]))
 
-    return LlmAgent(name=name, model=OfflineLlm(model="offline-stub"), instruction=CALLER_PROMPT)
+    return LlmAgent(name=name, model=OfflineLlm(model=model), instruction=CALLER_PROMPT)
 
 
 async def _one_turn(runner: Any, text: str = "What fee applies to an opened box?") -> None:
@@ -76,12 +76,13 @@ async def _one_turn(runner: Any, text: str = "What fee applies to an opened box?
         pass
 
 
-def _runner(plugin: Any, name: str = "app_probe", response: Any = None) -> Any:
+def _runner(plugin: Any, name: str = "app_probe", response: Any = None,
+            model: str = "offline-stub") -> Any:
     from google.adk.apps import App
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
 
-    return Runner(app=App(name=name, root_agent=_agent(name, response), plugins=[plugin]),
+    return Runner(app=App(name=name, root_agent=_agent(name, response, model), plugins=[plugin]),
                   session_service=InMemorySessionService())
 
 
@@ -161,14 +162,20 @@ def test_a_sync_run_links_its_parent_through_adks_own_context_copy(client):
     }
 
 
-def _traced_output_tokens(client: MagicMock, response: Any) -> Any:
-    """The output tokens the plugin records for one model call that answers `response`."""
+def _traced_call(client: MagicMock, response: Any, model: str = "offline-stub") -> Any:
+    """The LlmCallRecord the plugin records for one model call that answers `response`."""
     import decimalai.adk as adk
 
-    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin(agent_name="tokens"), response=response)))
+    asyncio.run(_one_turn(_runner(adk.DecimalAIPlugin(agent_name="tokens"), response=response,
+                                  model=model)))
     (trace,) = _flushed(client)
     (call,) = trace.llm_calls
-    return call.output_tokens
+    return call
+
+
+def _traced_output_tokens(client: MagicMock, response: Any) -> Any:
+    """The output tokens the plugin records for one model call that answers `response`."""
+    return _traced_call(client, response).output_tokens
 
 
 def _answer(usage: Any) -> Any:
@@ -222,6 +229,39 @@ def test_a_claude_calls_output_tokens_are_what_anthropic_billed(client):
     response = message_to_generate_content_response(message)
     assert response.usage_metadata.candidates_token_count == 40  # what 0.25.1 recorded
     assert _traced_output_tokens(client, response) == message.usage.output_tokens == 120
+
+
+def test_a_claude_calls_input_keeps_anthropics_cache_split(client):
+    """ADK's AnthropicLlm folds the cache into prompt_token_count; Anthropic bills its
+    input_tokens (the uncached remainder), the cache read and the cache write apart, and a
+    Claude call's record keeps that split (live, 2026-10-26: 2892 recorded where Anthropic
+    billed 4, with the 2888-token cache write missing)."""
+    pytest.importorskip("anthropic")
+    from anthropic.types import Message, TextBlock, Usage
+    from google.adk.models.anthropic_llm import message_to_generate_content_response
+
+    response = message_to_generate_content_response(Message(
+        id="msg_1", type="message", role="assistant", model="claude-haiku-5-5",
+        content=[TextBlock(type="text", text="steady")], stop_reason="end_turn",
+        stop_sequence=None,
+        usage=Usage(input_tokens=4, output_tokens=4, cache_read_input_tokens=2865,
+                    cache_creation_input_tokens=13),
+    ))
+    assert response.usage_metadata.prompt_token_count == 2882
+    call = _traced_call(client, response, model="claude-haiku-5-5")
+    assert (call.input_tokens, call.cache_read_tokens, call.cache_creation_tokens,
+            call.output_tokens) == (4, 2865, 13, 4)
+
+
+def test_a_gemini_calls_prompt_stays_whole(client):
+    """Gemini's cached tokens are part of its prompt count, which the record keeps whole."""
+    from google.genai import types
+
+    call = _traced_call(client, _answer(types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=1000, cached_content_token_count=800, candidates_token_count=7,
+        total_token_count=1007,
+    )), model="gemini-3.5-flash")
+    assert (call.input_tokens, call.cache_read_tokens, call.cache_creation_tokens) == (1000, None, None)
 
 
 def test_a_litellm_calls_reasoning_is_not_counted_twice(client):

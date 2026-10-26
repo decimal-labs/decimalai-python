@@ -123,7 +123,7 @@ def _run_agent(provider: str, model: str, agent_name: str, *, skills: bool) -> s
 @pytest.mark.live_llm
 @pytest.mark.adk
 @pytest.mark.parametrize("provider, model", h.matrix("adk"))
-def test_adk_skill_body_reaches_the_models_answer(provider, model):
+def test_adk_skill_body_reaches_the_models_answer(provider, model, claude_bill):
     """``load_skill`` serves a body a real model's answer then quotes back."""
     h.require_key_for(provider)
     pytest.importorskip("google.adk")
@@ -182,6 +182,8 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
         f"nothing about delivery. Control answer: {control_text!r}"
     )
 
+    # The agent's own run starts here; the control's requests came before it.
+    billed_from = len(claude_bill.responses) if claude_bill else 0
     answer = _run_agent(provider, model, agent_name, skills=True)
 
     assert _TOKEN in answer.upper(), (
@@ -195,6 +197,8 @@ def test_adk_skill_body_reaches_the_models_answer(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill and claude_bill.since(billed_from),
+                   what="adk skill delivery")
     assert skill_name in (detail.get("skills_loaded_by_agent") or []), (
         f"the model loaded {skill_name} and the trace does not say so: "
         f"skills_loaded_by_agent={detail.get('skills_loaded_by_agent')!r}"

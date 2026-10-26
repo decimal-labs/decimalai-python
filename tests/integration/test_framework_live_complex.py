@@ -24,7 +24,7 @@ from . import _live_helpers as h
 @pytest.mark.live_llm
 @pytest.mark.complex
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_complex_agent(provider, model):
+def test_langchain_complex_agent(provider, model, claude_bill):
     """5-tool customer support agent via langgraph + CallbackHandler."""
     h.require_key_for(provider)
     pytest.importorskip("langgraph")
@@ -90,6 +90,7 @@ def test_langchain_complex_agent(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="langchain complex")
     h.assert_rich_agent_trace(
         detail,
         min_llm_calls=3,        # plan → ≥2 act → finalize
@@ -351,7 +352,7 @@ def _openai_complex_loop(model: str, query: str, max_iters: int = 8) -> str:
 @pytest.mark.live_llm
 @pytest.mark.complex
 @pytest.mark.parametrize("provider, model", h.matrix("generic"))
-def test_generic_complex_agent(provider, model):
+def test_generic_complex_agent(provider, model, claude_bill):
     """5-tool customer support agent via @decimalai.trace + manual logging.
 
     'google' drives the native google.genai SDK (via h.gemini_tool_loop);
@@ -394,6 +395,7 @@ def test_generic_complex_agent(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="generic complex")
     h.assert_rich_agent_trace(
         detail,
         min_llm_calls=3,

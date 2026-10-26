@@ -105,7 +105,7 @@ def _raw_provider_call(provider: str, model: str) -> str:
 @pytest.mark.live_llm
 @pytest.mark.providers
 @pytest.mark.parametrize("provider, model", h.matrix("providers"))
-def test_direct_provider_sdk_call_traced(provider, model):
+def test_direct_provider_sdk_call_traced(provider, model, claude_bill):
     """A raw provider-SDK call → ``providers.instrument()`` → one backend trace
     whose model turn is captured as an llm_call with the right model id, plus an
     auto-detected manifest."""
@@ -160,6 +160,7 @@ def test_direct_provider_sdk_call_traced(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="raw messages.create")
 
     llm_calls = detail.get("llm_calls", [])
     assert llm_calls, (

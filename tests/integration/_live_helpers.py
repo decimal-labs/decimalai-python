@@ -7,6 +7,7 @@ file stays focused on its own scenario.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -119,20 +120,19 @@ FRAMEWORK_PROVIDERS = {
 }
 
 
-def adk_model(provider: str, model: str, *, client=None):
+def adk_model(provider: str, model: str):
     """The ``model=`` an ADK ``LlmAgent`` takes for a matrix cell.
 
     Gemini is a plain model id. Claude is ADK's own ``AnthropicLlm`` (the Anthropic
     API, ANTHROPIC_API_KEY), passed as an object: a bare ``"claude-..."`` string
-    resolves to ADK's Vertex ``Claude`` class instead. ``client`` is an optional
-    ``anthropic.AsyncAnthropic`` for the cell to watch the raw responses through.
+    resolves to ADK's Vertex ``Claude`` class instead.
     """
     if provider == "google":
         return model
     if provider == "anthropic":
         from google.adk.models.anthropic_llm import AnthropicLlm
 
-        return AnthropicLlm(model=model, client=client)
+        return AnthropicLlm(model=model)
     raise ValueError(f"no ADK model for provider {provider!r}")
 
 
@@ -872,6 +872,9 @@ def anthropic_tool_loop(
             output={"content": text_out},
             input_tokens=getattr(resp.usage, "input_tokens", None),
             output_tokens=getattr(resp.usage, "output_tokens", None),
+            # Anthropic's input_tokens is the uncached remainder: the cache counts go apart.
+            cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", None),
+            cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", None),
         )
         tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
         if resp.stop_reason != "tool_use" or not tool_uses:
@@ -896,6 +899,222 @@ def anthropic_tool_loop(
             })
         messages.append({"role": "user", "content": tool_results})
     raise RuntimeError("Agent loop exceeded safety bound")
+
+
+# ─── Process-wide tracing switches ───────────────────────────────────
+
+def _openinference_instrumentors() -> list:
+    found = []
+    for module, cls in (("openinference.instrumentation.openai", "OpenAIInstrumentor"),
+                        ("openinference.instrumentation.anthropic", "AnthropicInstrumentor"),
+                        ("openinference.instrumentation.google_genai", "GoogleGenAIInstrumentor")):
+        try:
+            found.append(getattr(__import__(module, fromlist=[cls]), cls))
+        except ImportError:
+            pass
+    return found
+
+
+def unpatch_provider_tracing() -> None:
+    """Turn off the process-wide switches these cells turn on.
+
+    ``init(openai=True)`` and ``decimalai.anthropic.agent_config()`` turn OpenInference's
+    instrumentors on, and Pydantic AI's ``Agent.instrument_all()`` is global too (no cell
+    calls it now; one left on by another file would trace the controls). Each
+    cell starts and ends with them off, so no cell traces another's calls, and a later
+    file meets the SDK unpatched (the 0.23.0 gate failed on one left on, f426799).
+    """
+    for cls in _openinference_instrumentors():
+        if cls().is_instrumented_by_opentelemetry:
+            cls().uninstrument()
+    for name in ("decimalai.anthropic", "decimalai.openai", "decimalai.google_genai",
+                 "decimalai.pydantic_ai"):
+        try:
+            # So the next agent_config() turns its provider's tracing on again.
+            __import__(name, fromlist=["_tracing_turned_on"])._tracing_turned_on = False
+        except ImportError:
+            pass
+    try:
+        from pydantic_ai import Agent
+        Agent.instrument_all(False)
+    except ImportError:
+        pass
+
+
+# ─── What Anthropic billed, read on the wire ─────────────────────────
+#
+# A trace's tokens are only worth something if they are what the provider billed. The
+# Claude cells check that against Anthropic's own numbers, not against what the framework
+# under test reports (that is the thing being checked). billed_anthropic_usage() puts a
+# local proxy in front of api.anthropic.com for the length of a block: every client the
+# cells use honours ANTHROPIC_BASE_URL (anthropic, langchain-anthropic, pydantic-ai, ADK's
+# AnthropicLlm, the Claude Code CLI that claude-agent-sdk starts), and the proxy keeps the
+# `usage` of each /v1/messages response, streamed or not.
+
+#: Anthropic's usage fields and the LlmCallRecord field each one is kept in.
+_BILLED_TO_TRACE = (
+    ("input_tokens", "input_tokens"),                        # the uncached remainder
+    ("cache_read_input_tokens", "cache_read_tokens"),
+    ("cache_creation_input_tokens", "cache_creation_tokens"),
+    ("output_tokens", "output_tokens"),                      # thinking included
+)
+
+
+def _usage_from_sse(text: str) -> dict:
+    usage: dict = {}
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        if event.get("type") == "message_start":
+            usage.update({k: v for k, v in ((event.get("message") or {}).get("usage") or {}).items()
+                          if v is not None})
+        elif event.get("type") == "message_delta":
+            # Cumulative: the last delta carries the final counts.
+            usage.update({k: v for k, v in (event.get("usage") or {}).items() if v is not None})
+    return usage
+
+
+class BilledUsage:
+    """What one block sent to Anthropic: ``responses`` is every /v1/messages answer
+    (``status``, ``model``, ``usage``), ``billed`` the usage of the 200s."""
+
+    def __init__(self) -> None:
+        self.responses: list[dict] = []
+
+    @property
+    def billed(self) -> list[dict]:
+        return [r["usage"] for r in self.responses if r["status"] == 200]
+
+    def total(self, field: str) -> int:
+        return sum(int(u.get(field) or 0) for u in self.billed)
+
+    def thinking(self) -> int:
+        return sum(int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0)
+                   for u in self.billed)
+
+    def since(self, start: int) -> "BilledUsage":
+        """The responses after the first ``start``: a run's own, when a control ran first."""
+        part = BilledUsage()
+        part.responses = self.responses[start:]
+        return part
+
+
+@contextlib.contextmanager
+def billed_anthropic_usage():
+    """Send every Anthropic request made inside the block through a local proxy that keeps
+    each response's billed ``usage``. Build the clients inside the block: one built before
+    it has already read ANTHROPIC_BASE_URL. An outer ANTHROPIC_BASE_URL stays the upstream."""
+    import http.server
+    import threading
+
+    import httpx
+
+    upstream = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+    seen = BilledUsage()
+    lock = threading.Lock()
+    drop_request = {"host", "content-length", "connection", "accept-encoding"}
+    drop_response = {"content-length", "content-encoding", "transfer-encoding", "connection"}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"   # the body ends when the connection closes
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self._forward()
+
+        def do_POST(self):
+            self._forward()
+
+        def _forward(self):
+            length = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(length) if length else b""
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in drop_request}
+            buf, status, ctype = bytearray(), 502, ""
+            try:
+                with httpx.Client(timeout=600) as client, client.stream(
+                        self.command, upstream.rstrip("/") + self.path, headers=headers,
+                        content=body) as resp:
+                    status, ctype = resp.status_code, resp.headers.get("content-type", "")
+                    self.send_response(status)
+                    for k, v in resp.headers.items():
+                        if k.lower() not in drop_response:
+                            self.send_header(k, v)
+                    self.end_headers()
+                    for chunk in resp.iter_bytes():
+                        buf += chunk
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            if self.command != "POST" or not self.path.split("?")[0].endswith("/v1/messages"):
+                return   # count_tokens, model lists: nothing billed
+            text = bytes(buf).decode("utf-8", "replace")
+            usage, model = {}, None
+            if "event-stream" in ctype:
+                usage = _usage_from_sse(text)
+            else:
+                try:
+                    parsed = json.loads(text)
+                    usage, model = parsed.get("usage") or {}, parsed.get("model")
+                except (ValueError, AttributeError):
+                    pass
+            with lock:
+                seen.responses.append({"status": status, "model": model, "usage": usage})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    previous = os.environ.get("ANTHROPIC_BASE_URL")
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield seen
+    finally:
+        if previous is None:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            os.environ["ANTHROPIC_BASE_URL"] = previous
+        server.shutdown()
+        server.server_close()
+
+
+def assert_trace_tokens_match_billed(calls: list[dict], seen: BilledUsage, *, what: str) -> None:
+    """A trace's model calls carry what Anthropic billed for the same requests.
+
+    The trace keeps Anthropic's convention for a Claude call (LlmCallRecord): input_tokens is
+    the uncached remainder, cache_read_tokens and cache_creation_tokens sit apart from it,
+    and output_tokens includes the thinking. The trace has no thinking field, so thinking is
+    checked through output_tokens. A field the trace leaves None counts as 0 here. A trace that
+    drops the cache split therefore passes only while the cache is cold, and the cache-hit
+    cells (test_framework_live_claude_billed_tokens.py) are where it is warm.
+    """
+    billed = seen.billed
+    assert billed, f"{what}: no Anthropic response went through the meter, so nothing was checked"
+    recorded = {trace_field: sum(int(c.get(trace_field) or 0) for c in calls)
+                for _, trace_field in _BILLED_TO_TRACE}
+    paid = {trace_field: seen.total(billed_field) for billed_field, trace_field in _BILLED_TO_TRACE}
+    print(f"\n[billed] {what}: {len(billed)} Claude responses, billed {paid} "
+          f"(thinking {seen.thinking()}); trace {len(calls)} llm_calls {recorded}")
+    assert len(calls) == len(billed), (
+        f"{what}: the trace has {len(calls)} llm_calls for {len(billed)} billed Claude responses")
+    mismatched = {f: (recorded[f], paid[f]) for f in recorded if recorded[f] != paid[f]}
+    assert not mismatched, (
+        f"{what}: the trace's tokens differ from Anthropic's bill, as (trace, billed): {mismatched}; "
+        f"thinking billed {seen.thinking()}. Per call, trace: "
+        f"{[{f: c.get(f) for _, f in _BILLED_TO_TRACE} for c in calls]}; billed: "
+        f"{[{b: u.get(b) for b, _ in _BILLED_TO_TRACE} for u in billed]}")
+
+
+def check_billed(calls: list[dict], seen: BilledUsage | None, *, what: str) -> None:
+    """``assert_trace_tokens_match_billed``, for a cell whose ``claude_bill`` fixture is not
+    None (its provider is anthropic)."""
+    if seen is not None:
+        assert_trace_tokens_match_billed(calls, seen, what=what)
 
 
 def get_topology(orchestrator_name: str) -> dict:

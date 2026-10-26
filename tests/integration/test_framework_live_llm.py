@@ -175,7 +175,7 @@ _GENERIC_IMPORT = {"google": "google.genai", "openai": "openai", "anthropic": "a
 @pytest.mark.live_llm
 @pytest.mark.simple_agent
 @pytest.mark.parametrize("provider, model", h.matrix("generic"))
-def test_generic_simple_agent(provider, model):
+def test_generic_simple_agent(provider, model, claude_bill):
     h.require_key_for(provider)
     pytest.importorskip(_GENERIC_IMPORT[provider])
 
@@ -194,6 +194,7 @@ def test_generic_simple_agent(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="generic simple")
     h.assert_rich_agent_trace(detail, min_llm_calls=2, min_tool_calls=2)
 
 
@@ -204,7 +205,7 @@ def test_generic_simple_agent(provider, model):
 @pytest.mark.live_llm
 @pytest.mark.simple_agent
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_simple_agent(provider, model):
+def test_langchain_simple_agent(provider, model, claude_bill):
     h.require_key_for(provider)
     pytest.importorskip("langgraph")
     from langchain_core.tools import tool
@@ -247,6 +248,7 @@ def test_langchain_simple_agent(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="langchain simple")
     h.assert_rich_agent_trace(detail, min_llm_calls=2, min_tool_calls=2)
 
 

@@ -246,7 +246,7 @@ def _assert_the_skill_text_reached_the_model(sent: list, answer: str) -> None:
 # ── 1. one message ──────────────────────────────────────────────────────────
 
 
-def test_one_message_loads_the_matching_skill_and_answers_from_it(platform, wire):
+def test_one_message_loads_the_matching_skill_and_answers_from_it(platform, wire, claude_bill):
     support = lc.agent_config("support")
     agent = create_agent(_claude(wire), tools=[lookup_order], middleware=[support.middleware])
     handler = lc.CallbackHandler(auto_send=False)
@@ -258,6 +258,8 @@ def test_one_message_loads_the_matching_skill_and_answers_from_it(platform, wire
         "You are Acme's customer support agent. The customer is Sam.")
 
     trace = handler.get_trace()
+    h.check_billed([c.model_dump() for c in trace.llm_calls], claude_bill,
+                   what="langchain agent_config() invoke")
     assert trace.agent_name == "support"
     assert trace.skills_loaded_by_agent == ["damaged-item"]
     assert "damaged-item" in trace.skills_offered_in_prompt

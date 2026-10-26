@@ -123,49 +123,11 @@ _CELLS = [
 # ── leave the process as found ───────────────────────────────────────────────
 
 
-def _openinference_instrumentors() -> list:
-    found = []
-    for module, cls in (("openinference.instrumentation.openai", "OpenAIInstrumentor"),
-                        ("openinference.instrumentation.anthropic", "AnthropicInstrumentor"),
-                        ("openinference.instrumentation.google_genai", "GoogleGenAIInstrumentor")):
-        try:
-            found.append(getattr(__import__(module, fromlist=[cls]), cls))
-        except ImportError:
-            pass
-    return found
-
-
-def _unpatch() -> None:
-    """Turn off the process-wide switches these cells turn on.
-
-    ``init(openai=True)`` and ``decimalai.anthropic.agent_config()`` turn OpenInference's
-    instrumentors on, and Pydantic AI's ``Agent.instrument_all()`` is global too (no cell
-    calls it now; one left on by another file would trace the controls). Each
-    cell starts and ends with them off, so no cell traces another's calls, and a later
-    file meets the SDK unpatched (the 0.23.0 gate failed on one left on, f426799).
-    """
-    for cls in _openinference_instrumentors():
-        if cls().is_instrumented_by_opentelemetry:
-            cls().uninstrument()
-    for name in ("decimalai.anthropic", "decimalai.openai", "decimalai.google_genai",
-                 "decimalai.pydantic_ai"):
-        try:
-            # So the next agent_config() turns its provider's tracing on again.
-            __import__(name, fromlist=["_tracing_turned_on"])._tracing_turned_on = False
-        except ImportError:
-            pass
-    try:
-        from pydantic_ai import Agent
-        Agent.instrument_all(False)
-    except ImportError:
-        pass
-
-
 @pytest.fixture(autouse=True)
 def _unpatched():
-    _unpatch()
+    h.unpatch_provider_tracing()
     yield
-    _unpatch()
+    h.unpatch_provider_tracing()
 
 
 # ── one runner per binding ───────────────────────────────────────────────────
@@ -519,7 +481,7 @@ def _seed_agent(agent_name: str) -> None:
 @pytest.mark.live_llm
 @pytest.mark.skill_routing
 @pytest.mark.parametrize("binding, provider", _CELLS)
-def test_binding_skill_body_reaches_the_models_answer(binding, provider):
+def test_binding_skill_body_reaches_the_models_answer(binding, provider, claude_bill):
     """``load_skill`` serves a body that a real model's answer then quotes back."""
     h.require_key_for(provider)
     model = h.resolve_model(provider)
@@ -535,6 +497,8 @@ def test_binding_skill_body_reaches_the_models_answer(binding, provider):
 
     agent_name = h.unique_agent(f"{binding}-skill-loading")
     _seed_agent(agent_name)
+    # The agent's own run starts here; the control's requests came before it.
+    billed_from = len(claude_bill.responses) if claude_bill else 0
     answer = run_agent(provider, model, agent_name, skills=True)
     assert _TOKEN in answer.upper(), (
         f"the {binding} agent was built from agent_config() and the model's answer does not "
@@ -546,6 +510,8 @@ def test_binding_skill_body_reaches_the_models_answer(binding, provider):
     decimalai.flush()
     h.flush_sdk_sender()
     detail = h.get_trace_detail(h.poll_for_trace(agent_name)[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill and claude_bill.since(billed_from),
+                   what=f"{binding} skill loading")
     assert _SKILL_NAME in (detail.get("skills_loaded_by_agent") or []), (
         f"the model loaded {_SKILL_NAME} and the trace does not say so: "
         f"skills_loaded_by_agent={detail.get('skills_loaded_by_agent')!r}"

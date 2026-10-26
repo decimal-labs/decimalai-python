@@ -48,7 +48,9 @@ try:  # pragma: no cover - import shape depends on the installed extras
 except Exception:  # noqa: BLE001 - any import failure means "not installed"
     _CallbackBase = object  # type: ignore[assignment,misc]
 
+from ._usage import anthropic_cache_split
 from .integrations._lc_compat import (
+    extract_cache_usage,
     extract_message_content,
     extract_model_name,
     extract_output_dict,
@@ -2379,6 +2381,11 @@ class CallbackHandler(_CallbackBase):
                     call.finish_reason = FinishReason.STOP
 
         input_tokens, output_tokens = extract_token_usage(response)
+        if "anthropic" in str(call.provider or "").lower():
+            # usage_metadata's input includes the cache; a Claude call keeps Anthropic's split.
+            cache_read, cache_creation = extract_cache_usage(response)
+            input_tokens, call.cache_read_tokens, call.cache_creation_tokens = (
+                anthropic_cache_split(input_tokens, cache_read, cache_creation))
         call.input_tokens = input_tokens
         call.output_tokens = output_tokens
 

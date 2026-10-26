@@ -21,10 +21,11 @@ On Gemini the model is the plain id. On Claude it is ADK's own ``AnthropicLlm``
 (``h.adk_model``), and the cell also checks tokens on a thinking model: Anthropic
 counts thinking inside ``output_tokens``, ADK's converter splits it out as
 ``thoughts_token_count``, and the trace's output tokens must add it back. So the
-cell asks for effort ``max``, watches the raw responses through its own
-``AsyncAnthropic`` client, and requires that at least one call thought and that the
-trace's output tokens equal what Anthropic billed. decimalai 0.26.0 and earlier
-recorded the answer's tokens alone (fixed in 9bb3792).
+cell asks for effort ``max``, reads what Anthropic billed on the wire (the
+``claude_bill`` fixture), and requires that at least one call thought and that the
+trace's tokens equal the bill (``h.assert_trace_tokens_match_billed``: input, cache
+read and write, output). decimalai 0.26.0 and earlier recorded the answer's tokens
+alone (fixed in 9bb3792).
 
 Marker: live_llm + adk. Install the extra with ``pip install -e ".[adk-tests]"``.
 """
@@ -46,28 +47,7 @@ _MODEL_SUBSTR = {"google": "gemini", "anthropic": "claude"}
 _THINKING_ATTEMPTS = 3
 
 
-def _thinking_tokens(usage) -> int:
-    return getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", None) or 0
-
-
-def _billing_client(billed: list):
-    """An ``AsyncAnthropic`` that keeps each response's ``usage``: what Anthropic billed."""
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(max_retries=2)
-    create = client.messages.create
-
-    async def create_and_keep_usage(**kwargs):
-        message = await create(**kwargs)
-        if getattr(message, "usage", None) is not None:
-            billed.append(message.usage)
-        return message
-
-    client.messages.create = create_and_keep_usage
-    return client
-
-
-def _run_shopping(provider: str, model: str, agent_name: str, billed: list) -> str:
+def _run_shopping(provider: str, model: str, agent_name: str) -> str:
     """One ADK invocation of the shopping agent, traced by the plugin; returns the answer."""
     from google.adk.agents import LlmAgent
     from google.adk.apps import App
@@ -97,8 +77,7 @@ def _run_shopping(provider: str, model: str, agent_name: str, billed: list) -> s
     # which must be a valid Python identifier — keep them parallel but distinct.
     agent = LlmAgent(
         name=agent_name.replace("-", "_"),
-        model=h.adk_model(provider, model,
-                          client=_billing_client(billed) if provider == "anthropic" else None),
+        model=h.adk_model(provider, model),
         instruction=(
             "You are a shopping assistant. Use get_price to look up unit prices "
             "and calculate to total them. Never guess a price — call the tool."
@@ -137,7 +116,7 @@ def _run_shopping(provider: str, model: str, agent_name: str, billed: list) -> s
 @pytest.mark.live_llm
 @pytest.mark.adk
 @pytest.mark.parametrize("provider, model", h.matrix("adk"))
-def test_adk_agent_traces_through_native_plugin(provider, model):
+def test_adk_agent_traces_through_native_plugin(provider, model, claude_bill):
     """A real ADK agent → DecimalAIPlugin callbacks → one backend trace with the LLM
     step(s), the tool call(s), and the model; on Claude, the output tokens billed."""
     h.require_key_for(provider)
@@ -156,9 +135,10 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
     attempts = _THINKING_ATTEMPTS if provider == "anthropic" else 1
     for attempt in range(attempts):
         agent_name = h.unique_agent(f"adk-{provider}-shopping")
-        billed: list = []
-        result = _run_shopping(provider, model, agent_name, billed)
-        if provider != "anthropic" or any(_thinking_tokens(u) for u in billed):
+        billed_from = len(claude_bill.responses) if claude_bill else 0
+        result = _run_shopping(provider, model, agent_name)
+        seen = claude_bill.since(billed_from) if claude_bill else None
+        if seen is None or seen.thinking():
             break
 
     assert str(h.SHOPPING_EXPECTED_TOTAL) in result.replace(",", "").replace("$", ""), (
@@ -185,27 +165,12 @@ def test_adk_agent_traces_through_native_plugin(provider, model):
         f"ADK trace didn't record the {_MODEL_SUBSTR[provider]} model. llm_calls={calls}"
     )
 
-    if provider != "anthropic":
+    if seen is None:
         return
 
-    # Tokens on a thinking model: what the trace says each call produced is what
-    # Anthropic billed for it, thinking included.
-    thinking = [_thinking_tokens(u) for u in billed]
-    print(f"\n[adk-anthropic] attempt {attempt + 1}: {len(billed)} Claude calls, output "
-          f"{[u.output_tokens for u in billed]}, thinking {thinking}, trace "
-          f"{[c.get('output_tokens') for c in calls]}")
-    assert any(thinking), (
-        f"{attempts} runs at effort max came back without thinking, so the trace's "
-        f"output tokens could not be checked against thinking. output_tokens per call: "
-        f"{[u.output_tokens for u in billed]}"
+    # Tokens on a thinking model: the trace carries what Anthropic billed, thinking included.
+    assert seen.thinking(), (
+        f"{attempts} runs at effort max came back without thinking, so the trace's output "
+        f"tokens could not be checked against thinking (attempt {attempt + 1})"
     )
-    assert len(calls) == len(billed), (
-        f"the trace has {len(calls)} llm_calls for {len(billed)} Claude responses"
-    )
-    recorded = sum(int(c.get("output_tokens") or 0) for c in calls)
-    paid = sum(u.output_tokens for u in billed)
-    assert recorded == paid, (
-        f"the trace records {recorded} output tokens; Anthropic billed {paid}, of which "
-        f"{sum(thinking)} were thinking (per call: trace "
-        f"{[c.get('output_tokens') for c in calls]}, billed {[u.output_tokens for u in billed]})"
-    )
+    h.assert_trace_tokens_match_billed(calls, seen, what=f"adk on Claude, attempt {attempt + 1}")

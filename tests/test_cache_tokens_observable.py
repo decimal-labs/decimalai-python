@@ -88,7 +88,11 @@ def test_openinference_cache_details_are_captured():
     """`decimalai.init(anthropic=True)` routes through here.
 
     OpenInference names Anthropic's cache CREATION `cache_write`, which reads
-    like a second kind of read and is easy to drop on the floor.
+    like a second kind of read and is easy to drop on the floor. Its prompt
+    count ADDS both cache counts to Anthropic's input_tokens (openinference-
+    instrumentation-anthropic 3.x, `_get_llm_token_counts`; seen live on
+    2026-10-26: prompt 2983 for input 17 + cache write 2966), so the exporter
+    takes them back out: a Claude call keeps Anthropic's split.
     """
     spans = [
         _MockSpan(
@@ -96,7 +100,7 @@ def test_openinference_cache_details_are_captured():
             attributes={
                 "llm.model_name": "claude-sonnet-4-5",
                 "llm.provider": "anthropic",
-                "llm.token_count.prompt": 4_000,
+                "llm.token_count.prompt": 200_000,   # 4_000 + 180_000 + 16_000
                 "llm.token_count.completion": 900,
                 "llm.token_count.prompt_details.cache_read": 180_000,
                 "llm.token_count.prompt_details.cache_write": 16_000,
@@ -105,21 +109,22 @@ def test_openinference_cache_details_are_captured():
     ]
     call = _assemble(spans).llm_calls[0]
 
-    assert call.input_tokens == 4_000          # NOT 200_000 — no folding
+    assert call.input_tokens == 4_000          # the uncached remainder Anthropic bills
     assert call.output_tokens == 900
     assert call.cache_read_tokens == 180_000
     assert call.cache_creation_tokens == 16_000
 
 
 def test_genai_semconv_cache_keys_are_captured():
-    """OTel-native instrumentations use the gen_ai.* spelling instead."""
+    """OTel-native instrumentations use the gen_ai.* spelling instead, and count
+    the cache inside gen_ai.usage.input_tokens."""
     spans = [
         _MockSpan(
             "chat claude-sonnet-4-5", 0xB2, 0x01,
             attributes={
                 "gen_ai.system": "anthropic",
                 "gen_ai.request.model": "claude-sonnet-4-5",
-                "gen_ai.usage.input_tokens": 500,
+                "gen_ai.usage.input_tokens": 12_500,
                 "gen_ai.usage.output_tokens": 60,
                 "gen_ai.usage.cache_read_input_tokens": 12_000,
                 "gen_ai.usage.cache_creation_input_tokens": 0,
@@ -218,7 +223,7 @@ def test_warm_and_cold_runs_are_distinguishable():
     warm = _assemble([
         _MockSpan("AnthropicMessages", 0xB6, 0x01, attributes={
             "llm.model_name": "claude-sonnet-4-5",
-            "llm.token_count.prompt": 4_000,
+            "llm.token_count.prompt": 184_000,   # 4_000 fresh + 180_000 read
             "llm.token_count.completion": 900,
             "llm.token_count.prompt_details.cache_read": 180_000,
             "llm.token_count.prompt_details.cache_write": 0,
@@ -238,6 +243,42 @@ def test_warm_and_cold_runs_are_distinguishable():
     folded_cold = cold.input_tokens + (cold.cache_read_tokens or 0)
     assert folded_warm == folded_cold                  # what the old code saw
     assert warm.cache_read_tokens != cold.cache_read_tokens   # what it now sees
+    assert (warm.input_tokens, cold.input_tokens) == (4_000, 184_000)
+
+
+def test_pydantic_ai_semconv_cache_spelling_is_captured():
+    """Pydantic AI writes the current semconv names, with a dot:
+    gen_ai.usage.cache_read.input_tokens / cache_creation.input_tokens. Before
+    2026-10-26 the exporter read neither, so its Claude calls lost the split and
+    billed the cached prompt as fresh input."""
+    call = _assemble([
+        _MockSpan("chat claude-haiku-5-5", 0xB8, 0x01, attributes={
+            "gen_ai.system": "anthropic",
+            "gen_ai.request.model": "claude-haiku-5-5",
+            "gen_ai.usage.input_tokens": 2_984,
+            "gen_ai.usage.output_tokens": 4,
+            "gen_ai.usage.cache_read.input_tokens": 2_967,
+            "gen_ai.usage.cache_creation.input_tokens": 13,
+        }),
+    ]).llm_calls[0]
+
+    assert (call.input_tokens, call.cache_read_tokens, call.cache_creation_tokens) == (4, 2_967, 13)
+
+
+def test_a_claude_total_smaller_than_its_cache_is_left_as_it_came():
+    """A prompt count below its own cache counts cannot include them, so there is
+    nothing to take out (an instrumentor that already reports the remainder)."""
+    call = _assemble([
+        _MockSpan("AnthropicMessages", 0xB9, 0x01, attributes={
+            "llm.model_name": "claude-sonnet-4-5",
+            "llm.provider": "anthropic",
+            "llm.token_count.prompt": 17,
+            "llm.token_count.completion": 4,
+            "llm.token_count.prompt_details.cache_write": 2_966,
+        }),
+    ]).llm_calls[0]
+
+    assert (call.input_tokens, call.cache_creation_tokens) == (17, 2_966)
 
 
 # ── Manual tracer (decimalai.trace / generic.py) ──────────────────────────────

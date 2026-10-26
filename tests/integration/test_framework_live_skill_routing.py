@@ -240,7 +240,9 @@ def test_real_model_routes_to_correct_skill(provider, model):
         )
 
         # ── 5. Close + assert the offered→activated join ──
-        chosen = [s for s in (expected, distractor) if s in answer]  # model-derived
+        # Model-derived, by the same stem as step 4: the model may leave the stamp off (Claude
+        # Haiku 5.5 did once in three gate runs, 2026-10-26).
+        chosen = [s for s in (expected, distractor) if s.rsplit("-", 1)[0] in answer]
         assert chosen == [expected]
         manifest_id = _seed_manifest(agent_name)
         _post_trace(agent_name, manifest_id, routing_id, chosen, _QUERY, answer)

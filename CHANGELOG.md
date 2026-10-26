@@ -18,6 +18,24 @@ and patch releases are fixes.
 - Through ADK's `LiteLlm`, `candidates_token_count` already holds the reasoning, and it is not
   counted twice.
 
+### Fixed: a Claude call's input tokens are the uncached remainder, with the prompt cache apart
+
+- Anthropic bills a cached prompt in three parts at three prices: `input_tokens` (the uncached
+  remainder), the cache read and the cache write. A trace keeps that split for a Claude call
+  (`input_tokens`, `cache_read_tokens`, `cache_creation_tokens`). The Claude Agent SDK binding
+  already did. LangChain (`decimalai.langchain`), Google ADK (`DecimalAIPlugin`) and the
+  OpenTelemetry path (Pydantic AI's `agent_config()`, and the OpenInference spans of
+  `decimalai.anthropic` and `init(anthropic=True)`) recorded the framework's input count instead,
+  which includes the cache. On a cache hit the trace therefore billed every cached token as fresh
+  input. For example, LangChain recorded 2,861 input tokens where Anthropic billed 17 plus a
+  2,844-token cache write, and the write was not on the trace. These now record the remainder as
+  `input_tokens` and the read and write apart.
+- Pydantic AI writes the cache counts as `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_creation.input_tokens`, which are now read. Before, its Claude calls carried
+  no cache counts at all.
+- OpenAI and Gemini calls are unchanged: their cached tokens are part of the input count, which
+  stays whole.
+
 ## [0.26.0] — 2026-10-26
 
 ### New: `decimalai.evaluate()`, cases run through your agent and checked, setup against setup

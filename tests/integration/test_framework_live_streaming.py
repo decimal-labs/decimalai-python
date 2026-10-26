@@ -26,7 +26,7 @@ from . import _live_helpers as h
 @pytest.mark.live_llm
 @pytest.mark.streaming
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_streaming(provider, model):
+def test_langchain_streaming(provider, model, claude_bill):
     """Run a langgraph agent via .stream() and verify the adapter still
     produces a single well-formed trace covering every streamed step."""
     h.require_key_for(provider)
@@ -90,6 +90,7 @@ def test_langchain_streaming(provider, model):
         f"(adapter should merge stream events into a single trace)."
     )
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="langchain streaming")
     h.assert_rich_agent_trace(detail, min_llm_calls=2, min_tool_calls=2)
 
 

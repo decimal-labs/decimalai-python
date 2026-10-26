@@ -109,9 +109,8 @@ def test_claude_agent_sdk_query_native(provider, model):
 @pytest.mark.live_llm
 @pytest.mark.claude_agent_sdk
 @pytest.mark.parametrize("provider, model", h.matrix("claude_agent_sdk"))
-def test_claude_agent_sdk_text_generation_token_usage(provider, model):
-    """Text generation token usage is correctly reported: uncached remainder +
-    cache read + cache creation summed into effective input_tokens.
+def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bill):
+    """Text generation token usage is what Anthropic billed, cache split included.
 
     The Claude Agent SDK's ResultMessage.usage carries:
     - input_tokens: uncached remainder only (unique to Anthropic)
@@ -119,9 +118,10 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model):
     - cache_creation_input_tokens: tokens paid to create cache (if any)
     - output_tokens: generated tokens
 
-    The tracer should sum the cache tokens into input_tokens so the trace
-    reports the true context consumption (matching OpenAI's prompt_tokens which
-    includes cached tokens). This test verifies that the sum is recorded."""
+    The tracer keeps them split, as Anthropic bills them (decimalai.claude_agent_sdk's
+    _extract_usage; it summed the cache into input_tokens until 2026-08-22). The Claude Code
+    CLI caches its own system prompt, so this cell runs with the cache warm, and its trace
+    must equal what the CLI's requests were billed (``claude_bill``)."""
     h.require_key_for(provider)
     pytest.importorskip("claude_agent_sdk")
     if shutil.which("claude") is None:
@@ -155,6 +155,7 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model):
 
     llm_calls = detail.get("llm_calls", [])
     assert llm_calls, f"No llm_calls in trace {detail['id']}"
+    h.check_billed(llm_calls, claude_bill, what="claude-agent-sdk text generation")
 
     # Find the response turn (responder role, not planner).
     responder_calls = [
@@ -170,9 +171,8 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model):
     output_tokens = resp.get("output_tokens")
     input_tokens = resp.get("input_tokens")
 
-    # Both should be present: output_tokens from generation, input_tokens from
-    # the summed uncached + cache tokens. For a non-cached run, input_tokens
-    # should be just the prompt size (small for our short prompt).
+    # Both should be present: output_tokens from generation, input_tokens the uncached
+    # remainder (small for our short prompt).
     assert input_tokens is not None and input_tokens > 0, (
         f"input_tokens missing or zero in llm_call: {resp}"
     )

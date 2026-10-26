@@ -81,7 +81,7 @@ _ERROR_TOOLS_ANTHROPIC = [
 @pytest.mark.live_llm
 @pytest.mark.error_recovery
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_tool_error_recovery(provider, model):
+def test_langchain_tool_error_recovery(provider, model, claude_bill):
     h.require_key_for(provider)
     pytest.importorskip("langgraph")
     from langchain_core.tools import tool
@@ -137,6 +137,7 @@ def test_langchain_tool_error_recovery(provider, model):
     h.flush_sdk_sender()
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="langchain tool errors")
     # Trace-level should still be success — the agent recovered, didn't crash.
     assert detail.get("status") == "success", (
         f"Trace status not 'success' after recovery: {detail.get('status')!r}"
@@ -219,7 +220,7 @@ def test_openai_agents_tool_error_recovery(provider, model):
 @pytest.mark.live_llm
 @pytest.mark.error_recovery
 @pytest.mark.parametrize("provider, model", h.matrix("generic"))
-def test_generic_tool_error_recovery(provider, model):
+def test_generic_tool_error_recovery(provider, model, claude_bill):
     """Hand-rolled loop where get_order_details raises for an unknown order
     ID. The agent observes the error string, apologizes, and the failure is
     recorded as a tool span with status='error'. 'google' drives the native
@@ -279,6 +280,7 @@ def test_generic_tool_error_recovery(provider, model):
         h.flush_sdk_sender()
         traces = h.poll_for_trace(agent_name)
         detail = h.get_trace_detail(traces[0]["id"])
+        h.check_billed(detail.get("llm_calls") or [], claude_bill, what="generic tool errors")
         assert detail.get("status") == "success", (
             f"Trace status not 'success' after recovery: {detail.get('status')!r}"
         )

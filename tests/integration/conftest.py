@@ -27,6 +27,20 @@ def _reset_sdk():
     yield
 
 
+@pytest.fixture
+def claude_bill(request):
+    """What Anthropic billed while the test ran (``_h.billed_anthropic_usage``), or None for a
+    cell whose ``provider`` parameter is not anthropic. Started before the test body, because
+    some clients read ANTHROPIC_BASE_URL when they are built (ChatAnthropic does), not when
+    they send. Check a trace against it with ``_h.check_billed``."""
+    callspec = getattr(request.node, "callspec", None)
+    if getattr(callspec, "params", {}).get("provider", "anthropic") != "anthropic":
+        yield None
+        return
+    with _h.billed_anthropic_usage() as seen:
+        yield seen
+
+
 @pytest.fixture(autouse=True)
 def _fresh_agents_http_pool():
     """Give each test a fresh OpenAI Agents HTTP connection pool.

@@ -32,7 +32,7 @@ from . import _live_helpers as h
 @pytest.mark.live_llm
 @pytest.mark.multi_agent
 @pytest.mark.parametrize("provider, model", h.matrix("langchain"))
-def test_langchain_multi_agent_handoff(provider, model):
+def test_langchain_multi_agent_handoff(provider, model, claude_bill):
     """Orchestrator → refund specialist via a sub-agent tool.
 
     The orchestrator only has the `consult_refund_specialist` tool. When it
@@ -125,6 +125,11 @@ def test_langchain_multi_agent_handoff(provider, model):
 
     orch = h.get_trace_detail(orch_traces[0]["id"])
     spec = h.get_trace_detail(spec_traces[0]["id"])
+    # Every Claude request of the run is in one of the two agents' traces (the orchestrator may
+    # consult the specialist more than once, each a trace of its own).
+    h.check_billed([c for t in (orch_traces[:1] + spec_traces)
+                    for c in h.get_trace_detail(t["id"]).get("llm_calls") or []],
+                   claude_bill, what="langchain orchestrator + specialist")
 
     # Orchestrator called consult_refund_specialist at least once.
     orch_tool_names = {
