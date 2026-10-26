@@ -119,6 +119,31 @@ def _flushed_traces():
 
 
 class TestAdkErrorPathFinalization:
+    def test_message_less_model_error_is_recorded_on_run_and_span(self):
+        from decimalai.adk import DecimalAIPlugin
+
+        plugin = DecimalAIPlugin(agent_name="test-agent")
+        ic = _invocation_context(_make_agent())
+        cb = _callback_context()
+        error = TimeoutError()
+
+        async def drive():
+            await plugin.before_run_callback(invocation_context=ic)
+            await plugin.before_model_callback(
+                callback_context=cb,
+                llm_request=SimpleNamespace(model="gemini-2.0-flash", contents=[], config=None),
+            )
+            await plugin.on_model_error_callback(callback_context=cb, llm_request=None, error=error)
+            await plugin.on_run_error_callback(invocation_context=ic, error=error)
+
+        asyncio.run(drive())
+        traces = _flushed_traces()
+        assert len(traces) == 1
+        assert traces[0].status == Status.ERROR
+        assert traces[0].error_message == "TimeoutError"
+        assert any(span.status == Status.ERROR and span.output_preview == "TimeoutError"
+                   for span in traces[0].spans)
+
     def test_success_sends_one_trace_and_late_run_error_does_not_resend(self):
         from decimalai.adk import DecimalAIPlugin
 

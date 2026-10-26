@@ -804,9 +804,11 @@ def start_trace(
 
     try:
         yield ctx
-    except Exception as exc:
+    except BaseException as exc:
+        from ._error_message import exception_message
+
         ctx._status = Status.ERROR
-        ctx._error_message = str(exc)[:500]
+        ctx._error_message = exception_message(exc, 500)
         raise
     finally:
         _set_current_trace(prev)

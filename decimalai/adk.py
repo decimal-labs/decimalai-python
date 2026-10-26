@@ -102,6 +102,7 @@ from ._agent_binding import (
     attach_prompt_records,
     is_claude,
 )
+from ._error_message import exception_message
 from ._native import Load, NativeLoads, record
 from ._skill_witness import copy_delivered_versions
 from ._usage import anthropic_cache_split
@@ -1082,7 +1083,7 @@ def _plugin_class() -> Any:
             state.agent_stack.remove(span)
             self._close_span(
                 span,
-                output=str(error)[:500] if error else state.final_output_preview,
+                output=exception_message(error, 500) if error is not None else state.final_output_preview,
                 error=error is not None,
             )
             state.spans.append(span)
@@ -1117,7 +1118,7 @@ def _plugin_class() -> Any:
             self._close_agent_span(state, agent, error=error)
             state.status = Status.ERROR
             if not state.error_message:
-                state.error_message = str(error)
+                state.error_message = exception_message(error)
             return None
 
         async def after_run_callback(self, *, invocation_context: Any):  # noqa: ANN001
@@ -1142,7 +1143,7 @@ def _plugin_class() -> Any:
                 return None
             state.status = Status.ERROR
             if not state.error_message:
-                state.error_message = str(error)
+                state.error_message = exception_message(error)
             await self._complete(inv_id)
             return None
 
@@ -1284,10 +1285,10 @@ def _plugin_class() -> Any:
                 rec.status = Status.ERROR
                 rec.finish_reason = FinishReason.ERROR
                 state.llm_calls.append(rec)
-                self._close_span(span, output=str(error), error=True)
+                self._close_span(span, output=exception_message(error), error=True)
                 state.spans.append(span)
             state.status = Status.ERROR
-            state.error_message = str(error)
+            state.error_message = exception_message(error)
             return None
 
         # ── tool boundary ──────────────────────────────────
@@ -1370,7 +1371,7 @@ def _plugin_class() -> Any:
                 recorded: Any = {
                     "error": _clip(f"{type(error).__name__}: {error}", _TOOL_RESULT_STR_LIMIT),
                 }
-                preview: Optional[str] = str(error)[:_PREVIEW_LIMIT]
+                preview: Optional[str] = exception_message(error, _PREVIEW_LIMIT)
             else:
                 recorded = _recorded_tool_result(tool, result)
                 preview = _json_text(recorded)[:_PREVIEW_LIMIT] if result is not None else None
@@ -1433,7 +1434,7 @@ def _plugin_class() -> Any:
                     "will not carry it", getattr(tool, "name", None), exc_info=True,
                 )
             state.status = Status.ERROR
-            state.error_message = str(error)
+            state.error_message = exception_message(error)
             return None
 
         # ── finalize (runs in executor thread) ─────────────

@@ -6,6 +6,12 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed: timeouts and cancellation retain an error cause
+
+- Manual traces record cancellation as an error. Manual tracing and Google ADK retain the
+  exception type when its message is empty, so a bare `TimeoutError` or `CancelledError` no longer
+  produces a failed trace with no cause. The original exception still reaches the caller.
+
 ### Fixed: a Google ADK model call's output tokens include its thinking
 
 - `DecimalAIPlugin` recorded a model call's output as ADK's `candidates_token_count`, the answer
