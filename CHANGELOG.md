@@ -4,6 +4,20 @@ All notable changes to `decimalai` are documented here. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0, minor releases add features
 and patch releases are fixes.
 
+## [Unreleased]
+
+### Fixed: a Google ADK model call's output tokens include its thinking
+
+- `DecimalAIPlugin` recorded a model call's output as ADK's `candidates_token_count`, the answer
+  alone. ADK reports the thinking apart, as `thoughts_token_count` (its `AnthropicLlm` takes it out
+  of Anthropic's `output_tokens`), and it is billed as output. So on a model that thinks (Claude
+  Sonnet 5.5 and Opus 5.5 always do, as do Gemini's thinking models) the trace held less output than
+  was billed, and the cost DecimalAI estimates from it was low. A call's output tokens are now the
+  answer plus the thinking: what Anthropic or Gemini billed. On a Claude call with 107 thinking
+  tokens that was 115, where 0.25.1 recorded 8.
+- Through ADK's `LiteLlm`, `candidates_token_count` already holds the reasoning, and it is not
+  counted twice.
+
 ## [0.26.0] — 2026-10-26
 
 ### New: `decimalai.evaluate()`, cases run through your agent and checked, setup against setup
@@ -62,18 +76,6 @@ and patch releases are fixes.
 - `--format` takes `auto`, `json` or `jsonl`. Anything else (`--format josn`) now stops with a
   usage error before any request is sent; before, an unknown value was imported as JSON. Thanks to
   @Doomguy-BFG9000 ([#24](https://github.com/decimal-labs/decimalai-python/pull/24)).
-
-### Fixed: a Google ADK model call's output tokens include its thinking
-
-- `DecimalAIPlugin` recorded a model call's output as ADK's `candidates_token_count`, the answer
-  alone. ADK reports the thinking apart, as `thoughts_token_count` (its `AnthropicLlm` takes it out
-  of Anthropic's `output_tokens`), and it is billed as output. So on a model that thinks (Claude
-  Sonnet 5.5 and Opus 5.5 always do, as do Gemini's thinking models) the trace held less output than
-  was billed, and the cost DecimalAI estimates from it was low. A call's output tokens are now the
-  answer plus the thinking: what Anthropic or Gemini billed. On a Claude call with 107 thinking
-  tokens that was 115, where 0.25.1 recorded 8.
-- Through ADK's `LiteLlm`, `candidates_token_count` already holds the reasoning, and it is not
-  counted twice.
 
 ## [0.25.1] — 2026-10-23
 
