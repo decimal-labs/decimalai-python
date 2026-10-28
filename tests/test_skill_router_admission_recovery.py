@@ -49,7 +49,9 @@ def test_explicit_admission_recovers_exact_request_and_workspace_headers(method,
     first, second = [c.kwargs for c in request.call_args_list]
     assert first["json"] == second["json"] == expected
     assert first["params"] == second["params"] == {"agent_name": "support", "max_chars": 8000}
-    assert first["headers"] == second["headers"] == headers
+    # A route also says how long it will wait (X-Decimal-Route-Budget), the same on the retry.
+    budget = {sr._ROUTE_BUDGET_HEADER: f"{sr._hot_path_read_budget():g}"} if path == sr._ROUTE_PATH else {}
+    assert first["headers"] == second["headers"] == {**headers, **budget}
     get_headers.assert_called_once()
     sleep.assert_called_once_with(1.0)
     assert payload == expected
@@ -148,5 +150,6 @@ def test_retry_keeps_initial_nested_inputs_and_auth_scope_when_caller_context_ch
     }
     assert attempts[0]["headers"] == attempts[1]["headers"] == {
         "Authorization": "Bearer original", "X-Workspace-Id": "workspace-a",
+        sr._ROUTE_BUDGET_HEADER: f"{sr._hot_path_read_budget():g}",
     }
     assert attempts[0]["params"] == attempts[1]["params"] == {"agent_name": "support", "labels": ["original"]}
