@@ -496,6 +496,12 @@ def _hot_path_timeout(read_s: Optional[float] = None) -> httpx.Timeout:
 _CONNECT_FAILURES = (httpx.ConnectError, httpx.ConnectTimeout)
 _DROPPED_FAILURES = (httpx.ReadError, httpx.RemoteProtocolError)
 _ROUTE_PATH = "/api/v1/skills/route"
+#: Every route request says how long it will wait for the answer, in seconds. The platform
+#: sizes the query embedding's wait to it (backend services/llm/embeddings.route_budget):
+#: with no header it assumes this SDK's 5 s default and lets the embedding take 4 s, and a
+#: route that answers after the caller hung up is worse than a faster keyword-ranked one.
+#: Raising DECIMALAI_SKILL_ROUTE_TIMEOUT_S is therefore what gives a slow embedder more time.
+_ROUTE_BUDGET_HEADER = "X-Decimal-Route-Budget"
 
 # One `httpx.Client` per process instead of a fresh one per call
 # (`httpx.request` builds a client, an SSL context and a TCP+TLS connection
@@ -1988,6 +1994,11 @@ class SkillRouter:
         # "Transport" above `_platform_client`).
         spare = {"connect": True, "dropped": replay_safe, "read": retry_read_timeout}
         base_timeout: Any = _hot_path_timeout(read_budget_s) if hot else _COLD_PATH_TIMEOUT
+        if path == _ROUTE_PATH:
+            # Every route attempt reads with base_timeout (read retries are off for the
+            # route), so one value holds for the connect and dropped-connection retries too.
+            read_s = base_timeout.read if isinstance(base_timeout, httpx.Timeout) else base_timeout
+            headers[_ROUTE_BUDGET_HEADER] = f"{read_s:g}"
         retry_timeout: Any = (
             _hot_path_timeout(read_retry_s) if hot
             else httpx.Timeout(_COLD_PATH_TIMEOUT, read=read_retry_s)

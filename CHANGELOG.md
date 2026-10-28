@@ -6,6 +6,14 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: a route tells the platform how long it will wait
+
+- Every `POST /skills/route` now sends its read budget as `X-Decimal-Route-Budget` (seconds; 5 by
+  default, `DECIMALAI_SKILL_ROUTE_TIMEOUT_S` to change it). The platform sizes how long the
+  query's embedding may wait to it, so raising the budget gives a slow embedder more time instead
+  of the route degrading to keyword ranking after 4 s. Without the header the platform keeps
+  today's 4 s wait, so older SDKs and the default budget behave exactly as before.
+
 ### New: `agent_config()` for the Claude Agent SDK
 
 - `from decimalai.claude_agent_sdk import agent_config`, then
