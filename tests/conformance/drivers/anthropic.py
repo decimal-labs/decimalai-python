@@ -82,6 +82,7 @@ import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
 from ..delivery import INJECTED
 from ..probe import StubHTTPServer
@@ -253,7 +254,8 @@ def _message_payload(model: str, turn: StubTurn, tool_use_id: str) -> Dict[str, 
     if turn.content:
         content.append({"type": "text", "text": turn.content})
     return {
-        "id": "msg_conformance",
+        # Unique, as the API's are: a message thread continues from a reply by its id.
+        "id": f"msg_conformance_{uuid4().hex}",
         "type": "message",
         "role": "assistant",
         "model": model,
@@ -312,6 +314,41 @@ def _sse(message: Dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+class _Threads:
+    """The stub's side of anthropic >= 2's message threads (``message-threads-2026-08-12``).
+
+    The Tool Runner sends a thread's first request whole, with ``thread: {"type":
+    "create"}``, and each later one with ``thread: {"type": "continue",
+    "previous_message_id": ...}`` and only what is new: no ``system``, no ``tools``,
+    no earlier messages. The API holds the rest and answers the whole conversation,
+    so this does too: a reply's request, whole, is kept under the reply's id, and a
+    request that continues it is read as that request, the reply, then its own
+    messages. A request on no thread (anthropic < 2, ``thread=False``) is read as sent.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._held: Dict[str, Dict[str, Any]] = {}
+
+    def whole(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        thread = body.get("thread")
+        if not isinstance(thread, dict) or thread.get("type") != "continue":
+            return body
+        with self._lock:
+            earlier = self._held.get(str(thread.get("previous_message_id")))
+        if earlier is None:
+            return body
+        own = {k: v for k, v in body.items() if k != "messages"}
+        return {**earlier, **own, "messages": [*earlier["messages"], *(body.get("messages") or [])]}
+
+    def hold(self, body: Dict[str, Any], reply: Dict[str, Any]) -> None:
+        if not isinstance(body.get("thread"), dict):
+            return
+        answered = {"role": "assistant", "content": reply["content"]}
+        with self._lock:
+            self._held[reply["id"]] = {**body, "messages": [*(body.get("messages") or []), answered]}
+
+
 def _start_provider(
     lanes: Sequence[Tuple[Ctx, Optional[List[StubTurn]]]], *, fail: bool = False,
 ) -> Tuple[Any, str]:
@@ -319,8 +356,9 @@ def _start_provider(
 
     Answers ``stream: true`` requests (``messages.stream()``) as server-sent
     events and everything else as one JSON body — the two ways the Messages API
-    answers the same request.
+    answers the same request. Holds message threads as the API does (``_Threads``).
     """
+    threads = _Threads()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -347,7 +385,9 @@ def _start_provider(
                     },
                 }
             else:
-                status, payload = 200, _reply(lanes, body)
+                whole = threads.whole(body)
+                status, payload = 200, _reply(lanes, whole)
+                threads.hold(whole, payload)
             streamed = status == 200 and bool(body.get("stream"))
             data = _sse(payload) if streamed else json.dumps(payload).encode("utf-8")
             self.send_response(status)

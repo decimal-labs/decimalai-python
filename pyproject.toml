@@ -154,6 +154,10 @@ adk = ["google-adk>=2.12.0"]
 # OpenInference's span; the exporter merges or drops that duplicate (otel.py,
 # _with_content_from and _without_sdk_duplicates). Without that, the anthropic
 # conformance column fails 10 items on 1.15.0; with it, 1.15.0 passes all 27.
+# No `<2`: 2.x's Tool Runner sends each later request on a server-side message thread,
+# with only the new tool result, and the exporter restores what the call was given
+# (otel.py, "Anthropic message threads"). 2.3.0 passes the column with C4's every-call
+# clause, which fails without that.
 anthropic = ["anthropic>=1.13.0", "openinference-instrumentation-anthropic>=3.0.3"]
 langgraph = ["langgraph>=1.2.15"]
 # Runtime extra for the native LlamaIndex integration (decimalai.init(llamaindex=True)).

@@ -43,6 +43,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
 )
 from uuid import UUID, uuid4
 
@@ -1173,6 +1174,11 @@ class DecimalSpanExporter:
             # If somehow called without OTEL installed, just succeed silently
             return None
 
+        # Every threaded Anthropic turn, as it arrives: a later turn of the thread is
+        # restored from it (_thread_input), in this trace or another. Before the filter
+        # below: what a turn inside a run was given includes the thread's turns before it.
+        _note_thread_turns(spans)
+
         # Outside a DecimalAI run, what agent_config()'s runs-only tracing must not
         # send is dropped here, before it is buffered: nothing waits for a root that
         # is not DecimalAI's to send.
@@ -1691,6 +1697,11 @@ class DecimalSpanExporter:
                     attrs, name, model, started_at, ended_at, otel_span,
                     span_uuid=span_uuid, agent_name=agent_name,
                 )
+                # A later turn of an Anthropic message thread sent only what was new;
+                # what the model was given is the thread so far.
+                thread_input, thread_record = _thread_input(attrs)
+                if thread_input is not None:
+                    llm_call.rendered_input = thread_input
                 llm_calls.append(llm_call)
 
                 # Harvest tools for manifest auto-detection. Frameworks that
@@ -1735,7 +1746,7 @@ class DecimalSpanExporter:
                     parent_span_id=parent_uuid,
                     span_type=SpanType.LLM,
                     name=f"llm:{model}",
-                    attributes=_exported_attributes(otel_span),
+                    attributes={**_exported_attributes(otel_span), **thread_record},
                     status=llm_call.status,
                     started_at=started_at,
                     ended_at=ended_at,
@@ -2589,6 +2600,118 @@ def _with_content_from(attrs: Dict[str, Any], wrapper: Dict[str, Any]) -> Dict[s
     merged = dict(wrapper)
     merged.update({k: v for k, v in attrs.items() if v not in (None, "")})
     return merged
+
+
+# ── Anthropic message threads ─────────────────────────────────
+# anthropic >= 2 runs its Tool Runner (and ``client.beta.messages.thread()``) on a
+# message thread the API keeps (beta ``message-threads-2026-08-12``). The thread's
+# first request is the whole request, with ``thread: {"type": "create"}``. Every later
+# one names the reply it follows, ``thread: {"type": "continue", "previous_message_id":
+# ...}``, and carries only what is new: a tool result, with no ``system`` and no
+# ``tools``. The model answers, and Anthropic bills, the whole conversation, but the
+# span holds only the new part, and the API has no way to read a thread back. Recorded
+# as sent, every call after a run's first had no prompt and no history.
+#
+# So each threaded turn's whole input is kept under its reply's id, and a turn that
+# continues a reply was sent that reply's turn, the reply, then its own messages. This
+# is worked out as the spans reach the exporter, before any trace is assembled. Spans
+# arrive in the order they ended, and a reply has ended before the turn after it is
+# sent, so the earlier turn is always known first. That holds whichever trace each turn
+# is in (a chat's ``thread()`` outlives a run) and however long a run's trace waits for
+# its routing decision. A turn whose earlier turns this process never saw (another
+# process sent them, or they were evicted) keeps what it was sent, and its span says so.
+
+#: A threaded turn's reply id -> (everything the turn was sent, its reply). Each list
+#: shares its messages with the turn before, so a long thread costs a list per turn.
+_THREAD_TURNS_MAX = 2048
+_thread_turns: "OrderedDict[str, Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]]" = OrderedDict()
+_thread_turns_lock = threading.Lock()
+
+
+def _message_thread(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``thread`` field an Anthropic request was sent with, from OpenInference's
+    invocation parameters; None for a request with none."""
+    raw = attrs.get("llm.invocation_parameters")
+    if not isinstance(raw, str) or '"thread"' not in raw:
+        return None
+    try:
+        thread = json.loads(raw).get("thread")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if isinstance(thread, dict) and thread.get("type") in ("create", "continue"):
+        return thread
+    return None
+
+
+def _reply_id(attrs: Dict[str, Any]) -> Optional[str]:
+    """The id of the response a call's span recorded: the SDK's span names it, and
+    OpenInference's holds the whole response."""
+    reply_id = attrs.get("gen_ai.response.id")
+    if not reply_id:
+        raw = attrs.get("output.value")
+        if not isinstance(raw, str) or not raw.startswith("{"):
+            return None
+        try:
+            reply_id = json.loads(raw).get("id")
+        except (ValueError, TypeError, AttributeError):
+            return None
+    return reply_id if isinstance(reply_id, str) and reply_id else None
+
+
+def _note_thread_turns(spans: Sequence[Any]) -> None:
+    """Keep what each threaded Anthropic turn among ``spans`` was sent, whole, under its reply's id."""
+    for span in spans:
+        attrs = getattr(span, "attributes", None) or {}
+        thread = _message_thread(attrs)
+        reply_id = _reply_id(attrs) if thread is not None else None
+        if thread is None or reply_id is None:
+            continue
+        sent = _messages_from_attrs(attrs, "input") or []
+        if thread["type"] == "continue":
+            earlier = _thread_history(thread.get("previous_message_id"))
+            if earlier is None:
+                continue  # and a turn that follows this one cannot be completed either
+            sent = [*earlier, *sent]
+        reply = _output_message_from_attrs(attrs)
+        with _thread_turns_lock:
+            _thread_turns[reply_id] = (sent, reply)
+            _thread_turns.move_to_end(reply_id)
+            while len(_thread_turns) > _THREAD_TURNS_MAX:
+                _thread_turns.popitem(last=False)
+
+
+def _thread_history(reply_id: Any) -> Optional[List[Dict[str, Any]]]:
+    """What a turn that continues ``reply_id`` was sent before its own messages: everything
+    that reply's turn was sent, then the reply. None when that turn is not known."""
+    if not isinstance(reply_id, str):
+        return None
+    with _thread_turns_lock:
+        turn = _thread_turns.get(reply_id)
+        if turn is None:
+            return None
+        _thread_turns.move_to_end(reply_id)
+    sent, reply = turn
+    return [*sent, reply] if reply is not None else list(sent)
+
+
+def _thread_input(attrs: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    """For a call that continues a message thread, everything it was sent and its span's
+    record of the thread; ``(None, {})`` for any other call.
+
+    The input is None when this process never saw the turns before the call; the
+    record (content-free: a response id and a word) says whether they were restored.
+    """
+    thread = _message_thread(attrs)
+    if thread is None or thread["type"] != "continue":
+        return None, {}
+    reply_id = _reply_id(attrs)
+    with _thread_turns_lock:
+        turn = _thread_turns.get(reply_id) if reply_id else None
+    record = {"previous_message_id": thread.get("previous_message_id"),
+              "earlier_turns": "restored" if turn is not None else "not_seen"}
+    # Copies: the kept messages are every later turn's too.
+    restored = [dict(message) for message in turn[0]] if turn is not None else None
+    return restored, {"decimalai.message_thread": record}
 
 
 def _rendered_input_from_attrs(

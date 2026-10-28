@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -132,7 +133,13 @@ def test_a_run_gives_the_tool_runner_the_prompt_the_skill_list_and_load_skill(pl
     assert prompt == {"type": "text", "text": "Hello Sam."}, "the prompt block is the prompt, as filled"
     assert menu["text"].startswith("\n\n## Available Skills") and menu["text"].endswith(LOAD_SKILL_PROMPT_HINT)
     assert menu["cache_control"] == {"type": "ephemeral"}, "one breakpoint, at the end of the system text"
-    assert first["system"] == second["system"], "the run's second request reads the first one's cache"
+    if "thread" in second:
+        # anthropic >= 2: the Tool Runner's message thread keeps the system text, and a
+        # later request names the reply it follows (the exporter restores what it left out).
+        assert first["thread"] == {"type": "create"} and "system" not in second
+        assert second["thread"] == {"type": "continue", "previous_message_id": "msg_1"}
+    else:
+        assert first["system"] == second["system"], "the run's second request reads the first one's cache"
     assert [tool["name"] for tool in first["tools"]] == ["lookup_order", "load_skill"]
     assert first["tools"][1]["input_schema"]["properties"]["name"]["enum"] == ["damaged-item", "order-support"]
     (result,) = api.tool_results(1)
@@ -952,6 +959,8 @@ def traced(platform, monkeypatch):
     # an exporter built while one is listed sends every trace, not only runs (as it should
     # after a real init(otel=True)), so the test would grade another test's setup.
     monkeypatch.setattr(otel, "_installed_providers", [])
+    # The stub's reply ids repeat from test to test; a message thread is followed by them.
+    monkeypatch.setattr(otel, "_thread_turns", OrderedDict())
     sent: list = []
     monkeypatch.setattr(otel.DecimalSpanExporter, "_send", lambda self, trace: sent.append(trace))
     monkeypatch.setattr(da, "_tracing_turned_on", False)
@@ -983,6 +992,22 @@ def test_agent_config_sends_its_runs_and_nothing_else_from_the_process(traced, c
     (trace,) = sent
     assert trace.agent_name == "support" and len(trace.llm_calls) == 2
     assert not [r for r in caplog.records if "no Claude request" in r.getMessage()]
+
+
+def test_every_call_of_a_tool_runner_run_is_recorded_with_the_prompt_and_the_question(traced):
+    """anthropic >= 2 sends the Tool Runner's later requests on a message thread, with the
+    tool result alone; each call's record still holds what the model was given."""
+    _provider, sent = traced
+    support = da.agent_config("support")
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        tool_runner(Messages(("call", "damaged-item"), "answer").client(), run, "It arrived cracked.")
+    (trace,) = sent
+    assert len(trace.llm_calls) == 2
+    for call in trace.llm_calls:
+        system, question = call.rendered_input[:2]
+        assert system["role"] == "system" and system["content"].startswith("Hello Sam.")
+        assert question == {"role": "user", "content": "It arrived cracked."}
+    assert [m["role"] for m in trace.llm_calls[1].rendered_input] == ["system", "user", "assistant", "tool"]
 
 
 def test_an_explicit_init_anthropic_sends_every_call_again(traced):

@@ -18,7 +18,8 @@ Item list (v1)
 C1          at least one trace reaches the wire
 C2          every trace passes the backend's own required-field validation
 C3          llm_calls carry a model name and plausible token counts
-C4          previews and rendered_input carry the real prompt/completion text
+C4          previews and rendered_input carry the real prompt/completion text,
+            and every call of a run is recorded with the question it was given
 C5          a multi-step run has >1 span, a parent link, and distinct names
 C6          agent_name is the one asked for, and the manifest belongs to it
 C7          the same agent run twice does not mint a second manifest version
@@ -74,7 +75,7 @@ from .delivery import (
     PROMPT_CHANNEL,
     TOOL_CHANNEL,
 )
-from .drivers import OBSERVER_TAMPER
+from .drivers import OBSERVER_TAMPER, Ctx
 from .harness import Observation, Phase
 from .isolation import body_sentinel
 
@@ -144,6 +145,34 @@ def _rendered_text(trace: Dict[str, Any]) -> str:
     for call in trace.get("llm_calls") or []:
         _strings(call.get("rendered_input"), out)
     return "\n".join(out)
+
+
+def _calls_without_the_question(traces: Sequence[Dict[str, Any]], ctx: Ctx) -> List[str]:
+    """The model calls of ``ctx``'s run whose ``rendered_input`` lacks its question.
+
+    Each call of a run is given the conversation so far, the question included, so
+    each call's record has it, not only the first. A provider that keeps the
+    conversation itself is sent only what is new after the first call (anthropic
+    >= 2's message threads), and a trace that records what was sent shows no
+    prompt and no history for any later call.
+
+    A tool's result does not count: the stub tool echoes the question back.
+    """
+    problems: List[str] = []
+    for t in traces:
+        for i, call in enumerate(t.get("llm_calls") or []):
+            shown: List[str] = []
+            rendered = call.get("rendered_input")
+            for entry in rendered if isinstance(rendered, list) else [rendered]:
+                if not (isinstance(entry, dict) and entry.get("role") == "tool"):
+                    _strings(entry, shown)
+            if ctx.prompt_sentinel not in "\n".join(shown):
+                problems.append(
+                    f"{t.get('agent_name')}: llm_calls[{i}].rendered_input does not contain "
+                    f"the prompt text ({ctx.prompt_sentinel!r}), which the model was given "
+                    f"with the rest of the conversation; got {shown[:3]!r}"
+                )
+    return problems
 
 
 #: Role stamped on a message that arrived as a bare string, so it carries no
@@ -362,6 +391,11 @@ def c4_content(obs: Observation) -> Result:
             f"rendered_input does not contain the prompt text ({ctx.prompt_sentinel!r}); "
             f"got {rendered[:200]!r}"
         )
+    else:
+        problems += _calls_without_the_question(traces, ctx)
+        nested = obs.phases.get("nested")
+        if nested is not None and nested.ran and nested.ctxs:
+            problems += _calls_without_the_question(_nested_runs(nested), nested.ctxs[0])
     if ctx.reply_sentinel not in outputs:
         problems.append(
             f"llm_call output does not contain the completion text "
@@ -1672,6 +1706,7 @@ def grade_shape(obs: Observation, shape_name: str) -> Result:
                 f"is one trace (0 = the run is invisible, more = every run is counted "
                 f"{len(mine)} times, with the skill telemetry on at most one copy)"
             )
+        problems += _calls_without_the_question(mine, ctx)
         if not shape.routed:
             continue
         for t in mine:

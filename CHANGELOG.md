@@ -24,6 +24,23 @@ and patch releases are fixes.
   the skills `.decimal/skills.toml` lists read from disk, and nothing sent.
 - `decimalai init` has no Claude Agent SDK template yet; it says so.
 
+### Fixed: on anthropic 2, every Tool Runner call is traced with its prompt and history
+
+- anthropic 2.x's Tool Runner (and `client.beta.messages.thread()`) sends each request after the
+  first on a message thread the API keeps (`message-threads-2026-08-12`): the request names the
+  reply it follows and carries only what is new, a tool result, with no `system` and no `tools`.
+  The model is given the whole conversation, but the trace recorded the request as sent, so every
+  call after a run's first had no system prompt and no history. `decimalai[anthropic]` allows
+  anthropic 2.3.0, so a fresh install got this with `decimalai.anthropic.agent_config()` and
+  `init(anthropic=True)`.
+- Each later call is now recorded with the thread so far: the earlier turns, their replies, then
+  what it sent. That is the same `rendered_input` as `tool_runner(thread=False)`, which sends
+  the whole history every time, and it holds across runs when a chat keeps one thread. The
+  call's span says so (`decimalai.message_thread`: `previous_message_id`, `earlier_turns`).
+  A call whose earlier turns this process never saw is recorded as sent, and its span says
+  `earlier_turns: not_seen`: Anthropic has no way to read a thread back. anthropic 1.x sends no
+  threads and is unchanged.
+
 ### Fixed: timeouts and cancellation retain an error cause
 
 - Manual traces record cancellation as an error. Manual tracing and Google ADK retain the

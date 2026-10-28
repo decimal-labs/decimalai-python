@@ -264,7 +264,7 @@ a property of one driver's run, not something another framework may inject.
 | `degenerate` | no model, no tools | C7b |
 | `error` | a run that fails | C10 |
 | `concurrent` | N lanes, distinct agents | C9 |
-| `nested` | the snippet inside a `decimalai.start_trace()` the harness opens, with the suite's observer as `on_trace` | C15 C16 |
+| `nested` | the snippet inside a `decimalai.start_trace()` the harness opens, with the suite's observer as `on_trace` | C4 C15 C16 |
 | `skills` | the rail, N lanes, one agent | C8 |
 | `unnamed` | the rail on an agent the framework does not name the DecimalAI way, under a new agent name | C18 |
 | `conversation` | two turns of one conversation, the second carrying the first's history | C19 |
@@ -356,7 +356,7 @@ run* — and is what C18 and C19 join traces against.
 | C1 `emits` | at least one trace reaches the wire |
 | C2 `ingest_valid` | every trace passes the backend's own validation |
 | C3 `llm_calls` | model name present; token fields present and plausible |
-| C4 `content` | previews and `rendered_input` carry the real prompt/completion text |
+| C4 `content` | previews and `rendered_input` carry the real prompt/completion text, and every model call of a run (`main`, `nested`) is recorded with the question it was given, not only the first |
 | C5 `structure` | >1 span, ≥1 parent link, distinguishable names |
 | C6 `identity` | the trace names the agent asked for, carrying *that* agent's manifest |
 | C7 `manifest_stable` | the same agent run twice mints one manifest version |
@@ -375,7 +375,7 @@ run* — and is what C18 and C19 join traces against.
 | C18 `routed_as_traced` | the agent a run is routed for is the agent its trace is filed under — including an agent the framework does not name |
 | C19 `conversation_routed` | every turn of a conversation is routed, on that turn's own message |
 | D1 `delivery_channel` | …and each channel delivers **on its own**, with the other switched off |
-| S1 `entry_shape` | a second documented way into the framework constructs, ships one trace per run under the agent asked for, and is routed |
+| S1 `entry_shape` | a second documented way into the framework constructs, ships one trace per run under the agent asked for, every model call recorded with its question, and is routed |
 | J1 `journey` | the whole path: an agent on the platform → `decimalai init` → a file that runs → its prompt and a skill body in front of the model |
 
 C7b is the second clause of C7, split out so a framework with no degenerate form
