@@ -41,6 +41,21 @@ and patch releases are fixes.
   `earlier_turns: not_seen`: Anthropic has no way to read a thread back. anthropic 1.x sends no
   threads and is unchanged.
 
+### Fixed: on Pydantic AI 2.63, a Claude call's trace keeps the agent's prompt
+
+- Pydantic AI 2.63 adds a fixed system message to every request to a model with no
+  mid-conversation system role, Claude among them, saying what its `<system>` tag means. Its
+  traces carry the agent's instructions apart from the messages (`gen_ai.system_instructions`),
+  and DecimalAI added them to a call's `rendered_input` only when the messages held no system
+  message. So on 2.63 every Claude call's trace showed that sentence and not the agent's prompt,
+  with `decimalai.pydantic_ai.agent_config()` and with any traced Pydantic AI agent. The model
+  was given the prompt all along: only the trace lost it.
+- The instructions now lead a call's `rendered_input` whatever the messages hold, and are recorded
+  once when the messages already carry the same text. The same goes for an agent with both
+  `system_prompt=` and `instructions=` on any Pydantic AI version, whose instructions the trace
+  dropped before. For a Pydantic AI agent traced without `agent_config()`, the instructions are
+  again the prompt its manifest records, not the 2.63 sentence.
+
 ### Fixed: timeouts and cancellation retain an error cause
 
 - Manual traces record cancellation as an error. Manual tracing and Google ADK retain the

@@ -63,9 +63,9 @@ def test_a_message_mixing_a_tool_result_and_text_keeps_its_role():
 
 
 def test_a_system_message_in_the_messages_is_not_doubled():
-    """AG2 puts its system message in the messages; the attribute adds nothing then."""
+    """A span carrying its instructions in both places records them once."""
     attrs = {
-        "gen_ai.system_instructions": "IGNORED",
+        "gen_ai.system_instructions": "You are terse.",
         "gen_ai.input.messages": json.dumps([
             {"role": "system", "parts": [{"type": "text", "content": "You are terse."}]},
             {"role": "user", "parts": [{"type": "text", "content": "2+2?"}]},
@@ -75,6 +75,34 @@ def test_a_system_message_in_the_messages_is_not_doubled():
         {"role": "system", "content": "You are terse."},
         {"role": "user", "content": "2+2?"},
     ]
+
+
+#: What Pydantic AI 2.63 adds to every request to a model with no mid-conversation system
+#: role (Claude): a fixed system message saying what its ``<system>`` tag means.
+_ANNOUNCEMENT = ("Mid-conversation system messages arrive inside user turns wrapped in <system> "
+                 "tags, because this channel has no system role.")
+
+
+def test_the_instructions_lead_a_system_message_of_the_messages():
+    """Pydantic AI 2.63's own system message does not stand in for the instructions.
+
+    The rule was "the attribute adds a system message when the messages carry none", so on
+    2.63 the agent's prompt left every Claude call's rendered input, and the manifest took
+    the announcement as the agent's prompt. Found by the prod prober on 2026-10-28.
+    """
+    attrs = {
+        "gen_ai.system_instructions": _INSTRUCTIONS,
+        "gen_ai.input.messages": json.dumps([
+            {"role": "system", "parts": [{"type": "text", "content": _ANNOUNCEMENT}]},
+            {"role": "user", "parts": [{"type": "text", "content": "Where is order A1?"}]},
+        ]),
+    }
+    assert _rendered_input_from_attrs(attrs) == [
+        {"role": "system", "content": "You are a support agent."},
+        {"role": "system", "content": _ANNOUNCEMENT},
+        {"role": "user", "content": "Where is order A1?"},
+    ]
+    assert _extract_system_prompt(attrs) == "You are a support agent."
 
 
 def test_system_instructions_become_the_prompt_as_text():
@@ -125,3 +153,73 @@ def test_a_real_pydantic_ai_run_records_the_tool_result():
     rendered = _rendered_input_from_attrs(chats[-1])
     assert rendered[0] == {"role": "system", "content": "SYSTEM-TEXT"}
     assert rendered[-1] == {"role": "tool", "content": "BODY-TOKEN-123"}
+
+
+def test_a_real_pydantic_ai_run_on_claude_records_its_instructions():
+    """Pydantic AI's own Anthropic model, on a stub Messages API: every call's rendered input
+    leads with the instructions, which every request sent. On 2.63 the request also carries
+    the announcement, which used to push the instructions out of the trace."""
+    pytest.importorskip("pydantic_ai")
+    pytest.importorskip("pydantic_ai.models.anthropic")
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from pydantic_ai import Agent
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    try:
+        from pydantic_ai import InstrumentationSettings
+    except ImportError:  # older pydantic-ai
+        from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    sent: list = []
+
+    async def messages_api(request):
+        sent.append(json.loads(request.content))
+        if len(sent) == 1:
+            content = [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}}]
+            stop = "tool_use"
+        else:
+            content = [{"type": "text", "text": "done"}]
+            stop = "end_turn"
+        return httpx2.Response(200, json={
+            "id": f"msg_{len(sent)}", "type": "message", "role": "assistant", "model": "claude-haiku-4-5",
+            "content": content, "stop_reason": stop, "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    client = anthropic.AsyncAnthropic(
+        api_key="sk-ant-test", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(messages_api)))
+    spans = InMemorySpanExporter()
+    provider = TracerProvider()  # private: never the global one
+    provider.add_span_processor(SimpleSpanProcessor(spans))
+    # A max_tokens cap keeps the request unstreamed, so the stub answers in one JSON body.
+    agent = Agent(AnthropicModel("claude-haiku-4-5", provider=AnthropicProvider(anthropic_client=client)),
+                  instructions="SYSTEM-TEXT", model_settings={"max_tokens": 64})
+
+    @agent.tool_plain
+    def lookup(q: str) -> str:
+        return "BODY-TOKEN-123"
+
+    Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        agent.run_sync("hello?")
+    finally:
+        Agent.instrument_all(False)
+
+    def system_text(body):
+        system = body.get("system")
+        return system if isinstance(system, str) else " ".join(b.get("text", "") for b in system or ())
+
+    assert len(sent) == 2 and all("SYSTEM-TEXT" in system_text(body) for body in sent)
+    chats = [dict(s.attributes or {}) for s in spans.get_finished_spans()
+             if "gen_ai.input.messages" in (s.attributes or {})]
+    assert len(chats) == 2, [s.name for s in spans.get_finished_spans()]
+    for chat in chats:
+        rendered = _rendered_input_from_attrs(chat)
+        assert rendered[0] == {"role": "system", "content": "SYSTEM-TEXT"}
+        assert [m["content"] for m in rendered].count("SYSTEM-TEXT") == 1
+        assert _extract_system_prompt(chat) == "SYSTEM-TEXT"
+    assert _rendered_input_from_attrs(chats[-1])[-1] == {"role": "tool", "content": "BODY-TOKEN-123"}

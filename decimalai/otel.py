@@ -2483,8 +2483,12 @@ def _semconv_messages_from_attrs(
 ) -> Optional[List[Dict[str, Any]]]:
     """Rebuild one direction's messages from the GenAI-semconv JSON attribute.
 
-    On input, ``gen_ai.system_instructions`` becomes the leading system message when
-    the messages carry none (Pydantic AI keeps its instructions in that attribute).
+    On input, ``gen_ai.system_instructions`` becomes the leading system message unless a
+    system message already carries its text (Pydantic AI keeps its instructions in that
+    attribute). It leads even when the messages hold a system message of their own:
+    Pydantic AI 2.63 puts a fixed one there on every request to a model with no
+    mid-conversation system role (Claude), saying what its ``<system>`` tag means, and
+    the first system message is the prompt the trace's manifest takes.
     """
     for key in _SEMCONV_MSG_KEYS[direction]:
         raw = attrs.get(key)
@@ -2510,10 +2514,10 @@ def _semconv_messages_from_attrs(
                         entry.get("parts", entry.get("content", ""))
                     ),
                 })
-        if messages and direction == "input" and not any(
-                m["role"].lower() in ("system", "developer") for m in messages):
+        if messages and direction == "input":
             system = _system_instructions_text(attrs.get("gen_ai.system_instructions"))
-            if system:
+            if system and not any(m["role"].lower() in ("system", "developer")
+                                  and m["content"] == system for m in messages):
                 messages.insert(0, {"role": "system", "content": system})
         if messages:
             return messages
