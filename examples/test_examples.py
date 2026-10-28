@@ -341,7 +341,7 @@ def test_all_notebooks():
             if f.endswith(".ipynb"):
                 notebooks.append(os.path.join(root, f))
 
-    assert len(notebooks) == 10, f"Expected 10, found {len(notebooks)}"
+    assert len(notebooks) == 13, f"Expected 13, found {len(notebooks)}"
 
     for nb_path in notebooks:
         nb = json.load(open(nb_path))
@@ -366,7 +366,7 @@ def test_all_notebooks():
             if clean.strip():
                 compile(clean, f"{os.path.basename(nb_path)}:cell_{i}", "exec")
 
-test("All 10 notebooks (structure + Colab URLs + Python syntax)", test_all_notebooks)
+test("All 13 notebooks (structure + Colab URLs + Python syntax)", test_all_notebooks)
 
 
 # ═══════════════════════════════════════════════════════

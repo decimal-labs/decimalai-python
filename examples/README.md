@@ -4,6 +4,16 @@
 
 Runnable examples demonstrating how to use [DecimalAI](https://decimal.ai) — the manifest-aware platform for agent change management.
 
+## The tutorial's agent, in your own code
+
+`order-support`, the agent the [docs tutorial](https://docs.decimal.ai/tutorials/support-agent/try-it) runs on its own page, as [Part 2](https://docs.decimal.ai/tutorials/support-agent/build-it) has you run it: one notebook per SDK, the same program the docs show. With your `DECIMAL_API_KEY` it runs your copy (your saved prompt and skills, traced to your dashboard); without one it runs keyless. **Your own model key.** Built by [`tutorial/_build.py`](tutorial/_build.py).
+
+| Notebook | SDK | Colab |
+|----------|-----|-------|
+| [order_support_openai_agents](tutorial/order_support_openai_agents.ipynb) | OpenAI Agents SDK | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_openai_agents.ipynb) |
+| [order_support_openai](tutorial/order_support_openai.ipynb) | OpenAI SDK (Responses API) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_openai.ipynb) |
+| [order_support_anthropic](tutorial/order_support_anthropic.ipynb) | Anthropic API (Tool Runner) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_anthropic.ipynb) |
+
 ## Start here — no account, no install
 
 | Notebook | Description | Colab |
