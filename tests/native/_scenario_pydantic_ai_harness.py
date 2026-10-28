@@ -42,13 +42,27 @@ def _export_spans() -> None:
         flush(timeout_millis=5000)
 
 
-def _returns(messages) -> List[Any]:
-    """The tool results (and retry prompts) of the newest request: what the model got."""
+#: A loaded skill's text as Pydantic AI 2.63+ hands it to the model: an instruction change on
+#: the request after the load, rendered as this element (``<system>``-tagged user text on a
+#: model with no mid-conversation system role). Before 2.63 it was the load's own result.
+LOADED_TEXT = re.compile(r'<context id="capability:[^"]*">\n(.*?)\n</context>', re.S)
+
+
+def _received(messages) -> List[Any]:
+    """What the newest request handed the model, in order: its tool results and retry
+    prompts (a load's ``instructions``, before 2.63), and the text of a skill loaded since."""
     from pydantic_ai.messages import ModelRequest, RetryPromptPart, ToolReturnPart
 
     for m in reversed(messages):
         if isinstance(m, ModelRequest):
-            return [p for p in m.parts if isinstance(p, (ToolReturnPart, RetryPromptPart))]
+            out: List[Any] = []
+            for p in m.parts:
+                if isinstance(p, (ToolReturnPart, RetryPromptPart)):
+                    content = p.content
+                    out.append(content.get("instructions") if isinstance(content, dict) else content)
+                elif isinstance(getattr(p, "content", None), str):
+                    out.extend(LOADED_TEXT.findall(p.content))
+            return out
     return []
 
 
@@ -68,9 +82,7 @@ class _Script:
 
         self.instructions.append(info.instructions or "")
         self.tools.append(sorted(t.name for t in info.function_tools))
-        for part in _returns(messages):
-            content = part.content
-            text = content.get("instructions") if isinstance(content, dict) else content
+        for text in _received(messages):
             if self.run is not None:
                 self.run.saw(text)
             found = re.search(r"Skill directory: `([^`]+)`", text if isinstance(text, str) else "")

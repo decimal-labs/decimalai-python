@@ -56,6 +56,17 @@ and patch releases are fixes.
   dropped before. For a Pydantic AI agent traced without `agent_config()`, the instructions are
   again the prompt its manifest records, not the 2.63 sentence.
 
+### Fixed: on Pydantic AI 2.63, a skill the harness loads is reported again
+
+- From Pydantic AI 2.63 (pydantic-ai-harness 0.63), `load_capability` returns only a line
+  saying the skill loaded, and the skill's text reaches the model on the next request as an
+  instruction change. `decimalai.pydantic_ai_harness.skills()` read the text from the load's
+  result, so on 2.63 no load was reported: traces carried no activation of the skill the model
+  read. The model was given the skill all along.
+- The observer now also reads the loaded text from the run's history, the text the model was
+  sent, and reports each load once per run, with the version those bytes belong to. A
+  conversation's earlier runs are not counted again. Pydantic AI before 2.63 is unchanged.
+
 ### Fixed: timeouts and cancellation retain an error cause
 
 - Manual traces record cancellation as an error. Manual tracing and Google ADK retain the

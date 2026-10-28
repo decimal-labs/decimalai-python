@@ -40,6 +40,10 @@ from ._observe import (
 
 NAME = "pydantic-ai-harness"
 
+#: A loaded skill's text as Pydantic AI 2.63+ hands it to the model: an instruction change on
+#: the request after the load, rendered as this element. Before 2.63 it was the load's result.
+_LOADED_TEXT = re.compile(r'<context id="capability:[^"]*">\n(.*?)\n</context>', re.S)
+
 
 def _relative_root(ctx: Ctx) -> str:
     return str(ctx.skills_dir(relative_to=ctx.project))
@@ -93,6 +97,22 @@ def observe(ctx: Ctx) -> Dict[str, Any]:
                         return p.content
         return None
 
+    def loaded_text(messages):
+        """What the load handed the model: the result's ``instructions`` before 2.63; from
+        2.63 the skill's text beside the result; else the result itself (a refusal)."""
+        r = last_return(messages)
+        if isinstance(r, dict) and isinstance(r.get("instructions"), str):
+            return r["instructions"]
+        for m in reversed(messages):
+            if isinstance(m, ModelRequest):
+                for p in m.parts:
+                    found = (_LOADED_TEXT.search(p.content)
+                             if isinstance(getattr(p, "content", None), str) else None)
+                    if found:
+                        return found.group(1)
+                break
+        return None if r is None else str(r)
+
     def scripted(messages, info: AgentInfo) -> ModelResponse:
         n = sum(isinstance(m, ModelResponse) for m in messages)
         if n == 0:
@@ -101,9 +121,8 @@ def observe(ctx: Ctx) -> Dict[str, Any]:
                                                      tool_call_id="c1")])
         r = last_return(messages)
         if n == 1:
-            seen["load"] = r
-            text = r.get("instructions", "") if isinstance(r, dict) else str(r)
-            m = re.search(r"Skill directory: `([^`]+)`", text)
+            seen["load"] = loaded_text(messages)
+            m = re.search(r"Skill directory: `([^`]+)`", seen["load"] or "")
             if not m:   # the harness did not load it, so the model has no directory to use
                 return ModelResponse(parts=[TextPart(f"could not load {sc.target}")])
             seen["dir"] = m.group(1)
@@ -137,9 +156,7 @@ def observe(ctx: Ctx) -> Dict[str, Any]:
         obs["offered"] = unique(re.findall(r"(?m)^- ([^\s:]+): ", instructions))
         obs["user_only"]["offered"] = sc.user_only in obs["offered"]
         obs["notes"]["instructions"] = instructions[-1500:]
-    load = seen.get("load")
-    obs["body_text"] = (load.get("instructions") if isinstance(load, dict) else
-                        (str(load) if load is not None else None))
+    obs["body_text"] = seen.get("load")
     target = by.get(sc.target)
     if target is not None:
         obs["body"] = target.body

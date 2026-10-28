@@ -68,8 +68,9 @@ def test_the_observer_reads_what_load_capability_returned(native_project):
 
 
 def test_a_second_load_in_one_run_is_refused_and_counted_once(native_project):
-    """The harness refuses a second ``load_capability`` of an active skill (a retry
-    prompt, no body), and the trace counts the skill once."""
+    """The harness refuses a second ``load_capability`` of an active skill (no body: a
+    retry prompt before Pydantic AI 2.63, a tool result since), and the trace counts the
+    skill once."""
     result = _scenario("column", native_project)
     run = result["runs"][0]
     assert run["target_loads"] == 2
@@ -169,3 +170,33 @@ def test_both_shapes_of_a_load_result_are_read(result):
     from decimalai.pydantic_ai_harness import _instructions
 
     assert _instructions(result) == "x"
+
+
+def test_a_loaded_text_in_the_history_is_reported_once_for_its_own_run(monkeypatch):
+    """Pydantic AI 2.63+ states a loaded skill's text as an instruction change in the history.
+    Each one of this run is reported once, however many responses follow it; another run's
+    (a continued conversation's history) and another capability's are not."""
+    from types import SimpleNamespace
+
+    from decimalai import _native
+    from decimalai import pydantic_ai_harness as harness
+
+    reported = []
+    monkeypatch.setattr(_native, "record", lambda load, **_: reported.append(load.body))
+
+    def request(run_id, *parts):
+        return SimpleNamespace(kind="request", run_id=run_id, parts=list(parts))
+
+    def change(capability, content):
+        return SimpleNamespace(part_kind="instruction-delta", id=f"capability:{capability}",
+                               content=content)
+
+    observer = SimpleNamespace(ids=frozenset({"acme"}), reported=set(), loads=None)
+    ctx = SimpleNamespace(run_id="run-2", messages=[
+        request("run-1", change("acme", "# Skill: acme\n\nOLD RUN")),
+        request("run-2", change("other", "# Skill: other\n\nNOT A SKILL")),
+        request("run-2", change("acme", "# Skill: acme\n\nBODY")),
+    ])
+    harness._observe_instruction_changes(observer, ctx)
+    harness._observe_instruction_changes(observer, ctx)  # the next response's view
+    assert reported == ["BODY"]

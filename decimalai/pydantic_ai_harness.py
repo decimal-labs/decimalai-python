@@ -16,8 +16,8 @@ Setup::
 
 :func:`skills` is the harness's ``Skills`` over ``decimalai.skills_dir()``, read relative to
 the workspace as the harness requires, carrying an observer. The harness offers each skill
-as a deferred capability and the model loads one with ``load_capability``, whose result is
-the skill's rendered instructions::
+as a deferred capability and the model loads one with ``load_capability``. The model is
+then given the skill's rendered instructions::
 
     # Skill: acme-refund-policy
 
@@ -25,7 +25,11 @@ the skill's rendered instructions::
 
     <the SKILL.md body>
 
-The observer takes that result, cuts the harness's heading back off, and reports the body
+Before Pydantic AI 2.63 they are the load's result. From 2.63 the result only says the skill
+loaded, and the text reaches the model on the next request as an instruction change
+(``InstructionDeltaPart``, id ``capability:<skill>``), which the run's history keeps.
+
+The observer takes that text, cuts the harness's heading back off, and reports the body
 as an activation carrying the registry identity of exactly those bytes
 (:mod:`decimalai._native`). The harness parses the frontmatter and keeps none of
 ``metadata``, so the stamp never reaches the model: identity comes from the body's hash in
@@ -118,6 +122,7 @@ def _observed_skills_class() -> type:
             self.catalog = list(ids)
             self.ids = frozenset(ids)
             self.loads: Any = None
+            self.reported: set = set()  # (skill, text) already reported in this run
 
         async def before_run(self, ctx: Any) -> None:
             # Inside every wrap_run, so Pydantic AI's own run span is open here. It is
@@ -136,6 +141,15 @@ def _observed_skills_class() -> type:
             except Exception:  # noqa: BLE001 - observing must never cost the run
                 logger.debug("load_capability observation failed (non-fatal)", exc_info=True)
             return result
+
+        async def after_model_request(self, ctx: Any, *, request_context: Any, response: Any) -> Any:
+            # Pydantic AI 2.63+: the loaded text is in the history only once the request
+            # after the load is built, after every before_model_request hook.
+            try:
+                _observe_instruction_changes(self, ctx)
+            except Exception:  # noqa: BLE001 - observing must never cost the run
+                logger.debug("loaded-skill observation failed (non-fatal)", exc_info=True)
+            return response
 
     class ObservedSkills(Skills):
         """``Skills``, whose per-run capability also reports each skill the model loads."""
@@ -164,7 +178,30 @@ def _observe_load(observer: Any, ctx: Any, tool_def: Any, args: Any, result: Any
         return  # another deferred capability, not a skill
     text = _instructions(result)
     if text is None:
+        return  # refused, or Pydantic AI 2.63+, whose result carries no text
+    _report(observer, ctx, skill, text)
+
+
+def _observe_instruction_changes(observer: Any, ctx: Any) -> None:
+    """Each skill text this run's history states as a loaded capability's instructions."""
+    skills = {f"capability:{skill}": skill for skill in observer.ids}
+    run_id = getattr(ctx, "run_id", None)
+    for message in getattr(ctx, "messages", None) or ():
+        if getattr(message, "kind", None) != "request" or getattr(message, "run_id", None) != run_id:
+            continue  # another run's request, in a continued conversation
+        for part in getattr(message, "parts", None) or ():
+            if getattr(part, "part_kind", None) != "instruction-delta":
+                continue
+            skill = skills.get(str(getattr(part, "id", None)))
+            if skill is not None and isinstance(getattr(part, "content", None), str):
+                _report(observer, ctx, skill, part.content)
+
+
+def _report(observer: Any, ctx: Any, skill: str, text: str) -> None:
+    """Report one delivered skill text as an activation, once per run."""
+    if (skill, text) in observer.reported:
         return
+    observer.reported.add((skill, text))
     body, directory = _body(skill, text)
     from ._native import Load, record
 
@@ -175,7 +212,7 @@ def _observe_load(observer: Any, ctx: Any, tool_def: Any, args: Any, result: Any
 
 
 def _instructions(result: Any) -> Optional[str]:
-    """The text ``load_capability`` returned to the model."""
+    """The text ``load_capability`` returned to the model (before Pydantic AI 2.63)."""
     value = getattr(result, "return_value", result)  # a ToolReturn, or the bare dict
     text = value.get("instructions") if isinstance(value, dict) else None
     return text if isinstance(text, str) else None
