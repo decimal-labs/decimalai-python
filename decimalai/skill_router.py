@@ -398,8 +398,10 @@ _ADMISSION_MAX_WAIT_S = 5.0
 # shrugged at (`routing_status()`), and why the breaker opening logs at ERROR.
 _DEFAULT_HOT_PATH_READ_S = 5.0
 #: Env override, so an operator can tune without a release and a test can pin a
-#: value. Deliberately NOT read by the fleet: the fleet runs the customer
-#: default on purpose, because a budget only the fleet can meet tests nothing.
+#: value. The fleet ran the customer default until 2026-10-28, because a budget
+#: only the fleet can meet tests nothing; it now sets 10 s for its sessions while
+#: the platform's embeddings go through Machine B (owner, testing and buildout),
+#: and the route sends it as X-Decimal-Route-Budget so the platform waits to match.
 _HOT_PATH_READ_ENV = "DECIMALAI_SKILL_ROUTE_TIMEOUT_S"
 #: Clamp. Below the floor the call cannot succeed even against a warm backend
 #: (healthy p95 is 1.39 s); above the ceiling we are back to holding a turn open
