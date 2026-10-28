@@ -368,10 +368,10 @@ async def reply(question):
 
 
 if __name__ == "__main__":
-    root = os.path.dirname(os.path.dirname(HERE))
+    # Next to this file: tests/test_notebook_examples.py rebuilds in a temp dir and diffs.
     for key, sdk in SDKS.items():
         path, nb = notebook(key, sdk)
-        with open(os.path.join(root, path), "w") as f:
+        with open(os.path.join(HERE, os.path.basename(path)), "w") as f:
             json.dump(nb, f, indent=1, ensure_ascii=False)
             f.write("\n")
         print("wrote", path)
