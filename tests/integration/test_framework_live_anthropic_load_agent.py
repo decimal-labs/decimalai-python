@@ -147,7 +147,8 @@ def platform(monkeypatch):
 
 
 class Wire(Middleware):
-    """Every HTTP attempt a test's clients make: the request body and the status that came back."""
+    """Every HTTP attempt a test's clients make: the request body, the status that came back,
+    and a successful unstreamed reply's body (``reply``)."""
 
     def __init__(self) -> None:
         self.sent: list = []
@@ -156,20 +157,29 @@ class Wire(Middleware):
         if _SPENT[0] >= REQUEST_BUDGET:
             raise RuntimeError(f"this file may send at most {REQUEST_BUDGET} Anthropic requests per run")
         _SPENT[0] += 1
-        entry = {"body": _plain(request.json), "status": None}
+        entry = {"body": _plain(request.json), "status": None, "reply": None}
         self.sent.append(entry)
         return entry
+
+    @staticmethod
+    def _readable(entry: dict, response) -> bool:
+        # The SDK reads the body again after the chain; a stream could be read only once.
+        return response.status_code == 200 and not entry["body"].get("stream")
 
     def handle(self, request, call_next):
         entry = self._start(request)
         response = call_next(request)
         entry["status"] = response.status_code
+        if self._readable(entry, response):
+            entry["reply"] = response.json()
         return response
 
     async def handle_async(self, request, call_next):
         entry = self._start(request)
         response = await call_next(request)
         entry["status"] = response.status_code
+        if self._readable(entry, response):
+            entry["reply"] = await response.json()
         return response
 
 
@@ -202,10 +212,16 @@ def _text(content) -> str:
 
 
 def _loads(sent: list) -> dict:
-    """{tool_use id: (skill asked for, the tool_result text)} for each load_skill call on the wire."""
+    """{tool_use id: (skill asked for, the tool_result text)} for each load_skill call on the wire.
+
+    A ``tool_use`` is read from the reply that made it as well as from a later request's
+    history: on anthropic 2.x the Tool Runner continues on a message thread, and a request
+    there carries only the new ``tool_result``, never the turn that asked for it.
+    """
     asked, loads = {}, {}
     for entry in sent:
-        for message in entry["body"].get("messages", []):
+        reply = {"role": "assistant", "content": (entry.get("reply") or {}).get("content")}
+        for message in [*entry["body"].get("messages", []), reply]:
             content = message.get("content")
             for block in content if isinstance(content, list) else []:
                 if block.get("type") == "tool_use" and block.get("name") == "load_skill":
@@ -274,6 +290,13 @@ def test_tool_runner_one_message_loads_the_matching_skill_and_answers_from_it(pl
     assert trace.agent_name == "support"
     assert trace.skills_loaded_by_agent == ["damaged-item"] and trace.routing_id
     assert len(trace.llm_calls) >= 2, "each of the Tool Runner's requests is traced inside the run"
+    # On anthropic 2.x every request after the first is sent on a message thread, without the
+    # system or the question; the trace restores each call's whole input (decimalai/otel.py,
+    # "Anthropic message threads").
+    for call in trace.llm_calls:
+        roles = [m["role"] for m in call.rendered_input]
+        assert roles[0] == "system" and "Acme's customer support agent" in str(call.rendered_input[0]), roles
+        assert any(m["role"] == "user" and QUESTION in str(m["content"]) for m in call.rendered_input), roles
 
 
 # ── 2. a hand-written messages.create loop ─────────────────────────────────
