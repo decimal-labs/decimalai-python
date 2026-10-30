@@ -47,6 +47,35 @@ ORDERS = '''ORDERS = {
     "ORD-1002": {"item": "mechanical keyboard", "status": "delivered 2026-10-18", "charges": ["$129.00 on 2026-10-12", "$129.00 on 2026-10-12"]},
 }'''
 
+# The agent's tools, the same four as the docs' code tabs and the page's runner (platform
+# tutorial_model_worker.demo_tools): lookup_order reads the orders; the other three stand in for
+# the actions the skills call for.
+TOOL_DEFS = (
+    '''def lookup_order(order_id: str) -> str:
+    """Look up an order by its id, for example ORD-1002."""
+    return str(ORDERS.get(order_id, "No order with that id."))''',
+    '''def flag_for_billing(order_id: str, note: str) -> str:
+    """Flag an order's charges for the billing team, with a note on what to check. They email the customer."""
+    if order_id not in ORDERS:
+        return "No order with that id."
+    return f"Flagged {order_id} for the billing team: {note}"''',
+    '''def lock_account() -> str:
+    """Lock the customer's account: nobody can sign in or change it until they finish recovery or deletion."""
+    return "Locked the account."''',
+    '''def start_account_deletion() -> str:
+    """Send the account deletion link to the email on file. The account is deleted once the customer opens it."""
+    return "Sent the deletion confirmation link to the email on file."''',
+)
+
+
+def tools(decorator: str = "") -> str:
+    """The four tool functions, each under `decorator` when the SDK takes one, then their list."""
+    defs = "\n\n\n".join(decorator + "\n" + body if decorator else body for body in TOOL_DEFS)
+    return ("# Your tools. lookup_order reads your orders; the other three stand in for actions the\n"
+            "# agent's skills call for, and report what they would do.\n"
+            f"{defs}\n\n\nTOOLS = [lookup_order, flag_for_billing, lock_account, start_account_deletion]")
+
+
 CONFIG = '''support = agent_config(
     "order-support",
     fallback=(
@@ -68,18 +97,14 @@ from decimalai.openai_agents import agent_config
 {ORDERS}
 
 
-@function_tool
-def lookup_order(order_id: str) -> str:
-    """Look up an order by its id, for example ORD-1002."""
-    return str(ORDERS.get(order_id, "No order with that id."))
-
+{tools("@function_tool")}
 
 {CONFIG}
 
 agent = Agent(
     name=support.name,
-    instructions=support.instructions,     # the prompt, then the skill list
-    tools=[lookup_order, *support.tools],  # your tools, then load_skill
+    instructions=support.instructions,  # the prompt, then the skill list
+    tools=[*TOOLS, *support.tools],     # your tools, then load_skill
 )''',
         "reply": '''    # main.py says Runner.run_sync(agent, question); a notebook is already running an event
     # loop, so here the run is awaited.
@@ -92,7 +117,8 @@ agent = Agent(
         "provider": "OPENAI_API_KEY",
         "provider_name": "OpenAI",
         "provider_url": "https://platform.openai.com/api-keys",
-        "program": f'''import json
+        "program": f'''import inspect
+import json
 
 from openai import OpenAI
 from decimalai.openai import agent_config
@@ -100,20 +126,17 @@ from decimalai.openai import agent_config
 {ORDERS}
 
 
-def lookup_order(order_id: str) -> str:
-    return str(ORDERS.get(order_id, "No order with that id."))
+{tools()}
+BY_NAME = {{fn.__name__: fn for fn in TOOLS}}
 
 
-LOOKUP_ORDER = {{
-    "type": "function",
-    "name": "lookup_order",
-    "description": "Look up an order by its id, for example ORD-1002.",
-    "parameters": {{
-        "type": "object",
-        "properties": {{"order_id": {{"type": "string"}}}},
-        "required": ["order_id"],
-    }},
-}}
+def schema(fn):
+    """A Responses API tool definition from a function: its name, its docstring, string arguments."""
+    names = list(inspect.signature(fn).parameters)
+    return {{"type": "function", "name": fn.__name__, "description": fn.__doc__,
+            "parameters": {{"type": "object", "properties": {{name: {{"type": "string"}} for name in names}},
+                           "required": names, "additionalProperties": False}}}}
+
 
 client = OpenAI()
 {CONFIG}
@@ -128,7 +151,7 @@ def answer(question):
                 model="gpt-5.4-mini",
                 instructions=run.system,                    # the prompt, then the skill list
                 input=items,
-                tools=[LOOKUP_ORDER, *run.response_tools],  # your tool, then load_skill
+                tools=[*map(schema, TOOLS), *run.response_tools],  # your tools, then load_skill
             )
             items += response.output
             calls = [item for item in response.output if item.type == "function_call"]
@@ -138,7 +161,7 @@ def answer(question):
                 items.append(run.tool_result(call) or {{   # load_skill answers itself
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": lookup_order(**json.loads(call.arguments)),
+                    "output": BY_NAME[call.name](**json.loads(call.arguments)),
                 }})
     return response.output_text''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
@@ -156,11 +179,7 @@ from decimalai.anthropic import agent_config
 {ORDERS}
 
 
-@beta_tool
-def lookup_order(order_id: str) -> str:
-    """Look up an order by its id, for example ORD-1002."""
-    return str(ORDERS.get(order_id, "No order with that id."))
-
+{tools("@beta_tool")}
 
 client = anthropic.Anthropic()
 {CONFIG}
@@ -173,7 +192,7 @@ def answer(question):
             model="claude-haiku-5-5",
             max_tokens=4096,
             system=run.system,                 # the prompt, then the skill list
-            tools=[lookup_order, *run.tools],  # your tool, then load_skill
+            tools=[*TOOLS, *run.tools],        # your tools, then load_skill
             messages=[{{"role": "user", "content": question}}],
         )
         reply = runner.until_done()
@@ -339,8 +358,10 @@ async def reply(question):
         md("## 4. The agent\n"
            "\n"
            f"The program from the docs' **{sdk['label']}** tab. `agent_config()` gives the model the prompt and "
-           "the skill menu, and adds one tool, `load_skill`. `lookup_order` is your own tool: here it reads a "
-           "dictionary; in your app, your database."),
+           "the skill menu, and adds one tool, `load_skill`. The other four are your own: `lookup_order` reads "
+           "a dictionary here (your database, in your app), and the other three stand in for the actions the "
+           "skills call for, so the agent can do what a skill says. They report what they would do and change "
+           "nothing."),
         code(sdk["program"]),
         md("## 5. Ask it"),
         code(ask),
