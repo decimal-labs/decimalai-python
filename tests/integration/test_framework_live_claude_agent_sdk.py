@@ -35,16 +35,22 @@ import pytest
 
 from . import _live_helpers as h
 
-
 # Pure-reasoning prompt — no tools, no filesystem, deterministic answer.
 CAS_PROMPT = "What is 17 multiplied by 4? Reply with only the number."
 CAS_EXPECTED = "68"
+
+# Keep this no-tool request cacheable without installing Claude Code's much larger
+# built-in tool catalog. The token-usage cell must exercise a real cache write/read.
+CAS_CACHE_PROMPT = "You are a helpful assistant.\n" + "\n".join(
+    f"Greeting rule {i}: Answer greetings politely and briefly, using no external actions."
+    for i in range(1, 61)
+)
 
 
 @pytest.mark.live_llm
 @pytest.mark.claude_agent_sdk
 @pytest.mark.parametrize("provider, model", h.matrix("claude_agent_sdk"))
-def test_claude_agent_sdk_query_native(provider, model):
+def test_claude_agent_sdk_query_native(provider, model, tmp_path):
     """A real Claude Agent SDK ``query()`` on Anthropic → the native stream
     tracer → one backend trace whose model turn is captured as an llm_call with
     the Claude model id, plus an auto-detected manifest."""
@@ -61,10 +67,14 @@ def test_claude_agent_sdk_query_native(provider, model):
 
     agent_name = h.unique_agent(f"claude-agent-sdk-{provider}")
 
-    # Bound the run and give it a manifest-bearing system prompt. allowed_tools=[]
-    # keeps it from reaching for the Claude Code toolset on a pure-math prompt.
+    # Bound the run and give it a manifest-bearing system prompt. tools=[] removes
+    # the built-ins; allowed_tools controls permissions but does not remove them.
     options = ClaudeAgentOptions(
         model=model,
+        cwd=str(tmp_path),
+        setting_sources=[],
+        tools=[],
+        extra_args={"name": "DecimalAI calculator live check"},
         system_prompt="You are a calculator. Reply with only the number, nothing else.",
         allowed_tools=[],
         max_turns=2,
@@ -109,7 +119,7 @@ def test_claude_agent_sdk_query_native(provider, model):
 @pytest.mark.live_llm
 @pytest.mark.claude_agent_sdk
 @pytest.mark.parametrize("provider, model", h.matrix("claude_agent_sdk"))
-def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bill):
+def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bill, tmp_path):
     """Text generation token usage is what Anthropic billed, cache split included.
 
     The Claude Agent SDK's ResultMessage.usage carries:
@@ -120,14 +130,16 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bi
 
     The tracer keeps them split, as Anthropic bills them (decimalai.claude_agent_sdk's
     _extract_usage; it summed the cache into input_tokens until 2026-08-22). The Claude Code
-    CLI caches its own system prompt, so this cell runs with the cache warm, and its trace
-    must equal what the CLI's requests were billed (``claude_bill``)."""
+    CLI caches the fixed reference prompt below, and its trace must equal what the
+    agent's requests were billed (``claude_bill``). The explicit session name prevents
+    an unrelated title-generation model call that the CLI never emits as an agent turn."""
     h.require_key_for(provider)
     pytest.importorskip("claude_agent_sdk")
     if shutil.which("claude") is None:
         pytest.skip("Claude Code CLI ('claude') not found on PATH")
 
     from claude_agent_sdk import ClaudeAgentOptions
+
     from decimalai.claude_agent_sdk import traced_query
 
     agent_name = h.unique_agent(f"claude-agent-sdk-tokens-{provider}")
@@ -135,7 +147,11 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bi
     # Simple prompt that will generate a short text response (no tools).
     options = ClaudeAgentOptions(
         model=model,
-        system_prompt="You are a helpful assistant.",
+        cwd=str(tmp_path),
+        setting_sources=[],
+        tools=[],
+        extra_args={"name": "DecimalAI token usage live check"},
+        system_prompt=CAS_CACHE_PROMPT,
         allowed_tools=[],
         max_turns=1,
     )
@@ -156,6 +172,8 @@ def test_claude_agent_sdk_text_generation_token_usage(provider, model, claude_bi
     llm_calls = detail.get("llm_calls", [])
     assert llm_calls, f"No llm_calls in trace {detail['id']}"
     h.check_billed(llm_calls, claude_bill, what="claude-agent-sdk text generation")
+    assert sum((c.get("cache_read_tokens") or 0) + (c.get("cache_creation_tokens") or 0)
+               for c in llm_calls) > 0, "The cacheable prompt was neither written nor read"
 
     # Find the response turn (responder role, not planner).
     responder_calls = [
@@ -196,6 +214,7 @@ def test_claude_agent_sdk_one_llm_call_per_request(provider, model, tmp_path):
         pytest.skip("Claude Code CLI ('claude') not found on PATH")
 
     from claude_agent_sdk import ClaudeAgentOptions
+
     from decimalai.claude_agent_sdk import traced_query
 
     agent_name = h.unique_agent(f"claude-agent-sdk-requests-{provider}")

@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-31
+
 ### New: a route tells the platform how long it will wait
 
 - Every `POST /skills/route` now sends its read budget as `X-Decimal-Route-Budget` (seconds; 5 by

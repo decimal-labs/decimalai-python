@@ -24,7 +24,7 @@ Quick start::
         return resp.choices[0].message.content
 """
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 import atexit
 import logging
