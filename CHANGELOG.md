@@ -6,6 +6,16 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-10-31
+
+### Fixed: Anthropic token estimates are not recorded as model generations
+
+- CrewAI's current Anthropic integration estimates prompt sizes through
+  `messages.count_tokens()`. OpenInference records those requests with a model name,
+  so DecimalAI also recorded them as LLM calls alongside the actual generations.
+  Token-count requests now remain visible as spans without becoming `llm_calls`.
+  Real generations still count when their usage is missing or zero.
+
 ## [0.27.0] — 2026-10-31
 
 ### New: a route tells the platform how long it will wait

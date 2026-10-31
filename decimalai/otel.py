@@ -1775,7 +1775,8 @@ class DecimalSpanExporter:
                         final_output = llm_output
             else:
                 # Non-LLM span — classify by name/kind
-                span_type = _classify_span(name, attrs)
+                span_type = (SpanType.OTHER if _is_anthropic_token_count(otel_span)
+                             else _classify_span(name, attrs))
                 span_status = Status.SUCCESS
                 if otel_status and hasattr(otel_status, "status_code"):
                     if "ERROR" in str(otel_status.status_code):
@@ -2582,8 +2583,22 @@ def _scope_name(span: Any) -> str:
 
 def _is_anthropic_sdk_non_call(span: Any, operation: str) -> bool:
     """The Anthropic SDK's own span of a request that is no model call (``count_tokens``,
-    ``models.list``): it names a model but has no ``chat`` operation."""
-    return operation != "chat" and _scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE)
+    ``models.list``), and OpenInference's wrapper of a token-count request."""
+    return ((operation != "chat" and _scope_name(span).startswith(_ANTHROPIC_SDK_SCOPE))
+            or _is_anthropic_token_count(span))
+
+
+def _is_anthropic_token_count(span: Any) -> bool:
+    """Identify the provider's estimation endpoint, never by absent/zero usage.
+
+    OpenInference Anthropic 3.3 wraps ``messages.count_tokens`` as an LLM span with
+    a model name and no operation. CrewAI 1.15.33 uses it before real generations.
+    That response is a prompt-size estimate, not a generated message or billed usage.
+    """
+    scope = _scope_name(span)
+    return ((scope.startswith(_ANTHROPIC_SDK_SCOPE)
+             or scope == "openinference.instrumentation.anthropic")
+            and str(getattr(span, "name", "") or "").rsplit(".", 1)[-1] == "count_tokens")
 
 
 def _is_anthropic_sdk_call(span: Any) -> bool:

@@ -299,3 +299,38 @@ def test_count_tokens_is_not_a_model_call():
                           {"gen_ai.request.model": "claude-haiku-4-5"}), SDK_SCOPE)
     trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace([count, run])
     assert trace.llm_calls == []
+
+
+@pytest.mark.parametrize("usage", [None, 0])
+def test_openinference_token_estimates_do_not_invent_generations(usage):
+    # Captured with CrewAI 1.15.33, anthropic 2.3.0 and OI Anthropic 3.3.0:
+    # count_tokens has a model and an LLM kind, but no gen_ai.operation.name.
+    # The missing/zero usage on a REAL generation must not hide that call.
+    from decimalai.otel import DecimalSpanExporter
+
+    run = _Span("agent.run", ROOT, None, RUN_ATTRS)
+    count = _scoped(_Span("messages.count_tokens", 0xDDD1, ROOT, {
+        "llm.provider": "anthropic", "llm.system": "anthropic",
+        "llm.model_name": "claude-haiku-4-5",
+        "llm.request.model_name": "claude-haiku-4-5",
+        "openinference.span.kind": "LLM", "output.value": '{"input_tokens":7}',
+        "llm.invocation_parameters": "{}",
+    }), "openinference.instrumentation.anthropic")
+    attrs = dict(OPENINFERENCE_ATTRS)
+    for name in ("llm.token_count.prompt", "llm.token_count.completion", "llm.token_count.total"):
+        if usage is None:
+            attrs.pop(name, None)
+        else:
+            attrs[name] = usage
+    generation = _scoped(_Span("messages.create", OPENINFERENCE, ROOT, attrs),
+                         "openinference.instrumentation.anthropic")
+
+    trace, *_ = DecimalSpanExporter(agent_name="test-agent")._assemble_trace(
+        [count, generation, run])
+
+    (call,) = trace.llm_calls
+    assert call.output == {"role": "assistant", "content": "pong-COMPLETION-SENTINEL"}
+    assert call.input_tokens == usage and call.output_tokens == usage
+    (count_span,) = [span for span in trace.spans if span.name == "messages.count_tokens"]
+    assert count_span.span_type.value == "other"
+    assert '"input_tokens":7' in count_span.output_preview
