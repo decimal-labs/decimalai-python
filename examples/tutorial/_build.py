@@ -47,23 +47,50 @@ ORDERS = '''ORDERS = {
     "ORD-1002": {"item": "mechanical keyboard", "status": "delivered 2026-10-18", "charges": ["$129.00 on 2026-10-12", "$129.00 on 2026-10-12"]},
 }'''
 
+ACTION_CHECKS = '''# This runtime rule also applies to a saved prompt or an edited skill.
+ACTION_RULES = (
+    "Only claim an action after its tool succeeds. For a verified duplicate charge, call "
+    "flag_for_billing before saying billing will follow up. For deletion, call "
+    "start_account_deletion before saying a link was sent. Never claim a refund or deletion "
+    "was performed: these tools only simulate a billing handoff, lock, or confirmation link."
+)
+confirmed = set()
+
+
+def checked_reply(reply, question):
+    """Check this tutorial's two action examples before accepting a reply."""
+    question = " ".join(question.lower().split()).rstrip(".!?")
+    required = set()
+    if "ord-1002" in question and "charged twice" in question:
+        required = {("lookup_order", "ORD-1002"), ("flag_for_billing", "ORD-1002")}
+    elif question == "please delete my account and all my data today":
+        required = {("start_account_deletion", None)}
+    if not required.issubset(confirmed):
+        raise RuntimeError("The tools did not confirm this example's action; reply not accepted.")
+    return reply'''
+
 # The agent's tools, the same four as the docs' code tabs and the page's runner (platform
 # tutorial_model_worker.demo_tools): lookup_order reads the orders; the other three stand in for
 # the actions the skills call for.
 TOOL_DEFS = (
     '''def lookup_order(order_id: str) -> str:
     """Look up an order by its id, for example ORD-1002."""
+    if order_id in ORDERS:
+        confirmed.add(("lookup_order", order_id))
     return str(ORDERS.get(order_id, "No order with that id."))''',
     '''def flag_for_billing(order_id: str, note: str) -> str:
-    """Flag an order's charges for the billing team, with a note on what to check. They email the customer."""
+    """Flag an order's charges for the billing team. Call before claiming billing will follow up."""
     if order_id not in ORDERS:
         return "No order with that id."
+    confirmed.add(("flag_for_billing", order_id))
     return f"Flagged {order_id} for the billing team: {note}"''',
     '''def lock_account() -> str:
     """Lock the customer's account: nobody can sign in or change it until they finish recovery or deletion."""
+    confirmed.add(("lock_account", None))
     return "Locked the account."''',
     '''def start_account_deletion() -> str:
-    """Send the account deletion link to the email on file. The account is deleted once the customer opens it."""
+    """Send the deletion confirmation link. Call before claiming it was sent; this does not delete the account."""
+    confirmed.add(("start_account_deletion", None))
     return "Sent the deletion confirmation link to the email on file."''',
 )
 
@@ -80,7 +107,9 @@ CONFIG = '''support = agent_config(
     "order-support",
     fallback=(
         "You are Acme's order support agent. Look the order up before you answer. You cannot issue "
-        "refunds or change orders yourself: say what you found and that the billing team will follow up."
+        "refunds or change orders yourself. For a verified duplicate charge, call flag_for_billing "
+        "before saying the billing team will follow up. Only describe an action as done after "
+        "its tool succeeds; a failed or missing tool call means it has not happened."
     ),
 )'''
 
@@ -97,19 +126,27 @@ from decimalai.openai_agents import agent_config
 {ORDERS}
 
 
+{ACTION_CHECKS}
+
+
 {tools("@function_tool")}
 
 {CONFIG}
 
+async def instructions(context, agent):
+    return await support.instructions(context, agent) + "\\n\\n" + ACTION_RULES
+
+
 agent = Agent(
     name=support.name,
-    instructions=support.instructions,  # the prompt, then the skill list
+    instructions=instructions,  # saved prompt and skill list, followed by action rules
     tools=[*TOOLS, *support.tools],     # your tools, then load_skill
 )''',
         "reply": '''    # main.py says Runner.run_sync(agent, question); a notebook is already running an event
     # loop, so here the run is awaited.
+    confirmed.clear()
     result = await Runner.run(agent, question)
-    return str(result.final_output)''',
+    return checked_reply(str(result.final_output), question)''',
     },
     "openai": {
         "label": "OpenAI SDK",
@@ -126,6 +163,9 @@ from decimalai.openai import agent_config
 {ORDERS}
 
 
+{ACTION_CHECKS}
+
+
 {tools()}
 BY_NAME = {{fn.__name__: fn for fn in TOOLS}}
 
@@ -138,18 +178,19 @@ def schema(fn):
                            "required": names, "additionalProperties": False}}}}
 
 
-client = OpenAI()
 {CONFIG}
 
 
 def answer(question):
     # main.py's loop, as a function: the next cell runs it in a worker thread.
+    confirmed.clear()
+    client = OpenAI()  # ask() has checked the provider key before this cell needs a client
     with support.run(question) as run:
         items = [run.message]
         while True:
             response = client.responses.create(
                 model="gpt-5.4-mini",
-                instructions=run.system,                    # the prompt, then the skill list
+                instructions=run.system + "\\n\\n" + ACTION_RULES,
                 input=items,
                 tools=[*map(schema, TOOLS), *run.response_tools],  # your tools, then load_skill
             )
@@ -163,7 +204,7 @@ def answer(question):
                     "call_id": call.call_id,
                     "output": BY_NAME[call.name](**json.loads(call.arguments)),
                 }})
-    return response.output_text''',
+    return checked_reply(response.output_text, question)''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
     "anthropic": {
@@ -179,6 +220,9 @@ from decimalai.anthropic import agent_config
 {ORDERS}
 
 
+{ACTION_CHECKS}
+
+
 {tools("@beta_tool")}
 
 client = anthropic.Anthropic()
@@ -187,16 +231,18 @@ client = anthropic.Anthropic()
 
 def answer(question):
     # main.py's loop, as a function: the next cell runs it in a worker thread.
+    confirmed.clear()
     with support.run(question) as run:
         runner = client.beta.messages.tool_runner(
             model="claude-haiku-5-5",
             max_tokens=4096,
-            system=run.system,                 # the prompt, then the skill list
+            system=[*run.system, {{"type": "text", "text": ACTION_RULES}}],
             tools=[*TOOLS, *run.tools],        # your tools, then load_skill
             messages=[{{"role": "user", "content": question}}],
         )
         reply = runner.until_done()
-    return "".join(block.text for block in reply.content if block.type == "text")''',
+    text = "".join(block.text for block in reply.content if block.type == "text")
+    return checked_reply(text, question)''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
 }
@@ -361,7 +407,13 @@ async def reply(question):
            "the skill menu, and adds one tool, `load_skill`. The other four are your own: `lookup_order` reads "
            "a dictionary here (your database, in your app), and the other three stand in for the actions the "
            "skills call for, so the agent can do what a skill says. They report what they would do and change "
-           "nothing."),
+           "nothing.\n"
+           "\n"
+           "`ACTION_RULES` also applies to a saved prompt or an edited skill. Before accepting a reply to "
+           "either supplied action question, `checked_reply` requires the actual successful tool receipts "
+           "for that run. It prints a failure if a tool is missing; it never calls a tool afterward to repair "
+           "the answer. These checks cover the supplied billing and deletion examples; add checks for your "
+           "own tasks, and keep receipts separately for each run in a long-running application."),
         code(sdk["program"]),
         md("## 5. Ask it"),
         code(ask),
