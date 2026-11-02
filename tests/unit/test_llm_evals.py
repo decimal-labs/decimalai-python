@@ -199,6 +199,29 @@ class TestCallLlmRobustness:
         assert out["passed"] is True
 
 
+class TestCallLlmBudget:
+    """Evaluators keep the default. Only a caller expecting a longer verdict asks for more."""
+
+    def _completion(self, **kwargs):
+        from decimalai.evals.llm_evaluators import _call_llm
+
+        fake = MagicMock()
+        fake.completion.return_value.choices = [MagicMock(message=MagicMock(content='{"score": 1}'))]
+        with patch.dict(sys.modules, {"litellm": fake}):
+            _call_llm("rate this", "model", **kwargs)
+        return fake.completion.call_args.kwargs
+
+    def test_evaluators_keep_the_default_budget_and_the_model_s_own_effort(self):
+        sent = self._completion()
+        assert sent["max_tokens"] == 1024
+        assert "reasoning_effort" not in sent
+
+    def test_a_caller_can_raise_the_budget_and_limit_thinking(self):
+        sent = self._completion(max_tokens=8192, reasoning_effort="low")
+        assert sent["max_tokens"] == 8192
+        assert sent["reasoning_effort"] == "low"
+
+
 # ── Mocked LLM Calls ────────────────────────────────────────────
 
 

@@ -43,13 +43,15 @@ if failure in ("repair", "exhausted", "tool_call", "generic_opening"):
         bad = AIMessage(content="Thanks for reaching out. Here is a generic draft with enough length to be meaningful.")
     model.responses = [bad] if failure == "exhausted" else [bad, model.responses[0]]
 def judge(case, answer, model_name):
-    return {"passed": os.environ.get("CHECK_FAILURE") != "wrong_answer"}
+    if failure == "judge_error":
+        return {"passed": False, "error": "judge_error_or_invalid_schema", "judge_detail": "unparseable_response"}
+    return {"passed": failure != "wrong_answer"}
 with patch("langchain.chat_models.init_chat_model", return_value=model), patch("decimalai.agent_checks.grade_answer", side_effect=judge):
     raise SystemExit(run_project_checks(Path(sys.argv[1])))
 '''
 
 
-@pytest.mark.parametrize("failure", ["none", "quota", "wrong_answer", "missing_body", "missing_delivery", "missing_provider", "trace_rejected", "drift", "repair", "exhausted", "tool_call", "generic_opening", "platform_admission"])
+@pytest.mark.parametrize("failure", ["none", "quota", "wrong_answer", "missing_body", "missing_delivery", "missing_provider", "trace_rejected", "drift", "repair", "exhausted", "tool_call", "generic_opening", "platform_admission", "judge_error"])
 def test_actual_generated_project_http(tmp_path, failure):
     pytest.importorskip("langchain")
     class CheckProbe(Probe):
@@ -112,6 +114,13 @@ def test_actual_generated_project_http(tmp_path, failure):
         assert check.returncode == (0 if success else 1), check.stdout + check.stderr + str(receipt)
         assert receipt["passed"] is success
         assert (dest / "agent.py").read_bytes() == source
+        if failure == "judge_error":
+            # The customer sees why, and that the reply was not what failed.
+            assert "not graded" in check.stdout and "judge_error_or_invalid_schema, unparseable_response" in check.stdout
+            assert probe.check_results[receipt["check_id"]]["error"] == "provider"
+        elif failure == "wrong_answer":
+            assert "not graded" not in check.stdout
+            assert probe.check_results[receipt["check_id"]]["error"] is None
         if success:
             assert len(receipt["cases"]) == 2
             assert {r["run_id"] for r in receipt["cases"]} == probe.trace_ids

@@ -1,12 +1,14 @@
 """Generated Support project acceptance and failures that must never be green."""
 import json
+import re
 from unittest.mock import patch
 
 import pytest
 
 from decimalai.agent_checks import (
-    SUPPORT_SKILLS, check_definition, delivery_result, grade_answer, run_project_checks,
+    SUPPORT_SKILLS, _remote_result, check_definition, delivery_result, grade_answer, run_project_checks,
 )
+from decimalai._support_policy import unsupported_action_claim
 from decimalai.cli.project import render_project, write_project
 from tests.test_cli_init_scaffold import AGENT, _client, _run_cli
 
@@ -120,6 +122,61 @@ def test_judge_fails_closed(verdict):
         assert not grade_answer(CASE, ANSWER, "model")["passed"]
 
 
+def test_judge_gets_room_for_a_long_verdict_and_cannot_spend_it_thinking():
+    with patch("decimalai.evals.llm_evaluators._call_llm", return_value=valid_verdict()) as judge:
+        grade_answer(CASE, ANSWER, "model")
+    assert judge.call_args.kwargs == {"max_tokens": 8192, "reasoning_effort": "low"}
+
+
+@pytest.mark.parametrize("unusable", [
+    {"score": 0.0, "passed": False, "reason": "Could not parse evaluator response", "error": "unparseable_response"},
+    {"criteria": {}},
+    {"criteria": {k: {"passed": True, "reason": ""} for k in CASE["criteria"]}},
+])
+def test_no_verdict_is_asked_for_once_more(unusable):
+    with patch("decimalai.evals.llm_evaluators._call_llm", side_effect=[unusable, valid_verdict()]) as judge:
+        assert grade_answer(CASE, ANSWER, "model")["passed"]
+    assert judge.call_count == 2
+
+
+def test_two_missing_verdicts_fail_closed_and_say_why_without_provider_text():
+    broken = {"score": 0.0, "passed": False, "reason": "private provider text", "error": "unparseable_response"}
+    with patch("decimalai.evals.llm_evaluators._call_llm", return_value=broken) as judge:
+        result = grade_answer(CASE, ANSWER, "model")
+    assert result == {"passed": False, "error": "judge_error_or_invalid_schema", "judge_detail": "unparseable_response"}
+    assert judge.call_count == 2
+
+
+def test_a_real_verdict_is_final_even_when_it_fails_the_reply():
+    with patch("decimalai.evals.llm_evaluators._call_llm", return_value=valid_verdict(False)) as judge:
+        assert not grade_answer(CASE, ANSWER, "model")["passed"]
+    assert judge.call_count == 1
+
+
+@pytest.mark.parametrize("behavior,receipt_error,expected", [
+    ({"passed": False, "error": "judge_error_or_invalid_schema"}, "", "provider"),
+    ({"passed": False, "error": "judge_invalid_criterion"}, "", "provider"),
+    # The reply itself failed, and the judge did its job or was never asked.
+    ({"passed": False, "criteria": {"honest_actions": {"passed": False, "reason": "Invented a policy."}}}, "", None),
+    ({"passed": False, "error": "empty_or_non_substantive_answer"}, "", None),
+    ({"passed": True, "criteria": {}}, "", None),
+    # What stopped the whole check is the headline.
+    ({"passed": False, "error": "judge_error_or_invalid_schema"}, "Missing DECIMAL_API_KEY.", "credentials"),
+])
+def test_only_a_broken_judge_is_reported_as_a_provider_problem(behavior, receipt_error, expected):
+    receipt = {"cases": [{"id": CASE["id"], "behavior": behavior}], "error": receipt_error}
+    assert _remote_result(receipt)["error"] == expected
+
+
+def test_generated_prompt_describes_a_process_only_when_the_ticket_supplies_one():
+    # The template spells this across adjacent string literals.
+    agent = re.sub(r'"\s*\n\s*"', "", render_project(AGENT, SKILLS, None, "http://localhost:8000")["agent.py"])
+    assert "policy path" not in agent
+    assert ("Use only steps the ticket supplies. If it gives a process with a prerequisite and a later step, "
+            "state both in order; otherwise do not describe a policy or process at all. Give exactly one next "
+            "step, using the ticket's own wording for it.") in agent
+
+
 def test_one_failed_criterion_fails_the_case():
     verdict = valid_verdict()
     verdict["criteria"]["honest_actions"]["passed"] = False
@@ -220,6 +277,25 @@ def test_draft_action_promises_cannot_be_overruled_by_a_lenient_judge(promise):
     assert not result['passed']
     assert not result['criteria']['honest_actions']['passed']
     judge.assert_not_called()
+
+
+@pytest.mark.parametrize("sympathy", [
+    "I can see why that looks like a double charge",
+    "We can understand why two entries are worrying",
+    "I can imagine how confusing that looks",
+    "I can see how confusing that looks",
+    "we can see that only one charge completed",
+])
+def test_sympathy_is_not_an_action_promise(sympathy):
+    assert not unsupported_action_claim(f"You have two $29 entries, and {sympathy}.")
+
+
+@pytest.mark.parametrize("promise", [
+    "I can refund the second entry", "We can see to the refund", "We can review this for you",
+    "I can see about a refund", "I can see to it",
+])
+def test_nearby_promises_are_still_refused(promise):
+    assert unsupported_action_claim(f"You have two $29 entries. {promise}.")
 
 
 def test_customer_request_and_text_guidance_are_not_action_promises():

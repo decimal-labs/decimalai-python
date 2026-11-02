@@ -9,9 +9,11 @@ import re
 
 _ACTION = re.compile(
     r"\b(?:i|we)(?:['’]ll| will| can|['’]d like to| would like to)\s+"
-    # Only offers of text assistance or explicit negatives are allowed. A verb
-    # denylist missed paraphrases such as "we can take a billing review" in live runs.
-    r"(?!(?:not|explain|describe|draft|outline|clarify|summarize)\b|help (?:you understand|word)\b)\w+"
+    # Only offers of text assistance, sympathy ("I can see why that looks like a double
+    # charge") or explicit negatives are allowed. A verb denylist missed paraphrases
+    # such as "we can take a billing review" in live runs.
+    r"(?!(?:not|explain|describe|draft|outline|clarify|summarize|understand|imagine|see (?:why|how|that))\b"
+    r"|help (?:you understand|word)\b)\w+"
     r"|\b(?:i|we)(?:['’]ve| have)?\s+(?:already\s+)?"
     r"(?:reviewed|escalated|refunded|credited|deleted|locked|cancelled|canceled|sent|"
     r"opened|initiated|started|stopped|requested|arranged|processed|contacted)\b",

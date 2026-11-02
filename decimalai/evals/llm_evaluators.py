@@ -166,8 +166,13 @@ def _evaluator_error(reason: str, error: str) -> Dict[str, Any]:
     return {"score": 0.0, "passed": False, "reason": reason, "error": error}
 
 
-def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
+def _call_llm(prompt: str, model: str, *, max_tokens: int = 1024,
+              reasoning_effort: Optional[str] = None) -> Dict[str, Any]:
     """Call an LLM via litellm and parse the JSON response.
+
+    The defaults suit a one-score evaluator. A caller expecting a longer verdict
+    raises ``max_tokens``, and sets ``reasoning_effort`` so a model's thinking
+    cannot spend that budget instead.
 
     Raises ImportError if litellm is not installed.
     """
@@ -187,7 +192,7 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
             # 1024, not 256: reasoning models (Gemini 2.5/3.x, o-series) spend part
             # of the token budget on internal thinking, and a 256 cap can leave zero
             # tokens for the actual JSON answer — the completion comes back empty.
-            max_tokens=1024,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
             # The reasoning family (gpt-5*, o-series) rejects `temperature` and remaps
             # `max_tokens`→`max_completion_tokens`. Recent litellm handles this for known
@@ -196,6 +201,7 @@ def _call_llm(prompt: str, model: str) -> Dict[str, Any]:
             # this model instead of 400-ing (which our broad except would turn into a
             # failed eval for every trace). Scoped to this call, not litellm's global flag.
             drop_params=True,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
         )
 
         # Guard None: a reasoning model that exhausts its budget on thinking, or a

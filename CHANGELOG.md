@@ -13,6 +13,23 @@ only one tried. If it was over the per-body limit, nothing was injected even whe
 fit, and the model had no way to load one. The router now tries up to two more rows, and only after a
 refusal, so a turn whose top row fits makes no extra request.
 
+### Fixed: the generated Support check works beyond GPT-5.4
+
+- **`check_agent.py` no longer fails on any model outside GPT-5.4 because its judge ran out of room.**
+  The judge's verdict was capped at 1,024 tokens. A verdict needs up to about 2,200 tokens, and a Gemini
+  model's thinking counts against the same cap, so the verdict was cut off and the reply was never
+  graded. The judge now gets 8,192 tokens with low reasoning effort, and asks once more if it gets no
+  verdict. Other `decimalai.evals` evaluators are unchanged.
+- **A judge failure is now visible.** The check printed `behavior=FAIL` with no reason. It now says the
+  reply was not graded and why, and reports `provider` to the platform.
+- **The generated Support agent no longer invents a policy.** Its prompt told the agent to "state the
+  applicable policy path", including on tickets that supply no policy, and the check then correctly
+  failed the reply for inventing one. It now describes a process only when the ticket supplies one.
+  A project generated earlier keeps the old sentence until you regenerate it.
+- **The generated agent's draft guard no longer rejects sympathy.** "I can see why that looks like a
+  double charge" was treated as a promise to act, and a model that kept writing it used up its revisions
+  and returned no reply. Promises such as "I can see to it" are still refused.
+
 ## [0.27.1] — 2026-10-31
 
 ### Fixed: Anthropic token estimates are not recorded as model generations

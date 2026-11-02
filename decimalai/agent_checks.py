@@ -28,6 +28,11 @@ SUPPORT_SKILLS = (
 )
 CHECK_VERSION = "support-draft/v1"
 DEFAULT_OPENAI_JUDGE = "gpt-5.4-2026-03-05"
+# A five-criterion verdict needs up to 2,200 tokens before any thinking (1,463 at the median on
+# Claude Haiku 5.5), and a Gemini model's thoughts count against the same cap and grow to fill it.
+# At the shared 1,024-token default almost no verdict survived, so every check on those models failed.
+JUDGE_MAX_TOKENS = 8192
+JUDGE_ATTEMPTS = 2
 
 
 def check_definition(bindings: dict[str, str]) -> dict[str, Any]:
@@ -142,6 +147,27 @@ def judge_model(model: str) -> str:
     return model
 
 
+def _verdict_failure(verdict: Any, case: dict[str, Any]) -> dict[str, Any]:
+    """Why this judge output is not a verdict, or {} if it is one."""
+    if not isinstance(verdict, dict) or set(verdict) != {"criteria"}:
+        # The evaluator's own code is an exception name or empty/unparseable, never provider text.
+        detail = verdict.get("error") if isinstance(verdict, dict) else None
+        return {"error": "judge_error_or_invalid_schema", **({"judge_detail": detail} if detail else {})}
+    criteria = verdict["criteria"]
+    if not isinstance(criteria, dict) or set(criteria) != set(case["criteria"]):
+        return {"error": "judge_missing_or_unknown_criteria"}
+    for result in criteria.values():
+        if (not isinstance(result, dict) or type(result.get("passed")) is not bool
+                or not isinstance(result.get("reason"), str) or not result["reason"].strip()):
+            return {"error": "judge_invalid_criterion"}
+    return {}
+
+
+def _judge_failed(case: dict[str, Any]) -> bool:
+    """The judge broke, as opposed to grading the reply or finding it empty."""
+    return str(case.get("behavior", {}).get("error", "")).startswith("judge_")
+
+
 def grade_answer(case: dict[str, Any], answer: str, model: str) -> dict[str, Any]:
     """Strict, narrow rubric. Unknown/malformed/provider-error verdicts fail closed."""
     if not isinstance(answer, str) or len(answer.strip()) < 40:
@@ -201,17 +227,15 @@ def grade_answer(case: dict[str, Any], answer: str, model: str) -> dict[str, Any
         "Apply the no-invented-details/honest-actions criteria strictly. " + policy + "\n"
         + json.dumps({"case_id": case["id"], "task": case["input"], "rubric": case["criteria"], "candidate_answer": answer})
     )
-    verdict = _call_llm(prompt, model)
-    if not isinstance(verdict, dict) or set(verdict) != {"criteria"}:
-        return {"passed": False, "error": "judge_error_or_invalid_schema"}
-    criteria = verdict["criteria"]
-    if not isinstance(criteria, dict) or set(criteria) != set(case["criteria"]):
-        return {"passed": False, "error": "judge_missing_or_unknown_criteria"}
-    for result in criteria.values():
-        if (not isinstance(result, dict) or type(result.get("passed")) is not bool
-                or not isinstance(result.get("reason"), str) or not result["reason"].strip()):
-            return {"passed": False, "error": "judge_invalid_criterion"}
-    return {"passed": all(c["passed"] for c in criteria.values()), "criteria": criteria}
+    # No verdict means the reply was not graded, so asking again costs one call and can't flatter it.
+    failure: dict[str, Any] = {}
+    for _ in range(JUDGE_ATTEMPTS):
+        verdict = _call_llm(prompt, model, max_tokens=JUDGE_MAX_TOKENS, reasoning_effort="low")
+        failure = _verdict_failure(verdict, case)
+        if not failure:
+            criteria = verdict["criteria"]
+            return {"passed": all(c["passed"] for c in criteria.values()), "criteria": criteria}
+    return {"passed": False, **failure}
 
 
 def configuration_snapshot(client: Any, agent_name: str) -> dict[str, Any]:
@@ -297,6 +321,8 @@ def _remote_result(receipt: dict[str, Any]) -> dict[str, Any]:
     error = receipt.get("error", "")
     category = ("credentials" if "key" in error.lower() or "credentials" in error else
                 "provider" if "provider" in error.lower() else "check_failed") if error else None
+    if category is None and any(_judge_failed(c) for c in receipt["cases"]):
+        category = "provider"
     return {
         "suite": CHECK_VERSION, "configuration_stable": receipt.get("configuration_stable", False),
         "files_stable": receipt.get("files_stable", False),
@@ -496,6 +522,13 @@ def run_project_checks(directory: Path, *, resume: bool = False, wait_seconds: f
                 for criterion, verdict in result.get("behavior", {}).get("criteria", {}).items():
                     if verdict.get("passed") is False:
                         print(f"  {criterion}: {str(verdict.get('reason', 'Criterion failed'))[:500]}")
+                behavior = result.get("behavior", {})
+                if _judge_failed(result):
+                    detail = f", {behavior['judge_detail']}" if behavior.get("judge_detail") else ""
+                    print(f"  behavior: not graded. The judge returned no usable verdict ({behavior['error']}{detail}). "
+                          "Rerun the check, or set CHECK_MODEL to another model.")
+                elif behavior.get("error"):
+                    print(f"  behavior: {behavior['error']}")
             if result.get("error"):
                 print(f"  {result['error']}")
         receipt["configuration_stable"] = configuration_snapshot(client, module.AGENT_NAME) == snapshot
