@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.27.2] — 2026-11-02
+
 ### Fixed: a skill too large to inject no longer costs the turn its skill
 
 On an adapter that injects skill text (CrewAI, or `load_skill_tool=False`), the top-ranked skill was the
