@@ -20,6 +20,9 @@ TWO WAYS TO RUN, CHOSEN BY ONE SECRET.
 WHERE THE NOTEBOOK DIFFERS FROM main.py, AND WHY.
 - OpenAI Agents SDK: `await Runner.run(...)`, not Runner.run_sync. A notebook already runs an event
   loop, and run_sync starts its own, which raises there.
+- Claude Agent SDK: the run is awaited, not asyncio.run(main()), which raises there for the same
+  reason. Its engine reads a visitor's text as a developer's unless told not to, so the docs' options
+  stay exactly as they are, verbatim_prompts=True above all.
 - OpenAI SDK and Anthropic API: the loop is a function, `answer(question)`, called in a worker
   thread (asyncio.to_thread). decimalai's sync `with support.run(...)` must not be opened on a
   thread that is running an event loop, and a notebook cell is one.
@@ -147,6 +150,55 @@ agent = Agent(
     confirmed.clear()
     result = await Runner.run(agent, question)
     return checked_reply(str(result.final_output), question)''',
+    },
+    "claude_agent_sdk": {
+        "label": "Claude Agent SDK",
+        "extra": "claude-agent-sdk",
+        "floor": "0.27",  # decimalai.claude_agent_sdk.agent_config() arrived in 0.27.0
+        "provider": "ANTHROPIC_API_KEY",
+        "provider_name": "Anthropic",
+        "provider_url": "https://console.anthropic.com/settings/keys",
+        "install_note": "The `claude-agent-sdk` package brings the Claude Code engine with it, so this is a "
+                        "bigger download than most (about 145 MB).",
+        "program": f'''import inspect
+
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, create_sdk_mcp_server, tool
+from decimalai.claude_agent_sdk import agent_config
+
+{ORDERS}
+
+
+{ACTION_CHECKS}
+
+
+{tools()}
+
+
+def as_tool(fn):
+    """A Claude Agent SDK tool from a function: its name, its docstring, string arguments."""
+    async def handler(arguments):
+        return {{"content": [{{"type": "text", "text": fn(**arguments)}}]}}
+    return tool(fn.__name__, fn.__doc__, {{name: str for name in inspect.signature(fn).parameters}})(handler)
+
+
+{CONFIG}
+options = ClaudeAgentOptions(
+    model="claude-haiku-5-5",
+    mcp_servers={{"support": create_sdk_mcp_server("support", tools=[*map(as_tool, TOOLS)])}},
+    allowed_tools=[f"mcp__support__{{fn.__name__}}" for fn in TOOLS],  # your tools; run.query() adds load_skill
+    tools=[],               # none of Claude Code's own tools: no shell, no files
+    setting_sources=[],     # nothing from this machine's Claude settings
+    verbatim_prompts=True,  # a customer's "@file" or "/command" stays text
+)''',
+        "reply": '''    # main.py ends with asyncio.run(main()); a notebook is already running an event loop, so here
+    # the run is awaited.
+    confirmed.clear()
+    async with support.run(question) as run:
+        run.system += "\\n\\n" + ACTION_RULES
+        async for message in run.query(options=options):
+            if isinstance(message, ResultMessage):
+                final = message.result
+    return checked_reply(final, question)''',
     },
     "openai": {
         "label": "OpenAI SDK",
@@ -393,8 +445,8 @@ async def reply(question):
            "\n"
            "Not in Colab? The cell reads the same names from the environment, or asks for the provider key."),
         code(keys),
-        md("## 2. Install"),
-        code(f'!pip install -q "decimalai[{sdk["extra"]}]>=0.26"'),
+        md("## 2. Install" + (f"\n\n{sdk['install_note']}" if "install_note" in sdk else "")),
+        code(f'!pip install -q "decimalai[{sdk["extra"]}]>={sdk.get("floor", "0.26")}"'),
         md("## 3. The project folder\n"
            "\n"
            "Keyless, `agent_config()` reads the agent's skills from the project's files, so this adds the three "

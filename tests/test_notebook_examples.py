@@ -616,3 +616,18 @@ def test_fallback_copy_agrees_with_the_manifest():
         "the notebook's embedded manifest copy drifted from manifest.yaml — update FALLBACK in "
         "examples/measure-a-skill/_build.py and re-run it:\n  " + "\n  ".join(mismatches)
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 4. The tutorial's Claude Agent SDK notebook: the engine stays closed, the run is awaited
+# ──────────────────────────────────────────────────────────────────────
+
+def test_claude_tutorial_notebook_keeps_the_engine_closed_and_awaits():
+    """Its engine reads "@file" and "/command" in a customer's text as a developer's unless
+    verbatim_prompts is on, and asyncio.run raises inside a notebook's running event loop."""
+    nb = json.loads((EXAMPLES / "tutorial" / "order_support_claude_agent_sdk.ipynb").read_text())
+    source = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code")
+    program = "\n".join(line.split("#")[0] for line in source.split("\n"))
+    for option in ("verbatim_prompts=True", "tools=[]", "setting_sources=[]"):
+        assert option in program, f"the notebook's ClaudeAgentOptions lost {option}"
+    assert "asyncio.run(" not in program, "a notebook awaits the run; asyncio.run raises in Colab's event loop"
