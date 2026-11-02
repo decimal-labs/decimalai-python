@@ -17,7 +17,10 @@ number. So each cell here runs twice with the same long prompt, marked for cachi
     pydantic_ai-anthropic         decimalai.pydantic_ai.agent_config() on Agent(...,
                                   model_settings={"anthropic_cache": True}): Anthropic's
                                   automatic caching (anthropic_cache_instructions marks only
-                                  static instructions, and the capability's are a function)
+                                  static instructions, and the capability's are a function).
+                                  Its breakpoint sits on the last block, so this cell repeats
+                                  its question: measured 2026-11-02, a different question read
+                                  nothing back, however long the shared prompt
     adk-anthropic                 ADK's AnthropicLlm, App(context_cache_config=...), DecimalAIPlugin
 
 The second run must read the cache. Each run's trace must equal what Anthropic billed for it
@@ -53,6 +56,8 @@ _LONG_PROMPT = (
 )
 
 _QUESTIONS = ("Reply with the single word: ready.", "Reply with the single word: steady.")
+#: Automatic caching can only read back a request it has seen in full.
+_REPEATS_ITS_QUESTION = {"pydantic_ai"}
 
 _CELLS = [
     pytest.param("anthropic_messages", id="anthropic_messages-anthropic"),
@@ -173,7 +178,8 @@ def test_a_cache_hit_is_billed_and_traced_alike(binding):
 
     reads = []
     seen_traces: set = set()
-    for i, question in enumerate(_QUESTIONS):
+    questions = (_QUESTIONS[0],) * 2 if binding in _REPEATS_ITS_QUESTION else _QUESTIONS
+    for i, question in enumerate(questions):
         # agent_config() reads one agent's saved prompt for both runs; the others file each
         # run under its own name.
         agent_name = shared if binding in _SAVED_PROMPT else f"{shared}-{i + 1}"
