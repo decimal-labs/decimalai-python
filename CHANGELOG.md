@@ -6,6 +6,13 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed: a skill too large to inject no longer costs the turn its skill
+
+On an adapter that injects skill text (CrewAI, or `load_skill_tool=False`), the top-ranked skill was the
+only one tried. If it was over the per-body limit, nothing was injected even when the next row would have
+fit, and the model had no way to load one. The router now tries up to two more rows, and only after a
+refusal, so a turn whose top row fits makes no extra request.
+
 ## [0.27.1] — 2026-10-31
 
 ### Fixed: Anthropic token estimates are not recorded as model generations

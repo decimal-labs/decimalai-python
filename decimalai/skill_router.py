@@ -727,6 +727,12 @@ def _ranked_by_this_query(result: Dict[str, Any]) -> bool:
     return result.get("strategy") != "full_menu"
 
 
+#: How many rows past the body cap a turn may try when a row's text cannot go in. Without them a
+#: skill over the per-body limit ranked first cost the turn its only injected body while the next
+#: row would have fit, and an injection-only adapter (CrewAI) has no `load_skill` to recover with.
+#: Fetched only after a refusal, so a turn whose top row fits pays nothing.
+_SPARE_BODY_ROWS = 2
+
 #: A failed routing call that took at least this long is cached for the turn.
 #: Edge aborts, auth and plan refusals and most 5xx come back in milliseconds;
 #: a timeout or an admission wait costs seconds.
@@ -3409,7 +3415,9 @@ class SkillRouter:
             bodies = []
             body_tokens = 0
             count_cap = min(self.inject_body_top_k, self.max_loaded_bodies)
-            for name in body_names[:count_cap]:
+            for name in body_names[:count_cap + _SPARE_BODY_ROWS]:
+                if len(bodies) >= count_cap:
+                    break
                 body_options: Dict[str, Any] = {"max_chars": self.per_body_char_limit}
                 if effective_agent is not None:
                     body_options["agent_name"] = effective_agent
@@ -3430,7 +3438,9 @@ class SkillRouter:
                     continue
                 tokens = estimate_tokens(body)
                 if body_tokens + tokens > self.body_token_budget:
-                    break
+                    if bodies:
+                        break
+                    continue
                 body_tokens += tokens
                 bodies.append(f"## Skill: {name}\n\n{body}")
                 # The body actually reached the prompt → delivered.

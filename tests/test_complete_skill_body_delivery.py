@@ -149,3 +149,95 @@ def test_partial_cache_and_failed_fetch_do_not_lend_witnesses_to_the_next_body()
     assert "new complete body" in prefix
     assert consume_last_delivered_names() == [NAME]
     assert consume_last_delivered_versions() == [{"name": NAME, "hash": HASH, "routing_id": ROUTE["routing_id"]}]
+
+
+# ── a row that cannot go in costs that row, not the turn ─────────────────────────────────────────
+#
+# Measured on the fleet, 2026-11-01: 5 of 15 CrewAI steps that got no body had ranked first a skill of
+# 44,000-45,000 characters, with rows of 6,500-11,000 characters right behind it.
+
+def _ranked(*names):
+    return {"prompt_fragment": "MENU", "routing_id": "rt_rows", "strategy": "smart_routing",
+            "query_ranked": True, "skills": [{"name": n} for n in names]}
+
+
+def _records(by_name):
+    """A `get_skill_body_record` that answers by name and says which names were asked for."""
+    asked = []
+
+    def answer(name, *_args, **_kwargs):
+        asked.append(name)
+        return by_name[name]
+    return answer, asked
+
+
+def _prompt(router, route, by_name, scope):
+    answer, asked = _records(by_name)
+    with patch.object(router, "smart_route", return_value=route), \
+            patch.object(router, "get_skill_body_record", side_effect=answer):
+        prefix, _, _ = router.build_prompt_parts("review this function", scope=scope)
+    return prefix, asked
+
+
+@pytest.mark.parametrize("too_large", [
+    _record("partial", truncated=True),               # what a server does with max_chars
+    _record("y" * 30_000),                            # an older server that ignores max_chars
+])
+def test_a_top_row_over_the_limit_gives_way_to_the_next(too_large):
+    router = _router(inject_body=True)
+    prefix, asked = _prompt(router, _ranked("big", "fits", "third"),
+                            {"big": too_large, "fits": _record("the next row"),
+                             "third": _record("never fetched")}, "next")
+    assert "## Skill: fits" in prefix and "## Skill: big" not in prefix
+    assert consume_last_delivered_names() == ["fits"]
+    assert asked == ["big", "fits"], "the row after one that fit must not be fetched"
+
+
+def test_a_top_row_over_the_token_budget_gives_way_to_the_next():
+    router = _router(inject_body=True, per_body_char_limit=2000, body_token_budget=50)
+    prefix, _ = _prompt(router, _ranked("big", "fits"),
+                        {"big": _record("x" * 1000), "fits": _record("short")}, "budget")
+    assert "## Skill: fits" in prefix
+    assert consume_last_delivered_names() == ["fits"]
+
+
+def test_a_top_row_that_fits_makes_no_extra_request():
+    """This is on the hot path of every turn, so the spare rows must cost nothing normally."""
+    router = _router(inject_body=True)
+    _, asked = _prompt(router, _ranked("first", "second", "third"),
+                       {"first": _record("fits"), "second": _record("b"), "third": _record("c")},
+                       "fits")
+    assert asked == ["first"]
+    assert consume_last_delivered_names() == ["first"]
+
+
+def test_the_walk_past_a_refused_row_is_bounded():
+    """Three refusals end it, so a menu of oversized skills can't turn into a dozen fetches."""
+    router = _router(inject_body=True)
+    big = _record("partial", truncated=True)
+    prefix, asked = _prompt(router, _ranked("a", "b", "c", "d", "e"),
+                            {n: big for n in "abcde"}, "bounded")
+    assert asked == ["a", "b", "c"]
+    assert "## Skill:" not in prefix
+    assert consume_last_delivered_names() == []
+
+
+def test_a_later_body_over_the_budget_still_ends_the_turn():
+    """Spare rows are for a turn with no body yet. Once one is in, the budget means stop."""
+    router = _router(inject_body=True, inject_body_top_k=3, per_body_char_limit=400,
+                     body_token_budget=150)
+    _, asked = _prompt(router, _ranked("s1", "s2", "s3"),
+                       {n: _record("b" * 400) for n in ("s1", "s2", "s3")}, "later")
+    assert asked == ["s1", "s2"]
+    assert consume_last_delivered_names() == ["s1"]
+
+
+def test_an_unranked_result_still_injects_nothing():
+    """The spare rows must not widen what counts as a body worth injecting: a menu's top row is the
+    workspace's best-rated skill, not one about this turn."""
+    router = _router(inject_body=True)
+    route = {**_ranked("a", "b", "c"), "strategy": "full_menu", "query_ranked": False}
+    prefix, asked = _prompt(router, route, {n: _record("text") for n in "abc"}, "unranked")
+    assert asked == [] and "## Skill:" not in prefix
+    assert consume_last_delivered_names() == []
+
