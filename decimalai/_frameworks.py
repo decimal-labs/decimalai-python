@@ -68,6 +68,10 @@ class Capability:
 
     Markdown cells, written for the SDK release this module ships in. The native-loader
     column is not here: it is rendered from :attr:`Framework.native_loaders`.
+
+    No version notes such as "(0.16+)", here or in a ``use_for`` cell: the docs keep version
+    history in their changelog and Migrations, and ``tests/test_frameworks_registry.py``
+    fails on one.
     """
 
     tier: str           # First-class | Supported | Community
@@ -180,7 +184,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 requires="deepagents",
                 traced_by="`langchain=True`",
                 use_for="Deep Agents' own skills middleware, pointed at installed skills; "
-                        "each `read_file` of a skill is recorded as an activation (0.16+)",
+                        "each `read_file` of a skill is recorded as an activation",
             ),
         ),
         capability=Capability(
@@ -222,9 +226,9 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             skills_rail="`load_skill` tool",
         ),
         use_for="OpenAI Agents SDK — `agent_config(name)` returns the agent's prompt and "
-                "skills to pass as `Agent(instructions=..., tools=[...])`, nothing patched "
-                "(0.18+); `sandbox_skills()` is a `SandboxAgent`'s Skills capability over "
-                "installed skills (0.16+)",
+                "skills to pass as `Agent(instructions=..., tools=[...])`, nothing patched; "
+                "`sandbox_skills()` is a `SandboxAgent`'s Skills capability over installed "
+                "skills",
     ),
     Framework(
         key="claude-agent-sdk",
@@ -253,8 +257,8 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         ),
         use_for="Claude Agent SDK — `agent_config(name)` gives each independent "
                 "`support.run(question)` its saved prompt and routed skills through "
-                "`run.query()`, with one trace and an MCP `load_skill` tool (0.27+); "
-                "`skills_plugin()` also loads installed skills as a Claude Code plugin (0.16+)",
+                "`run.query()`, with one trace and an MCP `load_skill` tool; "
+                "`skills_plugin()` also loads installed skills as a Claude Code plugin",
     ),
     Framework(
         key="pydantic-ai",
@@ -290,7 +294,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 requires="pydantic-ai-harness",
                 traced_by="`otel=True` + `Agent.instrument_all()`",
                 use_for="The Pydantic AI harness's `Skills` capability, pointed at installed "
-                        "skills; each load recorded as an activation (0.16+)",
+                        "skills; each load recorded as an activation",
             ),
         ),
         capability=Capability(
@@ -301,7 +305,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             skills_rail="`load_skill` tool",
         ),
         use_for="Pydantic AI — `agent_config(name)` returns the agent's prompt and skills "
-                "as one capability for `Agent(capabilities=[...])`, nothing patched (0.19+)",
+                "as one capability for `Agent(capabilities=[...])`, nothing patched",
     ),
     Framework(
         key="adk",
@@ -343,7 +347,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         use_for="Google ADK — `agent_config(name)` returns the agent's prompt and skills as an "
                 "instruction provider and `load_skill` for your own `LlmAgent`; "
                 "`DecimalAIPlugin()` in `App(plugins=[...])` makes one trace per invocation, "
-                "nothing patched (0.20+); `skills()` feeds ADK's `SkillToolset` (0.16+)",
+                "nothing patched; `skills()` feeds ADK's `SkillToolset`",
     ),
     Framework(
         key="anthropic",
@@ -379,7 +383,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
         use_for="Anthropic Messages API — `agent_config(name)`; each `support.run(question)` gives "
                 "`run.system` (the prompt, then the skill list) and `load_skill` in `run.tools` "
                 "for the Tool Runner (`run.tool_params` and `run.tool_result()` for your own "
-                "`messages.create()` loop), one trace per run, nothing patched (0.23+)",
+                "`messages.create()` loop), one trace per run, nothing patched",
     ),
     Framework(
         key="openai",
@@ -412,7 +416,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "`run.system` (the prompt, then the skill list), `run.message` and `load_skill` "
                 "in `run.tools` for a Chat Completions loop (`run.response_tools` for the "
                 "Responses API), answered by `run.tool_result(call)`; one trace per run, "
-                "nothing patched (0.25+)",
+                "nothing patched",
     ),
     Framework(
         key="google-genai",
@@ -447,7 +451,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 "gives `run.system` (the prompt, then the skill list) for `system_instruction` "
                 "and `load_skill` as a function in `run.tools` for automatic function calling "
                 "(`run.tool_params` and `run.tool_result()` for your own loop); one trace per "
-                "run, nothing patched (0.25+)",
+                "run, nothing patched",
     ),
     Framework(
         key="llamaindex",
@@ -504,11 +508,11 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             manifest="✅ partial",
             schema_depth="Names only",
             handoffs="✅",
-            skills_rail="Prompt injection (0.13.9+)",
+            skills_rail="Prompt injection",
         ),
         use_for="CrewAI tracing through the OTel exporter, plus skill injection via CrewAI's "
-                "`before_llm_call` hook (0.13.9+, `crewai>=1.15.27`); `skills()` and "
-                "`skill_tools()` feed CrewAI's own loader (0.16+)",
+                "`before_llm_call` hook (`crewai>=1.15.27`); `skills()` and "
+                "`skill_tools()` feed CrewAI's own loader",
     ),
     Framework(
         key="otel",
@@ -531,8 +535,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 requires="agent-framework-core",
                 traced_by="`otel=True`",
                 use_for="Microsoft Agent Framework's `SkillsProvider`, pointed at installed "
-                        "skills, with a script runner; each load recorded as an activation "
-                        "(0.16+)",
+                        "skills, with a script runner; each load recorded as an activation",
             ),
             NativeLoader(
                 loader_id="strands-agents",
@@ -542,7 +545,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
                 requires="strands-agents",
                 traced_by="`otel=True`",
                 use_for="Strands' `AgentSkills` plugin, pointed at installed skills; each "
-                        "load recorded as an activation (0.16+)",
+                        "load recorded as an activation",
             ),
         ),
         capability=Capability(
@@ -553,7 +556,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             skills_rail="—",
         ),
         use_for="Generic OpenTelemetry GenAI span exporter; also the trace for Microsoft "
-                "Agent Framework and Strands, from their own spans (0.16+)",
+                "Agent Framework and Strands, from their own spans",
     ),
     # ── not rows of the docs' tables ──
     Framework(
@@ -679,7 +682,7 @@ def _native_cell(f: Framework) -> str:
 
 CAPABILITY_HEADER = (
     "Framework", "Tier", "Auto-detected manifest", "Tool schema depth",
-    "Handoffs / multi-agent", "Skills rail", "Native skill loader (0.16+)",
+    "Handoffs / multi-agent", "Skills rail", "Native skill loader",
 )
 _CAPABILITY_ALIGN = ("---", "---", ":---:", ":---:", ":---:", ":---:", "---")
 

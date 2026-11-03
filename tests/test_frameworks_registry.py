@@ -223,6 +223,36 @@ def test_min_python_is_set_only_where_the_extra_needs_it():
 
 # ── the docs' tables ─────────────────────────────────────────────────
 
+#: A version note in a rendered table: "(0.16+)", or the start of "(0.13.9+, `crewai>=1.15.27`)".
+_VERSION_NOTE = re.compile(r" \(\d+\.\d+(?:\.\d+)?\+\)|(?<=\()\d+\.\d+(?:\.\d+)?\+, ")
+
+
+def without_version_notes(table: str) -> str:
+    """A rendered table with its version notes taken out.
+
+    The docs keep version history in their changelog and Migrations, so the page shows these
+    tables with no notes, and the registry of a release cut before they left this repo still
+    renders them. Comparing without them means the page did not have to wait for a release to
+    drop them."""
+    return _VERSION_NOTE.sub("", table)
+
+
+def test_without_version_notes_takes_out_only_the_notes():
+    assert without_version_notes("| Native skill loader (0.16+) |") == "| Native skill loader |"
+    assert without_version_notes("nothing patched (0.18+); `skills()` (0.16+)") == "nothing patched; `skills()`"
+    assert without_version_notes("hook (0.13.9+, `crewai>=1.15.27`); x") == "hook (`crewai>=1.15.27`); x"
+    kept = "span handler (`llama-index-core>=0.14.25`)"
+    assert without_version_notes(kept) == kept
+
+
+def test_tables_carry_no_version_notes():
+    """decimalai-docs' scripts/check_doc_rules.py fails on a note in these tables, so a note
+    added here would break the docs' next land. This says so on the commit that adds it."""
+    for name in reg.GENERATED_BLOCKS:
+        found = re.findall(r"\b\d+\.\d+(?:\.\d+)?\+", reg.render_block(name))
+        assert not found, (f"{name}: version notes {found}. Version history belongs in the docs' "
+                           f"changelog and Migrations, not in decimalai/_frameworks.py.")
+
 
 def test_capability_table_advertises_the_conformance_snapshot():
     """The rendered first column parses, the way the coverage guard parses it, into the
@@ -310,10 +340,12 @@ def _documented_registry(changelog: Path, tmp_path: Path, monkeypatch) -> Tuple[
 
 
 def test_docs_generated_blocks_are_the_documented_releases(tmp_path, monkeypatch):
-    """The docs page carries exactly what the registry of the release it documents renders.
-    Skips without the docs checkout; decimalai-docs' scripts/check_generated_framework_tables.py
-    makes the comparison from that side (`--write` regenerates), and a release's docs change
-    regenerates the blocks (RELEASING.md, docs sync)."""
+    """The docs page carries what the registry of the release it documents renders, version
+    notes aside (`without_version_notes`, on both sides, so this test passes before and after
+    the page drops them). Skips without the docs checkout;
+    decimalai-docs' scripts/check_generated_framework_tables.py makes the comparison from that
+    side (`--write` regenerates) and its scripts/check_doc_rules.py refuses a note on the page,
+    and a release's docs change regenerates the blocks (RELEASING.md, docs sync)."""
     if not DOCS_FRAMEWORKS.exists():
         pytest.skip(f"docs repo not on disk at {DOCS_FRAMEWORKS}")
     registry, source = _documented_registry(DOCS_CHANGELOG, tmp_path, monkeypatch)
@@ -321,7 +353,7 @@ def test_docs_generated_blocks_are_the_documented_releases(tmp_path, monkeypatch
     for name in registry.GENERATED_BLOCKS:
         have = registry.extract_block(text, name)
         assert have is not None, f"frameworks.mdx has no generated {name!r} block"
-        assert have == registry.render_block(name), (
+        assert without_version_notes(have) == without_version_notes(registry.render_block(name)), (
             f"frameworks.mdx's {name!r} block differs from the registry of {source}. In "
             f"decimalai-docs run `python3 scripts/check_generated_framework_tables.py --write` "
             f"with the docs for that release.")
