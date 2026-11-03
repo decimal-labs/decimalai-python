@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.28.1] — 2026-11-04
+
 ### Fixed: `skills search` no longer prints counts it knows are wrong
 
 Before August 2026 a benchmark stored a case as failed when no check separated the with-skill and
