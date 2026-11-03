@@ -1,4 +1,4 @@
-"""Run the linked Colab notebooks' actual action checks and loops without a model or keys."""
+"""Run the linked Colab notebooks' actual tools and loops without a model or keys."""
 from __future__ import annotations
 
 import ast
@@ -14,9 +14,9 @@ import pytest
 
 HERE = Path(__file__).resolve().parents[1] / "examples" / "tutorial"
 SDKS = ("openai_agents", "openai", "anthropic")
-QUESTION = "I was charged twice for order ORD-1002. Can you fix it?"
+QUESTION = "I opened my kettle from ORD-1001 and it works, but I don't want it. How much do I get back if I return it?"
 SAVED = "An older saved prompt says billing will follow up."
-ANSWER = "Charge: $129\nCharge: $129\nI've flagged ORD-1002 for billing review."
+ANSWER = "You'd get back **$41.65**.\n\nStart at acme.example/returns."
 
 
 def notebook(sdk):
@@ -25,15 +25,15 @@ def notebook(sdk):
 
 def program(sdk):
     return "\n\n".join("".join(cell["source"]) for cell in notebook(sdk)["cells"]
-                       if cell["cell_type"] == "code" and "def checked_reply" in "".join(cell["source"]))
+                       if cell["cell_type"] == "code" and "def lookup_order" in "".join(cell["source"]))
 
 
 def load_program(sdk):
     """Execute the real notebook definitions, substituting only SDK/network objects."""
     source = program(sdk)
     tree = ast.parse(source)
-    names = {"ORDERS", "ACTION_RULES", "confirmed", "TOOLS", "BY_NAME", "agent"}
-    functions = {"checked_reply", "lookup_order", "flag_for_billing", "lock_account",
+    names = {"ORDERS", "TOOLS", "BY_NAME", "agent"}
+    functions = {"lookup_order", "flag_for_billing", "lock_account",
                  "start_account_deletion", "schema", "instructions", "answer"}
     body = []
     for node in tree.body:
@@ -72,30 +72,15 @@ def test_notebook_cells_compile_without_outputs_or_literal_credentials(sdk):
 
 
 @pytest.mark.parametrize("sdk", SDKS)
-@pytest.mark.parametrize("outcome", ("missing", "failed", "wrong_order", "success"))
-def test_actual_notebook_loop_checks_current_run_and_keeps_saved_prompt_policy(sdk, outcome):
+def test_actual_notebook_loop_passes_the_saved_prompt_as_it_is_and_returns_the_reply(sdk):
     env = load_program(sdk)
-    # A previous successful run cannot authorize the next model answer.
-    env["confirmed"].update({("lookup_order", "ORD-1002"), ("flag_for_billing", "ORD-1002")})
     seen = []
-
-    def calls():
-        if outcome == "missing":
-            return []
-        order = {"failed": "ORD-9999", "wrong_order": "ORD-1001", "success": "ORD-1002"}[outcome]
-        return [("lookup_order", {"order_id": "ORD-1002"}),
-                ("flag_for_billing", {"order_id": order, "note": "check the duplicate"})]
-
-    def perform_tools():
-        for name, args in calls():
-            env[name](**args)
 
     if sdk == "openai_agents":
         class Runner:
             @staticmethod
             async def run(agent, question):
                 seen.append(await agent.instructions(None, agent))
-                perform_tools()
                 return SimpleNamespace(final_output=ANSWER)
         env["Runner"] = Runner
         def run():
@@ -116,43 +101,38 @@ def test_actual_notebook_loop_checks_current_run_and_keeps_saved_prompt_policy(s
             def create(**kwargs):
                 seen.append(kwargs["instructions"])
                 requests.append(kwargs)
-                items = [SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=str(i))
-                         for i, (name, args) in enumerate(calls())] if len(requests) == 1 else []
+                items = [SimpleNamespace(type="function_call", name="lookup_order",
+                                         arguments=json.dumps({"order_id": "ORD-1001"}), call_id="0")] if len(requests) == 1 else []
                 return SimpleNamespace(output=items, output_text=ANSWER)
             env["OpenAI"] = lambda: SimpleNamespace(responses=SimpleNamespace(create=create))
         else:
             def tool_runner(**kwargs):
                 seen.append(kwargs["system"])
-                def until_done():
-                    perform_tools()
-                    return SimpleNamespace(content=[SimpleNamespace(type="text", text=ANSWER)])
-                return SimpleNamespace(until_done=until_done)
+                return SimpleNamespace(until_done=lambda: SimpleNamespace(content=[SimpleNamespace(type="text", text=ANSWER)]))
             env["client"] = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(tool_runner=tool_runner)))
         def run():
             return env["answer"](QUESTION)
 
-    if outcome == "success":
-        assert run() == ANSWER  # formatting is preserved, not replaced with a repaired answer
-    else:
-        with pytest.raises(RuntimeError, match="reply not accepted"):
-            run()
+    assert run() == ANSWER
     assert seen  # the actual callback/model loop ran
     for instructions in seen:
-        if isinstance(instructions, list):
-            assert instructions == [{"type": "text", "text": SAVED}, {"type": "text", "text": env["ACTION_RULES"]}]
-        else:
-            assert instructions == SAVED + "\n\n" + env["ACTION_RULES"]
+        assert instructions in (SAVED, [{"type": "text", "text": SAVED}])
 
 
 @pytest.mark.parametrize("sdk", SDKS)
-def test_deletion_requires_the_actual_link_tool_not_only_an_account_lock(sdk):
+def test_tools_report_what_happened_and_an_unknown_order_flags_nothing(sdk):
     env = load_program(sdk)
-    question = "Please delete my account and all my data today."
-    env["lock_account"]()
-    with pytest.raises(RuntimeError):
-        env["checked_reply"]("The confirmation link was sent.", question)
-    env["start_account_deletion"]()
-    assert env["checked_reply"]("The confirmation link was sent.", question) == "The confirmation link was sent."
+    assert "electric kettle" in env["lookup_order"]("ORD-1001")
+    assert env["lookup_order"]("ORD-9999") == "No order with that id."
+    assert env["flag_for_billing"]("ORD-9999", "check") == "No order with that id."
+    assert env["flag_for_billing"]("ORD-1002", "check") == "Flagged ORD-1002 for the billing team: check"
+
+
+@pytest.mark.parametrize("sdk", SDKS)
+def test_the_model_is_told_not_to_claim_an_action_and_the_reader_is_pointed_at_the_check(sdk):
+    assert "Only describe an action as done after" in program(sdk)
+    text = "".join("".join(cell["source"]) for cell in notebook(sdk)["cells"] if cell["cell_type"] == "markdown")
+    assert "A model can say it did something without doing it" in text and "/measure-it" in text
 
 
 def test_openai_notebook_can_start_and_skip_with_a_blank_provider_key(monkeypatch, capsys):

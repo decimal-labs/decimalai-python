@@ -14,7 +14,7 @@ TWO WAYS TO RUN, CHOSEN BY ONE SECRET.
   wrong, or a workspace with no copy yet, is said plainly and the notebook falls back to keyless
   rather than let agent_config() create an empty agent.
 - Without it: keyless, as Part 2's first half. The demo's prompt is the fallback= text, and the
-  setup cell adds the three registry skills to a project folder with `decimalai skills add` (no
+  setup cell adds the four registry skills to a project folder with `decimalai skills add` (no
   account), which is where keyless agent_config() reads them. Nothing goes to DecimalAI.
 
 WHERE THE NOTEBOOK DIFFERS FROM main.py, AND WHY.
@@ -42,58 +42,32 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = "decimal-labs/decimalai-python"
 DOCS = "https://docs.decimal.ai/tutorials/support-agent"
-SKILLS = ["billing-dispute-resolution", "account-deletion-verification-policy", "diagnostic-triage-questions"]
-QUESTION = "I was charged twice for order ORD-1002. Can you fix it?"
+SKILLS = ["billing-dispute-resolution", "account-deletion-verification-policy", "diagnostic-triage-questions",
+          "acme-returns-policy"]
+QUESTION = "I opened my kettle from ORD-1001 and it works, but I don't want it. How much do I get back if I return it?"
 
 ORDERS = '''ORDERS = {
     "ORD-1001": {"item": "electric kettle", "status": "delivered 2026-10-20", "charges": ["$49.00 on 2026-10-15"]},
     "ORD-1002": {"item": "mechanical keyboard", "status": "delivered 2026-10-18", "charges": ["$129.00 on 2026-10-12", "$129.00 on 2026-10-12"]},
 }'''
 
-ACTION_CHECKS = '''# This runtime rule also applies to a saved prompt or an edited skill.
-ACTION_RULES = (
-    "Only claim an action after its tool succeeds. For a verified duplicate charge, call "
-    "flag_for_billing before saying billing will follow up. For deletion, call "
-    "start_account_deletion before saying a link was sent. Never claim a refund or deletion "
-    "was performed: these tools only simulate a billing handoff, lock, or confirmation link."
-)
-confirmed = set()
-
-
-def checked_reply(reply, question):
-    """Check this tutorial's two action examples before accepting a reply."""
-    question = " ".join(question.lower().split()).rstrip(".!?")
-    required = set()
-    if "ord-1002" in question and "charged twice" in question:
-        required = {("lookup_order", "ORD-1002"), ("flag_for_billing", "ORD-1002")}
-    elif question == "please delete my account and all my data today":
-        required = {("start_account_deletion", None)}
-    if not required.issubset(confirmed):
-        raise RuntimeError("The tools did not confirm this example's action; reply not accepted.")
-    return reply'''
-
 # The agent's tools, the same four as the docs' code tabs and the page's runner (platform
 # tutorial_model_worker.demo_tools): lookup_order reads the orders; the other three stand in for
 # the actions the skills call for.
 TOOL_DEFS = (
     '''def lookup_order(order_id: str) -> str:
-    """Look up an order by its id, for example ORD-1002."""
-    if order_id in ORDERS:
-        confirmed.add(("lookup_order", order_id))
+    """Look up an order by its id, for example ORD-1001."""
     return str(ORDERS.get(order_id, "No order with that id."))''',
     '''def flag_for_billing(order_id: str, note: str) -> str:
     """Flag an order's charges for the billing team. Call before claiming billing will follow up."""
     if order_id not in ORDERS:
         return "No order with that id."
-    confirmed.add(("flag_for_billing", order_id))
     return f"Flagged {order_id} for the billing team: {note}"''',
     '''def lock_account() -> str:
     """Lock the customer's account: nobody can sign in or change it until they finish recovery or deletion."""
-    confirmed.add(("lock_account", None))
     return "Locked the account."''',
     '''def start_account_deletion() -> str:
     """Send the deletion confirmation link. Call before claiming it was sent; this does not delete the account."""
-    confirmed.add(("start_account_deletion", None))
     return "Sent the deletion confirmation link to the email on file."''',
 )
 
@@ -129,27 +103,19 @@ from decimalai.openai_agents import agent_config
 {ORDERS}
 
 
-{ACTION_CHECKS}
-
-
 {tools("@function_tool")}
 
 {CONFIG}
 
-async def instructions(context, agent):
-    return await support.instructions(context, agent) + "\\n\\n" + ACTION_RULES
-
-
 agent = Agent(
     name=support.name,
-    instructions=instructions,  # saved prompt and skill list, followed by action rules
+    instructions=support.instructions,  # the prompt and a menu of skills
     tools=[*TOOLS, *support.tools],     # your tools, then load_skill
 )''',
         "reply": '''    # main.py says Runner.run_sync(agent, question); a notebook is already running an event
     # loop, so here the run is awaited.
-    confirmed.clear()
     result = await Runner.run(agent, question)
-    return checked_reply(str(result.final_output), question)''',
+    return str(result.final_output)''',
     },
     "claude_agent_sdk": {
         "label": "Claude Agent SDK",
@@ -166,9 +132,6 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, create_sdk_mcp_s
 from decimalai.claude_agent_sdk import agent_config
 
 {ORDERS}
-
-
-{ACTION_CHECKS}
 
 
 {tools()}
@@ -192,13 +155,11 @@ options = ClaudeAgentOptions(
 )''',
         "reply": '''    # main.py ends with asyncio.run(main()); a notebook is already running an event loop, so here
     # the run is awaited.
-    confirmed.clear()
     async with support.run(question) as run:
-        run.system += "\\n\\n" + ACTION_RULES
         async for message in run.query(options=options):
             if isinstance(message, ResultMessage):
                 final = message.result
-    return checked_reply(final, question)''',
+    return final''',
     },
     "openai": {
         "label": "OpenAI SDK",
@@ -213,9 +174,6 @@ from openai import OpenAI
 from decimalai.openai import agent_config
 
 {ORDERS}
-
-
-{ACTION_CHECKS}
 
 
 {tools()}
@@ -235,14 +193,13 @@ def schema(fn):
 
 def answer(question):
     # main.py's loop, as a function: the next cell runs it in a worker thread.
-    confirmed.clear()
     client = OpenAI()  # ask() has checked the provider key before this cell needs a client
     with support.run(question) as run:
         items = [run.message]
         while True:
             response = client.responses.create(
                 model="gpt-5.4-mini",
-                instructions=run.system + "\\n\\n" + ACTION_RULES,
+                instructions=run.system,
                 input=items,
                 tools=[*map(schema, TOOLS), *run.response_tools],  # your tools, then load_skill
             )
@@ -256,7 +213,7 @@ def answer(question):
                     "call_id": call.call_id,
                     "output": BY_NAME[call.name](**json.loads(call.arguments)),
                 }})
-    return checked_reply(response.output_text, question)''',
+    return response.output_text''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
     "anthropic": {
@@ -272,9 +229,6 @@ from decimalai.anthropic import agent_config
 {ORDERS}
 
 
-{ACTION_CHECKS}
-
-
 {tools("@beta_tool")}
 
 client = anthropic.Anthropic()
@@ -283,18 +237,16 @@ client = anthropic.Anthropic()
 
 def answer(question):
     # main.py's loop, as a function: the next cell runs it in a worker thread.
-    confirmed.clear()
     with support.run(question) as run:
         runner = client.beta.messages.tool_runner(
             model="claude-haiku-5-5",
             max_tokens=4096,
-            system=[*run.system, {{"type": "text", "text": ACTION_RULES}}],
+            system=run.system,
             tools=[*TOOLS, *run.tools],        # your tools, then load_skill
             messages=[{{"role": "user", "content": question}}],
         )
         reply = runner.until_done()
-    text = "".join(block.text for block in reply.content if block.type == "text")
-    return checked_reply(text, question)''',
+    return "".join(block.text for block in reply.content if block.type == "text")''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
 }
@@ -430,7 +382,7 @@ async def reply(question):
            "\n"
            "- **With your `DECIMAL_API_KEY`**: it runs *your* copy of `order-support`, with the prompt and "
            "skills you saved. The run shows up in your DecimalAI dashboard.\n"
-           "- **Without it**: keyless. The demo's prompt and its three skills from the registry; nothing is "
+           "- **Without it**: keyless. The demo's prompt and its four skills from the registry; nothing is "
            "sent to DecimalAI."),
         md("## 1. Your keys\n"
            "\n"
@@ -449,7 +401,7 @@ async def reply(question):
         code(f'!pip install -q "decimalai[{sdk["extra"]}]>={sdk.get("floor", "0.26")}"'),
         md("## 3. The project folder\n"
            "\n"
-           "Keyless, `agent_config()` reads the agent's skills from the project's files, so this adds the three "
+           "Keyless, `agent_config()` reads the agent's skills from the project's files, so this adds the four "
            "from the registry, as Part 2's `decimalai skills add` step does. No account is needed. With your "
            "key, your skills live on DecimalAI instead and there is nothing to add."),
         code(setup),
@@ -461,11 +413,8 @@ async def reply(question):
            "skills call for, so the agent can do what a skill says. They report what they would do and change "
            "nothing.\n"
            "\n"
-           "`ACTION_RULES` also applies to a saved prompt or an edited skill. Before accepting a reply to "
-           "either supplied action question, `checked_reply` requires the actual successful tool receipts "
-           "for that run. It prints a failure if a tool is missing; it never calls a tool afterward to repair "
-           "the answer. These checks cover the supplied billing and deletion examples; add checks for your "
-           "own tasks, and keep receipts separately for each run in a long-running application."),
+           "A model can say it did something without doing it. "
+           f"[Part 5]({DOCS}/measure-it) of the tutorial checks what the tools really returned."),
         code(sdk["program"]),
         md("## 5. Ask it"),
         code(ask),
@@ -473,7 +422,8 @@ async def reply(question):
         md("Ask another question: each one needs a different skill, and the model picks it.\n"
            "\n"
            "- *Please delete my account and all my data today.*\n"
-           "- *My kettle from order ORD-1001 won't turn on.*"),
+           "- *My kettle from order ORD-1001 won't turn on.*\n"
+           "- *I was charged twice for order ORD-1002. Can you fix it?*"),
         code('await ask("Please delete my account and all my data today.")'),
         md("## What just happened\n"
            "\n"
@@ -485,7 +435,7 @@ async def reply(question):
            "it, add `DECIMAL_API_KEY` and run the notebook again from the top (**Runtime → Restart session**, "
            "then **Run all**).\n"
            "\n"
-           f"Next: [3. Start from a template]({DOCS}/start-from-a-template)."),
+           f"Next: [3. Add skills from the registry]({DOCS}/start-from-a-template)."),
     ]
     for i, cell in enumerate(cells):
         cell["id"] = f"{key}-{i:02d}"  # nbformat 4.5 wants one; stable, so a rebuild diffs cleanly
