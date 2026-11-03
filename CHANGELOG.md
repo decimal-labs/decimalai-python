@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-11-03
+
 ### New: `decimalai skills search <query>`, with no key
 
 The terminal could not find a skill without the MCP server or the plugin. `decimalai skills search`
