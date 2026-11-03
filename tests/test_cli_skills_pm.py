@@ -226,6 +226,16 @@ class TestAddEndsWithHowToTry:
         assert f"Use the {REFUND_DIR} skill. What can it help me with?" in result.output
         assert "from the skill's tests" not in result.output
 
+    def test_reading_the_test_results_never_sends_the_key(self, env):
+        """The route is public, so a key has no business on it, and `add` here has one."""
+        skill = env.skill()
+        self._benchmark(env, skill, _case(self.QUESTION))
+        result = env.run("add", REFUND, key=OWNER_KEY)
+        assert result.exit_code == 0, result.output
+        request = env.registry.calls("benchmark")[-1]
+        assert request.path.endswith(f"/{skill.skill_id}/benchmark")
+        assert "authorization" not in request.headers
+
     def test_a_question_reaches_the_terminal_with_no_control_characters(self, env):
         skill = env.skill()
         self._benchmark(env, skill, _case("Refund it\x1b[2J\u202e now\nplease"))

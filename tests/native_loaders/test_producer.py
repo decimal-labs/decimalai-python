@@ -119,8 +119,12 @@ def test_p1_install_frozen_resolved_nothing_and_fetched_every_skill(made):
     fetched = sorted(path.rsplit("/", 1)[1] for _, path, status in frozen.requests
                      if "/bundles/" in path and status == 200)
     assert fetched == sorted(r.version_id for r in oracle.ROWS), frozen.requests
-    assert all(path.startswith("/api/v1/install/") for _, path, _ in
-               [req for c in made.commands for req in c.requests]), "a request went unauthenticated"
+    # `add` also reads the skill's public test results for a question to try. That read
+    # carries no skill bytes and needs no key; everything that installs must have one.
+    installing = [req for c in made.commands for req in c.requests
+                  if not req[1].endswith("/benchmark")]
+    assert all(path.startswith("/api/v1/install/") for _, path, _ in installing), (
+        "a request went unauthenticated")
 
 
 def test_p1_the_producer_writes_the_oracles_bytes(made):
