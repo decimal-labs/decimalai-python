@@ -1211,10 +1211,10 @@ def _write_folder(target: Path, planned: Dict[str, Tuple[bytes, int]]) -> None:
 def _print_quality(url: str) -> None:
     """The registry's quality and efficiency lines for the skill; nothing when unavailable.
 
-    For example: ``SkillScore 87 (provisional) · +60 pts vs no skill · 96% live pass``.
+    For example: ``SkillScore 87 · +60 pts vs no skill · 96% live pass``.
     SkillScore is the quality composite (benchmark pass, live eval pass, rated trace
-    quality); "provisional" means one evidence leg. The registry's detail route only
-    reads: it counts no view, install or delivery, so this read changes no number.
+    quality). The registry's detail route only reads: it counts no view, install or
+    delivery, so this read changes no number.
     """
     import httpx
 
@@ -1232,8 +1232,7 @@ def _print_quality(url: str) -> None:
         score = eff.get("avg_effectiveness")  # frozen alias (older backends)
     quality = []
     if score is not None:
-        early = " (provisional)" if (eff.get("score_components") or {}).get("provisional") else ""
-        quality.append(f"SkillScore {score * 100:.0f}{early}")
+        quality.append(f"SkillScore {score * 100:.0f}")
     lift = bench.get("pass_rate_delta_pts")
     if lift is not None:
         quality.append(f"{'+' if lift >= 0 else ''}{lift:.0f} pts vs no skill")

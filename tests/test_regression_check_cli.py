@@ -391,3 +391,48 @@ class TestRegressionCheckCommand:
             ])
         assert result.exit_code == 2
         assert "failed" in result.output.lower()
+
+
+class TestUnverifiedAndWindowWording:
+    """What the two regression reports say about what they actually measured."""
+
+    def test_github_annotation_does_not_call_unverified_no_regression(self, capsys):
+        _render_regression_github_annotations(
+            {"verdict": "unverified", "verdict_message": "No traffic to measure it against.",
+             "structural_severity": "low", "high_risk_count": 0, "medium_risk_count": 0, "low_risk_count": 0},
+            "support-agent",
+        )
+        out = capsys.readouterr().out
+        assert "No regression" not in out
+        assert "Unverified" in out
+        assert "No traffic to measure it against." in out
+
+    def test_github_annotation_for_unverified_follows_the_diffs_severity(self, capsys):
+        for severity, level in (("high", "::error"), ("medium", "::warning"), ("low", "::notice"), (None, "::notice")):
+            _render_regression_github_annotations(
+                {"verdict": "unverified", "verdict_message": "m", "structural_severity": severity},
+                "x",
+            )
+            assert capsys.readouterr().out.startswith(level), severity
+
+    def test_terminal_report_states_the_window_it_was_asked_for(self, capsys):
+        _render_regression_terminal(
+            {"verdict": "medium_risk", "verdict_message": "m", "total_traces_analyzed": 4},
+            "x", "https://api.decimal.ai", trace_window_days=7,
+        )
+        out = capsys.readouterr().out
+        assert "last 7 days" in out
+        assert "30 days" not in out
+
+    def test_the_command_passes_its_window_to_the_terminal_report(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        report = {"verdict": "low_risk", "verdict_message": "m", "total_traces_analyzed": 1,
+                  "diff_summary": {"changes": []}}
+        with patch("decimalai.cli.main._make_client") as make_client:
+            make_client.return_value.run_regression_check.return_value = report
+            result = CliRunner().invoke(cli, [
+                "regression-check", "--agent-name", "a", "--candidate-manifest-id", "m",
+                "--trace-window-days", "14", "--api-key", "k",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "last 14 days" in result.output

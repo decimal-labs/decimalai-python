@@ -1433,7 +1433,7 @@ class DecimalAIClient:
         Two modes:
 
         - **Template-based** — pass ``template_id`` (e.g. ``"skill_output_check"``
-          or ``"helpfulness_judge"``) to instantiate a pre-built evaluator.
+          or ``"helpfulness"``) to instantiate a pre-built evaluator.
         - **Custom** — pass ``name``, ``eval_type`` (``"deterministic"`` |
           ``"llm_judge"``), and for LLM judges, a ``prompt_template`` containing
           ``{input}`` / ``{output}`` placeholders.
@@ -1635,11 +1635,13 @@ class DecimalAIClient:
         self,
         limit: int = 20,
         offset: int = 0,
+        agent_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """List all datasets in the workspace."""
-        resp = self._http.get(
-            "/api/v1/datasets", params={"limit": limit, "offset": offset}
-        )
+        """List the workspace's datasets, or only those targeting ``agent_name``."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if agent_name:
+            params["agent_name"] = agent_name
+        resp = self._http.get("/api/v1/datasets", params=params)
         _raise_for_status(resp)
         return resp.json()
 

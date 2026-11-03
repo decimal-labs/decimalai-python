@@ -429,3 +429,97 @@ class TestLangchainInstall:
                     instrument()
         finally:
             sys.modules.update(saved)
+
+
+class TestTraceOnCoroutines:
+    """`@trace` on `async def` keeps the trace open for the whole coroutine."""
+
+    def setup_method(self):
+        import decimalai._config as cfg
+        from decimalai._config import DecimalConfig
+
+        cfg._config = DecimalConfig(
+            api_key="dai_sk_test",
+            base_url="http://localhost:8000",
+            enabled=True,
+        )
+        cfg._client = MagicMock()
+
+        import decimalai.generic as _gen
+        _gen._manifest_id = None
+        _gen._manifest_tracker = _gen.ManifestTracker()
+
+    def _sent(self):
+        import decimalai._config as cfg
+        from decimalai._config import _sender
+
+        _sender.flush()
+        return [call.args[0] for call in cfg._client.ingest_trace.call_args_list]
+
+    def test_log_calls_inside_the_coroutine_land_on_its_trace(self):
+        import asyncio
+        import inspect
+
+        import decimalai
+
+        @decimalai.trace(agent_name="async-agent")
+        async def run(query):
+            await asyncio.sleep(0)
+            decimalai.log_llm_call(model="gpt-4o", input=[], output={"content": "x"})
+            return "answer"
+
+        assert inspect.iscoroutinefunction(run)
+        coroutine = run("hello")
+        assert self._sent() == []  # nothing was sent before the coroutine ran
+
+        assert asyncio.run(coroutine) == "answer"
+
+        sent = self._sent()
+        assert len(sent) == 1
+        assert sent[0].agent_name == "async-agent"
+        assert sent[0].user_input_preview == "hello"
+        assert sent[0].final_output_preview == "answer"
+        assert len(sent[0].llm_calls) == 1
+
+    def test_an_exception_in_the_coroutine_marks_the_trace_failed(self):
+        import asyncio
+
+        import pytest
+
+        import decimalai
+
+        @decimalai.trace(agent_name="async-agent")
+        async def run():
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError):
+            asyncio.run(run())
+
+        sent = self._sent()
+        assert sent[0].status.value == "error"
+        assert "boom" in sent[0].error_message
+
+    def test_session_metadata_and_turn_index_reach_the_trace(self):
+        import decimalai
+
+        @decimalai.trace(agent_name="a", session_metadata={"tenant": "acme"}, turn_index=3)
+        def run():
+            return "x"
+
+        run()
+        trace = self._sent()[0]
+        assert trace.session_metadata == {"tenant": "acme"}
+        assert trace.turn_index == 3
+
+    def test_session_metadata_set_during_one_call_stays_out_of_the_next(self):
+        import decimalai
+
+        @decimalai.trace(agent_name="a", session_metadata={"tenant": "acme"})
+        def run(extra):
+            decimalai.generic._get_current_trace().set_session_metadata(extra)
+
+        run({"first": 1})
+        run({"second": 2})
+        first, second = self._sent()
+        assert first.session_metadata == {"tenant": "acme", "first": 1}
+        assert second.session_metadata == {"tenant": "acme", "second": 2}

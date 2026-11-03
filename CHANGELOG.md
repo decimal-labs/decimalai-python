@@ -6,6 +6,31 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `@decimalai.trace` works on `async def`. It used to end the trace as soon as the coroutine was
+  created, so an empty trace went out and `log_llm_call` inside the coroutine raised "No active
+  trace". A generator still ends the trace when it is created: use `start_trace` inside it.
+- `@decimalai.trace(session_metadata=..., turn_index=...)` reach the trace. They were accepted and
+  dropped.
+- `decimalai datasets build --verdict` filters. It sent a field the API does not read.
+- `decimalai datasets list --agent-name` filters. It was accepted and not sent.
+- `decimalai evaluators add --template` keeps the template's category. `--category` defaulted to
+  `quality` and overrode it.
+- List commands print whole ids (`traces list`, `manifests list`, `evaluators list`, `datasets
+  list`, `datasets show`), since `traces show` and the others need the whole id.
+- `decimalai regression-check --format github` no longer labels an `unverified` result "No
+  regression". The annotation's level follows the size of the change, as the exit code does.
+- `decimalai regression-check`'s report states the `--trace-window-days` it used, not always 30.
+- `decimalai repair apply` prints no link to a page that does not exist.
+- `decimalai skills push` no longer says publishing runs a free verification. It has not since
+  August; `decimalai skills benchmark` is the way to a verified result.
+- `decimalai skills pull` no longer prints "(provisional)", which the registry's own pages do not
+  say.
+- `decimalai evaluators add --help` names a template that exists (`helpfulness`).
+- The warning for `tool_use_behavior="stop_on_first_tool"` recommends a call that works,
+  `StopAtTools(stop_at_tool_names=[...])`. `StopAtTools([...])` raises `ValueError`.
+
 ## [0.28.1] — 2026-11-04
 
 ### Fixed: `skills search` no longer prints counts it knows are wrong

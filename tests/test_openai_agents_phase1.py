@@ -377,7 +377,7 @@ class TestToolUseBehavior:
         assert [t.name for t in agent.model.calls[0]["tools"]] == ["lookup_order"]
         assert MENU not in agent.model.calls[0]["instructions"]
         assert router.routes == []
-        assert sum("StopAtTools" in r.getMessage() for r in caplog.records) == 1
+        assert sum("StopAtTools(stop_at_tool_names=[" in r.getMessage() for r in caplog.records) == 1
 
     def test_run_llm_again_reads_the_body_then_answers(self, router):
         support = oa.agent_config("support")

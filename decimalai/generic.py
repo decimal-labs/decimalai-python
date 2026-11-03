@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -846,21 +847,45 @@ def trace(
     on each call, not at decoration: the decorator usually runs at import,
     before ``init()`` has.
 
-    The trace is auto-sent when the function returns.
+    The trace is auto-sent when the function returns. An ``async def`` stays traced
+    until its coroutine finishes. A generator does not: the trace ends when it is
+    created, so open one with :func:`start_trace` inside the generator.
     """
 
     def decorator(fn: Callable) -> Callable:
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
+        def open_trace() -> Any:
             from . import _config
 
-            with start_trace(
+            return start_trace(
                 agent_name=agent_name or _config.default_agent_name() or fn.__name__,
                 session_id=session_id,
                 auto_send=auto_send,
+                # A copy: `set_session_metadata` updates the trace's dict in place,
+                # and this one is shared by every call.
+                session_metadata=dict(session_metadata) if session_metadata else None,
+                turn_index=turn_index,
                 parent_trace_id=parent_trace_id,
                 subagents=subagents,
-            ) as ctx:
+            )
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                with open_trace() as ctx:
+                    if args and isinstance(args[0], str):
+                        ctx.set_input(args[0])
+
+                    result = await fn(*args, **kwargs)
+
+                    if isinstance(result, str):
+                        ctx.set_output(result)
+                    return result
+
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with open_trace() as ctx:
                 # Capture the first positional arg as input if it's a string
                 if args and isinstance(args[0], str):
                     ctx.set_input(args[0])

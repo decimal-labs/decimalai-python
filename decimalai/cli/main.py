@@ -1045,7 +1045,7 @@ def traces_list(limit, status, api_key, base_url):
         click.echo(f"Found {len(traces_data)} traces:")
         for t in traces_data:
             click.echo(
-                f"  {t.get('id', '?')[:8]}  "
+                f"  {t.get('id', '?')}  "
                 f"{t.get('status', '?'):8s}  "
                 f"{t.get('agent_name', '?'):20s}  "
                 f"{t.get('started_at', '?')}"
@@ -1241,7 +1241,7 @@ def evaluators_list(agent_name, api_key, base_url):
             agent = ev.get("agent_name") or "(workspace)"
             click.echo(
                 f"  {mark} {ev.get('display_name') or ev.get('name'):<30}  "
-                f"{badge:<14}  {agent:<24}  id={ev.get('id', '')[:8]}"
+                f"{badge:<14}  {agent:<24}  id={ev.get('id', '')}"
             )
     finally:
         client.close()
@@ -1264,14 +1264,14 @@ def evaluators_templates(api_key, base_url):
 
 @evaluators.command("add")
 @click.option("--agent", "agent_name", help="Attach to this agent (omit for workspace-wide)")
-@click.option("--template", "template_id", help="Pre-built template id (e.g. 'helpfulness_judge', 'skill_output_check')")
+@click.option("--template", "template_id", help="Pre-built template id (e.g. 'helpfulness', 'skill_output_check')")
 @click.option("--name", help="Evaluator name (required if not using --template)")
 @click.option("--type", "eval_type",
               type=click.Choice(["deterministic", "llm_judge"]),
               help="Evaluator type")
-@click.option("--category", default="quality",
+@click.option("--category", default=None,
               type=click.Choice(["quality", "safety", "rag", "agentic", "custom"]),
-              help="Category bucket")
+              help="Category bucket. A template brings its own; otherwise quality.")
 @click.option("--rubric", "prompt_template",
               help="Rubric prompt for llm_judge type. Use {input} and {output} placeholders.")
 @click.option("--threshold", type=float, default=None, help="Pass threshold (0.0-1.0)")
@@ -1285,7 +1285,7 @@ def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_te
     \b
     Examples:
         # From a template
-        decimalai evaluators add --template helpfulness_judge --agent support-agent
+        decimalai evaluators add --template helpfulness --agent support-agent
 
         # Custom LLM judge
         decimalai evaluators add \\
@@ -1314,6 +1314,8 @@ def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_te
             err=True,
         )
         raise SystemExit(1)
+    if not template_id and not category:
+        category = "quality"
 
     client = _make_client(api_key, base_url)
     try:
@@ -1329,7 +1331,7 @@ def evaluators_add(agent_name, template_id, name, eval_type, category, prompt_te
             description=description,
         )
         label = result.get("display_name") or result.get("name") or "evaluator"
-        click.echo(f"✓ Added {label} (id={result.get('id', '')[:8]})")
+        click.echo(f"✓ Added {label} (id={result.get('id', '')})")
     finally:
         client.close()
 
@@ -2442,8 +2444,8 @@ def skills_push(results_file, skill_name, api_key, base_url):
 
     The imported run shows on the skill's Benchmark tab tagged
     *unverified*; it never feeds registry rankings. For a verified,
-    rankable result run ``decimalai skills benchmark`` (metered) or
-    publish the skill (publish triggers a free verification run).
+    rankable result run ``decimalai skills benchmark`` (metered).
+    Publishing does not run one.
 
     \b
     Example:
@@ -2504,7 +2506,7 @@ def skills_push(results_file, skill_name, api_key, base_url):
         click.echo("")
         click.echo("  Unverified runs never feed rankings. To get a verified result:")
         click.echo("    decimalai skills benchmark <skill-dir>   # metered")
-        click.echo("    …or publish the skill (verification run included, free).")
+        click.echo("  Publishing does not run one.")
         click.echo(
             f"  View: {_dashboard_url(base_url)}"
             f"/skills/{name}?tab=benchmark"
@@ -2534,7 +2536,7 @@ def manifests_list(agent_name, limit, api_key, base_url):
         click.echo(f"Found {len(manifests_data)} manifests:")
         for m in manifests_data:
             click.echo(
-                f"  {m.get('id', '?')[:12]}  "
+                f"  {m.get('id', '?')}  "
                 f"{m.get('agent_name', '?'):20s}  "
                 f"{m.get('version_label', '')}"
             )
@@ -2558,15 +2560,15 @@ def datasets_list(limit, agent_name, api_key, base_url):
     """List datasets in the workspace."""
     client = _make_client(api_key, base_url)
     try:
-        result = client.list_datasets(limit=limit)
+        result = client.list_datasets(limit=limit, agent_name=agent_name)
         ds_list = result.get("datasets", [])
         click.echo(f"Found {len(ds_list)} datasets:")
         click.echo("")
-        click.echo(f"  {'ID':14s}  {'Name':25s}  {'Type':8s}  {'Rows':>6s}  {'Versions':>8s}")
-        click.echo(f"  {'─' * 14}  {'─' * 25}  {'─' * 8}  {'─' * 6}  {'─' * 8}")
+        click.echo(f"  {'ID':36s}  {'Name':25s}  {'Type':8s}  {'Rows':>6s}  {'Versions':>8s}")
+        click.echo(f"  {'─' * 36}  {'─' * 25}  {'─' * 8}  {'─' * 6}  {'─' * 8}")
         for d in ds_list:
             click.echo(
-                f"  {d.get('id', '?')[:12]:14s}  "
+                f"  {d.get('id', '?'):36s}  "
                 f"{d.get('name', '?'):25s}  "
                 f"{d.get('dataset_type', '?'):8s}  "
                 f"{d.get('row_count', 0):>6}  "
@@ -2600,13 +2602,13 @@ def datasets_show(dataset_id, api_key, base_url):
         versions = ds.get("versions", [])
         if versions:
             click.echo(f"  Versions ({len(versions)}):")
-            click.echo(f"  {'#':>4s}  {'ID':14s}  {'Status':10s}  {'Rows':>6s}  {'Created':20s}")
-            click.echo(f"  {'─' * 4}  {'─' * 14}  {'─' * 10}  {'─' * 6}  {'─' * 20}")
+            click.echo(f"  {'#':>4s}  {'ID':36s}  {'Status':10s}  {'Rows':>6s}  {'Created':20s}")
+            click.echo(f"  {'─' * 4}  {'─' * 36}  {'─' * 10}  {'─' * 6}  {'─' * 20}")
             for v in sorted(versions, key=lambda x: x.get("version_number", 0), reverse=True):
                 marker = " ←" if v.get("id") == ds.get("current_version_id") else ""
                 click.echo(
                     f"  v{v.get('version_number', '?'):>3}  "
-                    f"{v.get('id', '?')[:12]:14s}  "
+                    f"{v.get('id', '?'):36s}  "
                     f"{v.get('status', '?'):10s}  "
                     f"{v.get('row_count', 0):>6}  "
                     f"{v.get('created_at', '?'):20s}{marker}"
@@ -2628,7 +2630,7 @@ def datasets_build(dataset_id, verdict, api_key, base_url):
     try:
         filters = {}
         if verdict:
-            filters["eval_verdict"] = verdict
+            filters["allowed_verdicts"] = [verdict]
         result = client.build_dataset(dataset_id, filters=filters or None)
         click.echo(
             f"Built version {result.get('version_id', '?')}: "
@@ -2683,7 +2685,7 @@ def datasets_pull(dataset_id, output, version_spec, fmt, api_key, base_url):
         click.echo(f"    Format:  {result['format']}")
         click.echo(f"    Rows:    {result['row_count']}")
         click.echo(f"    Size:    {_format_bytes(result['bytes_written'])}")
-        click.echo(f"    Version: {result['version_id'][:12]}...")
+        click.echo(f"    Version: {result['version_id']}")
         click.echo("")
     except ValueError as e:
         click.echo(f"  ✗ {e}", err=True)
@@ -2812,7 +2814,7 @@ def datasets_push_to_hub(dataset_id, repo_id, version_spec, token, is_public, sp
         click.echo(f"    Repo:    {result['repo_url']}")
         click.echo(f"    Rows:    {result['row_count']}")
         click.echo(f"    Split:   {result['split']}")
-        click.echo(f"    Version: {result['version_id'][:12]}...")
+        click.echo(f"    Version: {result['version_id']}")
         click.echo("")
         click.echo("  Load it in Python:")
         click.echo('    from datasets import load_dataset')
@@ -3149,10 +3151,8 @@ def repair_apply_cmd(old_manifest_id, new_manifest_id, rule_indices, fmt, api_ke
         click.echo(json_mod.dumps(data, indent=2, default=str))
         return
     click.echo("")
-    click.echo(f"  Repair batch {str(data.get('batch_id', ''))[:12]} — {data.get('status')}")
+    click.echo(f"  Repair batch {data.get('batch_id', '')} — {data.get('status')}")
     click.echo(f"    Episodes: {data.get('total_episodes', 0)}   Repaired: {data.get('repaired_count', 0)}")
-    dash = _dashboard_url(base_url)
-    click.echo(f"    → {dash}/repair/{data.get('batch_id', '')}")
     click.echo("")
 
 
@@ -3274,7 +3274,7 @@ def regression_check(
     elif fmt == "github":
         _render_regression_github_annotations(report, agent_name)
     else:
-        _render_regression_terminal(report, agent_name, base_url)
+        _render_regression_terminal(report, agent_name, base_url, trace_window_days=trace_window_days)
 
     # 5. Exit code per --fail-on
     verdict = report.get("verdict", "no_change")
@@ -3334,7 +3334,7 @@ def _should_fail(verdict: str, fail_on: str, structural_severity: str | None = N
     return rank.get(verdict, 0) >= threshold
 
 
-def _render_regression_terminal(report: dict, agent_name: str, base_url: str) -> None:
+def _render_regression_terminal(report: dict, agent_name: str, base_url: str, trace_window_days: int = 30) -> None:
     """Render an impact report in terminal/human format."""
     verdict = report.get("verdict", "?")
     msg = report.get("verdict_message", "")
@@ -3379,7 +3379,7 @@ def _render_regression_terminal(report: dict, agent_name: str, base_url: str) ->
             click.echo(f"    … and {len(diff) - 8} more")
         click.echo("")
 
-    click.echo(f"  Impact on last 30 days of traces ({total} total):")
+    click.echo(f"  Impact on last {trace_window_days} days of traces ({total} total):")
     click.echo("")
     click.echo(f"    🔴 HIGH RISK    — {high} traces will break")
     click.echo(f"    🟡 MEDIUM RISK  — {medium} traces may behave differently")
@@ -3437,6 +3437,12 @@ def _render_regression_github_annotations(report: dict, agent_name: str) -> None
         click.echo(f"::warning title=DecimalAI: MEDIUM RISK regression::{summary}")
     elif verdict == "first_run":
         click.echo(f"::notice title=DecimalAI: First run::{msg}")
+    elif verdict == "unverified":
+        # Structural changes with no traffic to measure them against. The level
+        # follows the diff's severity, the same ranking `_should_fail` applies.
+        severity = (report.get("structural_severity") or "low").lower()
+        level = {"high": "error", "medium": "warning"}.get(severity, "notice")
+        click.echo(f"::{level} title=DecimalAI: Unverified change::Agent '{agent_name}': {msg}")
     else:
         click.echo(f"::notice title=DecimalAI: No regression::{summary}")
 

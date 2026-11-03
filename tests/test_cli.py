@@ -186,8 +186,7 @@ class TestSkillsPullCli:
         assert "Do a code review" in body
         # Quality line — composite · lift · live pass, on one line.
         assert "SkillScore 87 · +60 pts vs no skill · 96% live pass" in result.output
-        # Full evidence (2 legs) → no provisional marker.
-        assert "(provisional)" not in result.output
+        assert "provisional" not in result.output
         # Efficiency headline is tokens-first and no longer repeats the lift.
         assert "Efficiency vs no skill: -43% tokens · -30% turns" in result.output
         assert "pts pass rate" not in result.output
@@ -195,9 +194,9 @@ class TestSkillsPullCli:
         assert "/skills/code-review" in result.output
         assert "decimalai skills add code-review" in result.output
 
-    def test_pull_quality_line_marks_provisional(self, tmp_path):
-        """One evidence leg → the score renders `(provisional)` so a pulled
-        skill never overstates one-signal evidence."""
+    def test_pull_quality_line_with_one_evidence_leg(self, tmp_path):
+        """One evidence leg → the score alone. The registry's chip adds no words
+        for it either, and "provisional" is a word only this line ever printed."""
         _, result = self._pull(tmp_path, "prov-skill", {
             "effectiveness": {
                 "skill_score": 0.97,
@@ -205,7 +204,8 @@ class TestSkillsPullCli:
             },
         })
         assert result.exit_code == 0, result.output
-        assert "SkillScore 97 (provisional)" in result.output
+        assert "SkillScore 97" in result.output
+        assert "provisional" not in result.output
         # No live/lift evidence → quality line is the score alone.
         assert "live pass" not in result.output
         assert "vs no skill" not in result.output

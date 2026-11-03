@@ -1767,7 +1767,7 @@ class OpenAIAgentConfig(AgentBinding):
             return base
         if tool and getattr(agent, "tool_use_behavior", None) == "stop_on_first_tool":
             return ("with tool_use_behavior='stop_on_first_tool' a skill's text would become "
-                    "the answer. Use StopAtTools([...your tools]) instead.")
+                    "the answer. Use tool_use_behavior=StopAtTools(stop_at_tool_names=[...your tools]) instead.")
         if _has_native_skills(agent):
             return ("it loads skills with the sandbox Skills capability. Use "
                     "decimalai.openai_agents.sandbox_skills() there instead.")
