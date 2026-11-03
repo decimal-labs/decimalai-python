@@ -6,6 +6,14 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed: `skills search` no longer prints counts it knows are wrong
+
+Before August 2026 a benchmark stored a case as failed when no check separated the with-skill and
+without-skill runs, even when every check passed, and those counts were never repaired.
+`browser-automation` stored 2 of 23 where its own checks say 23 of 23. A skill's page corrects this,
+but `skills search` printed the stored count with no note. It now says the skill was tested under
+older counting and shows no count. `--json` still prints the registry's answer.
+
 ## [0.28.0] — 2026-11-03
 
 ### New: `decimalai skills search <query>`, with no key

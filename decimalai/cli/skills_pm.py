@@ -510,12 +510,22 @@ def _assign_to_agent(project: Any, router: Any, ref: str, agent: str, *, yes: bo
 # ── search ──────────────────────────────────────────────────────────────────
 
 
+# Until this date a benchmark stored a case as failed when no check separated the two runs, even
+# when every check passed, and those counts were never repaired: `browser-automation` stored 2 of
+# 23 where its own checks say 23 of 23. The page corrects them from the run's checks, which a
+# search result doesn't carry. `casesPassedByChecks` in the platform's `metrics.ts` has this date.
+_COUNTS_FROM_CHECKS_SINCE = "2026-08-01"
+
+
 def _test_result(item: Dict[str, Any]) -> str:
     """The sentence a skill's page leads with, from the registry's own summary."""
     bench = item.get("benchmark_summary")
     if isinstance(bench, dict) and not bench.get("lift_withheld_reason"):
         cases, rate, lift = (bench.get(k) for k in ("lift_cases", "lift_pass_rate_pct", "pass_rate_delta_pts"))
         if isinstance(cases, int) and cases > 0 and all(isinstance(v, (int, float)) for v in (rate, lift)):
+            completed = bench.get("completed_at")
+            if isinstance(completed, str) and completed < _COUNTS_FROM_CHECKS_SINCE:
+                return "Tested before August 2026, when results were counted differently, so no count is shown."
             # Rounds as the page does (half up), so the two never disagree on a count.
             with_skill = int(rate / 100 * cases + 0.5)
             without = int((rate - lift) / 100 * cases + 0.5)

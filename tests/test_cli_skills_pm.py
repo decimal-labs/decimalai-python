@@ -353,6 +353,28 @@ class TestSearch:
         env.registry.search_cards = [_card(benchmark_summary=summary)]
         assert sentence in self._search(env, "refunds").output
 
+    @pytest.mark.parametrize("completed,counted", [
+        ("2026-07-28T17:29:20.394975+00:00", False),
+        ("2026-07-31T23:59:59+00:00", False),
+        ("2026-08-01T00:00:00+00:00", True),
+        ("2026-10-31T09:59:50+00:00", True),
+        (None, True),
+    ])
+    def test_a_count_from_before_verdicts_came_from_the_checks_is_not_printed(self, env, completed, counted):
+        env.registry.search_cards = [_card(benchmark_summary={
+            "lift_cases": 23, "lift_pass_rate_pct": 8.7, "pass_rate_delta_pts": 4.35, "completed_at": completed,
+        })]
+        output = self._search(env, "refunds").output
+        assert ("Passed 2 of 23 test cases" in output) is counted
+        assert ("Tested before August 2026, when results were counted differently" in output) is not counted
+
+    def test_json_keeps_the_registrys_answer_for_a_run_from_before_august(self, env):
+        summary = {"lift_cases": 23, "lift_pass_rate_pct": 8.7, "pass_rate_delta_pts": 4.35,
+                   "completed_at": "2026-07-28T17:29:20+00:00"}
+        env.registry.search_cards = [_card(benchmark_summary=summary)]
+        payload = json.loads(self._search(env, "refunds", "--json").output)
+        assert payload["items"][0]["benchmark_summary"]["lift_cases"] == 23
+
     def test_registry_text_cannot_write_to_the_terminal(self, env):
         env.registry.search_cards = [_card(
             description="Evil\x1b[2J\u202e text", author_display_name="a\x07b", skill_safety="passed\x1b[0m",
