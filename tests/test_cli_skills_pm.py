@@ -13,6 +13,7 @@ own semantics are pinned in ``tests/skillpkg/``; this file pins what the CLI add
   only the authored one, as it always did;
 - ``pull`` writes the registry's bytes to ``<out>/<install_name>/`` with ``eval.yaml``,
   and refuses to overwrite a folder that differs unless ``--force``;
+- ``add`` ends with how to try the skill, and ``search`` needs no key;
 - ``sync`` skips folders the registry stamped; ``scan`` reads the metadata category;
 - an end-to-end run in subprocesses: add, install --frozen, verify, update, remove.
 
@@ -20,6 +21,7 @@ The registry is ``tests/fakes/fake_registry.py`` on a real socket (``serve()``).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import stat
@@ -145,8 +147,8 @@ class TestHelp:
     def test_every_command_is_listed(self):
         result = CliRunner().invoke(cli, ["skills", "--help"])
         assert result.exit_code == 0
-        for name in ("add", "install", "update", "remove", "status", "verify", "migrate",
-                     "pull", "sync", "scan"):
+        for name in ("add", "search", "install", "update", "remove", "status", "verify",
+                     "migrate", "pull", "sync", "scan"):
             assert f"  {name} " in result.output, name
 
     @pytest.mark.parametrize("command", ["add", "install", "update", "remove", "status",
@@ -158,6 +160,244 @@ class TestHelp:
         for code in range(9):
             assert f"  {code}  " in result.output, (command, code)
         assert "--directory" in result.output
+
+
+# ── what add ends with ─────────────────────────────────────────────────────
+
+
+def _case(prompt: str, **overrides: Any) -> Dict[str, Any]:
+    return {"case_prompt": prompt, "outcome": "flip_to_pass", "authored_by": "platform",
+            "mode": "single_shot", **overrides}
+
+
+def _printed_python(output: str) -> str:
+    """The program `add` prints, from its first import to its last line, unindented."""
+    lines = output.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip().startswith("from agents import"))
+    end = next(i for i, line in enumerate(lines) if "Runner.run_sync" in line)
+    return "\n".join(line[4:] for line in lines[start:end + 1])
+
+
+class TestAddEndsWithHowToTry:
+    QUESTION = "Which command refunds an order that shipped?"
+
+    def _benchmark(self, env: Env, skill: Any, *results: Dict[str, Any]) -> None:
+        env.registry.benchmarks[skill.skill_id] = {"latest_run": {"results": list(results)}}
+
+    def test_one_line_for_a_skills_allowed_tools(self, env):
+        env.skill(allowed_tools=["Bash", "Write", "mcp__x__y"])
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        lines = [line for line in result.output.splitlines() if "allowed-tools" in line]
+        assert lines == [f"  • {REFUND}: allowed-tools: dropped 'Bash', 'Write', 'mcp__x__y' "
+                         "(not authored by your organization)"]
+
+    def test_the_last_thing_it_prints_is_how_to_try_it(self, env):
+        env.skill()
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        before, after = result.output.split("Now try it.")
+        assert "install --frozen" in before
+        assert "start a new chat in this project" in after
+        assert after.rstrip().endswith(f"/skills/{REFUND}")
+
+    def test_it_asks_a_case_from_the_skills_tests(self, env):
+        skill = env.skill()
+        self._benchmark(env, skill, _case("A longer case that the model also failed without it."),
+                        _case(self.QUESTION))
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        assert f"    Use the {REFUND_DIR} skill. {self.QUESTION}\n" in result.output
+        assert "from the skill's tests" in result.output
+        assert self.QUESTION in _printed_python(result.output)
+
+    @pytest.mark.parametrize("case", [
+        _case("Passed both ways", outcome="pass_kept"),
+        _case("The author wrote this, so it is the author's words", authored_by="publisher"),
+        _case("A conversation, not one question", mode="multi_turn"),
+        _case("x" * 301),
+        _case(None),
+    ])
+    def test_it_never_asks_a_case_that_does_not_show_the_skill(self, env, case):
+        skill = env.skill()
+        self._benchmark(env, skill, case)
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        assert f"Use the {REFUND_DIR} skill. What can it help me with?" in result.output
+        assert "from the skill's tests" not in result.output
+
+    def test_a_question_reaches_the_terminal_with_no_control_characters(self, env):
+        skill = env.skill()
+        self._benchmark(env, skill, _case("Refund it\x1b[2J\u202e now\nplease"))
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        assert f"    Use the {REFUND_DIR} skill. Refund it [2J now please\n" in result.output
+        assert "\x1b" not in result.output and "\u202e" not in result.output
+
+    def test_the_printed_python_is_valid_whatever_the_question_says(self, env):
+        skill = env.skill()
+        self._benchmark(env, skill, _case("""Is it "it's" or 'its'? Use a \\ here."""))
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        literals = [node.value for node in ast.walk(ast.parse(_printed_python(result.output)))
+                    if isinstance(node, ast.Constant)]
+        assert f"""Use the {REFUND_DIR} skill. Is it "it's" or 'its'? Use a \\ here.""" in literals
+
+    @pytest.mark.parametrize("fault", [500, "timeout", "connect"])
+    def test_a_registry_that_will_not_answer_costs_only_the_question(self, env, fault):
+        skill = env.skill()
+        self._benchmark(env, skill, _case(self.QUESTION))
+        env.registry.stall_seconds = 0.2
+        env.registry.fault("benchmark", fault)
+        with patch.object(skills_pm, "_TRY_IT_HTTP_TIMEOUT", 0.1):
+            result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        assert env.folder().is_dir()
+        assert "What can it help me with?" in result.output and "Now try it." in result.output
+
+    def test_the_claude_code_line_works_with_no_git_repository(self, env):
+        """A relative --plugin-dir loads nothing from a subdirectory, and `git rev-parse`
+        prints nothing outside a repository, so the line carries the absolute path."""
+        env.skill()
+        (env.dir / ".git").rmdir()
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        assert f"claude --plugin-dir {env.dir / '.agents'}\n" in result.output.replace("'", "")
+        assert "git rev-parse" not in result.output
+
+    def test_only_a_skill_on_disk_gets_the_next_step(self, env):
+        env.skill()
+        assert "Now try it." not in env.run("add", REFUND, "--no-install").output
+
+    def test_adding_it_again_does_not_repeat_it(self, env):
+        env.skill()
+        assert "Now try it." in env.run("add", REFUND).output
+        assert "Now try it." not in env.run("add", REFUND).output
+
+    def test_update_json_keeps_one_note_per_tool(self, env):
+        skill = env.skill(allowed_tools=["Bash", "Write"])
+        _added(env)
+        env.registry.add_version(skill)
+        result = env.run("update", "--json")
+        assert result.exit_code == 0, result.output
+        notes = [p["message"] for p in json.loads(result.output)["problems"]
+                 if "allowed-tools" in p["message"]]
+        assert len(notes) == 2
+
+
+# ── search ─────────────────────────────────────────────────────────────────
+
+
+def _card(slug: str = "refund-policy", **overrides: Any) -> Dict[str, Any]:
+    return {"id": "11111111-2222-3333-4444-555555555555", "name": slug, "url_slug": slug,
+            "description": "Handles refunds.", "author_display_name": "acme",
+            "skill_safety": "passed",
+            "benchmark_summary": {"lift_cases": 23, "lift_pass_rate_pct": 100.0,
+                                  "pass_rate_delta_pts": 69.57, "lift_withheld_reason": None},
+            **overrides}
+
+
+class TestSearch:
+    def _search(self, env: Env, *args: str, **kwargs: Any):
+        return env.run("search", *args, directory=False, key=None, **kwargs)
+
+    def test_a_result_says_what_it_changes_and_how_to_add_it(self, env):
+        env.registry.search_cards = [_card()]
+        result = self._search(env, "refunds")
+        assert result.exit_code == 0, result.output
+        assert "  refund-policy, by acme\n" in result.output
+        assert "Handles refunds." in result.output
+        assert "Passed 23 of 23 test cases with the skill, and 7 of 23 without it." in result.output
+        assert "Safety review: passed." in result.output
+        assert "    decimalai skills add refund-policy\n" in result.output
+
+    def test_it_sends_no_key_even_with_one_in_the_environment(self, env, monkeypatch):
+        env.registry.search_cards = [_card()]
+        monkeypatch.setenv("DECIMAL_API_KEY", OWNER_KEY)
+        assert self._search(env, "refunds").exit_code == 0
+        request = env.registry.calls("search")[-1]
+        assert "authorization" not in request.headers
+
+    def test_the_words_are_one_query_on_the_registrys_ranking(self, env):
+        env.registry.search_cards = [_card()]
+        assert self._search(env, "refund", "policy", "--limit", "3").exit_code == 0
+        query = env.registry.calls("search")[-1].query
+        assert query == {"q": "refund policy", "sort": "recommended", "limit": "3"}
+
+    def test_a_query_is_required(self, env):
+        assert self._search(env).exit_code == 2
+
+    @pytest.mark.parametrize("summary,sentence", [
+        (None, "No with-and-without test result yet."),
+        ({"lift_cases": 23, "lift_pass_rate_pct": 90.0, "pass_rate_delta_pts": 10.0,
+          "lift_withheld_reason": "not_comparable"}, "No with-and-without test result yet."),
+        ({"lift_cases": 0, "lift_pass_rate_pct": 0.0, "pass_rate_delta_pts": 0.0},
+         "No with-and-without test result yet."),
+        ({"lift_cases": 20, "lift_pass_rate_pct": 25.0, "pass_rate_delta_pts": -10.0},
+         "Passed 5 of 20 test cases with the skill, and 7 of 20 without it."),
+        # The page's Math.round: 12.5 is 13, where Python's round() says 12.
+        ({"lift_cases": 25, "lift_pass_rate_pct": 50.0, "pass_rate_delta_pts": 10.0},
+         "Passed 13 of 25 test cases with the skill, and 10 of 25 without it."),
+    ])
+    def test_the_test_result_is_the_pages_sentence_or_says_there_is_none(self, env, summary, sentence):
+        env.registry.search_cards = [_card(benchmark_summary=summary)]
+        assert sentence in self._search(env, "refunds").output
+
+    def test_registry_text_cannot_write_to_the_terminal(self, env):
+        env.registry.search_cards = [_card(
+            description="Evil\x1b[2J\u202e text", author_display_name="a\x07b", skill_safety="passed\x1b[0m",
+        )]
+        output = self._search(env, "refunds").output
+        assert "\x1b" not in output and "\x07" not in output and "\u202e" not in output
+        assert "Evil [2J text" in output
+
+    def test_a_slug_that_cannot_be_typed_gives_the_id(self, env):
+        env.registry.search_cards = [_card(url_slug="$(rm -rf ~)")]
+        output = self._search(env, "refunds").output
+        assert "decimalai skills add 11111111-2222-3333-4444-555555555555\n" in output
+        assert "rm -rf" not in output
+
+    def test_a_blocked_skill_is_named_apart_with_no_way_to_add_it(self, env):
+        env.registry.search_cards = [_card(), _card("evil-skill", skill_safety="blocked")]
+        output = self._search(env, "refunds").output
+        assert "decimalai skills add evil-skill" not in output
+        assert "Blocked, `skills add` refuses these: evil-skill" in output
+
+    def test_more_results_are_mentioned(self, env):
+        env.registry.search_cards = [_card(f"skill-{n}") for n in range(3)]
+        output = self._search(env, "refunds", "--limit", "2").output
+        assert "skill-1" in output and "skill-2" not in output
+        assert "--limit 4" in output
+
+    def test_no_results_is_not_a_failure_and_says_what_next(self, env):
+        env.registry.search_cards = []
+        result = self._search(env, "nothing")
+        assert result.exit_code == 0
+        assert "No skills matched 'nothing'" in result.output
+
+    def test_json_is_the_registrys_answer(self, env):
+        env.registry.search_cards = [_card()]
+        result = self._search(env, "refunds", "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.output)["items"][0]["url_slug"] == "refund-policy"
+
+    def test_an_unreachable_registry_is_exit_8(self, env):
+        result = CliRunner().invoke(cli, ["skills", "search", "x", "--base-url", "http://127.0.0.1:9"])
+        assert result.exit_code == 8
+        assert "could not search the registry" in result.output
+
+    @pytest.mark.parametrize("fault", [500, 429])
+    def test_a_registry_that_refuses_is_exit_8(self, env, fault):
+        env.registry.fault("search", fault)
+        assert self._search(env, "refunds").exit_code == 8
+
+    def test_what_it_lists_can_be_added(self, env):
+        env.skill("plain-skill")
+        env.registry.search_cards = None
+        listed = self._search(env, "plain").output
+        command = next(line.strip() for line in listed.splitlines() if "skills add" in line)
+        result = env.run("add", command.split()[-1], key=None)
+        assert result.exit_code == 0, result.output
 
 
 # ── add ────────────────────────────────────────────────────────────────────
@@ -1088,6 +1328,13 @@ class TestPull:
         assert "assets/logo.png" in result.output
         assert "dropped 'Bash'" in result.output
         assert not (tmp_path / "acme-tools" / "assets").exists()
+
+    def test_policy_notes_fold_into_one_line_per_reason(self, env, tmp_path):
+        env.skill("acme/tools", allowed_tools=["Bash", "Write"])
+        result = _pull(env, "acme/tools", "--out", str(tmp_path), "--no-evals")
+        assert result.exit_code == 0, result.output
+        assert ("note: allowed-tools: dropped 'Bash', 'Write' "
+                "(not authored by your organization)") in result.output
 
     # A project's managed root belongs to its lock: a loose copy there would break
     # `install --frozen`, so pull refuses it, `--force` or not.

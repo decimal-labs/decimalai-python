@@ -32,6 +32,63 @@ def _no_keys(monkeypatch):
         monkeypatch.delenv(k, raising=False)
 
 
+# ── the first screens: what a person with no key and no account reads ──
+
+
+class TestFirstRun:
+    SENTENCE = ("A registry of agent skills with test results. See what a skill changes, "
+                "then add it to the agent you already have.")
+
+    def test_help_says_what_it_is_and_where_to_start(self):
+        result = CliRunner().invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert self.SENTENCE in " ".join(result.output.split())
+        assert "Start with: decimalai skills add <name>" in result.output
+        assert "decimalai skills search" in result.output
+        assert "Agent dataset lifecycle" not in result.output
+
+    def test_help_lists_skills_first_and_the_rest_a_to_z(self):
+        listed = CliRunner().invoke(cli, ["--help"]).output.split("Commands:\n")[1]
+        names = [line.split()[0] for line in listed.splitlines() if line.startswith("  ") and line[2] != " "]
+        names = names[:names.index("traces") + 1]
+        assert names[0] == "skills"
+        assert names[1:] == sorted(names[1:])
+        assert "init" in names and "demo" in names
+
+    def test_init_with_no_key_says_skills_need_none(self, monkeypatch):
+        _no_keys(monkeypatch)
+        result = CliRunner().invoke(cli, ["init"])
+        # A script that runs `init` to check a key still sees that there is none.
+        assert result.exit_code == 1
+        assert "skills don't need one" in result.output
+        assert "decimalai skills add <name>" in result.output
+        assert "https://docs.decimal.ai/quickstart" in result.output
+        assert "Settings → API keys" in result.output
+        assert "https://app.decimal.ai/settings" in result.output
+        assert "No API key found" not in result.output
+        assert "Settings → API Key\n" not in result.output
+
+    def _verified_output(self):
+        client = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = {"workspace_id": "ws_1"}
+        client._http.get.return_value = resp
+        with patch("decimalai._client.DecimalAIClient", return_value=client):
+            return CliRunner().invoke(cli, ["init", "--api-key", "dai_sk_x", "--no-test-trace"])
+
+    def test_init_success_points_at_skills_and_the_quickstart(self):
+        result = self._verified_output()
+        assert result.exit_code == 0, result.output
+        assert "decimalai skills add <name>" in result.output
+        assert "https://docs.decimal.ai/quickstart" in result.output
+
+    def test_init_success_drops_the_demo_and_the_old_notebook(self):
+        output = self._verified_output().output
+        assert "decimalai demo" not in output
+        assert "colab.research.google.com" not in output
+        assert "support_agent.ipynb" not in output
+
+
 # ── init triage: auth rejection vs transport failure ──
 
 
@@ -262,9 +319,9 @@ class TestHelpPapercuts:
         # Click prints the group help on a bare invocation and exits 2 —
         # that exit code is kept as-is; the hint rides the help epilog.
         assert result.exit_code == 2
-        assert "Start with: decimalai init" in result.output
+        assert "Start with: decimalai skills add <name>" in result.output
 
     def test_help_flag_also_shows_start_hint(self):
         result = CliRunner().invoke(cli, ["--help"])
         assert result.exit_code == 0
-        assert "Start with: decimalai init" in result.output
+        assert "Start with: decimalai skills add <name>" in result.output

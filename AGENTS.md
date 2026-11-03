@@ -4,11 +4,12 @@ Machine-readable guide for AI coding agents working with or on this package.
 
 ## What this package is
 
-`decimalai` is the open source Python SDK for [DecimalAI](https://decimal.ai): manifest-aware
-agent change management. It captures traces and structural manifests (tools + prompts + models +
-skills) from agent frameworks, sends them to a DecimalAI workspace, and lets you run a structural
-regression check of an agent change against recorded traces. It also manages SKILL.md skills
-(discover, sync, install from the public registry).
+`decimalai` is the open source Python SDK for [DecimalAI](https://decimal.ai): a registry of agent
+skills with test results. See what a skill changes, then add it to the agent you already have. It
+finds SKILL.md skills in the public registry and installs them, with no account, and `agent_config()`
+gives an agent its prompt and skills. With a key, it also captures traces and
+structural manifests (tools + prompts + models + skills) and runs a structural regression check of
+an agent change against recorded traces.
 
 - Package name: `decimalai` — one word, never a hyphen or an underscore between "decimal" and "ai".
   (CI greps the whole tree for the separated spellings, so don't write one out here — not even as
@@ -29,6 +30,13 @@ Adapter extras (core stays thin; install the one matching the user's stack):
 `[langchain]`, `[langgraph]`, `[openai]`, `[openai-agents]`, `[anthropic]`, `[google-genai]`, `[llamaindex]`,
 `[claude-agent-sdk]`, `[pydantic-ai]`, `[adk]`, `[evals]`, `[all]`.
 
+## Try a skill (no key)
+
+```bash
+decimalai skills search browser automation   # the public registry, with each skill's test results
+decimalai skills add playwright-cli          # installs it, then prints how to try it
+```
+
 ## Demo / smoke test
 
 ```bash
@@ -39,8 +47,9 @@ decimalai demo reset                  # removes all demo data
 ```
 
 The demo needs an API key (it seeds data into a workspace). Its numbers come from a seeded
-reference agent — illustrative, not customer traffic. Keyless commands: `decimalai skills pull
-<slug>` (fetch a published SKILL.md, no account) and the `agentversion` manifest diff flow
+reference agent — illustrative, not customer traffic. Keyless commands: `decimalai skills search`,
+`decimalai skills add`, `decimalai skills pull <slug>` (fetch a published SKILL.md, no account) and
+the `agentversion` manifest diff flow
 (fully local). `decimalai starter support --project <new-directory>` downloads a frozen
 public Support project without a DecimalAI key. Its Python-stdlib runtime uses the
 customer's OpenAI key locally and sends no platform telemetry; `--checks` makes two

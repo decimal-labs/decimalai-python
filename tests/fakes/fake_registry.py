@@ -22,7 +22,11 @@ body) and ``GET /api/v1/registry/skills?q=``, with browse cards (keyless ``agent
 reads them): the public skills, or :attr:`FakeRegistry.search_results` in its order, each
 ``skill_safety`` from its band (``passed`` when clean) and a ``benchmark_summary`` unless
 ``benchmarked=False``. ``search_post=False`` makes it a registry from before the POST route,
-which answers that one the framework's 405.
+which answers that one the framework's 405. :attr:`FakeRegistry.search_cards` replaces the
+whole answer, for what ``decimalai skills search`` prints from a card.
+
+``GET /api/v1/registry/skills/{id}/benchmark`` answers from :attr:`FakeRegistry.benchmarks`,
+by skill id, and 404 for any other skill.
 
 It also answers ``GET /api/v1/skills/{name}/body``, the delivery route older clients used
 for disk exports, so a test can prove the engine never falls back to it. ``old=True`` makes
@@ -116,10 +120,11 @@ SEARCH_POST = "/api/v1/registry/skills/search"
 SKILLS = "/api/v1/skills/"
 
 #: Route names, for :meth:`FakeRegistry.fault` and :meth:`FakeRegistry.calls`.
-ROUTES = ("resolve", "bundle", "registry_bundle", "body", "search", "other")
+ROUTES = ("resolve", "bundle", "registry_bundle", "body", "search", "benchmark", "other")
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _REGISTRY_BUNDLE_RE = re.compile(r"^/api/v1/registry/skills/(?P<ref>.+)/bundle$")
+_BENCHMARK_RE = re.compile(r"^/api/v1/registry/skills/(?P<ref>[^/]+)/benchmark$")
 _BODY_RE = re.compile(r"^/api/v1/skills/(?P<name>.+)/body$")
 
 FaultAction = Union[int, str, httpx.Response, Callable[[httpx.Request], httpx.Response]]
@@ -257,6 +262,10 @@ class FakeRegistry:
         self._lock = threading.Lock()
         #: What the search answers, in order; None: every public skill, in the order added.
         self.search_results: Optional[List[FakeSkill]] = None
+        #: Browse cards the search answers with as they are; None: built from the skills.
+        self.search_cards: Optional[List[Dict[str, Any]]] = None
+        #: Skill id -> what its benchmark route answers.
+        self.benchmarks: Dict[str, Dict[str, Any]] = {}
         #: False: a registry from before ``POST /api/v1/registry/skills/search``.
         self.search_post = True
 
@@ -515,6 +524,10 @@ class FakeRegistry:
         match = _BODY_RE.match(path)
         if match and method == "GET":
             return self._body(match.group("name"))
+        match = _BENCHMARK_RE.match(path)
+        if match and method == "GET":
+            found = self.benchmarks.get(match.group("ref"))
+            return _json(200, found) if found is not None else _framework(404)
         if path == SEARCH and method == "GET":
             return self._search(query)
         if path == SEARCH_POST and method == "POST":
@@ -853,6 +866,10 @@ class FakeRegistry:
 
     def _search(self, query: Mapping[str, str]) -> httpx.Response:
         """The browse card of each public skill, as ``GET /api/v1/registry/skills`` lists it."""
+        if self.search_cards is not None:
+            limit = int(query.get("limit") or 20)
+            return _json(200, {"items": self.search_cards[:limit], "next_cursor": None,
+                               "has_next": len(self.search_cards) > limit, "total_hint": None})
         found = self.search_results if self.search_results is not None else [
             s for s in self.skills if s.public]
         limit = int(query.get("limit") or 20)
@@ -946,6 +963,8 @@ def _route_of(path: str) -> str:
         return "body"
     if path in (SEARCH, SEARCH_POST):
         return "search"
+    if _BENCHMARK_RE.match(path):
+        return "benchmark"
     return "other"
 
 

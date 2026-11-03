@@ -1,4 +1,4 @@
-"""DecimalAI SDK — Agent dataset lifecycle platform.
+"""DecimalAI SDK — a registry of agent skills with test results. See what a skill changes, then add it to the agent you already have.
 
 Quick start::
 
@@ -444,7 +444,7 @@ def _verify_backend_at_init(
                 f"Invalid API key — the server rejected it ({url}, HTTP {exc.code}). "
                 "The key is invalid, revoked, or scoped to a different "
                 "workspace. Get a valid key at "
-                "https://app.decimal.ai/settings (Settings → API Key). "
+                "https://app.decimal.ai/settings (Settings → API keys). "
                 "Pass init(verify=False) to skip this probe."
             ) from exc
         # Older backends may not have /api/v1/auth/verify at all.

@@ -7,24 +7,24 @@ name = "decimalai"
 version = "0.27.2"
 # Keep byte-identical with the GitHub repo description and the docs landing line.
 # It is the one sentence a stranger reads on PyPI, in GitHub search results and in
-# the org list, and it drifted: PyPI said "manifest-aware agent change management"
-# while GitHub said the lift sentence — two different products to a skimming
-# reader. The lift sentence is the differentiated one; the other names a mechanism
-# nobody is searching for. Reaches PyPI on the next release, not before.
-description = "Python SDK for agent evals and skill routing — measure a skill's real lift before you trust it"
+# the org list, and it drifted: at least eight descriptions of one product, from
+# "manifest-aware agent change management" to "Agent dataset lifecycle platform".
+# Reaches PyPI on the next release, not before.
+description = "A registry of agent skills with test results. See what a skill changes, then add it to the agent you already have."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "Decimal AI"}]
 keywords = [
     "ai-agents",
+    "agent-skills",
+    "skills",
     "llm",
     "agent-versioning",
     "regression-testing",
     "tracing",
     "observability",
     "evaluation",
-    "skills",
     "manifest",
     "langchain",
     "openai-agents",

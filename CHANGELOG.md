@@ -6,6 +6,30 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### New: `decimalai skills search <query>`, with no key
+
+The terminal could not find a skill without the MCP server or the plugin. `decimalai skills search`
+reads the public registry anonymously. Each result says how an agent did with the skill and without
+it, the same sentence the skill's page leads with, and gives the command that adds it. A blocked
+skill is named apart with no such command. `--json` prints the registry's answer. Exit 8 means the
+registry could not be reached or did not answer.
+
+### Changed: the CLI starts from skills
+
+- `decimalai --help` says what the product is, says `Start with: decimalai skills add <name>`, and
+  lists `skills` first.
+- `decimalai skills add` ends with how to try the skill: a question that names the skill and, when
+  DecimalAI wrote one, comes from a test a model failed without it and passed with it, and where to
+  ask it. The Claude Code line now carries the project's absolute path, so it also works outside a
+  git repository.
+- A skill's `allowed-tools` notes print as one line in `add`, `install`, `update` and `pull`.
+  `--json` keeps one note per tool.
+- `decimalai init` with no key says that skills need no key or account and points at the
+  Quickstart, and still exits 1, since it checks a key. Its success output no longer advertises the
+  demo commands or the old notebook. `Settings → API Key` is now `Settings → API keys`.
+- The package description, README and `AGENTS.md` use the one sentence, and the README leads with
+  `skills add` and `agent_config()`.
+
 ## [0.27.2] — 2026-11-02
 
 ### Fixed: a skill too large to inject no longer costs the turn its skill

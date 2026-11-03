@@ -14,13 +14,25 @@ from . import skills_pm
 logger = logging.getLogger("decimalai")
 
 
+class _SkillsFirst(click.Group):
+    """`decimalai --help` lists `skills` first, the first thing a reader needs; the
+    other commands stay in Click's A to Z."""
+
+    def list_commands(self, ctx):
+        return sorted(super().list_commands(ctx), key=lambda name: name != "skills")
+
+
 # Epilog rides every help render — including the bare `decimalai` invocation
 # (click prints the group help there before exiting 2), so a keyless first
 # run always sees where to start.
-@click.group(epilog="Start with: decimalai init")
+@click.group(
+    cls=_SkillsFirst,
+    epilog="\b\nStart with: decimalai skills add <name>\n"
+           "Find a name with: decimalai skills search <what your agent does>",
+)
 @click.version_option(version=__version__, prog_name="decimalai")
 def cli():
-    """DecimalAI — Agent dataset lifecycle platform."""
+    """A registry of agent skills with test results. See what a skill changes, then add it to the agent you already have."""
     pass
 
 
@@ -570,14 +582,21 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     # 1. Resolve API key
     resolved_key = api_key or os.environ.get("DECIMAL_API_KEY") or os.environ.get("DECIMALAI_API_KEY")
     if not resolved_key:
+        # Still exit 1: this command checks a key, and a script that runs it wants to know
+        # there is none. What it says is for the person, who may need no key at all.
         click.echo("")
-        click.echo("  ✗ No API key found.", err=True)
+        click.echo("  No DecimalAI API key is set, and skills don't need one, or an account:")
         click.echo("")
-        click.echo("  Set your key:")
-        click.echo('    export DECIMAL_API_KEY="dai_sk_..."')
+        click.echo("    decimalai skills search <what your agent does>")
+        click.echo("    decimalai skills add <name>")
         click.echo("")
-        click.echo("  Or get one from: Settings → API Key in the dashboard")
+        click.echo("  Start here: https://docs.decimal.ai/quickstart")
+        click.echo("")
+        click.echo("  `decimalai init` checks a key. A free account lets you change an agent's "
+                   "prompt and skills without redeploying, and see which skills each run used.")
+        click.echo("  Get a key from Settings → API keys, then set it:")
         click.echo(f"    → {_dashboard_url(base_url)}/settings")
+        click.echo('    export DECIMAL_API_KEY="dai_sk_..."')
         raise SystemExit(1)
 
     key_preview = f"{resolved_key[:10]}...{resolved_key[-4:]}"
@@ -643,17 +662,12 @@ def init(agent_name, api_key, base_url, framework, out_path, model, force, dry_r
     click.echo("    decimalai agents create <agent-name> --pack <role>")
     click.echo("    decimalai init <agent-name>   # writes ./agent.py, skills wired")
     click.echo("")
-    click.echo("  See it work in 2 minutes — seeds a demo into your workspace:")
-    click.echo("    decimalai demo regression   # what your next agent change would break")
-    click.echo("    decimalai demo skills       # the registry, ranked by real effectiveness")
+    click.echo("  Or add a skill to the agent you already have:")
+    click.echo("    decimalai skills search <what your agent does>")
+    click.echo("    decimalai skills add <name>")
     click.echo("")
     click.echo(f"  → Open dashboard: {dashboard_url}/traces")
     click.echo("  → Docs: https://docs.decimal.ai/quickstart")
-    # Points at the support-agent notebook, not the quickstart one: quickstart.ipynb
-    # calls decimalai.init() in its second code cell and raises DecimalConfigError on
-    # its placeholder key, so it is the worst possible first click for someone who has
-    # just run `init`. The support-agent notebook runs with no DecimalAI account at all.
-    click.echo("  → Build an agent from a skill: https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/support-agent/support_agent.ipynb")
     click.echo("")
     client.close()
 
@@ -1337,7 +1351,9 @@ def evaluators_remove(evaluator_id, api_key, base_url):
 
 @cli.group(epilog=skills_pm._EXIT_CODES)
 def skills():
-    """Skill commands.
+    """Find skills in the registry and add them to your project.
+
+    `search` finds a skill and `add` adds it, with no API key or account.
 
     Registry skills are managed like packages: `add` records a skill in
     .decimal/skills.toml and installs it into .agents/skills/<name>/,
@@ -1347,7 +1363,7 @@ def skills():
     pass
 
 
-# add, install, update, remove, status, verify, migrate and pull.
+# add, search, install, update, remove, status, verify, migrate and pull.
 skills_pm.register(skills)
 
 

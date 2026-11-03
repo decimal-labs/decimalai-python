@@ -5,6 +5,7 @@ installed as a real folder, ``.agents/skills/<install-name>/``, and ``.decimal/s
 records exactly what was written, so CI and Docker get the same bytes back
 (``install --frozen``)::
 
+    decimalai skills search refund policy         # find one, no API key
     decimalai skills add acme/refund-policy       # record it, install it
     decimalai skills install --frozen             # CI: exactly the lock, or a refusal
     decimalai skills update                       # move `latest` entries forward
@@ -21,11 +22,14 @@ command runs, so ``decimalai --help`` loads none of it.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
 import shlex
 import stat
 import sys
+import unicodedata
 import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -49,6 +53,19 @@ _EXIT_CODES = "\b\nExit codes:\n" + "\n".join(
 # that timed out warms the instance the retry then hits.
 _PULL_HTTP_TIMEOUT = 30.0
 
+# `skills add` has already done its job when it asks the registry for a question to try, so
+# it waits this long, once, and does without. A first-run command stays quick.
+_TRY_IT_HTTP_TIMEOUT = 6.0
+
+#: skillfmt writes one of these per tool, so a skill with three tools printed three lines.
+_TOOL_NOTE = re.compile(r"allowed-tools: dropped (?P<tool>'.*') (?P<why>\(.*\))")
+
+#: A question longer than this does not read as something to paste at an agent.
+_TRY_IT_MAX_QUESTION = 300
+
+#: A registry `url_slug` that a person can type as it is.
+_TYPABLE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 #: OS and tool clutter, never counted as a difference in a folder `pull` writes to.
 _CLUTTER_FILES = (".DS_Store", "Thumbs.db", "desktop.ini")
 _CLUTTER_DIRS = ("__pycache__",)
@@ -56,8 +73,8 @@ _CLUTTER_DIRS = ("__pycache__",)
 
 def register(group: click.Group) -> None:
     """Add the package-manager commands to the ``skills`` group."""
-    for command in (skills_add, skills_install, skills_update, skills_remove, skills_status,
-                    skills_verify, skills_migrate, skills_pull):
+    for command in (skills_add, skills_search, skills_install, skills_update, skills_remove,
+                    skills_status, skills_verify, skills_migrate, skills_pull):
         group.add_command(command)
 
 
@@ -121,8 +138,34 @@ def _gate() -> Dict[str, Any]:
 # ── printing a result ───────────────────────────────────────────────────────
 
 
-def _print_problems(problems: Iterable[Any]) -> None:
+def _fold_tool_notes(problems: Iterable[Any]) -> List[Any]:
+    """``problems`` with one allowed-tools note per skill and reason, naming every tool.
+
+    Takes notices or plain strings. Only what is printed folds: ``--json`` and the engine
+    keep one note per tool.
+    """
+    folded: List[Any] = []
+    tools: Dict[Tuple[Optional[str], str], Tuple[int, List[str]]] = {}
     for problem in problems:
+        message = getattr(problem, "message", problem)
+        match = _TOOL_NOTE.fullmatch(message) if isinstance(message, str) else None
+        if match is None:
+            folded.append(problem)
+            continue
+        key = (getattr(problem, "skill", None), match["why"])
+        if key not in tools:
+            tools[key] = (len(folded), [])
+            folded.append(problem)
+        tools[key][1].append(match["tool"])
+    for (_, why), (index, names) in tools.items():
+        message = f"allowed-tools: dropped {', '.join(names)} {why}"
+        first = folded[index]
+        folded[index] = message if isinstance(first, str) else dataclasses.replace(first, message=message)
+    return folded
+
+
+def _print_problems(problems: Iterable[Any]) -> None:
+    for problem in _fold_tool_notes(problems):
         if isinstance(problem, SkillpkgError):
             click.echo(f"  ✗ {problem}", err=True)
         elif getattr(problem, "level", None) == "info":
@@ -153,13 +196,96 @@ def _exit(result: Any) -> None:
     raise SystemExit(int(result.exit_code))
 
 
-def _next_steps() -> None:
+def _plain(text: Any, limit: int = 200) -> str:
+    """Registry text on one line, safe for a terminal, cut to ``limit`` characters.
+
+    Authors write these fields, and a registry skill can be imported from anywhere, so
+    control and formatting characters go: an escape sequence could rewrite what the
+    terminal shows, and a bidi override could reorder it.
+    """
+    if not isinstance(text, str):
+        return ""
+    kept = "".join(" " if unicodedata.category(c)[0] in "CZ" else c for c in text)
+    kept = " ".join(kept.split())
+    return kept if len(kept) <= limit else kept[:limit - 1].rstrip() + "…"
+
+
+def _question_from_tests(base_url: str, skill_id: str) -> Optional[str]:
+    """A task from the skill's tests that a model failed without it and passed with it.
+
+    The shortest such case that DecimalAI wrote: a case its author wrote is the author's
+    words, and this command tells someone to paste them at their agent. None when there
+    is no such case or the registry does not answer in time.
+    """
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/api/v1/registry/skills/{urllib.parse.quote(skill_id, safe='')}/benchmark"
+    try:
+        resp = httpx.get(url, timeout=_TRY_IT_HTTP_TIMEOUT)
+        run = (resp.json() if resp.status_code == 200 else {}).get("latest_run")
+        results = run.get("results") if isinstance(run, dict) else None
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return None
+    questions = [
+        _plain(row.get("case_prompt"), _TRY_IT_MAX_QUESTION + 1)
+        for row in (results if isinstance(results, list) else [])
+        if isinstance(row, dict) and row.get("outcome") == "flip_to_pass"
+        and row.get("authored_by") == "platform" and row.get("mode") == "single_shot"
+    ]
+    fitting = [q for q in questions if q and len(q) <= _TRY_IT_MAX_QUESTION]
+    return min(fitting, key=len) if fitting else None
+
+
+def _skill_id(project: Any, install_name: str) -> Optional[str]:
+    """The registry's id for an installed skill: a name can hold a slash, which the
+    per-skill routes do not read."""
+    from ..skillpkg import lock as L
+
+    entry = L.load(project).skills.get(install_name)
+    return entry.get("skill_id") if entry else None
+
+
+def _next_steps(project: Any, change: Any, base_url: str) -> None:
+    """What to commit, then how to try the skill, with nothing but this text to go on."""
+    from .main import _dashboard_url
+
     click.echo("")
     click.echo("  Commit .decimal/skills.toml, .decimal/skills.lock and .agents/; CI and "
                "Docker run `decimalai skills install --frozen`.")
-    click.echo("  Point your framework's skill loader at .agents/skills "
-               "(decimalai.skills_dir()); Claude Code loads it with:")
-    click.echo('    claude --plugin-dir "$(git rev-parse --show-toplevel)/.agents"')
+
+    name = change.skill or change.install_name
+    skill_id = _skill_id(project, change.install_name)
+    from_tests = _question_from_tests(base_url, skill_id) if skill_id else None
+    # It names the skill because an agent that may choose often answers from memory instead.
+    # Claude Code with playwright-cli on 2026-11-03, Haiku: the question alone loaded the skill
+    # 1 time in 3, and this wording 3 in 3, all right. With no skill, 0 of 5 were right.
+    question = (f"Use the {change.install_name} skill. "
+                f"{from_tests or 'What can it help me with?'}")
+
+    click.echo("")
+    click.echo("  Now try it. Ask your agent:")
+    click.echo("")
+    click.echo(f"    {question}")
+    if from_tests:
+        click.echo("")
+        click.echo("  This one is from the skill's tests: a model failed it without the skill "
+                   "and passed it with the skill.")
+    click.echo("")
+    click.echo("  In Cursor, Copilot, Cline, Warp or Codex: start a new chat in this project.")
+    click.echo(f"  In Claude Code: claude --plugin-dir {shlex.quote(str(project.agents_dir))}")
+    click.echo('  In Python: pip install "decimalai[openai-agents]", set OPENAI_API_KEY, and '
+               "run this from the project:")
+    click.echo("")
+    click.echo("    from agents import Agent, Runner")
+    click.echo("    from decimalai.openai_agents import agent_config")
+    click.echo("")
+    click.echo('    support = agent_config("my-agent", fallback="You are a helpful assistant.")')
+    click.echo("    agent = Agent(name=support.name, instructions=support.instructions, "
+               "tools=[*support.tools])")
+    click.echo(f"    print(Runner.run_sync(agent, {question!r}).final_output)")
+    click.echo("")
+    click.echo("  Steps for other frameworks, and what this skill changes:")
+    click.echo(f"    {_dashboard_url(base_url)}/skills/{urllib.parse.quote(name, safe='/')}")
 
 
 # ── add ─────────────────────────────────────────────────────────────────────
@@ -253,8 +379,9 @@ def _add(ref: str, *, yes: bool, force: bool, no_install: bool, agent_name: Opti
                           directory=directory, api_key=api_key or None, base_url=base_url,
                           **_gate())
     _print_result(result)
-    if result.ok and any(getattr(c, "action", None) == "add" for c in result.changes):
-        _next_steps()
+    added = next((c for c in result.changes if getattr(c, "action", None) == "add"), None)
+    if result.ok and added is not None:
+        _next_steps(project, added, base_url)
     _exit(result)
 
 
@@ -378,6 +505,99 @@ def _assign_to_agent(project: Any, router: Any, ref: str, agent: str, *, yes: bo
     click.echo(f"  ✓ added {resolved.registry_name} to agent {agent!r} on DecimalAI ({how})")
     _keyless.record(project, agent_name=agent,
                     assigned={resolved.registry_name: spec or "latest"})
+
+
+# ── search ──────────────────────────────────────────────────────────────────
+
+
+def _test_result(item: Dict[str, Any]) -> str:
+    """The sentence a skill's page leads with, from the registry's own summary."""
+    bench = item.get("benchmark_summary")
+    if isinstance(bench, dict) and not bench.get("lift_withheld_reason"):
+        cases, rate, lift = (bench.get(k) for k in ("lift_cases", "lift_pass_rate_pct", "pass_rate_delta_pts"))
+        if isinstance(cases, int) and cases > 0 and all(isinstance(v, (int, float)) for v in (rate, lift)):
+            # Rounds as the page does (half up), so the two never disagree on a count.
+            with_skill = int(rate / 100 * cases + 0.5)
+            without = int((rate - lift) / 100 * cases + 0.5)
+            return (f"Passed {with_skill} of {cases} test cases with the skill, "
+                    f"and {without} of {cases} without it.")
+    return "No with-and-without test result yet."
+
+
+def _add_ref(item: Dict[str, Any]) -> Optional[str]:
+    """What to type after `skills add`: the slug, or the id when the slug cannot be typed."""
+    slug, skill_id = item.get("url_slug"), item.get("id")
+    if isinstance(slug, str) and _TYPABLE_REF.fullmatch(slug):
+        return slug
+    return _plain(skill_id, 80) or None
+
+
+@click.command("search")
+@click.argument("query", nargs=-1, required=True)
+@click.option("--limit", type=click.IntRange(1, 100), default=10, show_default=True,
+              help="How many skills to show.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print the registry's answer as JSON.")
+@click.option("--base-url", envvar=["DECIMAL_BASE_URL", "DECIMALAI_BASE_URL"],
+              default=_DEFAULT_BASE_URL, show_envvar=True, help="Platform URL")
+def skills_search(query, limit, as_json, base_url):
+    """Search the public skills registry: no signup, no API key.
+
+    Each result says how an agent did with the skill and without it, and how to add it.
+    Exit 8 means the registry could not be reached or did not answer.
+
+    \b
+    Examples:
+        $ decimalai skills search browser automation
+        $ decimalai skills search pdf --limit 25
+    """
+    import httpx
+
+    from .main import _dashboard_url
+
+    words = " ".join(query)
+    url = base_url.rstrip("/") + "/api/v1/registry/skills"
+    try:
+        resp = _pull_get(url, params={"q": words, "sort": "recommended", "limit": limit})
+        resp.raise_for_status()
+        data = resp.json()
+        items = [i for i in data.get("items") or [] if isinstance(i, dict)]
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        click.echo(f"  ✗ could not search the registry at {base_url}: {exc}", err=True)
+        raise SystemExit(int(ExitCode.NETWORK))
+
+    if as_json:
+        click.echo(json.dumps(data, indent=2))
+        return
+
+    registry_url = f"{_dashboard_url(base_url)}/skills"
+    if not items:
+        click.echo(f"  No skills matched {_plain(words)!r}. Try fewer or broader words, or "
+                   f"browse {registry_url}")
+        return
+
+    blocked = [i for i in items if i.get("skill_safety") == "blocked"]
+    for item in items:
+        if item in blocked:
+            continue
+        ref = _add_ref(item)
+        author = _plain(item.get("author_display_name"), 60)
+        click.echo(f"  {ref or _plain(item.get('name'), 80)}" + (f", by {author}" if author else ""))
+        description = _plain(item.get("description"), 160)
+        if description:
+            click.echo(f"    {description}")
+        click.echo(f"    {_test_result(item)} Safety review: "
+                   f"{_plain(item.get('skill_safety'), 20) or 'unknown'}.")
+        if ref:
+            click.echo(f"    decimalai skills add {shlex.quote(ref)}")
+        click.echo("")
+    if blocked:
+        click.echo("  Blocked, `skills add` refuses these: "
+                   + ", ".join(_plain(i.get("url_slug") or i.get("name"), 80) for i in blocked))
+        click.echo("")
+    if data.get("has_next"):
+        click.echo(f"  There are more: add --limit {min(limit * 2, 100)}, or use more words.")
+    click.echo(f"  See a skill's test results: {registry_url}/<name>")
 
 
 # ── install ─────────────────────────────────────────────────────────────────
@@ -855,7 +1075,7 @@ def skills_pull(ref, out_dir, base_url, no_evals, to_stdout, force):
             click.echo(f"    note: left in place, not part of the skill: {', '.join(extra)}")
     for missing in bundle.unavailable:
         click.echo(f"    note: not included: {missing.path} ({missing.reason})")
-    for note in bundle.policy_notes:
+    for note in _fold_tool_notes(bundle.policy_notes):
         click.echo(f"    note: {note}")
 
     if skill_id:

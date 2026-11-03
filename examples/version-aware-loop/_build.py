@@ -101,7 +101,7 @@ if not API_KEY.startswith("dai_") or API_KEY.endswith("..."):
     raise RuntimeError(
         "No DecimalAI API key. Paste one into API_KEY above, or set the "
         "DECIMAL_API_KEY environment variable. Keys live at "
-        "https://app.decimal.ai/settings (Settings → API Key)."
+        "https://app.decimal.ai/settings (Settings → API keys)."
     )
 
 os.environ["DECIMAL_API_KEY"] = API_KEY
