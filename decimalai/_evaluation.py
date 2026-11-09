@@ -11,7 +11,10 @@
   ran on something else would report on the wrong prompt;
 - its answer never becomes the agent's local copy of its skill list, so ordinary runs are untouched;
 - its trace is marked ``source_type="evaluation"`` and kept out of the agent's own numbers, and the
-  :class:`Trial` the block yields has its trace id.
+  :class:`Trial` the block yields has its trace id;
+- a run has time to wait out a rate limit, unlike a customer's turn (``SkillRouter._request``), and a
+  skill the platform could not deliver is noted on its trial, so ``evaluate()`` doesn't score a run
+  that went without it as though the model had chosen to.
 
 Every binding asks :func:`active` for the trial covering its agent (``AgentBinding._begin_run``).
 """
@@ -102,6 +105,7 @@ class Trial:
         self._hold = hold
         self._lock = Lock()
         self._trace_ids: List[str] = []
+        self._undelivered: Dict[str, str] = {}
 
     def __repr__(self) -> str:
         return f"Trial(agent={self.override.agent!r}, {self.override.label}, traces={len(self._trace_ids)})"
@@ -124,6 +128,16 @@ class Trial:
         trace_id = self.trace_id
         return trace_url(trace_id) if trace_id else None
 
+    @property
+    def undelivered(self) -> Dict[str, str]:
+        """Skill name -> why: what a run in the block asked for and the platform could not deliver."""
+        with self._lock:
+            return dict(self._undelivered)
+
+    def _note_undelivered(self, skill: str, why: str) -> None:
+        with self._lock:
+            self._undelivered[skill] = why
+
     def _take(self, trace: Any) -> bool:
         """A run of this block finished: note its trace. True: the trial holds it (evaluate() sends it)."""
         self._note(str(trace.id))
@@ -145,6 +159,19 @@ def active(agent_name: Optional[str]) -> Optional[Trial]:
         if trial.override.agent == agent_name:
             return trial
     return None
+
+
+def in_evaluation() -> bool:
+    """Whether this context is inside an evaluation run's block."""
+    return bool(_ACTIVE.get())
+
+
+def note_undelivered(agent_name: Optional[str], skill: str, why: str) -> None:
+    """A ``load_skill`` here got no answer from the platform. Outside a trial, nothing to note."""
+    trials = _ACTIVE.get()
+    trial = active(agent_name) or (trials[-1] if trials else None)
+    if trial is not None:
+        trial._note_undelivered(skill, why)
 
 
 @contextmanager

@@ -153,3 +153,62 @@ def test_retry_keeps_initial_nested_inputs_and_auth_scope_when_caller_context_ch
         sr._ROUTE_BUDGET_HEADER: f"{sr._hot_path_read_budget():g}",
     }
     assert attempts[0]["params"] == attempts[1]["params"] == {"agent_name": "support", "labels": ["original"]}
+
+
+# ── An evaluation run has time to wait; a customer's turn does not ──
+
+BODY = "/api/v1/skills/refund-policy/body"
+
+
+def _evaluation_block():
+    from decimalai import _evaluation
+
+    return _evaluation.block(_evaluation.Trial(_evaluation.Override.make("support")))
+
+
+def _limited(times, retry_after="1"):
+    return [response(429, {"Retry-After": retry_after}) for _ in range(times)] + [
+        response(200, body={"body": "# useful policy"})]
+
+
+def test_an_evaluation_run_waits_out_a_rate_limit_a_turn_would_give_up_on():
+    router = SkillRouter(api_key="fixture", base_url="http://127.0.0.1:8001")
+    with _evaluation_block(), patch("decimalai.skill_router.httpx.request", side_effect=_limited(6)) as request, \
+            patch("decimalai.skill_router.time.sleep") as sleep:
+        assert router._request("GET", BODY) == {"body": "# useful policy"}
+    assert request.call_count == 7
+    assert sleep.call_count == 6
+
+
+def test_outside_an_evaluation_a_turn_still_gives_up_after_its_retries():
+    router = SkillRouter(api_key="fixture", base_url="http://127.0.0.1:8001")
+    with patch("decimalai.skill_router.httpx.request", side_effect=_limited(6)) as request, \
+            patch("decimalai.skill_router.time.sleep"), pytest.raises(SkillRouterError):
+        router._request("GET", BODY)
+    assert request.call_count == sr._ADMISSION_MAX_RETRIES + 1
+
+
+def test_even_an_evaluation_run_stops_waiting_at_its_cap():
+    router = SkillRouter(api_key="fixture", base_url="http://127.0.0.1:8001")
+    wait = int(sr._EVALUATION_ADMISSION_MAX_WAIT_S // 3)
+    with _evaluation_block(), patch("decimalai.skill_router.httpx.request", side_effect=_limited(9, str(wait))) as request, \
+            patch("decimalai.skill_router.time.sleep"), pytest.raises(SkillRouterError):
+        router._request("GET", BODY)
+    assert request.call_count == 4
+
+
+def test_a_call_that_asked_not_to_wait_does_not_wait_in_an_evaluation():
+    router = SkillRouter(api_key="fixture", base_url="http://127.0.0.1:8001")
+    with _evaluation_block(), patch("decimalai.skill_router.httpx.request", side_effect=_limited(1)) as request, \
+            patch("decimalai.skill_router.time.sleep") as sleep, pytest.raises(SkillRouterError):
+        router._request("GET", BODY, admission_wait_s=0.0)
+    assert request.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_a_write_is_still_never_replayed_in_an_evaluation():
+    router = SkillRouter(api_key="fixture", base_url="http://127.0.0.1:8001")
+    with _evaluation_block(), patch("decimalai.skill_router.httpx.request", side_effect=_limited(1)) as request, \
+            patch("decimalai.skill_router.time.sleep"), pytest.raises(SkillRouterError):
+        router._request("POST", "/api/v1/skills", json={"name": "x"})
+    assert request.call_count == 1

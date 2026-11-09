@@ -424,6 +424,38 @@ def test_a_skill_left_out_is_not_listed_or_loaded(evaldecimal):
     assert evaldecimal.body_calls() == [], "nothing loaded the skill left out"
 
 
+def _skill_body_refused(platform, monkeypatch, skill):
+    """The platform turns away every fetch of ``skill``'s text, as a spent rate limit does."""
+    answer = platform.request
+
+    def limited(method, path, *args, **kwargs):
+        if path.endswith(f"/{skill}/body"):
+            raise sr.SkillRouterError("SkillRouter request failed (429)", status_code=429)
+        return answer(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(oa._skill_router_singleton, "_request", limited)
+
+
+def test_a_run_that_could_not_get_its_skill_is_an_error_never_a_failed_check(evaldecimal, monkeypatch):
+    # Scored, it reads as "the model didn't use the skill": a wrong result nothing marks as wrong.
+    _skill_body_refused(evaldecimal, monkeypatch, "damaged-item")
+    agent, _support = _agent()
+    report = decimalai.evaluate(agent, CASES, evals=CHECKS)
+    broken = next(c for c in report.cases if c.id == "broken-mug")
+    assert "damaged-item" in broken.error and "could not deliver" in broken.error
+    assert broken.results == {}
+    assert all(c.error is None for c in report.cases if c.id != "broken-mug")
+    assert report.summary["loaded_the_right_skill"]["failed"] == 0
+
+
+def test_when_every_run_lacks_its_skill_evaluate_raises(evaldecimal, monkeypatch):
+    _skill_body_refused(evaldecimal, monkeypatch, "damaged-item")
+    agent, _support = _agent()
+    only = [c for c in CASES if c["id"] == "broken-mug"]
+    with pytest.raises(decimalai.EvaluationNotApplied, match="could not deliver"):
+        decimalai.evaluate(agent, only, evals=CHECKS)
+
+
 def test_a_check_that_raises_is_an_error_on_its_case_never_a_skip(evaldecimal):
     @check
     def reads_a_missing_field(trace: TraceData) -> bool:

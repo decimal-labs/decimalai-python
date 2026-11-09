@@ -8,6 +8,10 @@ and patch releases are fixes.
 
 ### Fixed
 
+- `decimalai.evaluate()` waits out a rate limit. On a Free key, four cases at once exceeded the
+  request limit: cases errored, and a run that couldn't load a skill was scored as though the model
+  had chosen not to. Evaluation runs now wait, and a case that still can't get a skill it asked for
+  is reported as an error, not a failed check.
 - `@decimalai.trace` works on `async def`. It used to end the trace as soon as the coroutine was
   created, so an empty trace went out and `log_llm_call` inside the coroutine raised "No active
   trace". A generator still ends the trace when it is created: use `start_trace` inside it.

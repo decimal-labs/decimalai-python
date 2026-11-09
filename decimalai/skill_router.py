@@ -34,6 +34,8 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from . import _evaluation
+
 logger = logging.getLogger("decimalai.skill_router")
 
 
@@ -367,6 +369,12 @@ _SKILLS_PREFIX = "/api/v1/skills/"
 _BODY_SUFFIX = "/body"
 _ADMISSION_MAX_RETRIES = 2
 _ADMISSION_MAX_WAIT_S = 5.0
+#: The same limits for a call inside an evaluation run. A customer's turn can't sit waiting, but
+#: nobody is waiting on one evaluation case, and a case that gives up is a case with no result: a
+#: Free key (60 requests a minute) running eight cases four at a time goes over its limit, and on
+#: 2026-11-09 that errored 7 of 8 cases and left another to answer without the skill it asked for.
+_EVALUATION_ADMISSION_MAX_RETRIES = 60
+_EVALUATION_ADMISSION_MAX_WAIT_S = 90.0
 
 # WHY 5 SECONDS AND NOT 2 (changed 2026-09-02, and the old value was measured
 # doing real harm).
@@ -1997,7 +2005,10 @@ class SkillRouter:
         request_params = deepcopy(clean_params)
         started = time.monotonic()
         waited = 0.0
-        max_wait = _ADMISSION_MAX_WAIT_S if admission_wait_s is None else admission_wait_s
+        patient = admission_wait_s is None and _evaluation.in_evaluation()
+        max_wait = (_EVALUATION_ADMISSION_MAX_WAIT_S if patient else _ADMISSION_MAX_WAIT_S
+                    ) if admission_wait_s is None else admission_wait_s
+        max_retries = _EVALUATION_ADMISSION_MAX_RETRIES if patient else _ADMISSION_MAX_RETRIES
         # One spare attempt per transport failure kind, for the whole call (see
         # "Transport" above `_platform_client`).
         spare = {"connect": True, "dropped": replay_safe, "read": retry_read_timeout}
@@ -2040,11 +2051,11 @@ class SkillRouter:
                 )
 
         try:
-            for attempt in range(_ADMISSION_MAX_RETRIES + 1):
+            for attempt in range(max_retries + 1):
                 # Admission recovery never retries generic 5xx; transport
                 # failures get their one spare attempt inside `attempt_once`.
                 resp = attempt_once()
-                if not admission_safe or resp.status_code != 429 or attempt >= _ADMISSION_MAX_RETRIES:
+                if not admission_safe or resp.status_code != 429 or attempt >= max_retries:
                     break
                 if resp.headers.get("X-Quota-Exceeded"):
                     break
@@ -2055,7 +2066,7 @@ class SkillRouter:
                     break
                 logger.warning(
                     "SkillRouter admission limited on %s %s; retrying in %.1fs (%d/%d)",
-                    method, path, delay, attempt + 1, _ADMISSION_MAX_RETRIES,
+                    method, path, delay, attempt + 1, max_retries,
                 )
                 time.sleep(delay)
                 waited += delay
@@ -2518,6 +2529,7 @@ class SkillRouter:
             # Not "no skill named X": the skill exists, the platform did not
             # answer. Telling the model it is missing invites it to guess
             # another name, or to claim the skill does not exist.
+            _evaluation.note_undelivered(agent_name or self.agent_name, name, unavailable)
             return (
                 f"load_skill: {name!r} could not be loaded right now — the skills "
                 f"platform is unavailable ({unavailable}). Its instructions were not "

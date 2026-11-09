@@ -376,6 +376,14 @@ async def evaluate_async(
                 refused = _cause(exc, EvaluationNotApplied)
                 shown = refused or exc
                 result.error = f"{type(shown).__name__}: {shown}"
+            if result.error is None and trial.undelivered:
+                # It ran, without a skill it asked for: the answer says nothing about the setup.
+                skills = ", ".join(sorted(trial.undelivered))
+                why = "; ".join(sorted(set(trial.undelivered.values())))
+                refused = EvaluationNotApplied(
+                    f"the run asked for {skills} and DecimalAI could not deliver it ({why}), so its "
+                    "answer isn't a result for this setup")
+                result.error = f"EvaluationNotApplied: {refused}"
             trace = held.get("trace")
             if trace is None:
                 if result.error is None:
@@ -501,7 +509,8 @@ def evaluate(
             default the case's ``context`` value as is.
         label: This setup's name in reports. Default: ``"served"``, ``"prompt v4"``,
             ``"without refund-policy"``.
-        concurrency: How many cases run at once.
+        concurrency: How many cases run at once. When they outrun the API key's request limit
+            they wait for it, so a low limit makes this slower, not wrong.
 
     Returns:
         An :class:`~decimalai.evals.EvalReport`; ``print()`` it, or ``.compare(other)``.
