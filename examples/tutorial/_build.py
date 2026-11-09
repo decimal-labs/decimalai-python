@@ -2,8 +2,8 @@
 """Build the tutorial notebooks: order_support_<sdk>.ipynb, one per runnable SDK tab.
 
 WHAT THEY ARE FOR. The docs tutorial (docs.decimal.ai, "Tutorial: a support agent") runs
-`order-support` on its own page, then has the reader run it in their own code (Part 2). These
-notebooks are Part 2 with nothing to install: the docs link them as "Open in Colab" beside each
+`order-support` on its own page, then has the reader run it in their own code (Part 3). These
+notebooks are Part 3 with nothing to install: the docs link them as "Open in Colab" beside each
 SDK's code. The program is the one the docs show for that SDK, unchanged except where a notebook
 forces it (below).
 
@@ -13,7 +13,7 @@ TWO WAYS TO RUN, CHOSEN BY ONE SECRET.
   to their dashboard. The keys cell first checks the key reaches an `order-support`: a key that is
   wrong, or a workspace with no copy yet, is said plainly and the notebook falls back to keyless
   rather than let agent_config() create an empty agent.
-- Without it: keyless, as Part 2's first half. The demo's prompt is the fallback= text, and the
+- Without it: keyless, as Part 3's no-account path. The demo's prompt is the fallback= text, and the
   setup cell adds the four registry skills to a project folder with `decimalai skills add` (no
   account), which is where keyless agent_config() reads them. Nothing goes to DecimalAI.
 
@@ -375,7 +375,7 @@ async def reply(question):
            f"# order-support, in your own code: {sdk['label']}\n"
            "\n"
            f"This is the DecimalAI tutorial's support agent, the one you ran on [the docs page]({DOCS}/try-it), "
-           f"running here in your own code with nothing to install. It is [Part 2]({DOCS}/build-it) of the "
+           f"running here in your own code with nothing to install. It is [Part 3]({DOCS}/run-it-in-your-code) of the "
            f"tutorial as a notebook: the same program the docs show for the {sdk['label']}.\n"
            "\n"
            "**It runs one of two ways, depending on one secret:**\n"
@@ -391,7 +391,7 @@ async def reply(question):
            "\n"
            f"- **`{provider}`** (required for a reply): your own [{sdk['provider_name']} key]({sdk['provider_url']}). "
            "These model calls are on your account.\n"
-           "- **`DECIMAL_API_KEY`** (optional): the *Docs tutorial* key from signing in on Part 1 (Part 2's "
+           "- **`DECIMAL_API_KEY`** (optional): the *Docs tutorial* key from signing in on Part 1 (Part 3's "
            "`.env` box shows it, in the same browser tab), or any key from **Settings → API keys** in the "
            "DecimalAI dashboard.\n"
            "\n"
@@ -402,7 +402,7 @@ async def reply(question):
         md("## 3. The project folder\n"
            "\n"
            "Keyless, `agent_config()` reads the agent's skills from the project's files, so this adds the four "
-           "from the registry, as Part 2's `decimalai skills add` step does. No account is needed. With your "
+           "from the registry, as Part 3's no-account path does. No account is needed. With your "
            "key, your skills live on DecimalAI instead and there is nothing to add."),
         code(setup),
         md("## 4. The agent\n"
@@ -435,7 +435,7 @@ async def reply(question):
            "it, add `DECIMAL_API_KEY` and run the notebook again from the top (**Runtime → Restart session**, "
            "then **Run all**).\n"
            "\n"
-           f"Next: [3. Add skills from the registry]({DOCS}/start-from-a-template)."),
+           f"Next: [4. See what it did]({DOCS}/see-what-it-did)."),
     ]
     for i, cell in enumerate(cells):
         cell["id"] = f"{key}-{i:02d}"  # nbformat 4.5 wants one; stable, so a rebuild diffs cleanly

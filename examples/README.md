@@ -6,7 +6,7 @@ Runnable examples demonstrating how to use [DecimalAI](https://decimal.ai) — t
 
 ## The tutorial's agent, in your own code
 
-`order-support`, the agent the [docs tutorial](https://docs.decimal.ai/tutorials/support-agent/try-it) runs on its own page, as [Part 2](https://docs.decimal.ai/tutorials/support-agent/build-it) has you run it: one notebook per SDK, the same program the docs show. With your `DECIMAL_API_KEY` it runs your copy (your saved prompt and skills, traced to your dashboard); without one it runs keyless. **Your own model key.** Built by [`tutorial/_build.py`](tutorial/_build.py).
+`order-support`, the agent the [docs tutorial](https://docs.decimal.ai/tutorials/support-agent/try-it) runs on its own page, as [Part 3](https://docs.decimal.ai/tutorials/support-agent/run-it-in-your-code) has you run it: one notebook per SDK, the same program the docs show. With your `DECIMAL_API_KEY` it runs your copy (your saved prompt and skills, traced to your dashboard); without one it runs keyless. **Your own model key.** Built by [`tutorial/_build.py`](tutorial/_build.py).
 
 | Notebook | SDK | Colab |
 |----------|-----|-------|
