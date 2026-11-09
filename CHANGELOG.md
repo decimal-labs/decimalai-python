@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.28.2] — 2026-11-10
+
 ### Fixed
 
 - `decimalai.evaluate()` waits out a rate limit. On a Free key, four cases at once exceeded the
