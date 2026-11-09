@@ -499,7 +499,11 @@ class TestTheRoutingCallAndTheEventLoop:
         runs the hooks inline on the loop thread. The ticker's zero is the
         evidence for the warning's claim — if a CrewAI release moves this hook
         off the loop, this assertion is what says the warning went stale."""
-        from crewai.agents.crew_agent_executor import CrewAgentExecutor
+        # CrewAI 1.15.39 removed this executor; the releases before it still have it.
+        CrewAgentExecutor = pytest.importorskip(
+            "crewai.agents.crew_agent_executor",
+            reason="this CrewAI has no CrewAgentExecutor",
+        ).CrewAgentExecutor
 
         ticks: List[int] = []
         router = use_router(_Router(delay_s=0.3, ticks=ticks))
