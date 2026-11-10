@@ -676,20 +676,9 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 
 ## Supported Frameworks
 
-| Framework | Status | Setup |
-|-----------|--------|-------|
-| LangChain / LangGraph | ✅ | `agent_config(name).middleware` in `create_agent` (tracing only: `init(langchain=True)`) |
-| OpenAI Agents SDK | ✅ | `agent_config(name)` (tracing only: `init(openai_agents=True)`) |
-| Google ADK | ✅ (native) | `agent_config(name)` + `DecimalAIPlugin()` in `App(plugins=[...])` |
-| Claude Agent SDK | ✅ | `agent_config(name)` from `decimalai.claude_agent_sdk`, one `support.run(question)` per query; traces its own runs (tracing only: `init(claude_agent_sdk=True)`; Claude Code's own loader: `skills_plugin()`) |
-| Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])`; traces its own runs |
-| Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
-| OpenAI SDK (Chat Completions / Responses API) | ✅ | `agent_config(name)` from `decimalai.openai`, one `support.run(message)` per user message; traces its own runs |
-| Gemini API (`google-genai`) | ✅ | `agent_config(name)` from `decimalai.google_genai`, one `support.run(message)` per user message; traces its own runs |
-| LlamaIndex | ✅ | `init(llamaindex=True)` |
-| CrewAI | ✅ | `init(crewai=True)` (traces and delivers skills; `on_trace` via `from decimalai.crewai import instrument`) |
-| Generic (any framework) | ✅ | `@decimalai.trace()` |
-| OpenTelemetry | ✅ | `init(otel=True)` |
+LangChain / LangGraph, OpenAI Agents, the Claude Agent SDK, Pydantic AI, Google ADK, the Anthropic, OpenAI and Gemini APIs, LlamaIndex, CrewAI, OpenTelemetry (`init(otel=True)`), and any other framework through `@decimalai.trace()`.
+
+What each one records, how skills reach its model, its own skill loader, and whether `decimalai.evaluate()` can run it are in one table: [All frameworks](https://docs.decimal.ai/sdk/python/frameworks#capability-comparison). It is generated from this SDK's framework registry (`decimalai/_frameworks.py`), so it changes when the SDK does. Each framework's setup is on its own page there.
 
 Tracing a direct LLM SDK with no agent framework? Use the provider flags: `init(openai=True)`, `init(anthropic=True)`, or `init(google=True)`.
 

@@ -79,6 +79,10 @@ class Capability:
     schema_depth: str   # Tool schema depth
     handoffs: str       # Handoffs / multi-agent
     skills_rail: str    # how DecimalAI's skill router reaches the model
+    #: Whether ``decimalai.evaluate()`` runs this framework's agent: it finds the agent's
+    #: ``agent_config()`` and runs each case as its own trace (``decimalai/evals/_runner.py``
+    #: ``_target``). "—" until a framework has that seam.
+    evaluate: str = "—"
 
 
 @dataclass(frozen=True)
@@ -224,6 +228,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             schema_depth="Full schemas",
             handoffs="✅",
             skills_rail="`load_skill` tool",
+            evaluate="✅",
         ),
         use_for="OpenAI Agents SDK — `agent_config(name)` returns the agent's prompt and "
                 "skills to pass as `Agent(instructions=..., tools=[...])`, nothing patched; "
@@ -626,6 +631,7 @@ def _framework_dict(f: Framework) -> Dict[str, Any]:
             "schema_depth": cap.schema_depth,
             "handoffs": cap.handoffs,
             "skills_rail": cap.skills_rail,
+            "evaluate": cap.evaluate,
         },
         "use_for": f.use_for,
         "init_flag_note": f.init_flag_note,
@@ -682,9 +688,9 @@ def _native_cell(f: Framework) -> str:
 
 CAPABILITY_HEADER = (
     "Framework", "Tier", "Auto-detected manifest", "Tool schema depth",
-    "Handoffs / multi-agent", "Skills rail", "Native skill loader",
+    "Handoffs / multi-agent", "Skills rail", "Native skill loader", "`evaluate()`",
 )
-_CAPABILITY_ALIGN = ("---", "---", ":---:", ":---:", ":---:", ":---:", "---")
+_CAPABILITY_ALIGN = ("---", "---", ":---:", ":---:", ":---:", ":---:", "---", ":---:")
 
 
 def render_capability_table() -> str:
@@ -695,7 +701,7 @@ def render_capability_table() -> str:
         if cap is None:
             continue
         lines.append(_row((f.title, cap.tier, cap.manifest, cap.schema_depth,
-                           cap.handoffs, cap.skills_rail, _native_cell(f))))
+                           cap.handoffs, cap.skills_rail, _native_cell(f), cap.evaluate)))
     return "\n".join(lines) + "\n"
 
 
