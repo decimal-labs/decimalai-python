@@ -2,7 +2,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/quickstart/quickstart.ipynb)
 
-Runnable examples demonstrating how to use [DecimalAI](https://decimal.ai) — the manifest-aware platform for agent change management.
+Runnable examples demonstrating how to use [DecimalAI](https://decimal.ai): a registry of agent skills with test results.
 
 ## The tutorial's agent, in your own code
 

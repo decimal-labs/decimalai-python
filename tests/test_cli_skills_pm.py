@@ -193,13 +193,22 @@ class TestAddEndsWithHowToTry:
                          "(not authored by your organization)"]
 
     def test_the_last_thing_it_prints_is_how_to_try_it(self, env):
-        env.skill()
+        skill = env.skill()
         result = env.run("add", REFUND)
         assert result.exit_code == 0, result.output
         before, after = result.output.split("Now try it.")
         assert "install --frozen" in before
         assert "start a new chat in this project" in after
-        assert after.rstrip().endswith(f"/skills/{REFUND}")
+        # REFUND is namespaced ("acme/refund-policy"): /skills/acme/refund-policy is a 404 on
+        # the web, so the link takes the skill's id, which the page resolves.
+        assert after.rstrip().endswith(f"/skills/{skill.skill_id}")
+        assert f"/skills/{REFUND}" not in after
+
+    def test_a_plain_name_links_by_its_name(self, env):
+        env.skill(name="refund-policy")
+        result = env.run("add", "refund-policy")
+        assert result.exit_code == 0, result.output
+        assert result.output.rstrip().endswith("/skills/refund-policy")
 
     def test_it_asks_a_case_from_the_skills_tests(self, env):
         skill = env.skill()

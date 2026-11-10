@@ -747,7 +747,7 @@ The demo runs on a seeded reference agent built for the demo — not a customer'
 <details>
 <summary><strong>Is the "lift" number on a skill real? Can I reproduce it?</strong></summary>
 
-The measurement spec is open: same task set run in two arms (with the skill injected vs. without), same model, conformance-graded, with a minimum case count, a never-hurt check, and a negative control. `pip install skillevaluation` and re-run any published number. The honest state today: effectiveness figures on the site are labeled "illustrative — run it yourself" until a skill's full benchmark run lands — no skill is claimed as measured unless its number was actually produced by that spec.
+The measurement spec is open: same task set run in two arms (with the skill injected vs. without), same model, conformance-graded, with a minimum case count, a never-hurt check, and a negative control. `pip install skillevaluation` and re-run any published number. The honest state today: a skill with no benchmark shows no number. A benchmarked skill's page shows how many test cases passed with the skill and without it, and the model and the version that were measured. No skill is claimed as measured unless that spec produced its number.
 </details>
 
 <details>

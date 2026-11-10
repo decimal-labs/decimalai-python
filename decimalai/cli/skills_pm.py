@@ -285,7 +285,11 @@ def _next_steps(project: Any, change: Any, base_url: str) -> None:
     click.echo(f"    print(Runner.run_sync(agent, {question!r}).final_output)")
     click.echo("")
     click.echo("  Steps for other frameworks, and what this skill changes:")
-    click.echo(f"    {_dashboard_url(base_url)}/skills/{urllib.parse.quote(name, safe='/')}")
+    # The page's route is one path segment: a namespaced name ("owner/skill") 404s there, and
+    # its "%2F" form renders "Skill not found". The page also resolves the skill's id, which
+    # the lock keeps (cold walk, 2026-11-10: a5c-ai/file-watcher-setup).
+    page_ref = skill_id if ("/" in name and skill_id) else name
+    click.echo(f"    {_dashboard_url(base_url)}/skills/{urllib.parse.quote(page_ref, safe='/')}")
 
 
 # ── add ─────────────────────────────────────────────────────────────────────
