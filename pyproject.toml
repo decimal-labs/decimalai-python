@@ -144,9 +144,15 @@ claude-agent-sdk = ["claude-agent-sdk>=0.2.166"]
 # provider extras are the ones the scaffold's `pip install "decimalai[pydantic-ai]"`
 # promises need no second install line (decimalai/cli/scaffold.py,
 # _PYDANTIC_AI_PROVIDERS).
-pydantic-ai = ["pydantic-ai-slim[openai,google,anthropic]>=2.56.0"]
-# Runtime extra for Google ADK (decimalai.adk.agent_config() and DecimalAIPlugin).
-adk = ["google-adk>=2.12.0"]
+#
+# PYTHON 3.11+, BY MARKER. pydantic-ai-slim 2.56 and google-adk 2.12 need Python 3.11. Without the
+# marker, `pip install "decimalai[adk]"` on 3.10 found no google-adk for this release and backtracked,
+# with no warning, to decimalai 0.13.9: the last release whose floor (google-adk>=2.0) 3.10 can meet,
+# without `skills add` or adk.agent_config() (cold walk, 2026-11-10). With it, 3.10 installs this release
+# without the framework, and agent_config() says Python 3.11 is needed (_framework_missing).
+pydantic-ai = ["pydantic-ai-slim[openai,google,anthropic]>=2.56.0; python_version >= '3.11'"]
+# Runtime extra for Google ADK (decimalai.adk.agent_config() and DecimalAIPlugin). Python 3.11+, above.
+adk = ["google-adk>=2.12.0; python_version >= '3.11'"]
 # Runtime extra for the Anthropic Messages API (decimalai.anthropic.agent_config()): the
 # SDK, and the OpenInference instrumentor that agent_config() turns on to trace its runs.
 # Floored at 1.13.0, the release the default suite runs against. From 1.14.0 the

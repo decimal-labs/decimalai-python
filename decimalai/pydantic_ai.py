@@ -205,9 +205,9 @@ def _require_pydantic_ai() -> None:
     try:
         import pydantic_ai  # noqa: F401
     except ImportError:
-        raise ImportError(
-            "agent_config() needs Pydantic AI: pip install \"decimalai[pydantic-ai]\""
-        ) from None
+        from ._extras import framework_missing
+
+        raise framework_missing("agent_config()", "Pydantic AI", "pydantic-ai") from None
 
 
 # ── the run's message ────────────────────────────────────────

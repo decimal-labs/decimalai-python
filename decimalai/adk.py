@@ -901,9 +901,9 @@ def _plugin_class() -> Any:
     try:
         from google.adk.plugins.base_plugin import BasePlugin
     except ImportError:
-        raise ImportError(
-            'DecimalAIPlugin needs Google ADK: pip install "decimalai[adk]"'
-        ) from None
+        from ._extras import framework_missing
+
+        raise framework_missing("DecimalAIPlugin", "Google ADK", "adk") from None
 
     class _DecimalAIPlugin(BasePlugin):
         """ADK BasePlugin that emits one DecimalAI RunTrace per invocation."""
@@ -2038,7 +2038,9 @@ def agent_config(
     try:
         import google.adk  # noqa: F401 — before any setup or network call
     except ImportError:
-        raise ImportError('agent_config() needs Google ADK: pip install "decimalai[adk]"') from None
+        from ._extras import framework_missing
+
+        raise framework_missing("agent_config()", "Google ADK", "adk") from None
     from ._agent import _open_prompt
 
     prompt = _open_prompt(agent_name, fallback)

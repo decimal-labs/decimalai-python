@@ -177,3 +177,38 @@ class TestCoreImportSurvivesMissingFrameworks:
         for mod in mods:
             monkeypatch.delitem(sys.modules, mod, raising=False)
             importlib.import_module(mod)
+
+
+class TestPython310Extras:
+    """`decimalai[adk]` on Python 3.10 silently installed decimalai 0.13.9 (cold walk, 2026-11-10):
+    google-adk 2.12 needs 3.11, so pip backtracked to the last release 3.10 could satisfy."""
+
+    def test_the_two_extras_carry_the_python_marker(self):
+        import pathlib
+        import tomllib
+
+        extras = tomllib.loads((pathlib.Path(__file__).parent.parent / "pyproject.toml").read_text())[
+            "project"]["optional-dependencies"]
+        for extra in ("adk", "pydantic-ai"):
+            assert all("python_version >= '3.11'" in req for req in extras[extra]), extra
+
+    @pytest.mark.parametrize("extra,framework", [("adk", "Google ADK"), ("pydantic-ai", "Pydantic AI")])
+    def test_on_310_the_error_names_python_311_not_the_install_line(self, extra, framework):
+        from decimalai._extras import framework_missing
+
+        err = framework_missing("agent_config()", framework, extra, version=(3, 10))
+        assert "needs Python 3.11 or newer; this is Python 3.10." in str(err)
+        assert "pip install" not in str(err)
+
+    def test_on_311_the_error_is_the_install_line(self):
+        from decimalai._extras import framework_missing
+
+        err = framework_missing("agent_config()", "Google ADK", "adk", version=(3, 11))
+        assert str(err) == 'agent_config() needs Google ADK: pip install "decimalai[adk]"'
+
+    def test_adk_agent_config_raises_it(self, monkeypatch):
+        import decimalai.adk as adk
+
+        _block(monkeypatch, "google.adk")
+        with pytest.raises(ImportError, match=r'decimalai\[adk\]|Python 3\.11'):
+            adk.agent_config("support", fallback="x")
