@@ -523,7 +523,7 @@ Delivery support differs per adapter — the asymmetry is structural (`load_skil
 | `decimalai.anthropic` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Tool Runner) or `run.tool_params` (`messages.create`) the `load_skill` tool; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.google_genai` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (automatic function calling) or `run.tool_params` (your own loop) the `load_skill` tool, answered by `run.tool_result(call)`; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
 | `decimalai.openai` | ✅ | ✅ | from `agent_config()`, one `support.run(message)` per user message: `run.system` carries the skill list, `run.tools` (Chat Completions) or `run.response_tools` (Responses API) the `load_skill` tool, answered by `run.tool_result(call)`; routed on the run's message; bodies arrive via `load_skill` unless the tool is off |
-| `decimalai.claude_agent_sdk` | ❌ disk-only | ❌ | tracing-only adapter; Claude Code loads skills itself: install them with `decimalai skills add` and load `.agents` as a plugin |
+| `decimalai.claude_agent_sdk` | ✅ | ✅ (MCP tool) | from `agent_config()`, one `support.run(question)` per query: `run.query()` sets the system prompt (the saved prompt, then the skill list) and adds the `load_skill` tool as an in-process MCP server; bodies arrive via `load_skill`. `skills_plugin()` is the separate disk path: Claude Code loads installed skills itself |
 | generic (`@decimalai.trace`) | ❌ disk-only | ❌ | no prompt-assembly hook; install skills with `decimalai skills add` for a runtime that loads them from disk |
 
 Honest-measurement note: list-only (loader on, no body injection, no `load_skill` tool) means the model sees that a skill *exists* but never its content. Usage from that channel counts as **offered**, not **activated** — don't expect activation stats from prompt-injection-only setups.
@@ -681,7 +681,7 @@ decimalai datasets push-to-hub ds_abc123 my-org/support-agent-sft
 | LangChain / LangGraph | ✅ | `agent_config(name).middleware` in `create_agent` (tracing only: `init(langchain=True)`) |
 | OpenAI Agents SDK | ✅ | `agent_config(name)` (tracing only: `init(openai_agents=True)`) |
 | Google ADK | ✅ (native) | `agent_config(name)` + `DecimalAIPlugin()` in `App(plugins=[...])` |
-| Anthropic Claude Agent SDK | ✅ (native) | `init(claude_agent_sdk=True)` |
+| Claude Agent SDK | ✅ | `agent_config(name)` from `decimalai.claude_agent_sdk`, one `support.run(question)` per query; traces its own runs (tracing only: `init(claude_agent_sdk=True)`; Claude Code's own loader: `skills_plugin()`) |
 | Pydantic AI | ✅ | `agent_config(name)` as `Agent(capabilities=[...])`; traces its own runs |
 | Anthropic Messages API | ✅ | `agent_config(name)`, one `support.run(message)` per user message; traces its own runs |
 | OpenAI SDK (Chat Completions / Responses API) | ✅ | `agent_config(name)` from `decimalai.openai`, one `support.run(message)` per user message; traces its own runs |
