@@ -354,9 +354,16 @@ class TestSearch:
          "No with-and-without test result yet."),
         ({"lift_cases": 20, "lift_pass_rate_pct": 25.0, "pass_rate_delta_pts": -10.0},
          "Passed 5 of 20 test cases with the skill, and 7 of 20 without it."),
-        # The page's Math.round: 12.5 is 13, where Python's round() says 12.
+        # 50% of 25 is 12.5 passes, which no run had: a rate whose count is not whole gets rates.
         ({"lift_cases": 25, "lift_pass_rate_pct": 50.0, "pass_rate_delta_pts": 10.0},
-         "Passed 13 of 25 test cases with the skill, and 10 of 25 without it."),
+         "Passed 50.0% of its test cases with the skill, and 40.0% without it."),
+        # open-gsd-gsd-workspace as the registry sent it before 2026-11-11: 12 and 5 of 23, paired
+        # with the 16 comparable cases. Multiplying printed "8 of 16 ... 3 of 16".
+        ({"lift_cases": 16, "lift_pass_rate_pct": 52.2, "pass_rate_delta_pts": 30.43},
+         "Passed 52.2% of its test cases with the skill, and 21.8% without it."),
+        # The same run paired with the 23 cases its rate is counted over.
+        ({"lift_cases": 23, "lift_pass_rate_pct": 52.2, "pass_rate_delta_pts": 30.43},
+         "Passed 12 of 23 test cases with the skill, and 5 of 23 without it."),
     ])
     def test_the_test_result_is_the_pages_sentence_or_says_there_is_none(self, env, summary, sentence):
         env.registry.search_cards = [_card(benchmark_summary=summary)]

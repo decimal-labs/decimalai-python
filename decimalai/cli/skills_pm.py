@@ -521,6 +521,24 @@ def _assign_to_agent(project: Any, router: Any, ref: str, agent: str, *, yes: bo
 _COUNTS_FROM_CHECKS_SINCE = "2026-08-01"
 
 
+# The registry rounds the rate to 0.1 pts and the lift to 0.01, so a real count lands within a few
+# hundredths of a whole number.
+_WHOLE = 0.06
+
+
+def _counts_are_whole(rate: float, lift: float, cases: int) -> bool:
+    """True when ``rate`` and ``rate - lift`` are real counts out of ``cases``.
+
+    Until the registry fix of 2026-11-11 the summary paired some rates with fewer cases than they
+    were counted over (open-gsd-gsd-workspace: 52.2% and +30.43 pts are 12 and 5 of 23; paired with
+    16 they read as "8 of 16 ... 3 of 16", counts that never happened), and a rate from the
+    calibration recompute has no stored denominator at all. A count that does not come out whole
+    was never a count.
+    """
+    with_skill, without = rate / 100 * cases, (rate - lift) / 100 * cases
+    return abs(with_skill - round(with_skill)) <= _WHOLE and abs(without - round(without)) <= _WHOLE
+
+
 def _test_result(item: Dict[str, Any]) -> str:
     """The sentence a skill's page leads with, from the registry's own summary."""
     bench = item.get("benchmark_summary")
@@ -530,6 +548,10 @@ def _test_result(item: Dict[str, Any]) -> str:
             completed = bench.get("completed_at")
             if isinstance(completed, str) and completed < _COUNTS_FROM_CHECKS_SINCE:
                 return "Tested before August 2026, when results were counted differently, so no count is shown."
+            if not _counts_are_whole(rate, lift, cases):
+                # No count rather than an invented one: the rates are real, the pairing is not.
+                return (f"Passed {rate:.1f}% of its test cases with the skill, "
+                        f"and {rate - lift:.1f}% without it.")
             # Rounds as the page does (half up), so the two never disagree on a count.
             with_skill = int(rate / 100 * cases + 0.5)
             without = int((rate - lift) / 100 * cases + 0.5)
