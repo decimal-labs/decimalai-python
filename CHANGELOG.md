@@ -6,6 +6,22 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.28.3] — 2026-11-11
+
+### Fixed
+
+- `decimalai skills search` no longer prints test counts that never happened. It multiplied a
+  skill's with-skill pass rate by a case count that was sometimes counted differently, so
+  open-gsd-gsd-workspace read "Passed 8 of 16 ... and 3 of 16 without it" for a run that passed 12
+  of 23 and 5 of 23. When a count would not come out whole, it now prints the two rates instead.
+  (The registry now sends the matching count as well.)
+- `decimalai skills add` links a namespaced skill's page by its id. "Steps for other frameworks"
+  linked `https://app.decimal.ai/skills/<owner>/<name>`, a 404: the page's address is one path
+  segment. A plain name links by name as before.
+- README: the Claude Agent SDK adapter's `agent_config(name)` and its `load_skill` tool are
+  documented; two rows still called it tracing-only. Two out-of-date FAQ and examples lines
+  corrected.
+
 ## [0.28.2] — 2026-11-10
 
 ### Fixed
