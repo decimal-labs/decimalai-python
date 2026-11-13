@@ -6,6 +6,25 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.28.4] — 2026-11-14
+
+### Fixed
+
+- On Python 3.10, `pip install "decimalai[adk]"` and `pip install "decimalai[pydantic-ai]"`
+  installed decimalai 0.13.9 with no warning. google-adk 2.12 and pydantic-ai-slim 2.56 need
+  Python 3.11, so pip went back through older releases to the last one whose framework floor
+  3.10 could meet, which has no `skills add` and no `adk.agent_config()`. Both extras now apply
+  only on Python 3.11 or newer: on 3.10 you get this release, and `agent_config()` says the
+  framework needs Python 3.11.
+
+### Changed
+
+- The framework registry has an `evaluate()` column: ✅ for the OpenAI Agents SDK, the one
+  framework whose agent `decimalai.evaluate()` can run, and "—" elsewhere. It is in the JSON
+  too, as a new field. The README's Supported Frameworks section now lists the frameworks and
+  links to the docs' capability table, generated from this registry, instead of keeping its
+  own copy, which had drifted.
+
 ## [0.28.3] — 2026-11-11
 
 ### Fixed
