@@ -21,6 +21,15 @@ def _block(monkeypatch, *names):
         monkeypatch.setitem(sys.modules, name, None)
 
 
+def _extra_or_311(extra):
+    """What a missing Google ADK or Pydantic AI error says on this interpreter. Both need
+    Python 3.11, so on 3.10 the error names that instead of an install line that would
+    install nothing (see TestPython310Extras)."""
+    if sys.version_info >= (3, 11):
+        return rf'decimalai\[{extra}\]'
+    return r'needs Python 3\.11 or newer'
+
+
 class TestRaisingGuards:
     """instrument() paths that hard-require the framework raise, naming the extra."""
 
@@ -77,9 +86,9 @@ class TestWarningGuards:
         monkeypatch.setattr(adk, "_PluginClass", None)
         monkeypatch.setattr(agent_mod, "_open_prompt",
                             lambda *a: pytest.fail("set up before the import check"))
-        with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
+        with pytest.raises(ImportError, match=_extra_or_311("adk")):
             adk.agent_config("support")
-        with pytest.raises(ImportError, match=r'decimalai\[adk\]'):
+        with pytest.raises(ImportError, match=_extra_or_311("adk")):
             adk.DecimalAIPlugin()
 
     def test_pydantic_ai_load_agent_names_the_extra_before_any_call(self, monkeypatch):
@@ -91,7 +100,7 @@ class TestWarningGuards:
         _block(monkeypatch, "pydantic_ai")
         monkeypatch.setattr(agent_mod, "_open_prompt",
                             lambda *a: pytest.fail("set up before the import check"))
-        with pytest.raises(ImportError, match=r'decimalai\[pydantic-ai\]'):
+        with pytest.raises(ImportError, match=_extra_or_311("pydantic-ai")):
             pai.agent_config("support")
 
     def test_langchain_agent_config_names_the_extra_before_any_call(self, monkeypatch):
@@ -185,7 +194,11 @@ class TestPython310Extras:
 
     def test_the_two_extras_carry_the_python_marker(self):
         import pathlib
-        import tomllib
+
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10: tomllib arrived in 3.11, and pytest needs tomli there
+            import tomli as tomllib
 
         extras = tomllib.loads((pathlib.Path(__file__).parent.parent / "pyproject.toml").read_text())[
             "project"]["optional-dependencies"]
