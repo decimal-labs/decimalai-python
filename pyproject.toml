@@ -330,7 +330,13 @@ conformance-tests = [
     # Its OpenAI chat client, for the live native check (tests/native/test_native_live.py);
     # 1.16.0 is the newest that accepts agent-framework-core 1.21.
     "agent-framework-openai>=1.16.0",
-    "pydantic-ai-harness>=0.57.0",  # 0.57 keeps a user-only skill out of the model's catalog
+    # 0.57 keeps a user-only skill out of the model's catalog. The <0.68 cap guards a known
+    # break, set 2026-11-14 so 0.28.4 could publish: 0.68.0 (2026-11-12) changed what
+    # load_capability returns and refuses a leading-slash resource path as outside the project
+    # root, which fails nine pydantic-ai-harness tests here. This is a test-only package; users
+    # never install it through decimalai. Remove the cap once the SDK's harness observer
+    # (decimalai/pydantic_ai_harness.py) and tests/native_loaders work with 0.68.
+    "pydantic-ai-harness>=0.57.0,<0.68",
 ]
 # HERMETIC conformance, openai 2 world: the drivers whose framework cannot be
 # installed beside openai>=3, plus the unit tests that need those packages (the
