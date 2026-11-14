@@ -161,8 +161,8 @@
       "openai-agents": "0.23.1"
     },
     "pydantic-ai-harness": {
-      "pydantic-ai-harness": "0.56.0",
-      "pydantic-ai-slim": "2.56.0"
+      "pydantic-ai-harness": "0.68.0",
+      "pydantic-ai-slim": "2.68.0"
     },
     "strands-agents": {
       "strands-agents": "1.60.0"

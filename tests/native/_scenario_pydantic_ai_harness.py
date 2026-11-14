@@ -45,7 +45,10 @@ def _export_spans() -> None:
 #: A loaded skill's text as Pydantic AI 2.63+ hands it to the model: an instruction change on
 #: the request after the load, rendered as this element (``<system>``-tagged user text on a
 #: model with no mid-conversation system role). Before 2.63 it was the load's own result.
-LOADED_TEXT = re.compile(r'<context id="capability:[^"]*">\n(.*?)\n</context>', re.S)
+#: 2.68 (pinned by pydantic-ai-harness 0.68) renamed the element from ``context`` to
+#: ``pyai:context``; the load's result and the run's history did not change.
+LOADED_TEXT = re.compile(
+    r'<(?P<tag>(?:pyai:)?context) id="capability:[^"]*">\n(?P<text>.*?)\n</(?P=tag)>', re.S)
 
 
 def _received(messages) -> List[Any]:
@@ -61,7 +64,7 @@ def _received(messages) -> List[Any]:
                     content = p.content
                     out.append(content.get("instructions") if isinstance(content, dict) else content)
                 elif isinstance(getattr(p, "content", None), str):
-                    out.extend(LOADED_TEXT.findall(p.content))
+                    out.extend(m.group("text") for m in LOADED_TEXT.finditer(p.content))
             return out
     return []
 
