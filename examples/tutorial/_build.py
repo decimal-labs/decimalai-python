@@ -94,6 +94,7 @@ SDKS = {
     "openai_agents": {
         "label": "OpenAI Agents SDK",
         "extra": "openai-agents",
+        "measure": True,
         "provider": "OPENAI_API_KEY",
         "provider_name": "OpenAI",
         "provider_url": "https://platform.openai.com/api-keys",
@@ -250,6 +251,92 @@ def answer(question):
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
 }
+
+
+# Part 5 of the docs tutorial, in the notebook: the same cases and checks as measure-it.mdx's
+# cases.jsonl and measure.py. evaluate() takes OpenAI Agents SDK agents only, so only that
+# notebook has it, and a notebook awaits evaluate_async() (evaluate() refuses a running loop).
+MEASURE_CASES = [
+    {"id": "kettle-refund", "input": "I opened my kettle from ORD-1001 and it works, but I don't want it. How much do I get back if I return it?", "answer": "$46.55", "skill": "acme-returns-policy"},
+    {"id": "start-a-return", "input": "How do I start a return for my kettle from ORD-1001?", "answer": "acme.example/returns", "skill": "acme-returns-policy"},
+    {"id": "refund-timing", "input": "Once Acme has my returned kettle from ORD-1001, how long until the refund reaches my card?", "answer": "5 business days", "skill": "acme-returns-policy"},
+    {"id": "label-timing", "input": "How soon will I get a return label for my kettle from ORD-1001?", "answer": "1 business day", "skill": "acme-returns-policy"},
+    {"id": "double-charge", "input": "I was charged twice for order ORD-1002. Can you fix it?", "action": "flag_for_billing", "order_id": "ORD-1002", "skill": "billing-dispute-resolution"},
+    {"id": "delete-account", "input": "Please delete my account and all my data today.", "action": "start_account_deletion", "skill": "account-deletion-verification-policy"},
+    {"id": "kettle-dead", "input": "My kettle from order ORD-1001 won't turn on.", "asks": 3, "skill": "diagnostic-triage-questions"},
+    {"id": "where-is-it", "input": "Where is my order ORD-1001?", "answer": "delivered"},
+]
+
+MEASURE_CHECKS = '''# ── measure it: the cases and the checks ────────────────────────────────
+import json
+import decimalai
+from decimalai.evals import TraceData, eval
+
+# $46.55 is the kettle's refund at the 5% fee from Part 3. Kept another fee? Use your agent's figure.
+CASES = [
+''' + "".join(f"    {case!r},\n" for case in MEASURE_CASES) + ''']
+with open("cases.jsonl", "w") as f:
+    f.write("".join(json.dumps(case) + "\\n" for case in CASES))
+
+DONE = {"flag_for_billing": "Flagged", "start_account_deletion": "Sent"}
+
+
+@eval
+def gave_the_answer(trace: TraceData):
+    answer = trace.case.get("answer")
+    return None if answer is None else answer in str(trace.output)
+
+
+@eval
+def opened_the_right_skill(trace: TraceData):
+    skill = trace.case.get("skill")
+    return None if skill is None else skill in trace.skills_loaded
+
+
+@eval
+def did_the_action(trace: TraceData):
+    action = trace.case.get("action")
+    if action is None:
+        return None
+    # What the tool returned, for the right order. A reply saying it happened isn't enough.
+    return any(
+        call.name == action
+        and call.args.get("order_id") == trace.case.get("order_id")
+        and str(call.result).startswith(DONE[action])
+        for call in trace.tool_calls
+    )
+
+
+@eval
+def asked_questions(trace: TraceData):
+    asks = trace.case.get("asks")
+    return None if asks is None else str(trace.output).count("?") >= asks
+
+
+CHECKS = [gave_the_answer, opened_the_right_skill, did_the_action, asked_questions]
+print(f"{len(CASES)} cases in cases.jsonl, {len(CHECKS)} checks")'''
+
+MEASURE_NEEDS_KEY = ('    print("Measuring needs your DECIMAL_API_KEY: evaluate() runs your agent as DecimalAI serves it. "\n'
+                     '          "Add the secret, then run the notebook again from the top.")')
+
+MEASURE_SERVED = f'''# ── measure it: the agent as DecimalAI serves it ───────────────────────────
+# One case at a time keeps a free plan's key inside its request limit.
+if not KEYED:
+{MEASURE_NEEDS_KEY}
+else:
+    served = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS, concurrency=1)
+    print(served)'''
+
+MEASURE_WITHOUT = f'''# ── measure it: the same cases with a skill left out ─────────────────────────
+if not KEYED:
+{MEASURE_NEEDS_KEY}
+else:
+    without = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS,
+                                             exclude_skills=["acme-returns-policy"], concurrency=1)
+    print(without.compare(served))
+    no_triage = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS,
+                                               exclude_skills=["diagnostic-triage-questions"], concurrency=1)
+    print(no_triage.compare(served))'''
 
 
 def _s(source):
@@ -435,8 +522,28 @@ async def reply(question):
            "it, add `DECIMAL_API_KEY` and run the notebook again from the top (**Runtime → Restart session**, "
            "then **Run all**).\n"
            "\n"
-           f"Next: [4. See what it did]({DOCS}/see-what-it-did)."),
+           f"Next: [4. See what it did]({DOCS}/see-what-it-did), in the dashboard. "
+           + ("[Part 5](" + DOCS + "/measure-it) runs at the end of this notebook."
+              if sdk.get("measure") else
+              f"[Part 5]({DOCS}/measure-it) measures with `evaluate()`, which runs OpenAI Agents SDK agents: "
+              "use [that notebook](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/"
+              "examples/tutorial/order_support_openai_agents.ipynb) for it.")),
     ]
+    if sdk.get("measure"):
+        cells += [
+            md("## 6. Measure it\n"
+               "\n"
+               f"[Part 5]({DOCS}/measure-it) of the tutorial, here: eight questions, four checks, and the same "
+               "cases run with and without a skill. Come back to it after Part 4. It needs your `DECIMAL_API_KEY`, "
+               "and it runs your agent once per case, 24 times in all, on your OpenAI key.\n"
+               "\n"
+               "`did_the_action` is the check to copy into your own work: a model can say it flagged a charge "
+               "without calling the tool, so this reads what the tool really returned."),
+            code(MEASURE_CHECKS),
+            code(MEASURE_SERVED),
+            md("Leave a skill out and run the same cases again. Production keeps serving what it served."),
+            code(MEASURE_WITHOUT),
+        ]
     for i, cell in enumerate(cells):
         cell["id"] = f"{key}-{i:02d}"  # nbformat 4.5 wants one; stable, so a rebuild diffs cleanly
     return path, {"cells": cells, "metadata": META, "nbformat": 4, "nbformat_minor": 5}
