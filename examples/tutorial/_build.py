@@ -26,6 +26,9 @@ WHERE THE NOTEBOOK DIFFERS FROM main.py, AND WHY.
 - OpenAI SDK and Anthropic API: the loop is a function, `answer(question)`, called in a worker
   thread (asyncio.to_thread). decimalai's sync `with support.run(...)` must not be opened on a
   thread that is running an event loop, and a notebook cell is one.
+- LangChain: the same, `answer(question)` in a worker thread, for agent.invoke()'s sync run start.
+  The agent is built inside answer(), not at the top as main.py has it: create_agent("openai:...")
+  raises without OPENAI_API_KEY, and the notebook must say it skipped instead.
 
 KEYS. Colab Secrets first (they never enter the notebook file), then the environment, then a
 hidden prompt where something can answer it. A provider key is required to get a reply;
@@ -250,6 +253,38 @@ def answer(question):
     return "".join(block.text for block in reply.content if block.type == "text")''',
         "reply": '''    return await asyncio.to_thread(answer, question)''',
     },
+    "langchain": {
+        "label": "LangChain",
+        "extra": "langchain",
+        "packages": " langchain-openai",  # create_agent's "openai:..." model, as the docs' install line
+        "provider": "OPENAI_API_KEY",
+        "provider_name": "OpenAI",
+        "provider_url": "https://platform.openai.com/api-keys",
+        "program": f'''from langchain.agents import create_agent
+from langchain.tools import tool
+from decimalai.langchain import agent_config
+
+{ORDERS}
+
+
+{tools("@tool")}
+
+{CONFIG}
+
+
+def answer(question):
+    # main.py's program, as a function: the next cell runs it in a worker thread. main.py builds the
+    # agent at the top; here it is built when you ask, because create_agent() raises without an
+    # OPENAI_API_KEY, and ask() has checked the key before this runs.
+    agent = create_agent(
+        "openai:gpt-5.4-mini",
+        tools=TOOLS,                      # your tools; the middleware adds load_skill
+        middleware=[support.middleware],  # the prompt and a menu of skills
+    )
+    result = agent.invoke({{"messages": [{{"role": "user", "content": question}}]}})
+    return result["messages"][-1].text''',
+        "reply": '''    return await asyncio.to_thread(answer, question)''',
+    },
 }
 
 
@@ -463,7 +498,7 @@ async def reply(question):
            "\n"
            f"This is the DecimalAI tutorial's support agent, the one you ran on [the docs page]({DOCS}/try-it), "
            f"running here in your own code with nothing to install. It is [Part 3]({DOCS}/run-it-in-your-code) of the "
-           f"tutorial as a notebook: the same program the docs show for the {sdk['label']}.\n"
+           f"tutorial as a notebook: the same program the docs show on their {sdk['label']} tab.\n"
            "\n"
            "**It runs one of two ways, depending on one secret:**\n"
            "\n"
@@ -485,7 +520,7 @@ async def reply(question):
            "Not in Colab? The cell reads the same names from the environment, or asks for the provider key."),
         code(keys),
         md("## 2. Install" + (f"\n\n{sdk['install_note']}" if "install_note" in sdk else "")),
-        code(f'!pip install -q "decimalai[{sdk["extra"]}]>={sdk.get("floor", "0.26")}"'),
+        code(f'!pip install -q "decimalai[{sdk["extra"]}]>={sdk.get("floor", "0.26")}"{sdk.get("packages", "")}'),
         md("## 3. The project folder\n"
            "\n"
            "Keyless, `agent_config()` reads the agent's skills from the project's files, so this adds the four "

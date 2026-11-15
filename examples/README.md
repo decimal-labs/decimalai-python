@@ -14,6 +14,7 @@ Runnable examples demonstrating how to use [DecimalAI](https://decimal.ai): a re
 | [order_support_claude_agent_sdk](tutorial/order_support_claude_agent_sdk.ipynb) | Claude Agent SDK | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_claude_agent_sdk.ipynb) |
 | [order_support_openai](tutorial/order_support_openai.ipynb) | OpenAI SDK (Responses API) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_openai.ipynb) |
 | [order_support_anthropic](tutorial/order_support_anthropic.ipynb) | Anthropic API (Tool Runner) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_anthropic.ipynb) |
+| [order_support_langchain](tutorial/order_support_langchain.ipynb) | LangChain (`create_agent`) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/examples/tutorial/order_support_langchain.ipynb) |
 
 ## Start here — no account, no install
 

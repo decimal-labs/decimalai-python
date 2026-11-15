@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 HERE = Path(__file__).resolve().parents[1] / "examples" / "tutorial"
-SDKS = ("openai_agents", "openai", "anthropic")
+SDKS = ("openai_agents", "openai", "anthropic", "langchain")
 QUESTION = "I opened my kettle from ORD-1001 and it works, but I don't want it. How much do I get back if I return it?"
 SAVED = "An older saved prompt says billing will follow up."
 ANSWER = "You'd get back **$41.65**.\n\nStart at acme.example/returns."
@@ -85,6 +85,27 @@ def test_actual_notebook_loop_passes_the_saved_prompt_as_it_is_and_returns_the_r
         env["Runner"] = Runner
         def run():
             return asyncio.run(env["reply"](QUESTION))
+    elif sdk == "langchain":
+        # The prompt reaches the model through agent_config()'s middleware, not the notebook: the
+        # loop's part is to hand create_agent that middleware and the four tools, and send the
+        # question as the user's message.
+        middleware = object()
+        env["support"].middleware = middleware
+
+        def create_agent(model, *, tools, middleware):
+            assert [fn.__name__ for fn in tools] == ["lookup_order", "flag_for_billing", "lock_account",
+                                                     "start_account_deletion"]
+            given = middleware
+
+            def invoke(state):
+                assert state == {"messages": [{"role": "user", "content": QUESTION}]}
+                if given == [env["support"].middleware]:
+                    seen.append(SAVED)
+                return {"messages": [SimpleNamespace(text="(a tool call)"), SimpleNamespace(text=ANSWER)]}
+            return SimpleNamespace(invoke=invoke)
+        env["create_agent"] = create_agent
+        def run():
+            return env["answer"](QUESTION)
     else:
         system = SAVED if sdk == "openai" else [{"type": "text", "text": SAVED}]
         value = SimpleNamespace(system=system, message={"role": "user", "content": QUESTION},
@@ -135,20 +156,24 @@ def test_the_model_is_told_not_to_claim_an_action_and_the_reader_is_pointed_at_t
     assert "A model can say it did something without doing it" in text and "/measure-it" in text
 
 
-def test_openai_notebook_can_start_and_skip_with_a_blank_provider_key(monkeypatch, capsys):
+@pytest.mark.parametrize("sdk", ("openai", "langchain"))
+def test_notebook_can_start_and_skip_with_a_blank_provider_key(sdk, monkeypatch, capsys):
+    """OpenAI() and create_agent("openai:...") both raise without OPENAI_API_KEY, so neither may run
+    before ask() has checked the key: the program cell defines, and the reply cell says it skipped."""
     monkeypatch.setenv("OPENAI_API_KEY", "")
     constructors = []
 
-    def OpenAI():
+    def refuse(*args, **kwargs):
         constructors.append(True)
         raise RuntimeError("A provider client cannot be constructed with a blank key")
 
-    env = {"inspect": inspect, "json": json, "os": os, "asyncio": asyncio, "OpenAI": OpenAI,
-           "agent_config": lambda name, **kwargs: SimpleNamespace(name=name, tools=[])}
-    tree = ast.parse(program("openai"))
+    env = {"inspect": inspect, "json": json, "os": os, "asyncio": asyncio, "OpenAI": refuse,
+           "create_agent": refuse, "tool": lambda fn: fn,
+           "agent_config": lambda name, **kwargs: SimpleNamespace(name=name, tools=[], middleware=object())}
+    tree = ast.parse(program(sdk))
     body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
     exec(compile(ast.Module(body=body, type_ignores=[]), "blank-key notebook setup", "exec"), env)
-    ask_source = next("".join(cell["source"]) for cell in notebook("openai")["cells"]
+    ask_source = next("".join(cell["source"]) for cell in notebook(sdk)["cells"]
                       if cell["cell_type"] == "code" and "async def ask" in "".join(cell["source"]))
     body = [node for node in ast.parse(ask_source).body if isinstance(node, ast.AsyncFunctionDef)]
     exec(compile(ast.Module(body=body, type_ignores=[]), "blank-key notebook ask", "exec"), env)
