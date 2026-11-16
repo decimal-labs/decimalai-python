@@ -242,8 +242,9 @@ def test_rendered_input_and_output_populated_from_openinference_messages():
         {"role": "system", "content": "You are City Analyst. You are terse."},
         {"role": "user", "content": "Use the population_lookup tool for Paris."},
         # The assistant turn made a tool call and carries no content; it stays
-        # in the transcript so turn order survives.
-        {"role": "assistant", "content": ""},
+        # in the transcript so turn order survives, and names the tool it called.
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "population_lookup", "arguments": "{}"}}]},
         {"role": "tool", "content": "Paris has a population of 2,148,000."},
     ]
     assert call.output == {

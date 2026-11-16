@@ -2399,6 +2399,35 @@ _INDEXED_MSG_NAMESPACE_RE = re.compile(
 
 _DEFAULT_ROLE = {"input": "user", "output": "assistant"}
 
+# The tool calls a message made, which OpenInference records on the message itself
+# (…{i}.message.tool_calls.{j}.tool_call.{id,function.name,function.arguments}) on a
+# request's earlier turns as well as on the response. A Responses API ``function_call``
+# item arrives as an assistant message carrying nothing else.
+_MSG_TOOL_CALL_RES = {
+    direction: re.compile(
+        rf"^llm\.{direction}_messages\.(\d+)\.message\.tool_calls\.(\d+)\.tool_call\."
+        r"(id|function\.name|function\.arguments)$"
+    )
+    for direction in ("input", "output")
+}
+
+
+def _chat_tool_calls(by_index: Dict[int, Dict[str, str]]) -> List[Dict[str, Any]]:
+    """One message's tool calls, in the Chat Completions shape the trace view reads
+    (``openai_agents`` records a reply's calls the same way). OpenInference leaves out
+    the arguments of a call that has none, so they read ``{}``."""
+    calls: List[Dict[str, Any]] = []
+    for j in sorted(by_index):
+        fields = by_index[j]
+        name = fields.get("function.name")
+        if not name:
+            continue
+        call: Dict[str, Any] = {"id": fields["id"]} if fields.get("id") else {}
+        call["type"] = "function"
+        call["function"] = {"name": name, "arguments": fields.get("function.arguments") or "{}"}
+        calls.append(call)
+    return calls
+
 # Current GenAI semconv carries the whole conversation as ONE attribute holding
 # a JSON array — `gen_ai.input.messages` / `gen_ai.output.messages`, each entry
 # `{"role", "parts": [...]}` — rather than the indexed keys above. AG2 emits
@@ -2538,16 +2567,25 @@ def _messages_from_attrs(
     ``{"role", "content"}`` dicts — the shape the other adapters normalize to —
     or None when the span carries neither.
 
-    A message whose content is absent (an assistant turn that only made tool
-    calls) is kept with an empty content so turn order survives; its tool calls
-    are carried separately on ``LlmCallRecord.tool_calls``.
+    A message that made tool calls also carries them, as ``tool_calls`` in the
+    Chat Completions shape (:func:`_chat_tool_calls`), so a request's earlier
+    turns say which tool the model called and with what. Without them a turn
+    that only called a tool read as an empty assistant message. Its content
+    stays empty, so turn order survives and :func:`_ask_from_rendered_input`
+    still tells a tool result from a question.
     """
     found: Dict[int, Dict[str, str]] = {}
     parts: Dict[int, Dict[int, str]] = {}
+    call_fields: Dict[int, Dict[int, Dict[str, str]]] = {}
     for key, val in attrs.items():
         part = _MSG_PART_RES[direction].match(key)
         if part:
             parts.setdefault(int(part.group(1)), {})[int(part.group(2))] = str(val)
+            continue
+        call = _MSG_TOOL_CALL_RES[direction].match(key)
+        if call:
+            call_fields.setdefault(int(call.group(1)), {}).setdefault(
+                int(call.group(2)), {})[call.group(3)] = str(val)
             continue
         for pattern in _MSG_KEY_RES[direction]:
             m = pattern.match(key)
@@ -2558,18 +2596,27 @@ def _messages_from_attrs(
         found.setdefault(idx, {}).setdefault(
             "content", "".join(by_part[j] for j in sorted(by_part))
         )
+    tool_calls = {idx: calls for idx, by_call in call_fields.items()
+                  if (calls := _chat_tool_calls(by_call))}
+    for idx in tool_calls:
+        found.setdefault(idx, {})
     if not found:
         return _semconv_messages_from_attrs(attrs, direction)
-    return [
-        {
+    messages: List[Dict[str, Any]] = []
+    for idx in sorted(found):
+        fields = found[idx]
+        message: Dict[str, Any] = {
             # A message carrying a tool_call_id is a tool's result, whatever role the
             # instrumentor gave it (Anthropic's tool_result travels in a user turn).
-            "role": "tool" if found[idx].get("tool_call_id")
-            else (found[idx].get("role") or _DEFAULT_ROLE[direction]),
-            "content": found[idx].get("content", ""),
+            "role": "tool" if fields.get("tool_call_id")
+            else (fields.get("role") or ("assistant" if idx in tool_calls
+                                         else _DEFAULT_ROLE[direction])),
+            "content": fields.get("content", ""),
         }
-        for idx in sorted(found)
-    ]
+        if idx in tool_calls:
+            message["tool_calls"] = tool_calls[idx]
+        messages.append(message)
+    return messages
 
 
 #: The instrumentation scope of the Anthropic SDK's own spans (anthropic >= 1.14).
@@ -2827,7 +2874,13 @@ def _output_message_from_attrs(attrs: Dict[str, Any]) -> Optional[Dict[str, Any]
     """The response message for ``LlmCallRecord.output``."""
     messages = _messages_from_attrs(attrs, "output")
     if messages:
-        return messages[0]
+        # The Responses API returns each function call as an output item of its own,
+        # which OpenInference records as a message of its own. The reply is one turn,
+        # so it carries every call, as ``LlmCallRecord.tool_calls`` does.
+        calls = [call for message in messages for call in message.get("tool_calls", ())]
+        if len(messages) == 1 or not calls:
+            return messages[0]
+        return {**messages[0], "tool_calls": calls}
     content = _content_from_attrs(attrs, "output")
     if content is None:
         return None

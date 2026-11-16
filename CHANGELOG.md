@@ -15,6 +15,14 @@ and patch releases are fixes.
   `skills_loads_watched`, set when DecimalAI watched the framework's loader (Claude Agent SDK,
   ADK, Strands, CrewAI and the other native loaders). A run with a Router decision (`routing_id`)
   already shows None with any SDK version: the platform reads the id as the same sign.
+- A trace says which tool each model turn called, and with what, for the OpenAI SDK and anything
+  else OpenInference traces (CrewAI, LlamaIndex, the Anthropic SDK through OpenInference). A turn
+  that only called a tool was recorded as an empty assistant message, so the dashboard's **LLM
+  Call** showed what `lookup_order` returned but not that it was called, or with `ORD-1001`. Each
+  message in `rendered_input` that made calls now carries them as `tool_calls`
+  (`{"id", "type": "function", "function": {"name", "arguments"}}`), and so does a reply's
+  `output`, with every call of a Responses API reply that called several tools at once. The
+  message's text is unchanged (empty for a turn that only called tools).
 
 ## [0.29.0] — 2026-11-16
 

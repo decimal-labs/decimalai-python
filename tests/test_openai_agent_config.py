@@ -648,6 +648,59 @@ def test_a_responses_run_is_one_trace_with_its_calls(traced):
     assert trace.agent_name == "support" and len(trace.llm_calls) == 2
 
 
+def docs_responses_loop(client, run):
+    """Part 3's OpenAI SDK program: the whole conversation sent each turn, the model's
+    output items (SDK objects) added back to it as they came."""
+    items = [run.message]
+    while True:
+        response = client.responses.create(model="gpt-5.4-mini", instructions=run.system,
+                                           input=items, tools=[LOOKUP_ORDER_RESPONSES, *run.response_tools])
+        items += response.output
+        calls = [item for item in response.output if item.type == "function_call"]
+        if not calls:
+            return response.output_text
+        for call in calls:
+            items.append(run.tool_result(call) or {
+                "type": "function_call_output", "call_id": call.call_id, "output": "{'item': 'kettle'}"})
+
+
+def _called(message):
+    return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in message.get("tool_calls", ())]
+
+
+def test_a_responses_run_records_which_tool_each_turn_called_and_with_what(traced):
+    """The trace view's LLM Call shows a request's earlier turns from rendered_input. A turn
+    that only called a tool used to be recorded as an empty assistant message: the reader saw
+    what lookup_order returned, not that it was called, or with which order id."""
+    _provider, sent = traced
+    support = do.agent_config("support")
+    stub = OpenAIStub(("tool", "lookup_order"), ("call", "damaged-item"), "answer")
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        assert docs_responses_loop(stub.client(), run) == "done"
+    (trace,) = sent
+    first, _second, last = trace.llm_calls
+    assert _called(first.output) == [("lookup_order", {"order_id": "ORD-1"})]
+    turns = [(m["role"], _called(m)) for m in last.rendered_input if m["role"] in ("assistant", "tool")]
+    assert turns == [("assistant", [("lookup_order", {"order_id": "ORD-1"})]), ("tool", []),
+                     ("assistant", [("load_skill", {"name": "damaged-item"})]), ("tool", [])]
+    calls = [m for m in last.rendered_input if m.get("tool_calls")]
+    assert [m["content"] for m in calls] == ["", ""], "a turn that only called a tool says nothing"
+    assert [m["tool_calls"][0]["id"] for m in calls] == ["call_1", "call_2"]
+    assert last.output == {"role": "assistant", "content": "done"}
+
+
+def test_a_chat_completions_run_records_the_calls_of_its_earlier_turns(traced):
+    _provider, sent = traced
+    support = do.agent_config("support")
+    with support.run("It arrived cracked.", variables=SAM) as run:
+        chat_loop(OpenAIStub(("tool", "lookup_order"), "answer").client(), run)
+    (trace,) = sent
+    first, last = trace.llm_calls
+    assert _called(first.output) == [("lookup_order", {"order_id": "ORD-1"})]
+    (asked,) = [m for m in last.rendered_input if m["role"] == "assistant"]
+    assert _called(asked) == [("lookup_order", {"order_id": "ORD-1"})]
+
+
 def test_a_run_whose_calls_were_made_after_the_block_warns_once(traced, caplog):
     _provider, sent = traced
     support = do.agent_config("support")
