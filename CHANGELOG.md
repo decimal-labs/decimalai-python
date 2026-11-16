@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-11-16
+
 ### Added
 
 - `decimalai.evaluate()` and `evaluate_async()` run a Claude Agent SDK agent: pass
