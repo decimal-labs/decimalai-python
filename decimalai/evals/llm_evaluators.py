@@ -30,7 +30,7 @@ Example (server-side — uses DecimalAI's key)::
 
 Example (custom model)::
 
-    evals=[Relevance(model="claude-3-5-haiku-20241022")]
+    evals=[Relevance(model="claude-haiku-5-5")]
 
 **Failures fail closed.** If the judge cannot be reached or cannot be parsed
 (network error, revoked key, rate limit, exhausted quota, empty completion),

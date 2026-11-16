@@ -6,6 +6,12 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `decimalai.evals.llm_evaluators` docstring's custom-model example named
+  `claude-3-5-haiku-20241022`, which Anthropic retired on 2026-02-19, so copying it failed. It now
+  names `claude-haiku-5-5`.
+
 ## [0.28.4] — 2026-11-14
 
 ### Fixed
