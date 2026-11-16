@@ -6,6 +6,16 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A run in which a framework's own skill loader listed skills and the model opened none shows
+  **Loaded: None** in the trace's Recorded skills, not **Not reported**. Every trace sends
+  `skills_loaded_by_agent: []` whether or not its loads could be seen, so the platform keeps an
+  empty list only when the run says they were watched. The trace now carries
+  `skills_loads_watched`, set when DecimalAI watched the framework's loader (Claude Agent SDK,
+  ADK, Strands, CrewAI and the other native loaders). A run with a Router decision (`routing_id`)
+  already shows None with any SDK version: the platform reads the id as the same sign.
+
 ## [0.29.0] — 2026-11-16
 
 ### Added

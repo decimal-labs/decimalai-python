@@ -278,7 +278,8 @@ class TestEntry:
 
 def _trace(**fields: Any) -> SimpleNamespace:
     base: Dict[str, Any] = dict(active_skills=[], skills_loaded_by_agent=[],
-                                skills_delivered=[], skills_offered_in_prompt=[])
+                                skills_delivered=[], skills_offered_in_prompt=[],
+                                skills_loads_watched=False)
     base.update(fields)
     return SimpleNamespace(**base)
 
@@ -329,6 +330,27 @@ class TestNativeLoads:
         trace = _trace(skills_offered_in_prompt=["x"])
         NativeLoads().apply(trace)
         assert trace.skills_offered_in_prompt == ["x"]
+        # It never saw the loader, so it cannot say the model loaded nothing.
+        assert trace.skills_loads_watched is False
+
+    def test_a_listing_with_no_load_says_the_loads_were_watched(self):
+        # The run the docs tutorial's Part 4 shows: skills offered, none opened. The
+        # platform keeps the empty list only with this flag ("Loaded: None", not
+        # "Not reported").
+        loads = NativeLoads()
+        loads.listed(["acme/refund-policy", "acme-returns-desk"])
+        trace = _trace()
+        loads.apply(trace)
+        assert trace.skills_loads_watched is True
+        assert trace.skills_loaded_by_agent == []
+        assert trace.skills_offered_in_prompt == ["acme-returns-desk", "acme/refund-policy"]
+
+    def test_a_load_says_the_loads_were_watched(self):
+        loads = NativeLoads()
+        loads.add(Activation("acme/refund-policy", SKILL_ID, V1, H1, BY_STAMP))
+        trace = _trace()
+        loads.apply(trace)
+        assert trace.skills_loads_watched is True
 
 
 class TestRecord:
@@ -348,6 +370,18 @@ class TestRecord:
                                         "version_id": V1, "body_sha256": H1}]
         assert trace.skills_loaded_by_agent == ["acme/refund-policy"]
         assert trace.skills_offered_in_prompt == []
+
+    def test_a_generic_trace_sends_the_watched_flag(self):
+        # On the wire: a listing with no load sends `[]` and the flag, so the platform
+        # keeps the empty list. A trace with no native loader sends the flag false.
+        ctx = TraceContext(agent_name="native-test")
+        ctx._native_loads().listed(["acme/refund-policy"])
+        wire = ctx.build_trace().model_dump(mode="json")
+        assert wire["skills_loaded_by_agent"] == []
+        assert wire["skills_loads_watched"] is True
+        plain = TraceContext(agent_name="native-test").build_trace().model_dump(mode="json")
+        assert plain["skills_loaded_by_agent"] == []
+        assert plain["skills_loads_watched"] is False
 
     def test_the_live_otel_run_gets_the_load(self):
         trace_api = pytest.importorskip("opentelemetry.trace")

@@ -428,11 +428,15 @@ class NativeLoads:
           body reached the model.
         * ``skills_offered_in_prompt`` gains the listed names only. A load arrives through a
           tool call, not the prompt, so it is not evidence the name was in the prompt.
+        * ``skills_loads_watched`` is set: this collector saw the loader list or load, so it
+          sees every load the loader makes, and a run that listed skills and loaded none
+          reports an empty ``skills_loaded_by_agent`` the platform keeps ("Loaded: None").
         """
         activations = self.activations
         listed = self.listed_names
         if not activations and not listed:
             return
+        trace.skills_loads_watched = True
         active = [e for e in list(getattr(trace, "active_skills", None) or [])]
         for activation in activations:
             kept = []

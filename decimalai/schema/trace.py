@@ -170,6 +170,15 @@ class RunTrace(BaseModel):
     # metric — high gap means relevant skills went unread.
     skills_offered_in_prompt: List[str] = Field(default_factory=list)
     skills_loaded_by_agent: List[str] = Field(default_factory=list)
+    # True when the SDK watched this run's loads, so an empty
+    # ``skills_loaded_by_agent`` means the model loaded nothing, not that a load
+    # could not be seen. The platform stores an empty list only then, and shows
+    # "Loaded: None" rather than "Not reported". Set when DecimalAI watched a
+    # framework's own skill loader (``_native.NativeLoads.apply``). A run with a
+    # ``routing_id`` does not need it: the Router's load tool records every load,
+    # and the platform reads the id as the same sign, for SDKs older than this
+    # field too.
+    skills_loads_watched: bool = False
     # Names whose full BODY reached the model (Router body injection or a
     # load_skill serve) — between offered (menu row) and
     # activated. Delivered implies offered, never implies activation.
