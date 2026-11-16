@@ -97,7 +97,7 @@ SDKS = {
     "openai_agents": {
         "label": "OpenAI Agents SDK",
         "extra": "openai-agents",
-        "measure": True,
+        "measure": {"agent": "agent"},  # evaluate() runs the Agent itself
         "provider": "OPENAI_API_KEY",
         "provider_name": "OpenAI",
         "provider_url": "https://platform.openai.com/api-keys",
@@ -124,7 +124,8 @@ agent = Agent(
     "claude_agent_sdk": {
         "label": "Claude Agent SDK",
         "extra": "claude-agent-sdk",
-        "floor": "0.27",  # decimalai.claude_agent_sdk.agent_config() arrived in 0.27.0
+        "floor": "0.29",  # evaluate(support, ..., run=reply) on a Claude config arrived in 0.29.0
+        "measure": {"agent": "support", "run": "reply"},  # evaluate() calls the reply() below per case
         "provider": "ANTHROPIC_API_KEY",
         "provider_name": "Anthropic",
         "provider_url": "https://console.anthropic.com/settings/keys",
@@ -168,6 +169,7 @@ options = ClaudeAgentOptions(
     "openai": {
         "label": "OpenAI SDK",
         "extra": "openai",
+        "measure_in": "openai_agents",
         "provider": "OPENAI_API_KEY",
         "provider_name": "OpenAI",
         "provider_url": "https://platform.openai.com/api-keys",
@@ -223,6 +225,7 @@ def answer(question):
     "anthropic": {
         "label": "Anthropic API",
         "extra": "anthropic",
+        "measure_in": "claude_agent_sdk",
         "provider": "ANTHROPIC_API_KEY",
         "provider_name": "Anthropic",
         "provider_url": "https://console.anthropic.com/settings/keys",
@@ -256,6 +259,7 @@ def answer(question):
     "langchain": {
         "label": "LangChain",
         "extra": "langchain",
+        "measure_in": "openai_agents",
         "packages": " langchain-openai",  # create_agent's "openai:..." model, as the docs' install line
         "provider": "OPENAI_API_KEY",
         "provider_name": "OpenAI",
@@ -289,8 +293,9 @@ def answer(question):
 
 
 # Part 5 of the docs tutorial, in the notebook: the same cases and checks as measure-it.mdx's
-# cases.jsonl and measure.py. evaluate() takes OpenAI Agents SDK agents only, so only that
-# notebook has it, and a notebook awaits evaluate_async() (evaluate() refuses a running loop).
+# cases.jsonl and measure.py. evaluate() runs OpenAI Agents SDK and Claude Agent SDK agents, so
+# those two notebooks have it, and a notebook awaits evaluate_async() (evaluate() refuses a running
+# loop). The Claude one passes run=reply, the notebook's own run of one question.
 MEASURE_CASES = [
     {"id": "kettle-refund", "input": "I opened my kettle from ORD-1001 and it works, but I don't want it. How much do I get back if I return it?", "answer": "$46.55", "skill": "acme-returns-policy"},
     {"id": "start-a-return", "input": "How do I start a return for my kettle from ORD-1001?", "answer": "acme.example/returns", "skill": "acme-returns-policy"},
@@ -354,23 +359,31 @@ print(f"{len(CASES)} cases in cases.jsonl, {len(CHECKS)} checks")'''
 MEASURE_NEEDS_KEY = ('    print("Measuring needs your DECIMAL_API_KEY: evaluate() runs your agent as DecimalAI serves it. "\n'
                      '          "Add the secret, then run the notebook again from the top.")')
 
-MEASURE_SERVED = f'''# ── measure it: the agent as DecimalAI serves it ───────────────────────────
+def measure_served(measure):
+    """The cell that measures the agent as DecimalAI serves it."""
+    run = f", run={measure['run']}" if measure.get("run") else ""
+    return f'''# ── measure it: the agent as DecimalAI serves it ───────────────────────────
 # One case at a time keeps a free plan's key inside its request limit.
 if not KEYED:
 {MEASURE_NEEDS_KEY}
 else:
-    served = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS, concurrency=1)
+    served = await decimalai.evaluate_async({measure["agent"]}, "cases.jsonl", evals=CHECKS{run}, concurrency=1)
     print(served)'''
 
-MEASURE_WITHOUT = f'''# ── measure it: the same cases with a skill left out ─────────────────────────
+
+def measure_without(measure):
+    """The cell that runs the same cases with a skill left out, twice."""
+    run = f"run={measure['run']}, " if measure.get("run") else ""
+    target = measure["agent"]
+    return f'''# ── measure it: the same cases with a skill left out ─────────────────────────
 if not KEYED:
 {MEASURE_NEEDS_KEY}
 else:
-    without = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS,
-                                             exclude_skills=["acme-returns-policy"], concurrency=1)
+    without = await decimalai.evaluate_async({target}, "cases.jsonl", evals=CHECKS,
+                                             {run}exclude_skills=["acme-returns-policy"], concurrency=1)
     print(without.compare(served))
-    no_triage = await decimalai.evaluate_async(agent, "cases.jsonl", evals=CHECKS,
-                                               exclude_skills=["diagnostic-triage-questions"], concurrency=1)
+    no_triage = await decimalai.evaluate_async({target}, "cases.jsonl", evals=CHECKS,
+                                               {run}exclude_skills=["diagnostic-triage-questions"], concurrency=1)
     print(no_triage.compare(served))'''
 
 
@@ -560,9 +573,10 @@ async def reply(question):
            f"Next: [4. See what it did]({DOCS}/see-what-it-did), in the dashboard. "
            + ("[Part 5](" + DOCS + "/measure-it) runs at the end of this notebook."
               if sdk.get("measure") else
-              f"[Part 5]({DOCS}/measure-it) measures with `evaluate()`, which runs OpenAI Agents SDK agents: "
-              "use [that notebook](https://colab.research.google.com/github/decimal-labs/decimalai-python/blob/main/"
-              "examples/tutorial/order_support_openai_agents.ipynb) for it.")),
+              f"[Part 5]({DOCS}/measure-it) measures with `evaluate()`, which runs OpenAI Agents SDK and Claude "
+              f"Agent SDK agents: use [the {SDKS[sdk['measure_in']]['label']} notebook]"
+              f"(https://colab.research.google.com/github/{REPO}/blob/main/examples/tutorial/"
+              f"order_support_{sdk['measure_in']}.ipynb) for it, on the same {sdk['provider_name']} key.")),
     ]
     if sdk.get("measure"):
         cells += [
@@ -570,14 +584,14 @@ async def reply(question):
                "\n"
                f"[Part 5]({DOCS}/measure-it) of the tutorial, here: eight questions, four checks, and the same "
                "cases run with and without a skill. Come back to it after Part 4. It needs your `DECIMAL_API_KEY`, "
-               "and it runs your agent once per case, 24 times in all, on your OpenAI key.\n"
+               f"and it runs your agent once per case, 24 times in all, on your {sdk['provider_name']} key.\n"
                "\n"
                "`did_the_action` is the check to copy into your own work: a model can say it flagged a charge "
                "without calling the tool, so this reads what the tool really returned."),
             code(MEASURE_CHECKS),
-            code(MEASURE_SERVED),
+            code(measure_served(sdk["measure"])),
             md("Leave a skill out and run the same cases again. Production keeps serving what it served."),
-            code(MEASURE_WITHOUT),
+            code(measure_without(sdk["measure"])),
         ]
     for i, cell in enumerate(cells):
         cell["id"] = f"{key}-{i:02d}"  # nbformat 4.5 wants one; stable, so a rebuild diffs cleanly
