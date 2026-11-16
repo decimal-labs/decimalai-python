@@ -69,6 +69,39 @@ def test_a_tool_call_record_is_listed_with_its_args_and_result(as_json):
     assert (tc.name, tc.args, tc.result) == ("lookup_order", {"order": "A-1"}, "refunded")
 
 
+@pytest.mark.parametrize("recorded, name, server", [
+    pytest.param("mcp__support__flag_for_billing", "flag_for_billing", "support", id="claude-code-mcp"),
+    pytest.param("mcp__my_tools__look_up__order", "look_up__order", "my_tools", id="underscores"),
+    pytest.param("mcp__decimalai__load_skill", "load_skill", "decimalai", id="load_skill"),
+    pytest.param("flag_for_billing", "flag_for_billing", None, id="plain"),
+    pytest.param("mcp_flag", "mcp_flag", None, id="not-mcp"),
+])
+def test_a_claude_code_mcp_tool_is_read_by_its_own_name(recorded, name, server):
+    """Claude Code names a tool an MCP server serves `mcp__<server>__<tool>`. A check written
+    as `call.name == "flag_for_billing"` reads a Claude run as it reads any other framework's."""
+    (tc,) = trace_to_trace_data(_dict_trace({"tool_name": recorded, "args": {}})).tool_calls
+    assert (tc.name, tc.mcp_server) == (name, server)
+
+
+@pytest.mark.parametrize("recorded, read", [
+    pytest.param([{"type": "text", "text": "Flagged ORD-1002"}], "Flagged ORD-1002", id="one-text-block"),
+    pytest.param([{"type": "text", "text": "a"}, {"type": "image", "source": {}}, {"type": "text", "text": "b"}],
+                 "a\nb", id="text-around-an-image"),
+    pytest.param([{"type": "image", "source": {}}], [{"type": "image", "source": {}}], id="no-text"),
+    pytest.param(["a", "b"], ["a", "b"], id="a-list-not-of-blocks"),
+    pytest.param("refunded", "refunded", id="text"),
+    pytest.param(None, None, id="none"),
+])
+def test_a_tool_result_of_text_blocks_is_read_as_its_text(recorded, read):
+    """An MCP tool (and an Anthropic tool_result) returns content blocks; `str(call.result)` of
+    those is a list's repr, so `startswith("Flagged")` failed on a tool that did flag."""
+    trace = RunTrace(agent_name="support", llm_calls=[LlmCallRecord(tool_calls=[
+        ToolCallRecord(tool_name="flag_for_billing", result=recorded)])])
+    for shipped in (trace, trace.model_dump(mode="json")):
+        (tc,) = trace_to_trace_data(shipped).tool_calls
+        assert tc.result == read
+
+
 # ── Through a real adapter ───────────────────────────────────
 
 

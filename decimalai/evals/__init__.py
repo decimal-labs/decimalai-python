@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -96,11 +97,19 @@ def _capture_source_location_extra(fn: Callable) -> Optional[Dict[str, Any]]:
 
 @dataclass(frozen=True)
 class ToolCallView:
-    """Read-only view of a single tool call."""
+    """Read-only view of a single tool call.
+
+    ``name`` is the tool's own name. Claude Code names a tool an MCP server serves
+    ``mcp__<server>__<tool>`` (``mcp__support__flag_for_billing``); here that is
+    ``name="flag_for_billing"`` and ``mcp_server="support"``, so one check reads every
+    framework's runs alike. ``result`` is what the tool returned; a result made of text
+    content blocks (an MCP tool's, or an Anthropic ``tool_result``'s) is their text.
+    """
 
     name: str
     args: Dict[str, Any] = field(default_factory=dict)
     result: Optional[str] = None
+    mcp_server: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -576,11 +585,34 @@ def _tool_call_view(tc: Any) -> Optional[ToolCallView]:
             raw_args = json.loads(raw_args)
         except (ValueError, TypeError):
             raw_args = None
+    name, server = str(name), None
+    mcp = _MCP_TOOL_NAME.match(name)
+    if mcp is not None:
+        server, name = mcp.group(1), mcp.group(2)
     return ToolCallView(
-        name=str(name),
+        name=name,
         args=raw_args if isinstance(raw_args, dict) else {},
-        result=tc.get("result"),
+        result=_result_text(tc.get("result")),
+        mcp_server=server,
     )
+
+
+#: Claude Code's name for a tool an MCP server serves: ``mcp__<server>__<tool>``.
+_MCP_TOOL_NAME = re.compile(r"^mcp__(.+?)__(.+)$")
+
+
+def _result_text(raw: Any) -> Any:
+    """A tool's result as a check reads it: text content blocks joined into their text.
+
+    ``[{"type": "text", "text": "Flagged ORD-1002"}]`` (what an MCP tool or an Anthropic
+    ``tool_result`` carries) is ``"Flagged ORD-1002"``. Anything else is as recorded.
+    """
+    if not isinstance(raw, list) or not raw:
+        return raw
+    if not all(isinstance(block, dict) and isinstance(block.get("type"), str) for block in raw):
+        return raw
+    texts = [block["text"] for block in raw if block["type"] == "text" and isinstance(block.get("text"), str)]
+    return "\n".join(texts) if texts else raw
 
 
 def _tool_call_views(llm_call: Dict[str, Any]) -> List[ToolCallView]:

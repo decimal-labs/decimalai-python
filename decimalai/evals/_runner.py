@@ -28,7 +28,17 @@ import json
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from . import DecimalEval, EvalResult, TraceData, trace_to_trace_data
 
@@ -43,7 +53,8 @@ class CaseResult:
     Attributes:
         id: The case's ``id``, or ``case <line>`` when it has none.
         input: The case's ``input``.
-        output: The run's final answer (``RunResult.final_output`` as text); None when it errored.
+        output: The run's final answer as text (``RunResult.final_output``, or what ``run=``
+            returned); None when it errored.
         trace_id: The run's DecimalAI trace; None when the run produced none.
         trace_url: Its page in the dashboard.
         results: Check name -> its result, or None when the check skipped this case.
@@ -306,16 +317,52 @@ async def _run_check(check: DecimalEval, trace: TraceData) -> Tuple[Dict[str, Op
 # ── running ──────────────────────────────────────────────────────────────────
 
 
-def _target(agent: Any) -> Tuple[Any, Callable[..., Any]]:
-    """``(agent_config, run one case)`` for the agent given, or a TypeError saying what fits."""
+@dataclass(frozen=True)
+class _Target:
+    """What :func:`evaluate` needs from a framework to run its agent.
+
+    Attributes:
+        config: The agent's ``agent_config()``: its name, and the setup the runs ask for.
+        run_case: ``await run_case(input, context)`` runs one case; its result (or its
+            ``final_output``) is the answer.
+        submit: Sends one trace the case's trial held, once its checks are attached.
+        no_trace: Why a case whose run sent no trace could not be checked.
+        error_of: ``trace -> why the run failed``, for a run that ended in an error without
+            raising; None when it did not.
+    """
+
+    config: Any
+    run_case: Callable[[Any, Any], Awaitable[Any]]
+    submit: Callable[[Any], None]
+    no_trace: str
+    error_of: Callable[[Any], Optional[str]] = lambda trace: None
+
+
+def _target(agent: Any, run: Optional[Callable[..., Any]] = None) -> _Target:
+    """How to run ``agent``'s cases, or a TypeError saying what fits."""
     module = type(agent).__module__ or ""
     if module == "agents" or module.startswith("agents."):
-        from ..openai_agents import _evaluation_target
+        if run is not None:
+            raise TypeError(
+                "evaluate() runs an OpenAI Agents SDK Agent itself, with Runner.run: pass the Agent "
+                "without run=")
+        from ..openai_agents import _evaluation_target, _submit_trace
 
-        return _evaluation_target(agent)
+        config, run_case = _evaluation_target(agent)
+        return _Target(
+            config=config, run_case=run_case, submit=_submit_trace,
+            no_trace=("the run sent no trace, so it could not be checked: OpenAI Agents tracing is off "
+                      "(OPENAI_AGENTS_DISABLE_TRACING or RunConfig(tracing_disabled=True))"))
+    from .._claude_agent_config import ClaudeAgentConfig
+
+    if isinstance(agent, ClaudeAgentConfig):
+        from .._claude_agent_config import _evaluation_target as claude_target
+
+        return claude_target(agent, run)
     raise TypeError(
         "evaluate() runs an OpenAI Agents SDK Agent whose instructions come from "
-        "decimalai.openai_agents.agent_config(); got a " + type(agent).__name__)
+        "decimalai.openai_agents.agent_config(), or a decimalai.claude_agent_sdk.agent_config() "
+        "with run=your function; got a " + type(agent).__name__)
 
 
 def _cause(exc: BaseException, kind: type) -> Optional[BaseException]:
@@ -339,27 +386,32 @@ async def evaluate_async(
     context: Optional[Callable[[Dict[str, Any]], Any]] = None,
     label: Optional[str] = None,
     concurrency: int = 4,
+    run: Optional[Callable[..., Any]] = None,
 ) -> EvalReport:
     """:func:`evaluate` for code already on an event loop (a notebook, an async app)."""
     from .._evaluation import EvaluationNotApplied, Override, Trial, block, trace_url
 
-    config, run_case = _target(agent)
+    target = _target(agent, run)
+    if run is not None and context is not None:
+        raise TypeError("context= is Runner.run(context=...) for an OpenAI Agents SDK Agent; with run=, "
+                        "your function passes any variables to support.run() itself")
+    config = target.config
     override = Override.make(config.name, prompt_version, exclude_skills)
     rows = _load_cases(cases)
     checks = _checks(evals)
     if not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("concurrency takes a whole number of cases to run at once, 1 or more")
     gate = asyncio.Semaphore(concurrency)
-    from ..openai_agents import _submit_trace
 
     #: Check name -> the result names it produced (one, or a dict result's several), in order.
     produced: Dict[str, List[str]] = {}
 
     async def one(row: Dict[str, Any]) -> Tuple[CaseResult, Optional[BaseException]]:
-        held: Dict[str, Any] = {}
+        #: Every trace the case's runs finished, in order: one, unless the case ran the agent twice.
+        held: List[Any] = []
 
         def hold(trace: Any) -> bool:
-            held["trace"] = trace
+            held.append(trace)
             return True
 
         result = CaseResult(id=row["id"], input=row["input"])
@@ -369,7 +421,7 @@ async def evaluate_async(
             try:
                 with block(trial):
                     run_context = context(row) if context is not None else row.get("context")
-                    outcome = await run_case(row["input"], run_context)
+                    outcome = await target.run_case(row["input"], run_context)
                 final = getattr(outcome, "final_output", outcome)
                 result.output = final if isinstance(final, str) or final is None else str(final)
             except Exception as exc:  # noqa: BLE001 - one case's failure is that case's
@@ -384,17 +436,24 @@ async def evaluate_async(
                     f"the run asked for {skills} and DecimalAI could not deliver it ({why}), so its "
                     "answer isn't a result for this setup")
                 result.error = f"EvaluationNotApplied: {refused}"
-            trace = held.get("trace")
-            if trace is None:
+            if not held:
                 if result.error is None:
-                    result.error = ("the run sent no trace, so it could not be checked: OpenAI Agents "
-                                    "tracing is off (OPENAI_AGENTS_DISABLE_TRACING or "
-                                    "RunConfig(tracing_disabled=True))")
+                    result.error = target.no_trace
                 return result, refused
+            trace = held[-1]
             try:
                 result.trace_id = str(trace.id)
                 result.trace_url = trace_url(result.trace_id)
                 result.prompt_version = _prompt_version_of(trace, config.name)
+                if result.output is None and result.error is None:
+                    # A function that returned nothing: the answer the run recorded.
+                    result.output = getattr(trace, "final_output", None) or getattr(
+                        trace, "final_output_preview", None)
+                if result.error is None and len(held) > 1:
+                    result.error = (f"the case ran {config.name!r} {len(held)} times; a case is one run, "
+                                    "so its checks did not run")
+                if result.error is None:
+                    result.error = target.error_of(trace)
                 if result.error is None:
                     data = dataclasses.replace(trace_to_trace_data(trace), case=dict(row))
                     if not data.output and result.output:
@@ -415,7 +474,8 @@ async def evaluate_async(
             except Exception as exc:  # noqa: BLE001 - the trace still goes out, the case says why
                 result.error = f"could not check the run's trace: {type(exc).__name__}: {exc}"
             finally:
-                _submit_trace(trace)
+                for each in held:
+                    target.submit(each)
         return result, refused
 
     outcomes = await asyncio.gather(*(one(row) for row in rows))
@@ -481,6 +541,7 @@ def evaluate(
     context: Optional[Callable[[Dict[str, Any]], Any]] = None,
     label: Optional[str] = None,
     concurrency: int = 4,
+    run: Optional[Callable[..., Any]] = None,
 ) -> EvalReport:
     """Run each case through ``agent``, check each run, and report.
 
@@ -490,27 +551,36 @@ def evaluate(
         draft = decimalai.evaluate(agent, "cases.jsonl", evals=[looked_up_the_order], prompt_version=4)
         print(draft.compare(served))
 
+    A Claude Agent SDK agent runs through your own function, ``reply(question)``, which opens
+    ``support.run(question)`` and consumes its query as your program does::
+
+        served = decimalai.evaluate(support, "cases.jsonl", evals=CHECKS, run=reply)
+
     Each case is one run of the agent, traced to DecimalAI with the checks' results attached
     and kept out of the agent's own numbers. ``prompt_version`` and ``exclude_skills`` change
     what these runs get, not what production serves.
 
     Args:
         agent: An OpenAI Agents SDK ``Agent`` whose instructions come from
-            ``decimalai.openai_agents.agent_config()``.
+            ``decimalai.openai_agents.agent_config()``, or a
+            ``decimalai.claude_agent_sdk.agent_config()`` with ``run=``.
         cases: A path to a ``.jsonl`` file (one JSON object per line), a
             ``decimalai.Dataset``, or a list of dicts. Each case needs an ``input`` (the
             message); ``id`` names it in reports; ``context`` is passed to
-            ``Runner.run(context=...)``. Every other field is yours: checks read the row
-            as ``trace.case``.
+            ``Runner.run(context=...)`` (OpenAI Agents SDK). Every other field is yours:
+            checks read the row as ``trace.case``.
         evals: The ``@eval`` checks to run on each case's trace.
         prompt_version: Run every case on this saved prompt version instead of the served one.
         exclude_skills: Leave these skills out of every case: not listed, not loadable.
         context: ``case -> object`` for ``Runner.run(context=...)``, for a typed context; by
-            default the case's ``context`` value as is.
+            default the case's ``context`` value as is. OpenAI Agents SDK only.
         label: This setup's name in reports. Default: ``"served"``, ``"prompt v4"``,
             ``"without refund-policy"``.
         concurrency: How many cases run at once. When they outrun the API key's request limit
             they wait for it, so a low limit makes this slower, not wrong.
+        run: For a Claude Agent SDK agent: your function that answers one case's ``input``
+            (``async def`` or not). Each case calls it once; the one ``support.run()`` it opens
+            is the run that is checked, and what it returns is the answer.
 
     Returns:
         An :class:`~decimalai.evals.EvalReport`; ``print()`` it, or ``.compare(other)``.
@@ -531,5 +601,5 @@ def evaluate(
                            "app): use `await decimalai.evaluate_async(...)` there")
     return _default_loop().run_until_complete(evaluate_async(
         agent, cases, evals, prompt_version=prompt_version, exclude_skills=exclude_skills,
-        context=context, label=label, concurrency=concurrency,
+        context=context, label=label, concurrency=concurrency, run=run,
     ))

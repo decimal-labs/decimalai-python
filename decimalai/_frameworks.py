@@ -259,6 +259,7 @@ FRAMEWORKS: Tuple[Framework, ...] = (
             schema_depth="Names only",
             handoffs="✅ (subagents)",
             skills_rail="`load_skill` MCP tool (`agent_config()`)",
+            evaluate="✅ (`run=`)",
         ),
         use_for="Claude Agent SDK — `agent_config(name)` gives each independent "
                 "`support.run(question)` its saved prompt and routed skills through "

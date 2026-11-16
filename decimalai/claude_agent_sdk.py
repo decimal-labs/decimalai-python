@@ -83,9 +83,15 @@ from uuid import UUID, uuid4
 
 from . import _claude_skill_render as _render
 from ._native import Load, NativeLoads, record
-from .schema.common import CallRole, FinishReason, SpanType, Status
+from .schema.common import CallRole, FinishReason, SourceType, SpanType, Status
 from .schema.manifest import ManifestTracker, extract_from_config
-from .schema.trace import LlmCallRecord, RunTrace, ToolCallRecord, TraceSpan
+from .schema.trace import (
+    FINAL_OUTPUT_MAX_CHARS,
+    LlmCallRecord,
+    RunTrace,
+    ToolCallRecord,
+    TraceSpan,
+)
 
 logger = logging.getLogger("decimalai.claude_agent_sdk")
 
@@ -316,7 +322,7 @@ class _RunState:
 
     __slots__ = (
         "trace_id", "agent_name", "parent_trace_id",
-        "started_at", "ended_at", "user_input_preview", "final_output_preview",
+        "started_at", "ended_at", "user_input_preview", "final_output_preview", "final_output",
         "llm_calls", "spans", "pending_tools", "transcript", "root_span",
         "saw_turn_usage", "turns", "generated",
         "status", "error_message", "session_id", "init_data", "options", "finalized",
@@ -342,6 +348,8 @@ class _RunState:
         self.ended_at: Optional[datetime] = None
         self.user_input_preview = _preview(user_input) if isinstance(user_input, str) else None
         self.final_output_preview: Optional[str] = None
+        # The whole answer, up to FINAL_OUTPUT_MAX_CHARS: checks and the platform's judges read it.
+        self.final_output: Optional[str] = None
         self.llm_calls: List[LlmCallRecord] = []
         self.spans: List[TraceSpan] = []
         # tool_use_id -> (ToolCallRecord, TraceSpan, started_at); closed by the
@@ -745,6 +753,7 @@ def _add_to_turn(
             llm_span.output_preview = _preview(text)
             # Last assistant text seen so far; ResultMessage.result overrides at finalize.
             state.final_output_preview = text[:500]
+            state.final_output = text[:FINAL_OUTPUT_MAX_CHARS]
     if tool_uses:
         # A request that asks for tools is planning; a pure-text request is responding.
         rec.call_role = CallRole.PLANNER
@@ -862,8 +871,14 @@ def _ingest_result(state: _RunState, message: Any) -> None:
     result_text = getattr(message, "result", None)
     if isinstance(result_text, str) and result_text:
         state.final_output_preview = result_text[:500]
+        state.final_output = result_text[:FINAL_OUTPUT_MAX_CHARS]
     if getattr(message, "is_error", False):
         state.status = Status.ERROR
+        if state.error_message is None:
+            # Which error the run ended on: the CLI's subtype ("error_max_turns", ...), else its text.
+            subtype = getattr(message, "subtype", None)
+            detail = subtype if isinstance(subtype, str) and subtype else _preview(result_text)
+            state.error_message = f"the Claude Agent SDK run ended in an error: {detail or 'no detail given'}"
     if not state.llm_calls:
         return
 
@@ -1097,7 +1112,6 @@ def _finalize(state: _RunState) -> None:
 
     manifest_id = _maybe_register_manifest(state)
     try:
-        client = _config._get_client()
         spans = _closed_spans(state)
         trace = RunTrace(
             id=state.trace_id,
@@ -1110,6 +1124,7 @@ def _finalize(state: _RunState) -> None:
             ended_at=state.ended_at or _now(),
             user_input_preview=state.user_input_preview,
             final_output_preview=state.final_output_preview,
+            final_output=state.final_output,
             error_message=state.error_message,
             spans=spans,
             llm_calls=list(state.llm_calls),
@@ -1122,6 +1137,29 @@ def _finalize(state: _RunState) -> None:
             logger.debug("claude_agent_sdk: native skill loads not applied", exc_info=True)
         if state.config_run is not None:
             state.config_run._apply(trace)
+    except Exception:
+        logger.exception("Failed to build Claude Agent SDK trace %s", state.trace_id)
+        return
+    # An evaluation run (decimalai._evaluation): marked, kept out of the agent's own numbers, and
+    # its trial gets the trace. evaluate() holds it to attach its checks' results, then sends it
+    # itself, with `_submit_trace`.
+    trial = getattr(state.config_run, "_evaluation", None)
+    if trial is not None:
+        trace.source_type = SourceType.EVALUATION
+        try:
+            if trial._take(trace):
+                return
+        except Exception:  # noqa: BLE001 - the trace still goes out
+            logger.debug("evaluation trial did not take the trace (non-fatal)", exc_info=True)
+    _submit_trace(trace)
+
+
+def _submit_trace(trace: RunTrace) -> None:
+    """Queue one finished trace for upload (after its agent's manifest, when the platform refused that)."""
+    from . import _config
+
+    try:
+        client = _config._get_client()
         _agent = trace.agent_name
         if _agent in _pending_manifests:
             _config.submit_trace_pending_manifest(
@@ -1134,7 +1172,7 @@ def _finalize(state: _RunState) -> None:
             trace.id, len(trace.spans), len(trace.llm_calls), trace.manifest_id or "none",
         )
     except Exception:
-        logger.exception("Failed to queue Claude Agent SDK trace %s", state.trace_id)
+        logger.exception("Failed to queue Claude Agent SDK trace %s", trace.id)
 
 
 async def _finalize_off_loop(state: _RunState) -> None:

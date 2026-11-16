@@ -76,6 +76,9 @@ class Run:
         self._sealed = False
         self._stream: Any = None
         self._provider_stream: Any = None
+        #: The evaluation trial this run belongs to (decimalai._evaluation), or None: its trace
+        #: goes to the trial instead of straight out (`claude_agent_sdk._finalize`).
+        self._evaluation: Any = None
 
     async def __aenter__(self) -> "Run":
         if self._entered:
@@ -366,6 +369,13 @@ class ClaudeAgentConfig(AgentBinding):
         if run is not None:
             run._record(routing_id=routing_id)
 
+    def _note_evaluation(self, run_key: Optional[str], trial: Any) -> None:
+        # The run's trace is built by `claude_agent_sdk._finalize`, which hands it to the trial.
+        with self._lock:
+            run = self._active_runs.get(run_key)
+        if run is not None:
+            run._evaluation = trial
+
     def _serve_load(self, name: str) -> str:
         from ._agent import _serve_and_record
         return _serve_and_record(self._router(), name, scope=self._run_key(), agent_name=self.name,
@@ -397,3 +407,51 @@ def agent_config(agent_name: str, *, fallback: Optional[str] = None,
         raise ValueError("on_unavailable must be 'continue' or 'fail'")
     return ClaudeAgentConfig(_open_prompt(agent_name, fallback), fallback=fallback,
                              on_unavailable=on_unavailable)
+
+
+def _evaluation_target(config: ClaudeAgentConfig, run: Any) -> Any:
+    """For :func:`decimalai.evaluate`: how to run one case of ``config`` with the caller's ``run``.
+
+    ``run(question)`` is the caller's own function: it opens ``config.run(question)`` and
+    consumes its query, as their program does. Each case calls it once, inside the case's
+    evaluation block, so the run it opens asks for the evaluation's setup and its trace comes
+    back to ``evaluate()`` instead of going out.
+    """
+    import asyncio
+    import inspect
+
+    from .evals._runner import _Target
+    from .schema.common import Status
+
+    if run is None:
+        raise TypeError(
+            "evaluate() runs a Claude Agent SDK agent through your own function: "
+            "decimalai.evaluate(support, cases, evals=..., run=reply), where "
+            "`async def reply(question)` opens `async with support.run(question) as run:` and "
+            "consumes run.query(options=...), as your program does.")
+    if not callable(run):
+        raise TypeError(f"run= takes your function that answers one question, got {type(run).__name__}")
+    name = getattr(run, "__name__", None) or "run"
+
+    async def run_case(case_input: Any, context: Any) -> Any:
+        if inspect.iscoroutinefunction(run) or inspect.iscoroutinefunction(getattr(run, "__call__", None)):
+            outcome = await run(case_input)
+        else:
+            # A sync function may start its own event loop; this one's must keep running.
+            outcome = await asyncio.to_thread(run, case_input)
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        return outcome
+
+    def error_of(trace: Any) -> Optional[str]:
+        if getattr(trace, "status", None) == Status.ERROR:
+            return getattr(trace, "error_message", None) or "the Claude Agent SDK run ended in an error"
+        return None
+
+    from .claude_agent_sdk import _submit_trace
+
+    return _Target(
+        config=config, run_case=run_case, submit=_submit_trace, error_of=error_of,
+        no_trace=(f"{name}() made no run of {config.name!r}, so there was nothing to check: it must "
+                  f"open `async with support.run(question)` on the agent_config() given to evaluate()"),
+    )

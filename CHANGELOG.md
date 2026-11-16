@@ -6,6 +6,28 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added
+
+- `decimalai.evaluate()` and `evaluate_async()` run a Claude Agent SDK agent: pass
+  `decimalai.claude_agent_sdk.agent_config()` and your own function that answers one question,
+  `evaluate(support, "cases.jsonl", evals=CHECKS, run=reply)`. Each case calls `reply()` once; the
+  `support.run()` it opens asks for the case's setup (`prompt_version=`, `exclude_skills=`), and its
+  trace comes back to `evaluate()`, which checks it, attaches the results and sends it once as an
+  evaluation run. A case whose function made no run of the agent, or two, and a run that ended in an
+  error (such as `error_max_turns`), are reported as that case's error. The framework registry's
+  `evaluate()` cell for the Claude Agent SDK is now "✅ (`run=`)".
+
+### Changed
+
+- A check reads a Claude Code MCP tool by its own name: `mcp__support__flag_for_billing` is
+  `ToolCallView(name="flag_for_billing", mcp_server="support")`, so one check reads every framework's
+  runs alike. This applies to production checks on Claude Agent SDK traces too: a check comparing
+  against the full `mcp__…` name no longer matches. A tool result made of text content blocks (an
+  MCP tool's, or an Anthropic `tool_result`'s) is read as its text, so
+  `str(call.result).startswith("Flagged")` works.
+- A Claude Agent SDK trace carries the whole final answer (`final_output`, up to 20,000 characters),
+  not only its first 500, and a run that ended in an error says which one in `error_message`.
+
 ### Fixed
 
 - The `decimalai.evals.llm_evaluators` docstring's custom-model example named
