@@ -44,6 +44,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -568,50 +569,24 @@ class DecimalSpanHandler:
         a response twice — once from the LLM end event, once from the traced
         function's return value — so whichever arrives second must not
         overwrite real numbers with ``None``.
+
+        A response and the usage inside it are each a dict or an object, and
+        not necessarily the same kind: llama-index-llms-anthropic hands over
+        ``raw=dict(message)``, a dict whose ``"usage"`` is still an
+        ``anthropic.types.Usage`` object. So every level is read with
+        :func:`_field`, which takes either.
+
+        Never raises. When the LLM call is the root of its tree (a bare
+        ``llm.chat()``), an exception here would skip the flush that follows
+        in ``prepare_to_exit_span``, losing the whole trace rather than the
+        counts.
         """
         if result is None:
             return
-
-        def _fill(field: str, value: Any) -> None:
-            if value is not None and span_data.get(field) is None:
-                span_data[field] = value
-
-        # What the model actually said. Read before anything else so a streamed
-        # call — whose only complete response arrives on the LLM end event,
-        # after the span already exited with a bare generator — still records
-        # its completion.
-        _fill("output_text", _response_text(result))
-
-        # ChatResponse / CompletionResponse — the provider's own object under
-        # `.raw` (openai.ChatCompletion, anthropic.Message, …).
-        raw = getattr(result, "raw", None)
-        usage = getattr(raw, "usage", None)
-        if usage is not None:
-            _fill("input_tokens", getattr(usage, "prompt_tokens", None)
-                  or getattr(usage, "input_tokens", None))
-            _fill("output_tokens", getattr(usage, "completion_tokens", None)
-                  or getattr(usage, "output_tokens", None))
-        elif isinstance(raw, dict):
-            usage = raw.get("usage") or {}
-            _fill("input_tokens", usage.get("prompt_tokens") or usage.get("input_tokens"))
-            _fill("output_tokens", usage.get("completion_tokens") or usage.get("output_tokens"))
-        _fill("model_name", getattr(raw, "model", None))
-
-        # LlamaIndex normalizes usage onto additional_kwargs for several
-        # providers — either flat, or nested under a "usage" key.
-        ak = getattr(result, "additional_kwargs", None)
-        if isinstance(ak, dict) and ak:
-            nested = ak.get("usage")
-            source = nested if isinstance(nested, dict) else ak
-            _fill("input_tokens", source.get("prompt_tokens") or source.get("input_tokens"))
-            _fill("output_tokens", source.get("completion_tokens") or source.get("output_tokens"))
-
-        # Dict-style responses (raw HTTP payloads).
-        if isinstance(result, dict):
-            usage = result.get("usage") or {}
-            _fill("input_tokens", usage.get("prompt_tokens") or usage.get("input_tokens"))
-            _fill("output_tokens", usage.get("completion_tokens") or usage.get("output_tokens"))
-            _fill("model_name", result.get("model"))
+        try:
+            _read_llm_result(span_data, result)
+        except Exception:
+            logger.debug("Could not read the LLM response's usage", exc_info=True)
 
     def _flush_tree(self, root_id: str) -> None:
         """Assemble spans into a RunTrace and send to the backend.
@@ -1464,6 +1439,78 @@ def _rendered_input_from_bound_args(bound_args: Any) -> Optional[List[Dict[str, 
         if isinstance(value, str) and value.strip():
             return [{"role": "user", "content": value}]
     return None
+
+
+def _field(obj: Any, key: str) -> Any:
+    """``obj[key]`` when ``obj`` is a mapping, else ``obj.key``; None when it has neither."""
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _token_count(usage: Any, *names: str) -> Optional[int]:
+    """The first of ``names`` that ``usage`` holds as a whole number, else None.
+
+    Zero is a count, not a gap, so it is not skipped for the next name. A value that is not
+    an int (a mock, a string, a nested object) is no count at all.
+    """
+    for name in names:
+        value = _field(usage, name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _read_llm_result(span_data: Dict[str, Any], result: Any) -> None:
+    """Fill ``span_data``'s missing completion, token counts and model from one LLM response.
+
+    The body of ``DecimalSpanHandler._extract_llm_result``, which guards it.
+    """
+
+    def _fill(field: str, value: Any) -> None:
+        if value is not None and span_data.get(field) is None:
+            span_data[field] = value
+
+    def _fill_usage(usage: Any) -> None:
+        # OpenAI's names, then Anthropic's. LlamaIndex's Gemini binding reports OpenAI's.
+        _fill("input_tokens", _token_count(usage, "prompt_tokens", "input_tokens"))
+        _fill("output_tokens", _token_count(usage, "completion_tokens", "output_tokens"))
+
+    def _fill_model(model: Any) -> None:
+        if isinstance(model, str) and model:
+            _fill("model_name", model)
+
+    # What the model actually said. Read before anything else so a streamed
+    # call — whose only complete response arrives on the LLM end event,
+    # after the span already exited with a bare generator — still records
+    # its completion.
+    _fill("output_text", _response_text(result))
+
+    # ChatResponse / CompletionResponse — the provider's own response under
+    # `.raw`: an object (openai.ChatCompletion) or a dict of one
+    # (llama-index-llms-anthropic's dict(anthropic.Message), and for a stream
+    # the dict of its last event, message_delta, which carries the final usage).
+    raw = getattr(result, "raw", None)
+    _fill_usage(_field(raw, "usage"))
+    _fill_model(_field(raw, "model"))
+
+    # LlamaIndex normalizes usage onto additional_kwargs for several
+    # providers — either flat, or nested under a "usage" key. A streamed
+    # Claude call also puts it on the message's additional_kwargs.
+    ak = getattr(result, "additional_kwargs", None)
+    if isinstance(ak, Mapping):
+        _fill_usage(ak.get("usage"))
+        _fill_usage(ak)
+    message_ak = getattr(getattr(result, "message", None), "additional_kwargs", None)
+    if isinstance(message_ak, Mapping):
+        _fill_usage(message_ak.get("usage"))
+
+    # Dict-style responses (raw HTTP payloads).
+    if isinstance(result, Mapping):
+        _fill_usage(result.get("usage"))
+        _fill_model(result.get("model"))
 
 
 def _response_text(result: Any) -> Optional[str]:

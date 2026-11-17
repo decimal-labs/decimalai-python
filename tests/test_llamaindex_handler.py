@@ -73,7 +73,10 @@ def _openai_result(prompt_tokens=10, completion_tokens=20, model="gpt-4o"):
 
 def _anthropic_result(input_tokens=100, output_tokens=50, model="claude-haiku-4-5"):
     """A response whose .raw.usage uses Anthropic token names
-    (input_tokens/output_tokens) — the shape the OpenAI fallback must catch."""
+    (input_tokens/output_tokens) — the shape the OpenAI fallback must catch.
+
+    An object ``raw``. llama-index-llms-anthropic itself hands over a dict
+    (``raw=dict(message)``): that shape is ``_claude_chat_response`` below."""
     usage = SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
     return SimpleNamespace(raw=SimpleNamespace(usage=usage, model=model))
 
@@ -334,6 +337,215 @@ class TestSpanHandlerTree:
         _sender.flush()
         cfg._client.ingest_trace.assert_not_called()
         assert h._spans == {}  # cleanup still ran
+
+
+# ── Token usage, in the shapes the real provider bindings hand over ──
+#
+# Built from the providers' own response types, not look-alikes: the bug these
+# guard was a look-alike (an object `raw`) standing in for what
+# llama-index-llms-anthropic really returns (a dict `raw` holding a Usage
+# OBJECT), so every Claude run traced 0 tokens while the fakes passed.
+
+
+def _claude_message(input_tokens=260, output_tokens=35):
+    anthropic_types = pytest.importorskip("anthropic.types")
+    return anthropic_types.Message(
+        id="msg_1", type="message", role="assistant", model="claude-haiku-5-5",
+        content=[anthropic_types.TextBlock(type="text", text="330")],
+        stop_reason="end_turn", stop_sequence=None,
+        usage=anthropic_types.Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+    )
+
+
+def _claude_chat_response(input_tokens=260, output_tokens=35):
+    """What llama-index-llms-anthropic 0.13.0's ``chat()`` returns:
+    ``AnthropicChatResponse(message=..., raw=dict(response))``. ``dict()`` of a
+    pydantic model is shallow, so ``raw["usage"]`` is an ``anthropic.types.Usage``."""
+    raw = dict(_claude_message(input_tokens, output_tokens))
+    assert not isinstance(raw["usage"], dict)  # the shape that broke the dict branch
+    return SimpleNamespace(
+        raw=raw, additional_kwargs={},
+        message=SimpleNamespace(content="330", additional_kwargs={}),
+    )
+
+
+def _openai_chat_response(prompt_tokens=120, completion_tokens=8):
+    """What llama-index-llms-openai's ``chat()`` returns: ``raw`` is the
+    ``openai.types.chat.ChatCompletion`` itself, and ``additional_kwargs``
+    repeats the counts flat."""
+    chat = pytest.importorskip("openai.types.chat")
+    completion = chat.ChatCompletion.model_validate({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "gpt-5.4-mini",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": "330"}}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                  "total_tokens": prompt_tokens + completion_tokens},
+    })
+    return SimpleNamespace(
+        raw=completion,
+        additional_kwargs={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                           "total_tokens": prompt_tokens + completion_tokens},
+        message=SimpleNamespace(content="330", additional_kwargs={}),
+    )
+
+
+def _extract(result) -> dict:
+    span_data = {"input_tokens": None, "output_tokens": None, "model_name": None,
+                 "output_text": None}
+    DecimalSpanHandler()._extract_llm_result(span_data, result)
+    return span_data
+
+
+class TestUsageShapes:
+    def test_claude_dict_raw_with_usage_object(self):
+        """llama-index-llms-anthropic's non-streamed response: the counts are read
+        through a dict ``raw`` into the Usage object it holds."""
+        got = _extract(_claude_chat_response(260, 35))
+        assert (got["input_tokens"], got["output_tokens"]) == (260, 35)
+        assert got["model_name"] == "claude-haiku-5-5"
+
+    def test_claude_rag_run_trace_carries_the_counts(self):
+        """The prober's LlamaIndex-on-Claude shape end to end: query → Claude
+        synthesis call. The trace's one LLM call has what Anthropic billed."""
+        h = DecimalSpanHandler(agent_name="claude-rag")
+        h.new_span("root", None, instance=QueryEngine(), parent_span_id=None)
+        h.new_span("llm", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id="root")
+        h.prepare_to_exit_span("llm", None, instance=Anthropic(),
+                               result=_claude_chat_response(260, 35))
+        h.prepare_to_exit_span("root", None, instance=QueryEngine(), result="330")
+
+        trace = _flush_and_get_trace()
+        assert len(trace.llm_calls) == 1
+        call = trace.llm_calls[0]
+        assert (call.input_tokens, call.output_tokens) == (260, 35)
+
+    def test_bare_claude_call_still_sends_its_trace(self):
+        """A bare ``llm.chat()``: the Claude call is the root of its own tree, so
+        the flush follows the usage read in the same exit. Reading this shape used
+        to raise there, and the trace was never sent."""
+        h = DecimalSpanHandler(agent_name="claude-bare")
+        h.new_span("llm", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id=None)
+        h.prepare_to_exit_span("llm", None, instance=Anthropic(),
+                               result=_claude_chat_response(41, 7))
+
+        trace = _flush_and_get_trace()
+        assert [(c.input_tokens, c.output_tokens) for c in trace.llm_calls] == [(41, 7)]
+        assert h._spans == {}
+
+    def test_claude_stream_last_event(self):
+        """A streamed Claude call: the LLM end event carries the last chunk, whose
+        ``raw`` is ``dict(RawMessageDeltaEvent)`` holding a MessageDeltaUsage
+        object, and whose message repeats the counts as a dict."""
+        anthropic_types = pytest.importorskip("anthropic.types")
+        from anthropic.types.raw_message_delta_event import Delta
+
+        event = anthropic_types.RawMessageDeltaEvent(
+            type="message_delta",
+            delta=Delta(stop_reason="end_turn", stop_sequence=None),
+            usage=anthropic_types.MessageDeltaUsage(input_tokens=260, output_tokens=35),
+        )
+        chunk = SimpleNamespace(
+            raw=dict(event), additional_kwargs={}, delta="",
+            message=SimpleNamespace(
+                content="330",
+                additional_kwargs={"usage": {"input_tokens": 260, "output_tokens": 35},
+                                   "stop_reason": "end_turn"}),
+        )
+        got = _extract(chunk)
+        assert (got["input_tokens"], got["output_tokens"]) == (260, 35)
+
+        # The message's own copy alone is enough, for a binding that drops raw.
+        chunk.raw = None
+        got = _extract(chunk)
+        assert (got["input_tokens"], got["output_tokens"]) == (260, 35)
+
+    def test_openai_chat_completion_object(self):
+        """llama-index-llms-openai: an object ``raw`` (ChatCompletion → CompletionUsage)."""
+        response = _openai_chat_response(120, 8)
+        got = _extract(response)
+        assert (got["input_tokens"], got["output_tokens"]) == (120, 8)
+        assert got["model_name"] == "gpt-5.4-mini"
+
+        # And from additional_kwargs alone, flat.
+        response.raw = None
+        got = _extract(response)
+        assert (got["input_tokens"], got["output_tokens"]) == (120, 8)
+
+    @pytest.mark.parametrize("usage", [
+        {"prompt_tokens": 12, "completion_tokens": 3},
+        {"input_tokens": 12, "output_tokens": 3},
+        SimpleNamespace(prompt_tokens=12, completion_tokens=3),
+        SimpleNamespace(input_tokens=12, output_tokens=3),
+    ], ids=["dict-openai-names", "dict-anthropic-names", "object-openai-names",
+            "object-anthropic-names"])
+    def test_additional_kwargs_usage_dict_or_object(self, usage):
+        """``additional_kwargs["usage"]`` is read whether it is a dict or an object."""
+        got = _extract(SimpleNamespace(raw=None, additional_kwargs={"usage": usage}))
+        assert (got["input_tokens"], got["output_tokens"]) == (12, 3)
+
+    def test_additional_kwargs_holding_a_real_usage_object(self):
+        anthropic_types = pytest.importorskip("anthropic.types")
+        usage = anthropic_types.Usage(input_tokens=9, output_tokens=4)
+        got = _extract(SimpleNamespace(raw=None, additional_kwargs={"usage": usage}))
+        assert (got["input_tokens"], got["output_tokens"]) == (9, 4)
+
+    @pytest.mark.parametrize("usage", [
+        {"input_tokens": 5, "output_tokens": 2},
+        SimpleNamespace(input_tokens=5, output_tokens=2),
+    ], ids=["usage-dict", "usage-object"])
+    def test_dict_response(self, usage):
+        """A raw HTTP payload as the response, its ``usage`` a dict or an object."""
+        got = _extract({"model": "claude-haiku-5-5", "usage": usage})
+        assert (got["input_tokens"], got["output_tokens"]) == (5, 2)
+        assert got["model_name"] == "claude-haiku-5-5"
+
+    def test_zero_is_a_count(self):
+        """0 output tokens is a real count, kept rather than skipped for the next name."""
+        got = _extract(SimpleNamespace(raw={"usage": {"input_tokens": 7, "output_tokens": 0}}))
+        assert (got["input_tokens"], got["output_tokens"]) == (7, 0)
+
+    def test_first_source_wins_and_later_ones_only_fill_gaps(self):
+        span_data = {"input_tokens": 260, "output_tokens": None, "model_name": None,
+                     "output_text": None}
+        DecimalSpanHandler()._extract_llm_result(
+            span_data, SimpleNamespace(raw={"usage": {"input_tokens": 1, "output_tokens": 35}}))
+        assert (span_data["input_tokens"], span_data["output_tokens"]) == (260, 35)
+
+    @pytest.mark.parametrize("result", [
+        SimpleNamespace(raw={"usage": "260 in"}),
+        SimpleNamespace(raw={"usage": [260, 35]}),
+        SimpleNamespace(raw=["not", "a", "response"]),
+        SimpleNamespace(raw={"usage": {"input_tokens": "260", "output_tokens": True}}),
+        SimpleNamespace(raw=MagicMock()),
+        SimpleNamespace(raw=None, additional_kwargs={"usage": 260}),
+        {"usage": 260, "model": 5},
+    ], ids=["usage-str", "usage-list", "raw-list", "non-int-counts", "raw-mock",
+            "ak-usage-int", "dict-junk"])
+    def test_unexpected_shapes_give_no_counts_and_never_raise(self, result):
+        got = _extract(result)
+        assert (got["input_tokens"], got["output_tokens"]) == (None, None)
+        assert got["model_name"] is None
+
+    def test_a_raising_response_costs_the_counts_not_the_trace(self):
+        """Whatever a response does on read, the run's trace still ships."""
+
+        class Exploding:
+            message = None
+
+            @property
+            def raw(self):
+                raise RuntimeError("provider object broke on read")
+
+        h = DecimalSpanHandler(agent_name="claude-bare")
+        h.new_span("llm", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id=None)
+        h.prepare_to_exit_span("llm", None, instance=Anthropic(), result=Exploding())
+
+        trace = _flush_and_get_trace()
+        assert len(trace.llm_calls) == 1
+        assert trace.llm_calls[0].input_tokens is None
 
 
 # ── Pure helper functions ────────────────────────────────────────────

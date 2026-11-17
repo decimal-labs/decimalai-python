@@ -23,6 +23,15 @@ and patch releases are fixes.
   (`{"id", "type": "function", "function": {"name", "arguments"}}`), and so does a reply's
   `output`, with every call of a Responses API reply that called several tools at once. The
   message's text is unchanged (empty for a turn that only called tools).
+- LlamaIndex on Claude records each call's input and output tokens. Every trace of a LlamaIndex
+  run on a Claude model showed 0 tokens and no cost: llama-index-llms-anthropic hands over the
+  response as a dict whose `usage` is still an `anthropic.types.Usage` object, and the handler
+  read it as a dict, raised, and kept nothing. When the Claude call was the whole run (a bare
+  `llm.chat()` or `llm.complete()`, no query engine), the trace was never sent at all, and its
+  spans stayed in memory. Usage is now read as a dict or an object at every level, from a query
+  engine's answer, streamed or not, and from a bare call. A response in a shape the handler does
+  not know costs its counts, never the trace. A bare `llm.stream_chat()` still traces no counts,
+  with any provider: its trace is sent when the stream is handed back, before the counts exist.
 
 ## [0.29.0] — 2026-11-16
 

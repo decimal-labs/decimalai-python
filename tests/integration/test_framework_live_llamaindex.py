@@ -113,6 +113,26 @@ def _assert_rag_trace(detail: dict, provider: str) -> None:
     assert detail.get("manifest_id"), "manifest_id missing — auto-detection failed"
 
 
+def _assert_llm_calls_counted(detail: dict) -> None:
+    """Every LLM call carries its input and output token counts.
+
+    A call with no counts shows the customer zero tokens and no cost. Until
+    2026-11-17 this cell checked only that the call was recorded, so LlamaIndex
+    on Claude passed every release while tracing 0 tokens: llama-index-llms-anthropic
+    hands over ``raw=dict(message)``, whose ``usage`` is an object the handler read
+    as a dict. The production prober found it.
+    """
+    llm_calls = detail.get("llm_calls") or []
+    uncounted = [
+        {f: c.get(f) for f in ("model_name", "input_tokens", "output_tokens")}
+        for c in llm_calls
+        if not (c.get("input_tokens") or 0) > 0 or not (c.get("output_tokens") or 0) > 0
+    ]
+    assert not uncounted, (
+        f"Trace {detail['id']}: LLM calls without token counts: {uncounted}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Native path — decimalai.llamaindex span handler
 # ═══════════════════════════════════════════════════════════════════
@@ -120,10 +140,12 @@ def _assert_rag_trace(detail: dict, provider: str) -> None:
 @pytest.mark.live_llm
 @pytest.mark.llamaindex
 @pytest.mark.parametrize("provider, model", h.matrix("llamaindex"))
-def test_llamaindex_query_engine_native(provider, model):
+def test_llamaindex_query_engine_native(provider, model, claude_bill):
     """A real LlamaIndex RAG query on each provider → the native span handler →
     one backend trace whose synthesis LLM call is captured with the vendor's
-    model id."""
+    model id and its token counts. On Claude the counts must equal what
+    Anthropic billed (``claude_bill`` meters the wire; build the LLM inside the
+    test so it reads the meter's ANTHROPIC_BASE_URL)."""
     h.require_key_for(provider)
     pytest.importorskip("llama_index.core")
     pytest.importorskip(_LLM_IMPORT[provider])
@@ -155,6 +177,8 @@ def test_llamaindex_query_engine_native(provider, model):
     traces = h.poll_for_trace(agent_name)
     detail = h.get_trace_detail(traces[0]["id"])
     _assert_rag_trace(detail, provider)
+    _assert_llm_calls_counted(detail)
+    h.check_billed(detail.get("llm_calls") or [], claude_bill, what="llamaindex rag")
 
 
 # ═══════════════════════════════════════════════════════════════════
