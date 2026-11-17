@@ -126,8 +126,7 @@ _SPENT = [0]
 @pytest.fixture(autouse=True)
 def _require_gates():
     """This file's DecimalAI is in-process, so only the live switch and the key gate it."""
-    if not h.LIVE_TESTS_ENABLED:
-        pytest.skip("Set RUN_LIVE_LLM_TESTS=1 to run live LLM tests.")
+    h.require_live_enabled()
     h.require_key_for("anthropic")
 
 

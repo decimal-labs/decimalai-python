@@ -36,6 +36,8 @@ KEYS: Dict[str, str] = {"claude-agent-sdk": "ANTHROPIC_API_KEY"}
 
 @pytest.mark.parametrize("framework", sorted(FRAMEWORKS))
 def test_a_real_model_calls_the_native_loader(native_project, framework):
+    if os.environ.get("DECIMAL_LIVE_TESTS", "").strip().lower() in ("off", "0", "false", "no"):
+        pytest.skip("live: live LLM tests are switched off (DECIMAL_LIVE_TESTS=off)")
     if os.environ.get("RUN_LIVE_LLM_TESTS") != "1":
         pytest.skip("live: set RUN_LIVE_LLM_TESTS=1 to spend provider money")
     from tests.conformance.environments import current_env

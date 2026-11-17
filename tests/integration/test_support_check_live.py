@@ -17,7 +17,15 @@ def test_support_rubric_calibration(sample):
     model = os.environ.get("CHECK_MODEL", DEFAULT_OPENAI_JUDGE)
     if not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")):
         pytest.skip("Requires a provider key for CHECK_MODEL")
-    verdict = grade_answer(CASES[sample["case"]], sample["answer"], model)
+    try:
+        verdict = grade_answer(CASES[sample["case"]], sample["answer"], model)
+    except ImportError as exc:
+        # A case the rubric decides by its own rules needs no judge; one that asks the LLM judge
+        # needs the evals extra. A venv without it is a setup gap, not a judge that was
+        # unavailable (which stays a failure, below).
+        if "litellm" not in str(exc):
+            raise
+        pytest.skip('this case asks the LLM judge, which needs `pip install "decimalai[evals]"` (litellm)')
     # An unavailable judge is a failure of this calibration, never a true negative.
     assert "error" not in verdict, verdict
     assert verdict["passed"] is sample["expected"], verdict

@@ -83,7 +83,19 @@ OPENAI_MODEL = resolve_model("openai")
 ANTHROPIC_MODEL = resolve_model("anthropic")
 POLL_TIMEOUT_S = 15
 POLL_INTERVAL_S = 0.5
-LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LLM_TESTS") == "1"
+#: A machine's switch for every test that calls a model (the platform's `bin/live-llm tests off`
+#: exports it for its make targets, and drops the provider keys): "off" skips every live test and
+#: says why, even with RUN_LIVE_LLM_TESTS=1, so a run with no credits left spends nothing.
+LIVE_TESTS_SWITCHED_OFF = os.environ.get("DECIMAL_LIVE_TESTS", "").strip().lower() in ("off", "0", "false", "no")
+LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LLM_TESTS") == "1" and not LIVE_TESTS_SWITCHED_OFF
+
+
+def require_live_enabled() -> None:
+    """Skip the test unless live LLM tests are on for this run, saying which switch is off."""
+    if LIVE_TESTS_SWITCHED_OFF:
+        pytest.skip("Live LLM tests are switched off (DECIMAL_LIVE_TESTS=off).")
+    if not LIVE_TESTS_ENABLED:
+        pytest.skip("Set RUN_LIVE_LLM_TESTS=1 to run live LLM tests.")
 
 
 # ─── Framework × provider matrix (single source of truth) ────────────
@@ -1258,8 +1270,7 @@ def assert_subagent_resolved(specialist_name: str, orchestrator_name: str) -> No
 
 def require_gates_fixture():
     """Pytest fixture body — call this from each file's autouse fixture."""
-    if not LIVE_TESTS_ENABLED:
-        pytest.skip("Set RUN_LIVE_LLM_TESTS=1 to run live LLM tests.")
+    require_live_enabled()
     if not backend_alive():
         pytest.skip(f"Backend at {BACKEND_URL} unreachable.")
 
