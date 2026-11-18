@@ -6,6 +6,28 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A bare streamed LlamaIndex call records its input and output tokens, with any provider:
+  `llm.stream_chat()`, `stream_complete()`, `astream_chat()` and the like, with no query engine
+  around them. The trace was sent the moment the stream was handed back, before any token had
+  arrived, so it never had counts. It is now held until LlamaIndex reports the call finished,
+  which it does once the stream has been read to the end. The stream itself is not touched: it
+  yields exactly what the LLM produced. A stream the caller stops reading, or drops, still sends
+  its trace (without counts) when Python collects it, and one that fails partway sends it marked
+  as an error. An LLM built on LlamaIndex's `CustomLLM` that streams through its default
+  `astream_chat` sent each such call as two traces; it now sends one.
+- LlamaIndex traces record Claude's prompt-cache counts. A cached Claude prompt is billed in three
+  parts: the uncached input, the tokens read from the cache, and the tokens written to it. Only
+  the first was recorded, so a cached run was priced as if the rest had not been sent.
+  `cache_read_tokens` and `cache_creation_tokens` now carry Anthropic's `cache_read_input_tokens`
+  and `cache_creation_input_tokens`, for a streamed call too when Anthropic reports them on the
+  stream's last event. An OpenAI call records `prompt_tokens_details.cached_tokens` as
+  `cache_read_tokens`, which, as OpenAI counts it, is a part of the input rather than an addition
+  to it. A Claude model reached through an OpenAI-compatible proxy reports that shape too; its
+  cache read is taken out of the input, so it is not billed twice. A cache count the provider did
+  not report stays empty, not 0.
+
 ## [0.29.1] — 2026-11-18
 
 ### Fixed

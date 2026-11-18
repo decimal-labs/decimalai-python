@@ -44,11 +44,15 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+import sys
+import weakref
 from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
+
+from ._usage import anthropic_cache_split
 
 logger = logging.getLogger("decimalai.llamaindex")
 
@@ -136,6 +140,11 @@ class DecimalSpanHandler:
         self._adoption_probed: set[str] = set()
         # Roots whose flush is waiting on a streamed response to be delivered.
         self._deferred_roots: set[str] = set()
+        # The subset of those that are a bare LLM stream (``llm.stream_chat()``
+        # with nothing around it), each with the finalizer that ships it if the
+        # caller drops the generator before its end event. See
+        # ``_defer_for_llm_stream``.
+        self._llm_stream_roots: Dict[str, weakref.finalize] = {}
 
     def class_name(self) -> str:
         """Return the class name for LlamaIndex's handler registry."""
@@ -249,9 +258,10 @@ class DecimalSpanHandler:
         """Dispatcher shutdown hook — ship any tree still awaiting a stream.
 
         Trees normally flush as their roots exit; a tree whose root returned a
-        live stream flushes from the pass-through wrapper instead (see
-        ``_defer_for_stream``). If the process is shutting down with a stream
-        still undelivered, ship what we have rather than lose the trace.
+        live stream flushes from the pass-through wrapper or the LLM's end event
+        instead (see ``_defer_for_stream``). If the process is shutting down
+        with a stream still undelivered, ship what we have rather than lose the
+        trace.
         """
         for root_id in list(self._deferred_roots):
             self._deferred_roots.discard(root_id)
@@ -286,6 +296,8 @@ class DecimalSpanHandler:
             owner = _stream_parent.get()
             if owner and owner[0] is self and owner[1] in self._spans:
                 parent_span_id = owner[1]
+            else:
+                parent_span_id = self._llm_stream_running_here()
 
         span_data: Dict[str, Any] = {
             "id": id_,
@@ -303,6 +315,10 @@ class DecimalSpanHandler:
             "provider": None,
             "input_tokens": None,
             "output_tokens": None,
+            # Prompt-cache counts, each provider's own convention — see
+            # LlmCallRecord.cache_read_tokens. None = not reported.
+            "cache_read_tokens": None,
+            "cache_creation_tokens": None,
             "temperature": None,
             "is_llm_call": False,
             # The exact request/response text, for LlmCallRecord. Distinct from
@@ -444,6 +460,8 @@ class DecimalSpanHandler:
         function returned a generator, so ``prepare_to_exit_span`` saw no
         usage, and the event does not fire until the caller has consumed the
         stream. Fills only fields the span is still missing.
+
+        In a tree held open for a bare LLM stream, this event is what ships it.
         """
         if not span_id or response is None:
             return
@@ -460,6 +478,40 @@ class DecimalSpanHandler:
                 span_data["ended_at"] = datetime.now(timezone.utc)
         except Exception:  # pragma: no cover - never break the caller's run
             logger.debug("Failed to record LLM result for span %s", span_id, exc_info=True)
+        self._end_llm_stream_of(span_id)
+
+    def record_llm_exception(self, span_id: Optional[str], exception: Any) -> None:
+        """A streamed LLM call raised while the caller was reading it.
+
+        LlamaIndex reports that as an ``ExceptionEvent`` carrying the span id,
+        and fires no end event after it. Only a tree held open for a bare LLM
+        stream acts on it: the call is marked failed and the trace ships.
+        ``GeneratorExit`` is the caller closing the stream early (or dropping
+        it), which is not a failure of the call.
+        """
+        if not span_id or span_id not in self._spans:
+            return
+        if self._find_root(span_id) not in self._llm_stream_roots:
+            return
+        if exception is not None and not isinstance(exception, GeneratorExit):
+            span_data = self._spans[span_id]
+            span_data["status"] = "error"
+            span_data["output_preview"] = (str(exception) or type(exception).__name__)[:500]
+        self._end_llm_stream_of(span_id)
+
+    def _end_llm_stream_of(self, span_id: str) -> None:
+        """Ship the bare-stream tree ``span_id`` belongs to, if it is one.
+
+        The FIRST end event in such a tree finishes it. Wrapped calls end
+        inside-out — ``stream_complete`` wrapping ``stream_chat`` fires the inner
+        call's event, which carries the usage, then its own with the same
+        response — and ``LLM.stream()`` never fires one of its own at all, so
+        waiting for the root's event would hold some trees until the caller
+        dropped the generator.
+        """
+        root_id = self._find_root(span_id)
+        if root_id in self._llm_stream_roots:
+            self._finish_llm_stream(root_id)
 
     def _defer_for_stream(self, root_id: str, root_data: Dict[str, Any], result: Any) -> bool:
         """Hold a tree open until its streamed response has been delivered.
@@ -483,7 +535,7 @@ class DecimalSpanHandler:
 
         gen = _live_stream_gen(result)
         if gen is None:
-            return False
+            return self._defer_for_llm_stream(root_id, root_data, result)
 
         def _done(chunks: List[str]) -> None:
             self._finish_stream(root_id, root_data, chunks)
@@ -496,6 +548,104 @@ class DecimalSpanHandler:
             return False
         self._deferred_roots.add(root_id)
         return True
+
+    def _defer_for_llm_stream(
+        self, root_id: str, root_data: Dict[str, Any], result: Any
+    ) -> bool:
+        """Hold a bare LLM stream's tree until LlamaIndex's end event for it.
+
+        ``llm.stream_chat()`` / ``stream_complete()`` with nothing around them
+        make the LLM span the root, and it exits when the generator is handed
+        back — before a single token, so before any usage exists. The counts
+        arrive on ``LLMChatEndEvent`` / ``LLMCompletionEndEvent`` once the caller
+        has read the stream (``record_llm_result``), and that event ships the
+        tree.
+
+        The generator is the caller's own object and is left exactly as it is
+        (there is no response wrapper to swap a pass-through into, unlike the
+        query-engine case). The bound is a finalizer on it instead: a stream the
+        caller drops unread, or stops reading, is collected, and the tree ships
+        then with what it has — the same bound ``_StreamTee.__del__`` gives.
+
+        Returns True when the flush was deferred.
+        """
+        if not root_data.get("is_llm_call"):
+            return False
+        if not (inspect.isgenerator(result) or inspect.isasyncgen(result)):
+            return False
+        try:
+            finalizer = weakref.finalize(result, self._finish_llm_stream, root_id)
+        except TypeError:  # pragma: no cover - generators take weak references
+            return False
+        self._llm_stream_roots[root_id] = finalizer
+        self._deferred_roots.add(root_id)
+        return True
+
+    def _llm_stream_running_here(self) -> Optional[str]:
+        """The held bare-stream tree whose generator is executing on THIS call stack.
+
+        A span that opens while the caller is reading a held stream, with no
+        parent of its own, is work that stream started lazily. CustomLLM's
+        default ``astream_chat`` (MockLLM's too) calls the sync ``stream_chat``
+        from inside the async generator, outside every span, so it would land
+        as a second tree carrying the same call's counts — one call billed
+        twice. Like ``_stream_parent`` for a query engine's stream, it belongs
+        to the tree being read.
+
+        "Being read" is checked on this thread's own stack (the generator's
+        frame among the callers), not just the generator's running flag: on a
+        server another thread may be reading ITS stream at this moment.
+        """
+        if not self._llm_stream_roots:
+            return None
+        running: List[Tuple[Any, str]] = []
+        for root_id, finalizer in list(self._llm_stream_roots.items()):
+            held = finalizer.peek()
+            if held is None:
+                continue
+            gen = held[0]
+            if getattr(gen, "gi_running", False) or getattr(gen, "ag_running", False):
+                frame = getattr(gen, "gi_frame", None) or getattr(gen, "ag_frame", None)
+                if frame is not None and root_id in self._spans:
+                    running.append((frame, root_id))
+        if not running:
+            return None
+        caller = sys._getframe(1)
+        while caller is not None:
+            for frame, root_id in running:
+                if caller is frame:
+                    return root_id
+            caller = caller.f_back
+        return None
+
+    def _finish_llm_stream(self, root_id: str) -> None:
+        """Ship a bare LLM stream's tree (exactly once).
+
+        Reached from the end event, an ``ExceptionEvent``, or the generator's
+        finalizer — which can run on whichever thread collects it, so the
+        exactly-once gate is a single atomic ``set.remove``.
+        """
+        try:
+            self._deferred_roots.remove(root_id)
+        except KeyError:
+            return  # already shipped
+        finalizer = self._llm_stream_roots.pop(root_id, None)
+        if finalizer is not None:
+            finalizer.detach()
+        try:
+            root_data = self._spans.get(root_id)
+            if root_data is not None:
+                root_data["ended_at"] = datetime.now(timezone.utc)
+                if root_data.get("output_preview") is None:
+                    text = next((self._spans[sid].get("output_text")
+                                 for sid in self._trees.get(root_id, [])
+                                 if sid in self._spans and self._spans[sid].get("output_text")),
+                                None)
+                    if text:
+                        root_data["output_preview"] = _truncate(text)
+            self._flush_tree(root_id)
+        except Exception:  # pragma: no cover - may run during interpreter GC
+            logger.debug("Failed to flush streamed LLM tree %s", root_id, exc_info=True)
 
     def _finish_stream(
         self, root_id: str, root_data: Dict[str, Any], chunks: List[str]
@@ -709,6 +859,8 @@ class DecimalSpanHandler:
                 ),
                 input_tokens=sd.get("input_tokens"),
                 output_tokens=sd.get("output_tokens"),
+                cache_read_tokens=sd.get("cache_read_tokens"),
+                cache_creation_tokens=sd.get("cache_creation_tokens"),
                 temperature=sd.get("temperature"),
                 latency_ms=latency_ms,
                 status=Status.SUCCESS if sd["status"] == "success" else Status.ERROR,
@@ -972,12 +1124,19 @@ class DecimalSpanHandler:
         span_ids = self._trees.pop(root_id, [])
         self._tree_agents.pop(root_id, None)
         self._deferred_roots.discard(root_id)
+        finalizer = self._llm_stream_roots.pop(root_id, None)
+        if finalizer is not None:
+            finalizer.detach()  # shipped another way (close(), a dropped root)
         for sid in span_ids:
             self._spans.pop(sid, None)
             self._parents.pop(sid, None)
 
 
 # ── Helper functions ─────────────────────────────────────────────
+
+
+#: What one LLM call was billed for its prompt. Read, merged and recorded as a unit.
+_PROMPT_COUNT_FIELDS = ("input_tokens", "cache_read_tokens", "cache_creation_tokens")
 
 
 def _merge_llm_spans(group: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -993,15 +1152,23 @@ def _merge_llm_spans(group: List[Dict[str, Any]]) -> Dict[str, Any]:
     arrived (from the LLM end event), which is well after the wrapper returned
     its generator, so taking the wrapper's clock alone reported a 3ms call for
     a multi-second stream.
+
+    The prompt counts — input, cache read, cache write — come together from
+    one member, the first with an input count, so they never mix two
+    providers' conventions (see ``_read_llm_result``).
     """
     merged = dict(group[0])
-    for field in ("model_name", "provider", "input_tokens", "output_tokens",
+    for field in ("model_name", "provider", "output_tokens",
                   "temperature", "rendered_input", "output_text"):
         if merged.get(field) is None:
             for sd in group[1:]:
                 if sd.get(field) is not None:
                     merged[field] = sd[field]
                     break
+    prompt_source = next((sd for sd in group if sd.get("input_tokens") is not None), None)
+    if prompt_source is not None:
+        for field in _PROMPT_COUNT_FIELDS:
+            merged[field] = prompt_source.get(field)
     starts = [sd["started_at"] for sd in group if sd.get("started_at")]
     ends = [sd["ended_at"] for sd in group if sd.get("ended_at")]
     if starts:
@@ -1463,6 +1630,56 @@ def _token_count(usage: Any, *names: str) -> Optional[int]:
     return None
 
 
+def _is_claude(model_name: Any, raw: Any) -> bool:
+    """Whether the call went to a Claude model — the span's model, else the response's.
+
+    The platform prices a ``claude-*`` model with Anthropic's cache convention
+    (backend pricing keys off the model name, after stripping a provider
+    prefix such as ``anthropic/``), so that is the test here too, whatever
+    binding or proxy carried the call.
+    """
+    for name in (model_name, _field(raw, "model")):
+        if isinstance(name, str) and "claude" in name.lower():
+            return True
+    return False
+
+
+def _prompt_counts(
+    usage: Any, *, claude: bool
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """``(input_tokens, cache_read_tokens, cache_creation_tokens)`` from one usage,
+    in the convention LlmCallRecord keeps for the call's provider.
+
+    Two shapes reach here, and they place the cache in OPPOSITE ways:
+
+    * OpenAI's — ``prompt_tokens`` (LlamaIndex's Gemini binding uses these names
+      too), with any cache hit INSIDE it and reported
+      again as ``prompt_tokens_details.cached_tokens``. Recorded as given:
+      the cache read is a part of the input, and no write is reported
+      (``decimalai/generic.py``'s documented convention). A Claude model behind
+      an OpenAI-compatible proxy reports this shape too, and a Claude record
+      keeps Anthropic's convention, so its read is taken out of the input
+      (``anthropic_cache_split``) rather than billed a second time.
+    * Anthropic's — ``input_tokens``, already the uncached remainder, with
+      ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` beside it.
+      Recorded as given.
+
+    ``None`` stays ``None``: a cache count the provider did not report is not
+    a cache miss.
+    """
+    prompt = _token_count(usage, "prompt_tokens")
+    if prompt is not None:
+        cached = _token_count(_field(usage, "prompt_tokens_details"), "cached_tokens")
+        if claude:
+            return anthropic_cache_split(prompt, cached, None)
+        return prompt, cached, None
+    return (
+        _token_count(usage, "input_tokens"),
+        _token_count(usage, "cache_read_input_tokens"),
+        _token_count(usage, "cache_creation_input_tokens"),
+    )
+
+
 def _read_llm_result(span_data: Dict[str, Any], result: Any) -> None:
     """Fill ``span_data``'s missing completion, token counts and model from one LLM response.
 
@@ -1474,9 +1691,15 @@ def _read_llm_result(span_data: Dict[str, Any], result: Any) -> None:
             span_data[field] = value
 
     def _fill_usage(usage: Any) -> None:
-        # OpenAI's names, then Anthropic's. LlamaIndex's Gemini binding reports OpenAI's.
-        _fill("input_tokens", _token_count(usage, "prompt_tokens", "input_tokens"))
         _fill("output_tokens", _token_count(usage, "completion_tokens", "output_tokens"))
+        # The prompt counts are filled together, from the first usage that has an
+        # input count, so a record never pairs one provider's input with another
+        # convention's cache counts (see _prompt_counts).
+        if span_data.get("input_tokens") is None:
+            counts = _prompt_counts(usage, claude=_is_claude(span_data.get("model_name"), raw))
+            if counts[0] is not None:
+                for field, value in zip(_PROMPT_COUNT_FIELDS, counts):
+                    span_data[field] = value
 
     def _fill_model(model: Any) -> None:
         if isinstance(model, str) and model:
@@ -1695,6 +1918,10 @@ def _install_llm_event_handler(dispatcher: Any, handler: DecimalSpanHandler) -> 
     carries the ``span_id`` it belongs to, so the usage can still be stamped on
     the right span.
 
+    The end event is also what ships a bare stream's trace (``llm.stream_chat()``
+    with nothing around it), and ``ExceptionEvent`` ships one that raised
+    mid-stream as a failure.
+
     Best-effort: a llama-index-core without these events keeps the
     return-value extraction and simply reports no tokens for streamed calls.
     """
@@ -1710,6 +1937,10 @@ def _install_llm_event_handler(dispatcher: Any, handler: DecimalSpanHandler) -> 
             "no token counts", exc_info=True,
         )
         return
+    try:
+        from llama_index.core.instrumentation.events.exception import ExceptionEvent
+    except Exception:  # pragma: no cover - present in every supported core
+        ExceptionEvent = None  # type: ignore[assignment, misc]
 
     end_events = (LLMChatEndEvent, LLMCompletionEndEvent)
 
@@ -1722,6 +1953,10 @@ def _install_llm_event_handler(dispatcher: Any, handler: DecimalSpanHandler) -> 
             if isinstance(event, end_events):
                 handler.record_llm_result(
                     getattr(event, "span_id", None), getattr(event, "response", None)
+                )
+            elif ExceptionEvent is not None and isinstance(event, ExceptionEvent):
+                handler.record_llm_exception(
+                    getattr(event, "span_id", None), getattr(event, "exception", None)
                 )
 
     try:

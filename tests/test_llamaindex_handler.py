@@ -347,21 +347,25 @@ class TestSpanHandlerTree:
 # OBJECT), so every Claude run traced 0 tokens while the fakes passed.
 
 
-def _claude_message(input_tokens=260, output_tokens=35):
+def _claude_message(input_tokens=260, output_tokens=35, **cache):
+    """An ``anthropic.types.Message``. ``cache`` takes ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``, which Anthropic reports beside ``input_tokens``
+    (the uncached remainder)."""
     anthropic_types = pytest.importorskip("anthropic.types")
     return anthropic_types.Message(
         id="msg_1", type="message", role="assistant", model="claude-haiku-5-5",
         content=[anthropic_types.TextBlock(type="text", text="330")],
         stop_reason="end_turn", stop_sequence=None,
-        usage=anthropic_types.Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+        usage=anthropic_types.Usage(input_tokens=input_tokens, output_tokens=output_tokens,
+                                    **cache),
     )
 
 
-def _claude_chat_response(input_tokens=260, output_tokens=35):
+def _claude_chat_response(input_tokens=260, output_tokens=35, **cache):
     """What llama-index-llms-anthropic 0.13.0's ``chat()`` returns:
     ``AnthropicChatResponse(message=..., raw=dict(response))``. ``dict()`` of a
     pydantic model is shallow, so ``raw["usage"]`` is an ``anthropic.types.Usage``."""
-    raw = dict(_claude_message(input_tokens, output_tokens))
+    raw = dict(_claude_message(input_tokens, output_tokens, **cache))
     assert not isinstance(raw["usage"], dict)  # the shape that broke the dict branch
     return SimpleNamespace(
         raw=raw, additional_kwargs={},
@@ -369,17 +373,22 @@ def _claude_chat_response(input_tokens=260, output_tokens=35):
     )
 
 
-def _openai_chat_response(prompt_tokens=120, completion_tokens=8):
+def _openai_chat_response(prompt_tokens=120, completion_tokens=8, cached_tokens=None,
+                          model="gpt-5.4-mini"):
     """What llama-index-llms-openai's ``chat()`` returns: ``raw`` is the
     ``openai.types.chat.ChatCompletion`` itself, and ``additional_kwargs``
-    repeats the counts flat."""
+    repeats the counts flat. ``cached_tokens`` goes where OpenAI reports a
+    prompt-cache hit, ``usage.prompt_tokens_details`` — a part of ``prompt_tokens``."""
     chat = pytest.importorskip("openai.types.chat")
+    usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+             "total_tokens": prompt_tokens + completion_tokens}
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
     completion = chat.ChatCompletion.model_validate({
-        "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "gpt-5.4-mini",
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": model,
         "choices": [{"index": 0, "finish_reason": "stop",
                      "message": {"role": "assistant", "content": "330"}}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                  "total_tokens": prompt_tokens + completion_tokens},
+        "usage": usage,
     })
     return SimpleNamespace(
         raw=completion,
@@ -391,7 +400,7 @@ def _openai_chat_response(prompt_tokens=120, completion_tokens=8):
 
 def _extract(result) -> dict:
     span_data = {"input_tokens": None, "output_tokens": None, "model_name": None,
-                 "output_text": None}
+                 "output_text": None, "cache_read_tokens": None, "cache_creation_tokens": None}
     DecimalSpanHandler()._extract_llm_result(span_data, result)
     return span_data
 
@@ -546,6 +555,315 @@ class TestUsageShapes:
         trace = _flush_and_get_trace()
         assert len(trace.llm_calls) == 1
         assert trace.llm_calls[0].input_tokens is None
+
+
+# ── Prompt-cache counts ──────────────────────────────────────────────
+#
+# A cached Claude prompt is billed in three parts: the uncached remainder
+# (`input_tokens`), the cache read, and the cache write, each at its own price.
+# Without the last two the trace prices a cached run as if only the remainder
+# was sent. LlmCallRecord keeps each provider's own convention (see
+# decimalai/schema/trace.py): Anthropic's cache counts are ADDITIONAL to
+# input_tokens; OpenAI's cached_tokens is a PART of prompt_tokens.
+
+
+def _prompt_counts(got) -> tuple:
+    return (got["input_tokens"], got["cache_read_tokens"], got["cache_creation_tokens"])
+
+
+class TestPromptCacheCounts:
+    def test_claude_cache_counts_sit_beside_the_uncached_input(self):
+        got = _extract(_claude_chat_response(
+            60, 35, cache_read_input_tokens=200, cache_creation_input_tokens=0))
+        assert _prompt_counts(got) == (60, 200, 0)  # a reported 0 stays 0: a cold cache
+        assert got["output_tokens"] == 35
+
+        # Not reported is not zero: no cache fields leaves both unmeasured.
+        assert _prompt_counts(_extract(_claude_chat_response(60, 35))) == (60, None, None)
+
+    def test_bare_claude_call_trace_carries_cache_counts(self):
+        h = DecimalSpanHandler(agent_name="claude-bare")
+        h.new_span("llm", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id=None)
+        h.prepare_to_exit_span("llm", None, instance=Anthropic(), result=_claude_chat_response(
+            60, 35, cache_read_input_tokens=200, cache_creation_input_tokens=1500))
+
+        call = _flush_and_get_trace().llm_calls[0]
+        assert (call.input_tokens, call.output_tokens) == (60, 35)
+        assert (call.cache_read_tokens, call.cache_creation_tokens) == (200, 1500)
+
+    def test_claude_stream_last_event_cache_counts(self):
+        """A streamed Claude call's last chunk: ``raw`` is ``dict(RawMessageDeltaEvent)``
+        and its MessageDeltaUsage carries the cumulative cache counts."""
+        anthropic_types = pytest.importorskip("anthropic.types")
+        from anthropic.types.raw_message_delta_event import Delta
+
+        event = anthropic_types.RawMessageDeltaEvent(
+            type="message_delta",
+            delta=Delta(stop_reason="end_turn", stop_sequence=None),
+            usage=anthropic_types.MessageDeltaUsage(
+                input_tokens=60, output_tokens=35,
+                cache_read_input_tokens=200, cache_creation_input_tokens=0),
+        )
+        chunk = SimpleNamespace(
+            raw=dict(event), additional_kwargs={}, delta="",
+            message=SimpleNamespace(
+                content="330",
+                additional_kwargs={"usage": {"input_tokens": 60, "output_tokens": 35}}),
+        )
+        assert _prompt_counts(_extract(chunk)) == (60, 200, 0)
+
+    def test_wrapper_and_inner_call_record_the_inner_calls_cache_counts(self):
+        """``complete()`` wraps ``chat()``: two spans, one call. The wrapper's own result
+        has no usage, so the record's prompt counts come from the inner call."""
+        h = DecimalSpanHandler(agent_name="claude-rag")
+        h.new_span("root", None, instance=QueryEngine(), parent_span_id=None)
+        h.new_span("outer", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id="root")
+        h.new_span("inner", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id="outer")
+        h.prepare_to_exit_span("inner", None, instance=Anthropic(), result=_claude_chat_response(
+            60, 35, cache_read_input_tokens=200, cache_creation_input_tokens=7))
+        h.prepare_to_exit_span("outer", None, instance=Anthropic(), result="330")
+        h.prepare_to_exit_span("root", None, instance=QueryEngine(), result="330")
+
+        calls = _flush_and_get_trace().llm_calls
+        assert [(c.input_tokens, c.cache_read_tokens, c.cache_creation_tokens)
+                for c in calls] == [(60, 200, 7)]
+
+    def test_prompt_counts_come_from_one_usage(self):
+        """Input and cache counts are taken together from one usage, never paired
+        across two: an input count that already includes the cache (OpenAI's
+        convention) beside Anthropic-style cache counts would bill the cache twice."""
+        span_data = {"input_tokens": 264, "output_tokens": None, "model_name": None,
+                     "output_text": None, "cache_read_tokens": None,
+                     "cache_creation_tokens": None}
+        DecimalSpanHandler()._extract_llm_result(span_data, _claude_chat_response(
+            64, 35, cache_read_input_tokens=200, cache_creation_input_tokens=0))
+        assert _prompt_counts(span_data) == (264, None, None)
+        assert span_data["output_tokens"] == 35
+
+        # The same response on a fresh span does carry the cache counts.
+        assert _prompt_counts(_extract(_claude_chat_response(
+            64, 35, cache_read_input_tokens=200, cache_creation_input_tokens=0))) == (64, 200, 0)
+
+    def test_openai_cached_tokens_are_a_part_of_the_input(self):
+        """generic.py's documented convention: ``prompt_tokens_details.cached_tokens``
+        → cache_read_tokens, a SUBSET of input_tokens; no cache write is reported."""
+        got = _extract(_openai_chat_response(120, 8, cached_tokens=64))
+        assert _prompt_counts(got) == (120, 64, None)
+
+        # A response that reports a cold cache says 0; one that reports nothing, None.
+        assert _prompt_counts(_extract(_openai_chat_response(120, 8, cached_tokens=0))) == (
+            120, 0, None)
+        assert _prompt_counts(_extract(_openai_chat_response(120, 8))) == (120, None, None)
+
+    def test_claude_through_an_openai_shaped_usage_keeps_claudes_convention(self):
+        """Claude behind an OpenAI-compatible proxy reports OpenAI's shape: a
+        prompt count with the cache inside it. A Claude record keeps Anthropic's
+        convention (the platform prices ``claude-*`` that way), so the cache read
+        comes OUT of the input instead of being billed a second time."""
+        got = _extract(_openai_chat_response(
+            264, 8, cached_tokens=200, model="anthropic/claude-haiku-5-5"))
+        assert _prompt_counts(got) == (64, 200, None)
+
+
+# ── A bare streamed call: held until its end event ───────────────────
+#
+# `llm.stream_chat()` with no query engine around it makes the LLM span the
+# root, and it exits as soon as the generator is handed back. The counts come
+# later, on LlamaIndex's LLMChatEndEvent / LLMCompletionEndEvent, which the
+# dispatcher delivers to `record_llm_result` once the caller has consumed the
+# stream. Flushing at exit shipped every such trace with no counts.
+
+
+def _stream(*chunks):
+    def gen():
+        yield from chunks
+    return gen()
+
+
+def _sent():
+    import decimalai._config as cfg
+    from decimalai._config import _sender
+
+    _sender.flush()
+    return [c.args[0] for c in cfg._client.ingest_trace.call_args_list]
+
+
+class TestBareLlmStream:
+    def _start(self, h, span_id="llm", parent=None, result=None):
+        h.new_span(span_id, None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id=parent)
+        h.prepare_to_exit_span(span_id, None, instance=Anthropic(), result=result)
+
+    def test_trace_waits_for_the_end_event_and_carries_the_counts(self):
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = _stream("3", "30")
+        self._start(h, result=stream)
+        assert _sent() == []  # held: the counts have not arrived yet
+
+        assert list(stream) == ["3", "30"]  # the caller's stream, untouched
+        h.record_llm_result("llm", _claude_chat_response(
+            60, 35, cache_read_input_tokens=200, cache_creation_input_tokens=0))
+
+        [trace] = _sent()
+        [call] = trace.llm_calls
+        assert (call.input_tokens, call.output_tokens) == (60, 35)
+        assert (call.cache_read_tokens, call.cache_creation_tokens) == (200, 0)
+        assert trace.final_output_preview == "330"
+        assert trace.ended_at >= call.started_at
+        assert h._spans == {} and h._deferred_roots == set()
+
+    @pytest.mark.parametrize("started", [False, True], ids=["never-started", "half-read"])
+    def test_an_abandoned_stream_still_ships(self, started):
+        """No end event ever comes for a stream the caller walks away from. The
+        trace ships when the generator is collected — without counts, but not lost."""
+        import gc
+
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = _stream("3", "30")
+        self._start(h, result=stream)
+        if started:
+            assert next(stream) == "3"
+        assert _sent() == []
+
+        del stream
+        gc.collect()
+        [trace] = _sent()
+        assert [(c.input_tokens, c.output_tokens) for c in trace.llm_calls] == [(None, None)]
+        assert h._spans == {} and h._deferred_roots == set()
+
+    def test_stream_complete_wrapping_stream_chat_sends_one_trace(self):
+        """Anthropic's ``stream_complete`` wraps its ``stream_chat``: two LLM spans, both
+        exiting with generators. The inner end event (it carries the usage) ships the
+        trace; the outer one that follows finds nothing left to do."""
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        outer, inner = _stream("330"), _stream("330")
+        h.new_span("outer", None, instance=Anthropic(model="claude-haiku-5-5"),
+                   parent_span_id=None)
+        self._start(h, "inner", parent="outer", result=inner)
+        h.prepare_to_exit_span("outer", None, instance=Anthropic(), result=outer)
+        assert _sent() == []
+
+        response = _claude_chat_response(60, 35)
+        h.record_llm_result("inner", response)
+        h.record_llm_result("outer", response)
+
+        [trace] = _sent()
+        assert [(c.input_tokens, c.output_tokens) for c in trace.llm_calls] == [(60, 35)]
+
+    def test_a_stream_that_raises_ships_as_an_error(self):
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = _stream("3")
+        self._start(h, result=stream)
+
+        h.record_llm_exception("llm", RuntimeError("overloaded_error"))
+
+        [trace] = _sent()
+        assert trace.status.value == "error"
+        assert trace.llm_calls[0].status.value == "error"
+        assert h._spans == {}
+
+    def test_a_stream_the_caller_closes_ships_as_a_success(self):
+        """Closing a stream early raises GeneratorExit inside it, which LlamaIndex
+        reports as an ExceptionEvent. The caller chose to stop: not an error."""
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = _stream("3", "30")
+        self._start(h, result=stream)
+
+        h.record_llm_exception("llm", GeneratorExit())
+
+        [trace] = _sent()
+        assert trace.status.value == "success"
+
+    def test_async_stream_waits_for_the_end_event(self):
+        import asyncio
+
+        async def agen():
+            yield "3"
+            yield "30"
+
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = agen()
+        self._start(h, result=stream)
+        assert _sent() == []
+
+        async def consume():
+            return [chunk async for chunk in stream]
+
+        assert asyncio.run(consume()) == ["3", "30"]
+        h.record_llm_result("llm", _claude_chat_response(60, 35))
+
+        [trace] = _sent()
+        assert [(c.input_tokens, c.output_tokens) for c in trace.llm_calls] == [(60, 35)]
+
+    def test_a_call_the_stream_starts_while_being_read_joins_its_tree(self):
+        """A parentless span opened from inside the held generator's body is work
+        the stream started lazily (CustomLLM's default ``astream_chat``): it joins
+        the tree, so its counts are not shipped a second time as another trace."""
+        h = DecimalSpanHandler(agent_name="claude-stream")
+
+        def body():
+            h.new_span("lazy", None, instance=Anthropic(model="claude-haiku-5-5"),
+                       parent_span_id=None)
+            h.prepare_to_exit_span("lazy", None, instance=Anthropic(),
+                                   result=_claude_chat_response(60, 35))
+            yield "330"
+
+        stream = body()
+        self._start(h, result=stream)
+        assert list(stream) == ["330"]
+        assert h._parents["lazy"] == "llm"
+        h.record_llm_result("lazy", _claude_chat_response(60, 35))
+
+        [trace] = _sent()
+        assert [(c.input_tokens, c.output_tokens) for c in trace.llm_calls] == [(60, 35)]
+
+    def test_another_threads_stream_does_not_adopt_this_threads_span(self):
+        """On a server, thread A may be inside its held stream while thread B opens
+        an unrelated call. "Being read" is judged on B's own stack, not the
+        generator's running flag alone."""
+        import threading
+
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        started, release = threading.Event(), threading.Event()
+
+        def body():
+            started.set()
+            release.wait(5)
+            yield "330"
+
+        stream = body()
+        self._start(h, result=stream)
+        reader = threading.Thread(target=lambda: next(stream))
+        reader.start()
+        try:
+            assert started.wait(5)
+            assert stream.gi_running  # thread A is inside it right now
+            h.new_span("other", None, instance=Anthropic(model="claude-haiku-5-5"),
+                       parent_span_id=None)
+            assert h._parents["other"] is None
+        finally:
+            release.set()
+            reader.join(5)
+        h.prepare_to_exit_span("other", None, instance=Anthropic(),
+                               result=_claude_chat_response(41, 7))
+        assert [[(c.input_tokens, c.output_tokens) for c in t.llm_calls]
+                for t in _sent()] == [[(41, 7)]]
+
+    def test_close_ships_a_stream_still_in_flight(self):
+        """Dispatcher shutdown calls ``close()``; a stream still being read ships then."""
+        h = DecimalSpanHandler(agent_name="claude-stream")
+        stream = _stream("3")
+        self._start(h, result=stream)
+        assert _sent() == []
+
+        h.close()
+        assert len(_sent()) == 1
+        assert h._spans == {}
+        del stream  # the finalizer has nothing left to send
+        assert len(_sent()) == 1
 
 
 # ── Pure helper functions ────────────────────────────────────────────

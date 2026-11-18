@@ -129,6 +129,103 @@ class TestRealDispatcherQueryEngine:
         assert handler.open_spans == {}
 
 
+# ── Real dispatcher → a bare streamed LLM call → its counts ──────────
+
+
+def _usage_llm_class():
+    """A CustomLLM that streams like a provider binding: the usage arrives on the
+    LAST chunk only. No network; the real dispatcher and LLM callbacks drive it."""
+    from llama_index.core.base.llms.types import CompletionResponse, LLMMetadata
+    from llama_index.core.llms import CustomLLM
+    from llama_index.core.llms.callbacks import llm_completion_callback
+
+    def chunks():
+        return [
+            CompletionResponse(text="3", delta="3"),
+            CompletionResponse(text="330", delta="30",
+                               raw={"usage": {"input_tokens": 60, "output_tokens": 35,
+                                              "cache_read_input_tokens": 200,
+                                              "cache_creation_input_tokens": 0}}),
+        ]
+
+    class UsageLLM(CustomLLM):
+        @property
+        def metadata(self) -> LLMMetadata:
+            return LLMMetadata(model_name="claude-haiku-5-5")
+
+        @llm_completion_callback()
+        def complete(self, prompt, formatted=False, **kwargs):
+            return chunks()[-1]
+
+        @llm_completion_callback()
+        def stream_complete(self, prompt, formatted=False, **kwargs):
+            def gen():
+                yield from chunks()
+            return gen()
+
+        # Natively async, as the provider bindings are. CustomLLM's own default
+        # starts the sync stream lazily, from inside the async generator.
+        @llm_completion_callback()
+        async def astream_complete(self, prompt, formatted=False, **kwargs):
+            async def gen():
+                for chunk in chunks():
+                    yield chunk
+            return gen()
+
+    return UsageLLM
+
+
+class TestRealDispatcherBareStream:
+    @pytest.fixture
+    def instrumented(self):
+        pytest.importorskip("llama_index.core")
+        from llama_index.core.instrumentation import get_dispatcher
+
+        from decimalai.llamaindex import instrument
+
+        dispatcher = get_dispatcher()
+        saved = (list(dispatcher.span_handlers), list(dispatcher.event_handlers))
+        handler = instrument(agent_name="bare-stream")
+        try:
+            yield handler
+        finally:
+            dispatcher.span_handlers, dispatcher.event_handlers = saved
+
+    @pytest.mark.parametrize(
+        "call", ["stream_complete", "stream_chat", "astream_complete", "astream_chat"])
+    def test_bare_stream_trace_carries_the_counts(self, instrumented, call):
+        """One bare streamed call, one trace, with the counts from its last chunk.
+
+        ``astream_chat`` is CustomLLM's default, which starts the sync stream lazily
+        from inside the async generator, outside every span: that inner call must
+        join the held tree rather than ship as a second trace with the same counts.
+        """
+        import asyncio
+
+        from llama_index.core.llms import ChatMessage
+
+        llm = _usage_llm_class()()
+        messages = [ChatMessage(role="user", content="hi")]
+        if call == "stream_complete":
+            deltas = [r.delta for r in llm.stream_complete("hi")]
+        elif call == "stream_chat":
+            deltas = [r.delta for r in llm.stream_chat(messages)]
+        else:
+            async def consume():
+                stream = await (llm.astream_complete("hi") if call == "astream_complete"
+                                else llm.astream_chat(messages))
+                return [r.delta async for r in stream]
+            deltas = asyncio.run(consume())
+        assert deltas == ["3", "30"]  # what the LLM yielded, unchanged
+
+        traces = _flush_and_get_traces()
+        assert len(traces) == 1, [[c.model_name for c in t.llm_calls] for t in traces]
+        [call_record] = traces[0].llm_calls
+        assert (call_record.input_tokens, call_record.output_tokens) == (60, 35)
+        assert (call_record.cache_read_tokens, call_record.cache_creation_tokens) == (200, 0)
+        assert instrumented.open_spans == {}
+
+
 # ── Dispatcher calling convention (no llama-index needed) ────────────
 
 class TestDispatcherCallingConvention:
