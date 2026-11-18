@@ -6,35 +6,6 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
-### Fixed
-
-- A bare streamed LlamaIndex call records its input and output tokens, with any provider:
-  `llm.stream_chat()`, `stream_complete()`, `astream_chat()` and the like, with no query engine
-  around them. The trace was sent the moment the stream was handed back, before any token had
-  arrived, so it never had counts. It is now held until LlamaIndex reports the call finished,
-  which it does once the stream has been read to the end. The stream itself is not touched: it
-  yields exactly what the LLM produced. A stream the caller stops reading, or drops, still sends
-  its trace (without counts) when Python collects it, and one that fails partway sends it marked
-  as an error. An LLM built on LlamaIndex's `CustomLLM` that streams through its default
-  `astream_chat` sent each such call as two traces; it now sends one.
-- LlamaIndex traces record Claude's prompt-cache counts. A cached Claude prompt is billed in three
-  parts: the uncached input, the tokens read from the cache, and the tokens written to it. Only
-  the first was recorded, so a cached run was priced as if the rest had not been sent.
-  `cache_read_tokens` and `cache_creation_tokens` now carry Anthropic's `cache_read_input_tokens`
-  and `cache_creation_input_tokens`, for a streamed call too when Anthropic reports them on the
-  stream's last event. An OpenAI call records `prompt_tokens_details.cached_tokens` as
-  `cache_read_tokens`, which, as OpenAI counts it, is a part of the input rather than an addition
-  to it. A Claude model reached through an OpenAI-compatible proxy reports that shape too; its
-  cache read is taken out of the input, so it is not billed twice. A cache count the provider did
-  not report stays empty, not 0.
-- An agent traced through the OpenTelemetry exporter (`decimalai.otel`) no longer loses a run's
-  trace when registering its manifest fails, for example on a timeout or a refused (429) request.
-  The trace was sent straight away under an id DecimalAI had never stored, and was rejected with
-  "manifest_id ... does not exist". It is now held, as the other integrations already do: the
-  registration is retried in the background for 31–62 seconds, and the trace is sent under the id
-  DecimalAI stored. If the registration never succeeds, the trace is not sent, and
-  `decimalai.export_status()` says why. A 401 or 403 is not retried.
-
 ## [0.29.1] — 2026-11-18
 
 ### Fixed
@@ -61,8 +32,33 @@ and patch releases are fixes.
   `llm.chat()` or `llm.complete()`, no query engine), the trace was never sent at all, and its
   spans stayed in memory. Usage is now read as a dict or an object at every level, from a query
   engine's answer, streamed or not, and from a bare call. A response in a shape the handler does
-  not know costs its counts, never the trace. A bare `llm.stream_chat()` still traces no counts,
-  with any provider: its trace is sent when the stream is handed back, before the counts exist.
+  not know costs its counts, never the trace.
+- A bare streamed LlamaIndex call records its input and output tokens, with any provider:
+  `llm.stream_chat()`, `stream_complete()`, `astream_chat()` and the like, with no query engine
+  around them. The trace was sent the moment the stream was handed back, before any token had
+  arrived, so it never had counts. It is now held until LlamaIndex reports the call finished,
+  which it does once the stream has been read to the end. The stream itself is not touched: it
+  yields exactly what the LLM produced. A stream the caller stops reading, or drops, still sends
+  its trace (without counts) when Python collects it, and one that fails partway sends it marked
+  as an error. An LLM built on LlamaIndex's `CustomLLM` that streams through its default
+  `astream_chat` sent each such call as two traces; it now sends one.
+- LlamaIndex traces record Claude's prompt-cache counts. A cached Claude prompt is billed in three
+  parts: the uncached input, the tokens read from the cache, and the tokens written to it. Only
+  the first was recorded, so a cached run was priced as if the rest had not been sent.
+  `cache_read_tokens` and `cache_creation_tokens` now carry Anthropic's `cache_read_input_tokens`
+  and `cache_creation_input_tokens`, for a streamed call too when Anthropic reports them on the
+  stream's last event. An OpenAI call records `prompt_tokens_details.cached_tokens` as
+  `cache_read_tokens`, which, as OpenAI counts it, is a part of the input rather than an addition
+  to it. A Claude model reached through an OpenAI-compatible proxy reports that shape too; its
+  cache read is taken out of the input, so it is not billed twice. A cache count the provider did
+  not report stays empty, not 0.
+- An agent traced through the OpenTelemetry exporter (`decimalai.otel`) no longer loses a run's
+  trace when registering its manifest fails, for example on a timeout or a refused (429) request.
+  The trace was sent straight away under an id DecimalAI had never stored, and was rejected with
+  "manifest_id ... does not exist". It is now held, as the other integrations already do: the
+  registration is retried in the background for 31–62 seconds, and the trace is sent under the id
+  DecimalAI stored. If the registration never succeeds, the trace is not sent, and
+  `decimalai.export_status()` says why. A 401 or 403 is not retried.
 
 ## [0.29.0] — 2026-11-16
 
