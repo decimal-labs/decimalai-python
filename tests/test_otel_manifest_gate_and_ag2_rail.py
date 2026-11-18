@@ -242,29 +242,35 @@ def test_a_turn_that_observes_nothing_keeps_the_populated_manifest(_sdk):
     assert second.manifest_id == first.manifest_id
 
 
-def test_a_failed_registration_is_retried_on_the_next_trace(_sdk, caplog):
-    """The fallback id is a client-side uuid the backend has never seen, and it
-    rejects an unknown manifest_id exactly like a missing one — so a cached
-    failure would turn one blip into permanent trace loss."""
+def test_a_failed_registration_is_retried_on_the_next_trace(_sdk, caplog, monkeypatch):
+    """A cached failure would turn one blip into permanent trace loss, so the
+    next trace re-registers. The trace in hand is held on the sender and retried
+    there (test_otel_manifest_failure_does_not_cost_the_trace.py); here the
+    backend stays down for that whole ladder, so it is not sent at all, rather
+    than sent under an id the backend never stored."""
     import logging
 
     from decimalai.otel import DecimalSpanExporter
 
+    # The sender's ladder waits 31-62 s in all; none of it is this test's subject.
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
     _sdk._client.register_manifest.side_effect = RuntimeError("backend down")
     exporter = DecimalSpanExporter(agent_name="ag2-agent")
     with caplog.at_level(logging.WARNING, logger="decimalai"):
         _export(exporter, _ag2_turn(0x450, ["search"]))
     # Handled, so one line and no traceback.
-    loud = [r for r in caplog.records if "manifest" in r.getMessage()]
+    loud = [r for r in caplog.records
+            if r.name == "decimalai.otel" and "manifest" in r.getMessage()]
     assert len(loud) == 1 and loud[0].exc_info is None, [r.getMessage() for r in loud]
     assert "ag2-agent" in loud[0].getMessage() and "backend down" in loud[0].getMessage()
+    assert _sent_traces(_sdk) == []
 
     _sdk._client.register_manifest.side_effect = (
         lambda snapshot: {"manifest_id": "recovered"}
     )
     _export(exporter, _ag2_turn(0x460, ["search"]))
 
-    assert _sent_traces(_sdk)[1].manifest_id == "recovered"
+    assert [t.manifest_id for t in _sent_traces(_sdk)] == ["recovered"]
 
 
 def test_a_newly_seen_tool_still_grows_the_manifest(_sdk):

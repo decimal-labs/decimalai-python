@@ -27,6 +27,13 @@ and patch releases are fixes.
   to it. A Claude model reached through an OpenAI-compatible proxy reports that shape too; its
   cache read is taken out of the input, so it is not billed twice. A cache count the provider did
   not report stays empty, not 0.
+- An agent traced through the OpenTelemetry exporter (`decimalai.otel`) no longer loses a run's
+  trace when registering its manifest fails, for example on a timeout or a refused (429) request.
+  The trace was sent straight away under an id DecimalAI had never stored, and was rejected with
+  "manifest_id ... does not exist". It is now held, as the other integrations already do: the
+  registration is retried in the background for 31–62 seconds, and the trace is sent under the id
+  DecimalAI stored. If the registration never succeeds, the trace is not sent, and
+  `decimalai.export_status()` says why. A 401 or 403 is not retried.
 
 ## [0.29.1] — 2026-11-18
 

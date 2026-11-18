@@ -909,7 +909,7 @@ def instrument(
 
 
 class _ManifestRegistry:
-    """Per-agent manifest state for an OTel exporter — always has an id to give.
+    """Per-agent manifest state for an OTel exporter — always declares something.
 
     Two rules, both learned the hard way:
 
@@ -976,8 +976,9 @@ class _ManifestRegistry:
     ) -> Optional[str]:
         """Fold one trace's observations in and return the manifest id to stamp.
 
-        Returns None only when the SDK is disabled or registration failed
-        without even a synthetic id to fall back on.
+        Returns None when the SDK is disabled, or when registration failed: the
+        platform has stored no id for this trace yet, so the caller must hold it
+        (``reregister_refused``) rather than send it.
         """
         from . import _config
 
@@ -1045,6 +1046,7 @@ class _ManifestRegistry:
                 client = _config._get_client()
                 result = client.register_manifest(snapshot)
                 state.manifest_id = result.get("manifest_id", snapshot.id)
+                state.pending = None
                 logger.info(
                     "Registered manifest %s from OTel spans (agent=%s, hash=%s, "
                     "components=%d)",
@@ -1056,20 +1058,65 @@ class _ManifestRegistry:
             except Exception as exc:
                 logger.warning(
                     "decimalai: could not register %s's manifest from OTel spans "
-                    "(%s: %s); the next trace retries.",
+                    "(%s: %s); its trace is held and retried in the background.",
                     agent_name, type(exc).__name__, str(exc)[:200],
                 )
                 logger.debug("OTel manifest registration for %s failed", agent_name,
                              exc_info=True)
                 _config._sender.record_manifest_error(exc)
-                # Forget the hash so the NEXT trace retries. The fallback id
-                # below is a client-side uuid the backend has never seen, and
-                # it rejects an unknown manifest_id the same as a missing one —
-                # so caching it would turn one blip (a restart, a network hiccup)
-                # into permanent trace loss for the rest of the process.
+                # Forget the hash so the NEXT trace retries too, and return no id:
+                # the caller holds this trace on the background sender, which
+                # re-registers (`reregister_refused`) and stamps the id the
+                # platform stored. Every id we have is wrong for this trace. The
+                # snapshot's own is a client-side uuid the platform never stored,
+                # an earlier version's lacks what this run declared, and no id at
+                # all is rejected too: until 2026-11-18 stamping the snapshot's id
+                # cost exactly one trace per failed registration (a ReadTimeout on
+                # 2026-11-17, answered 400 "manifest_id ... does not exist").
                 state.tracker.reset()
-                state.manifest_id = snapshot.id
+                state.pending = (snapshot, exc)
+                return None
             return state.manifest_id
+
+    def reregister_refused(self, agent_name: str) -> Optional[str]:
+        """Re-attempt ``agent_name``'s failed registration; the stored id, or None.
+
+        Runs on the background sender (`_config.submit_trace_pending_manifest`),
+        once per step of its ladder. The network call is made OUTSIDE the lock:
+        the exporter thread takes it for every trace it finalizes.
+        """
+        from . import _config
+
+        with self._lock:
+            state = self._by_agent.get(agent_name)
+            if state is None:
+                return None
+            if state.pending is None:
+                # Registered since (by a later trace, or an earlier held one).
+                return state.manifest_id
+            snapshot, exc = state.pending
+        if exc is not None and ("401" in str(exc) or "403" in str(exc)):
+            return None  # a credential refusal does not change by waiting
+        try:
+            result = _config._get_client().register_manifest(snapshot)
+        except Exception:  # noqa: BLE001 — the sender retries; raising would drop it
+            return None
+        manifest_id = result.get("manifest_id")
+        if not manifest_id:
+            return None
+        with self._lock:
+            # Only if nothing newer replaced it while the request was out: a later
+            # trace that grew the manifest owns the agent's id from then on.
+            if (state.pending is not None
+                    and state.pending[0].manifest_hash == snapshot.manifest_hash):
+                state.pending = None
+                state.manifest_id = manifest_id
+                state.tracker.check_and_update(snapshot)
+        logger.info(
+            "Registered manifest %s from OTel spans on retry (agent=%s, hash=%s)",
+            manifest_id, agent_name, snapshot.manifest_hash[:12],
+        )
+        return manifest_id
 
     def _adopt_active_manifest(self, agent_name: str) -> Optional[str]:
         """The id of ``agent_name``'s already-active manifest, if it has one."""
@@ -1098,11 +1145,16 @@ class _ManifestRegistry:
 class _AgentManifestState:
     """One agent's cumulative manifest view inside a :class:`_ManifestRegistry`."""
 
-    __slots__ = ("tracker", "manifest_id", "tools", "model", "prompts", "adoption_checked")
+    __slots__ = (
+        "tracker", "manifest_id", "pending", "tools", "model", "prompts", "adoption_checked",
+    )
 
     def __init__(self) -> None:
         self.tracker = ManifestTracker()
         self.manifest_id: Optional[str] = None
+        #: (snapshot, exception) of a registration that failed and has not landed
+        #: since; the traces it was for are held until it does.
+        self.pending: Optional[tuple] = None
         self.tools: Dict[str, Dict[str, Any]] = {}
         self.model: Optional[Dict[str, Any]] = None
         self.prompts: Dict[str, str] = {}
@@ -1259,8 +1311,9 @@ class DecimalSpanExporter:
                 # Stamp the manifest onto the trace AFTER registration — the
                 # trace was assembled before it ran, and without an id the
                 # backend rejects the trace under require_manifest_on_ingest.
-                # There is always an id to stamp now, including for a run that
-                # observed no model/tool/prompt (see _ManifestRegistry).
+                # A run that observed no model/tool/prompt still gets one (see
+                # _ManifestRegistry). None means the registration failed: _send
+                # holds the trace until a retry lands.
                 run_trace.manifest_id = self._maybe_register_manifest(
                     agent_name, seen_model, seen_tools, seen_prompts
                 )
@@ -1954,7 +2007,13 @@ class DecimalSpanExporter:
         )
 
     def _send(self, trace: RunTrace) -> None:
-        """Send a trace via the background sender."""
+        """Send a trace via the background sender.
+
+        A trace with no manifest id is one whose registration just failed. It is
+        HELD: the sender re-registers on its own ladder and posts the trace under
+        the id the platform stored, or not at all
+        (`_config.submit_trace_pending_manifest`).
+        """
         from . import _config
 
         if not _config._is_enabled():
@@ -1962,7 +2021,14 @@ class DecimalSpanExporter:
 
         try:
             client = _config._get_client()
-            _submit_or_send_inline(client, trace)
+            if trace.manifest_id is None:
+                # The key `_finalize_trace` registered it under.
+                agent = trace.agent_name or "otel-agent"
+                _config.submit_trace_pending_manifest(
+                    client, trace, lambda: self._manifests.reregister_refused(agent)
+                )
+            else:
+                _submit_or_send_inline(client, trace)
             logger.debug(
                 "Queued OTEL trace %s (%d spans, %d llm_calls, manifest=%s) for agent %s",
                 trace.id,
@@ -1983,9 +2049,10 @@ class DecimalSpanExporter:
     ) -> Optional[str]:
         """Fold this trace's observations into the agent's manifest.
 
-        Returns the manifest id to stamp on the trace. Always registers
-        something — a run that observed nothing still needs an id or the
-        backend rejects its trace. Delegates to :class:`_ManifestRegistry`,
+        Returns the manifest id to stamp on the trace, or None when the
+        registration failed (the trace is then held; see :meth:`_send`). Always
+        registers something — a run that observed nothing still needs an id or
+        the backend rejects its trace. Delegates to :class:`_ManifestRegistry`,
         which owns the accumulate-never-shrink rules.
         """
         return self._manifests.manifest_id_for(
