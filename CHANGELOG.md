@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.29.1] — 2026-11-18
+
 ### Fixed
 
 - A run in which a framework's own skill loader listed skills and the model opened none shows
