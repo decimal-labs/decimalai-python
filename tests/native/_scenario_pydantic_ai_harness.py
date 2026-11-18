@@ -62,7 +62,19 @@ def _received(messages) -> List[Any]:
             for p in m.parts:
                 if isinstance(p, (ToolReturnPart, RetryPromptPart)):
                     content = p.content
-                    out.append(content.get("instructions") if isinstance(content, dict) else content)
+                    if isinstance(content, dict):
+                        # A fresh load's return only confirms the load ({"message": "... loaded
+                        # ..."}): its text arrives as the capability's instructions, below. A load
+                        # of a capability that is already active was a retry prompt saying so;
+                        # since Pydantic AI 2.70 (#8096) it is a no-op return whose message says
+                        # it, which is kept so both versions record the same thing.
+                        text = content.get("instructions")
+                        message = content.get("message")
+                        if text is None and isinstance(message, str) and "already active" in message:
+                            text = message
+                        out.append(text)
+                    else:
+                        out.append(content)
                 elif isinstance(getattr(p, "content", None), str):
                     out.extend(m.group("text") for m in LOADED_TEXT.finditer(p.content))
             return out

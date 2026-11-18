@@ -69,8 +69,8 @@ def test_the_observer_reads_what_load_capability_returned(native_project):
 
 def test_a_second_load_in_one_run_is_refused_and_counted_once(native_project):
     """The harness refuses a second ``load_capability`` of an active skill (no body: a
-    retry prompt before Pydantic AI 2.63, a tool result since), and the trace counts the
-    skill once."""
+    retry prompt before Pydantic AI 2.63, a tool result since; since 2.70 a no-op return
+    whose ``message`` says it is already active), and the trace counts the skill once."""
     result = _scenario("column", native_project)
     run = result["runs"][0]
     assert run["target_loads"] == 2
