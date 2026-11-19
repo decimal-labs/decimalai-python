@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.29.2] — 2026-11-19
+
 ### Changed
 
 - `decimalai agents apply-pack` names the numbered version it writes the way the dashboard now
