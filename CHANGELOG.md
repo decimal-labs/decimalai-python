@@ -6,6 +6,15 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed
+
+- `decimalai agents apply-pack` names the numbered version it writes the way the dashboard now
+  does: "Writes Config v4 on the agent's Versions page." and "✓ Applied the Support pack to
+  order-support (Config v4)", where it said "setup v4". The version is the agent's prompt and
+  skill list, what `agent_config()` returns; the dashboard and docs call it the Config version
+  from now on, and it is unrelated to the Code version DecimalAI detects from your code. Only
+  the wording changed: the number, the command, its flags and the API are the same.
+
 ## [0.29.1] — 2026-11-18
 
 ### Fixed

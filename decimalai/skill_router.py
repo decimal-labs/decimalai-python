@@ -3901,7 +3901,7 @@ class SkillRouter:
                 agent in the org; ``"restricted"`` is only the agents it has
                 been assigned to (:meth:`assign_skill`). Metadata only: it does
                 not create a new version, but each agent whose list changes
-                gets a new setup version on the platform.
+                gets a new config version on the platform.
             change_summary: Description of body changes (for version history).
             author: Author of the change.
 
