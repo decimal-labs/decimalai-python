@@ -239,17 +239,22 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install SDK
+      - name: Install SDK with langchain-core ${{ matrix.langchain-core }}
+        # The floor goes into the SAME resolve as the SDK's extras, so pip picks the
+        # langchain, langchain-openai and langchain-anthropic releases that declare
+        # they work with it (1.4.6, 1.7.2 and 1.7.7 on 2026-11-20). Until then a second
+        # install pinned it afterwards, downgrading core under partner releases that
+        # need a newer one. pip only warned, so the job tested a set pip itself calls
+        # broken, and it went red once langchain-anthropic 1.7.11 imported a helper
+        # core 1.6.10 lacks. If no partner release accepts the floor any more, this
+        # install fails to resolve: the floors in pyproject.toml disagree, fix them there.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Install langchain-core ${{ matrix.langchain-core }}
-        run: |
           if [ "${{ matrix.langchain-core }}" = "latest" ]; then
+            pip install -e ".[dev]"
             pip install langchain-core
           else
-            pip install langchain-core==${{ matrix.langchain-core }}
+            pip install -e ".[dev]" "langchain-core==${{ matrix.langchain-core }}"
           fi
 
       - name: Run compat tests
