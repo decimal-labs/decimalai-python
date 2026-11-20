@@ -6,9 +6,18 @@ to catch API incompatibilities when langchain-core updates.
 These tests require langchain-core to be installed and will skip
 gracefully if it is not available.
 
-Run against different versions in CI:
-    pip install langchain-core==0.2.38 && pytest tests/test_langchain_compat.py
-    pip install langchain-core==0.3.29 && pytest tests/test_langchain_compat.py
+CI runs them twice (ci.yml, `langchain-compat`): at the langchain-core floor the
+`langchain` extra in pyproject.toml declares, and at the newest release. To
+reproduce the floor run, put the floor in the same install as the extras, so pip
+picks the langchain, langchain-openai and langchain-anthropic releases that work
+with it:
+
+    pip install -e ".[dev]" "langchain-core==<floor>"
+    python -m pytest tests/test_langchain_compat.py
+
+Pinning langchain-core in a second install, after the extras, leaves partner
+releases that need a newer core in place: pip only warns, and the tests then run
+on a set of packages pip itself reports as broken.
 """
 
 from __future__ import annotations
