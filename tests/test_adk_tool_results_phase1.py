@@ -182,10 +182,20 @@ def fetch_doc(name: str) -> str:
 
 
 class _Opaque:
-    """A tool result with no JSON form, holding something deepcopy refuses."""
+    """A tool result with no JSON form that ``copy.deepcopy`` still accepts.
+
+    Until 2026-11-20 it also held a ``threading.Lock``, which deepcopy refuses.
+    google-adk 2.15.0 deep-copies every event an in-memory session stores, the
+    tool's result included ("isolate stored events and state deltas in
+    append_event"), so ADK itself now fails such a run at the tool call, with
+    or without DecimalAI; 2.14 already failed that session's next read the
+    same way. Which objects ADK can store is ADK's limit, not the adapter's:
+    the run here uses one ADK accepts, and a result deepcopy refuses is
+    checked without ADK, in ``TestBoundedConversion``.
+    """
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        self.handle = 42
 
     def __str__(self) -> str:
         return "opaque-handle-42"
@@ -370,7 +380,7 @@ class TestRecordedResultsAreBoundedAndExportable:
 
     def test_a_result_with_no_json_form_is_recorded_as_text_and_the_trace_survives(self):
         """Recorded raw, this object fails ``model_dump(mode="json")`` on the
-        export thread and the observer's deep copy, and the trace is lost."""
+        export thread, and the trace is lost."""
         observed: List[Any] = []
         trace = _only_trace(_run(
             [call("open_handle"), say("done")], [open_handle], on_trace=observed.append,
@@ -464,6 +474,22 @@ class TestBoundedConversion:
 
         recorded = adk._bounded_tool_result({"color": Color.RED})
         assert recorded == {"color": "red"} and type(recorded["color"]) is str
+
+    def test_a_result_deepcopy_refuses_is_recorded_as_text(self):
+        """Recorded raw, this would fail the ``on_trace`` observer's deep copy
+        as well as the export. Checked here rather than through a run, because
+        google-adk 2.15+ fails the run itself on such a result (see ``_Opaque``)."""
+        import decimalai.adk as adk
+
+        class Locked:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+
+            def __str__(self) -> str:
+                return "locked-handle-7"
+
+        assert adk._bounded_tool_result(Locked()) == "locked-handle-7"
+        assert adk._bounded_tool_result({"handle": Locked()}) == {"handle": "locked-handle-7"}
 
     def test_a_callers_own_tool_named_load_skill_is_not_a_skill_tool(self):
         from google.adk.tools.function_tool import FunctionTool
