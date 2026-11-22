@@ -403,3 +403,52 @@ def test_actual_sdk_query_executes_the_real_mcp_load_over_local_control_transpor
     trace, = traces(platform)
     assert trace.skills_loaded_by_agent == ["damaged-item"]
     assert "Ask for photos" in str([call.rendered_input for call in trace.llm_calls])
+
+
+# ── Claude Code's own tools ─────────────────────────────────────────────────────────────────
+# ClaudeAgentOptions(tools=None) gives the model Bash, Read, Edit and the rest of Claude Code's
+# tools. An agent moved from another framework gains a shell without its code saying so, so a
+# run says it once per agent; naming the tools, or tools=[], silences it.
+
+_BUILTIN = "Claude Code's own tools"
+
+
+@dataclass
+class OptionsWithTools(Options):
+    tools: object = None
+
+
+def _builtin_warnings(caplog):
+    return [r for r in caplog.records if _BUILTIN in r.getMessage()]
+
+
+def test_claude_codes_own_tools_left_on_are_named_once_per_agent(platform, caplog):
+    config = claude.agent_config("support")
+    with caplog.at_level("WARNING", logger="decimalai"):
+        asyncio.run(ask(config, OptionsWithTools(), variables=SAM))
+        asyncio.run(ask(config, OptionsWithTools(), variables=SAM))
+    warned = _builtin_warnings(caplog)
+    assert len(warned) == 1
+    message = warned[0].getMessage()
+    assert "support" in message and "tools=[]" in message and "Bash" in message
+
+
+def test_default_options_get_the_same_warning(platform, caplog, monkeypatch):
+    monkeypatch.setattr(platform.sdk, "ClaudeAgentOptions", OptionsWithTools, raising=False)
+    with caplog.at_level("WARNING", logger="decimalai"):
+        asyncio.run(ask(claude.agent_config("support"), None, variables=SAM))
+    assert len(_builtin_warnings(caplog)) == 1
+
+
+@pytest.mark.parametrize("tools", [[], ["Read"], {"type": "preset", "preset": "claude_code"}])
+def test_named_tools_are_a_choice_and_not_warned_about(platform, caplog, tools):
+    with caplog.at_level("WARNING", logger="decimalai"):
+        asyncio.run(ask(claude.agent_config("support"), OptionsWithTools(tools=tools), variables=SAM))
+    assert _builtin_warnings(caplog) == []
+    assert platform.sdk.calls[0][1].tools == tools  # passed through untouched
+
+
+def test_options_without_a_tools_field_are_not_warned_about(platform, caplog):
+    with caplog.at_level("WARNING", logger="decimalai"):
+        asyncio.run(ask(claude.agent_config("support"), Options(), variables=SAM))
+    assert _builtin_warnings(caplog) == []

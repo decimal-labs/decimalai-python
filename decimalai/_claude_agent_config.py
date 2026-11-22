@@ -26,6 +26,18 @@ _RUN: contextvars.ContextVar[Any] = contextvars.ContextVar("decimalai_claude_con
 _SERVER = "decimalai"
 _TOOL = "mcp__decimalai__load_skill"
 
+# ClaudeAgentOptions(tools=None), its default, gives the model Claude Code's own tools: Bash,
+# Read, Edit, Write and the rest. An agent moved here from a framework where it had only the
+# tools its code named gains a shell and file access with nothing in its code saying so, so a
+# run says it once per agent. Naming the tools, or tools=[] for none, is the choice made and
+# silences it. A stand-in options class with no `tools` field is not warned about.
+_NO_FIELD = object()
+_BUILTIN_TOOLS_WARNING = (
+    "ClaudeAgentOptions has no tools=, so this agent gets Claude Code's own tools, including Bash "
+    "and file editing. Pass tools=[] for none, or name the ones it should have, such as "
+    "tools=[\"Read\"]."
+)
+
 
 class Conversation:
     """An in-process chat that keeps its first prompt and resumes its Claude session.
@@ -228,6 +240,8 @@ class Run:
             options = ClaudeAgentOptions()
         if not isinstance(options, ClaudeAgentOptions):
             raise TypeError("options must be ClaudeAgentOptions")
+        if getattr(options, "tools", _NO_FIELD) is None:
+            self.config._warn_once(None, _BUILTIN_TOOLS_WARNING)
         # Replaying a session under a different prompt/tool schema breaks Claude's
         # signed thinking history. Only a config-owned conversation can resume.
         if options.resume or options.continue_conversation or getattr(options, "session_id", None):

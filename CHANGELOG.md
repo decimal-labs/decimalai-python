@@ -6,6 +6,15 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Added
+
+- `decimalai.claude_agent_sdk.agent_config()` warns once per agent when the run's
+  `ClaudeAgentOptions` has no `tools=`. That default gives the model Claude Code's own tools,
+  Bash and file editing among them, so an agent moved here from another framework could run
+  shell commands with nothing in its code saying so. Pass `tools=[]` for none, or name the tools
+  it should have, such as `tools=["Read"]`; either silences the warning. Nothing else about the
+  run changes.
+
 ## [0.29.2] — 2026-11-19
 
 ### Changed

@@ -1,6 +1,6 @@
 # DecimalAI Python SDK
 
-**A registry of agent skills with test results. See what a skill changes, then add it to the agent you already have.** The open source SDK for [DecimalAI](https://decimal.ai).
+**A registry of agent skills with test results. See what a skill changes, then add it to the agent you already have.** The open source SDK for [DecimalAI](https://decimal.ai). Your agent's prompt and skills live outside your framework code, so moving it between LangChain, OpenAI Agents, the Claude Agent SDK, Pydantic AI, Google ADK and the plain OpenAI, Anthropic and Gemini SDKs keeps both.
 
 [![PyPI](https://img.shields.io/pypi/v/decimalai)](https://pypi.org/project/decimalai/)
 [![Downloads](https://static.pepy.tech/badge/decimalai/month)](https://pepy.tech/project/decimalai)
