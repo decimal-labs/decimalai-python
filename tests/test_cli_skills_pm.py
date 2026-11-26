@@ -293,6 +293,57 @@ class TestAddEndsWithHowToTry:
         assert "Now try it." in env.run("add", REFUND).output
         assert "Now try it." not in env.run("add", REFUND).output
 
+
+class TestAddNamesTheProjectsFramework:
+    """Walkthrough 2026-11-26: every project was told `pip install "decimalai[openai-agents]"` and
+    OPENAI_API_KEY, whatever framework its code used."""
+
+    def _add(self, env: Env, files: Dict[str, str]) -> str:
+        for rel, text in files.items():
+            path = env.dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        env.skill()
+        result = env.run("add", REFUND)
+        assert result.exit_code == 0, result.output
+        return result.output.split("Now try it.")[1]
+
+    def test_a_claude_agent_sdk_project_gets_its_install_line_and_key(self, env):
+        after = self._add(env, {"agent.py": "import anyio\nfrom claude_agent_sdk import query\n"})
+        assert ('In Python with the Claude Agent SDK (this project uses it): '
+                'pip install "decimalai[claude-agent-sdk]", set ANTHROPIC_API_KEY') in after
+        assert "https://docs.decimal.ai/sdk/python/frameworks/claude-agent-sdk" in after
+        assert "OPENAI_API_KEY" not in after and "from agents import" not in after
+
+    def test_a_dependency_file_counts_too(self, env):
+        after = self._add(env, {"requirements.txt": "crewai>=1.15\nrequests\n"})
+        assert "In Python with CrewAI (this project uses it)" in after
+        assert "/sdk/python/frameworks/crewai" in after
+
+    def test_an_agent_framework_wins_over_the_provider_sdk_it_pulls_in(self, env):
+        after = self._add(env, {"app/main.py": "import openai\nfrom pydantic_ai import Agent\n"})
+        assert "In Python with Pydantic AI" in after
+
+    def test_an_openai_agents_project_gets_the_runnable_example(self, env):
+        after = self._add(env, {"pyproject.toml": '[project]\ndependencies = ["openai-agents>=0.4"]\n'})
+        assert "In Python with OpenAI Agents (this project uses it)" in after
+        assert "from agents import Agent, Runner" in after
+
+    def test_no_sign_keeps_the_example_and_says_it_is_one(self, env):
+        after = self._add(env, {"notes.md": "from claude_agent_sdk import query\n"})
+        assert 'In Python, for example with OpenAI Agents: pip install "decimalai[openai-agents]"' in after
+        assert "With the Claude Agent SDK, LangChain, CrewAI, Google ADK or Pydantic AI:" in after
+        assert "    https://docs.decimal.ai/sdk/python/frameworks\n" in after
+
+    def test_a_virtualenv_or_hidden_folder_is_not_the_project(self, env):
+        after = self._add(env, {".venv/app.py": "import langchain\n", "venv/app.py": "import crewai\n",
+                                "node_modules/x.py": "import crewai\n"})
+        assert "for example with OpenAI Agents" in after
+
+    def test_a_word_inside_a_name_is_not_a_dependency(self, env):
+        after = self._add(env, {"requirements.txt": "langchainify==1\nmy-openai-helpers\n"})
+        assert "for example with OpenAI Agents" in after
+
     def test_update_json_keeps_one_note_per_tool(self, env):
         skill = env.skill(allowed_tools=["Bash", "Write"])
         _added(env)

@@ -15,6 +15,17 @@ and patch releases are fixes.
   it should have, such as `tools=["Read"]`; either silences the warning. Nothing else about the
   run changes.
 
+### Changed
+
+- `decimalai skills add` tells you how to try the skill in the framework your project uses. It
+  always said `pip install "decimalai[openai-agents]"` and set `OPENAI_API_KEY`, so a Claude
+  Agent SDK or CrewAI project got the wrong install line and the wrong key. It now reads the
+  project's `pyproject.toml`, `requirements*.txt` and the imports in its Python files (the top
+  folder and one below, never a virtualenv), and names that framework's install line, its
+  model key and its docs page. A project that uses OpenAI Agents, or names no framework, still
+  gets the runnable OpenAI Agents example; with no framework found it is labelled as an example
+  and followed by the link to the other frameworks' pages. Nothing is imported or installed.
+
 ## [0.29.2] — 2026-11-19
 
 ### Changed

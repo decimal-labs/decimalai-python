@@ -245,6 +245,97 @@ def _skill_id(project: Any, install_name: str) -> Optional[str]:
     return entry.get("skill_id") if entry else None
 
 
+#: Where each framework's own steps are (decimalai-docs sdk/python/frameworks/<key>.mdx).
+_FRAMEWORK_DOCS = "https://docs.decimal.ai/sdk/python/frameworks"
+
+#: The frameworks `skills add` can tell a project uses, most specific first: an agent framework
+#: pulls in its provider's SDK, so the provider SDKs come last. Each: its key in
+#: decimalai._frameworks (which has a docs page under _FRAMEWORK_DOCS), the package names a
+#: pyproject.toml or requirements file lists it under, and the module after `import`/`from`.
+_FRAMEWORK_SIGNS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
+    ("claude-agent-sdk", ("claude-agent-sdk",), r"claude_agent_sdk"),
+    ("openai-agents", ("openai-agents",), r"agents"),
+    ("crewai", ("crewai",), r"crewai"),
+    ("adk", ("google-adk",), r"google\.adk|google\s+import\s+adk"),
+    ("pydantic-ai", ("pydantic-ai", "pydantic-ai-slim"), r"pydantic_ai"),
+    ("langchain", ("langchain", "langgraph", "langchain-core"), r"langchain\w*|langgraph\w*"),
+    ("anthropic", ("anthropic",), r"anthropic"),
+    ("google-genai", ("google-genai",), r"google\.genai|google\s+import\s+genai"),
+    ("openai", ("openai",), r"openai"),
+)
+#: How much of a project the guess reads: its dependency files, and the Python files at its
+#: top level and one folder down (never a virtualenv or node_modules).
+_GUESS_MAX_FILES = 200
+_GUESS_MAX_BYTES = 200_000
+_GUESS_SKIP_DIRS = {"node_modules", "site-packages", "__pycache__", "build", "dist", "venv", "env"}
+
+
+def _project_framework(directory: Path) -> Optional[str]:
+    """The framework this project's code or dependency files name, or None.
+
+    Why (onboarding walkthrough, 2026-11-26): `skills add` told every project to
+    `pip install "decimalai[openai-agents]"` and set OPENAI_API_KEY, so a Claude Agent SDK or
+    CrewAI project was sent the wrong install line and the wrong key. Reads files only; never
+    imports anything, and never fails the command.
+    """
+    def wanted(f: Path) -> bool:
+        return f.suffix == ".py" or f.name == "pyproject.toml" or (
+            f.name.startswith("requirements") and f.suffix in (".txt", ".in"))
+
+    code: List[str] = []   # .py files
+    deps: List[str] = []   # pyproject.toml, requirements*.txt / .in
+    try:
+        folders = [directory] + sorted(
+            d for d in directory.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and d.name not in _GUESS_SKIP_DIRS)
+        files = [f for folder in folders for f in sorted(folder.iterdir()) if f.is_file() and wanted(f)]
+        for f in files[:_GUESS_MAX_FILES]:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                (code if f.suffix == ".py" else deps).append(fh.read(_GUESS_MAX_BYTES))
+    except OSError:
+        return None
+    for key, packages, imports in _FRAMEWORK_SIGNS:
+        # A dependency line: the name, then a version, an extra, a marker, a quote or the end.
+        dep = re.compile(r"(?im)(?:^|[\"'\s])(?:%s)\s*(?:[\[<>=~!;\"',]|$)"
+                         % "|".join(map(re.escape, packages)))
+        imp = re.compile(r"(?m)^\s*(?:from|import)\s+(?:%s)\b" % imports)
+        if any(imp.search(t) for t in code) or any(dep.search(t) for t in deps):
+            return key
+    return None
+
+
+def _python_step(project: Any, question: str) -> None:
+    """How to try it from Python: this project's framework when its files name one, else
+    the OpenAI Agents example, labelled as one."""
+    from .. import _frameworks
+
+    key = _project_framework(project.directory)
+    if key is not None and key != "openai-agents":
+        fw = _frameworks.get(key)
+        keys = [v for v in fw.env_vars if v != "DECIMAL_API_KEY"]
+        label = re.sub(r"^The ", "the ", fw.cli_label)
+        click.echo(f"  In Python with {label} (this project uses it): {fw.install}"
+                   + (f", set {' and '.join(keys)}" if keys else "") + ", then follow:")
+        click.echo(f"    {_FRAMEWORK_DOCS}/{key}")
+        return
+    lead = "  In Python with OpenAI Agents (this project uses it)" if key else \
+        "  In Python, for example with OpenAI Agents"
+    click.echo(f'{lead}: pip install "decimalai[openai-agents]", set OPENAI_API_KEY, and '
+               "run this from the project:")
+    click.echo("")
+    click.echo("    from agents import Agent, Runner")
+    click.echo("    from decimalai.openai_agents import agent_config")
+    click.echo("")
+    click.echo('    support = agent_config("my-agent", fallback="You are a helpful assistant.")')
+    click.echo("    agent = Agent(name=support.name, instructions=support.instructions, "
+               "tools=[*support.tools])")
+    click.echo(f"    print(Runner.run_sync(agent, {question!r}).final_output)")
+    if not key:
+        click.echo("")
+        click.echo("  With the Claude Agent SDK, LangChain, CrewAI, Google ADK or Pydantic AI:")
+        click.echo(f"    {_FRAMEWORK_DOCS}")
+
+
 def _next_steps(project: Any, change: Any, base_url: str) -> None:
     """What to commit, then how to try the skill, with nothing but this text to go on."""
     from .main import _dashboard_url
@@ -273,18 +364,9 @@ def _next_steps(project: Any, change: Any, base_url: str) -> None:
     click.echo("")
     click.echo("  In Cursor, Copilot, Cline, Warp or Codex: start a new chat in this project.")
     click.echo(f"  In Claude Code: claude --plugin-dir {shlex.quote(str(project.agents_dir))}")
-    click.echo('  In Python: pip install "decimalai[openai-agents]", set OPENAI_API_KEY, and '
-               "run this from the project:")
+    _python_step(project, question)
     click.echo("")
-    click.echo("    from agents import Agent, Runner")
-    click.echo("    from decimalai.openai_agents import agent_config")
-    click.echo("")
-    click.echo('    support = agent_config("my-agent", fallback="You are a helpful assistant.")')
-    click.echo("    agent = Agent(name=support.name, instructions=support.instructions, "
-               "tools=[*support.tools])")
-    click.echo(f"    print(Runner.run_sync(agent, {question!r}).final_output)")
-    click.echo("")
-    click.echo("  Steps for other frameworks, and what this skill changes:")
+    click.echo("  What this skill changes, and how it tested:")
     # The page's route is one path segment: a namespaced name ("owner/skill") 404s there, and
     # its "%2F" form renders "Skill not found". The page also resolves the skill's id, which
     # the lock keeps (cold walk, 2026-11-10: a5c-ai/file-watcher-setup).
