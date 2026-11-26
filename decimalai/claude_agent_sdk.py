@@ -18,13 +18,23 @@ caller's messages, and an ingest failure never breaks the user's run.
 
 Config path (saved prompt, routed skills and one trace)::
 
-    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
     from decimalai.claude_agent_sdk import agent_config
 
     support = agent_config("support", fallback="You are a helpful agent.")
+    options = ClaudeAgentOptions(
+        model="claude-haiku-5-5",
+        tools=[],            # none of Claude Code's own tools: no shell, no files
+        setting_sources=[],  # nothing from this machine's Claude settings
+    )
     async with support.run(question) as run:
-        async for message in run.query(options=ClaudeAgentOptions(max_turns=6)):
-            print(message)
+        async for message in run.query(options=options):
+            if isinstance(message, ResultMessage):
+                print(message.result)
+
+Name the model, the tools and the settings, as above. Left out, the run takes this machine's
+Claude Code setup: its default model, its own tools (shell and file access among them), and its
+plugins, MCP servers and hooks.
 
 An in-process chat uses ``support.conversation().run(question)`` instead: it
 keeps its first prompt and tool schema and resumes its own Claude session.

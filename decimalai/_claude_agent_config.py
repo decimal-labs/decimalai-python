@@ -402,11 +402,14 @@ def agent_config(agent_name: str, *, fallback: Optional[str] = None,
 
     ::
 
+        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
         from decimalai.claude_agent_sdk import agent_config
         support = agent_config("support", fallback="You are a helpful agent.")
+        options = ClaudeAgentOptions(model="claude-haiku-5-5", tools=[], setting_sources=[])
         async with support.run(question) as run:
-            async for message in run.query(options=ClaudeAgentOptions(max_turns=6)):
-                print(message)
+            async for message in run.query(options=options):
+                if isinstance(message, ResultMessage):
+                    print(message.result)
 
     With no Decimal key and no ``init()`` it runs keyless, as the other bindings do: the
     ``fallback`` is the prompt, the skills are the ones ``.decimal/skills.toml`` lists, read

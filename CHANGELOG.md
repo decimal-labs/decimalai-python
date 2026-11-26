@@ -17,6 +17,11 @@ and patch releases are fixes.
 
 ### Changed
 
+- The Claude Agent SDK example in `decimalai.claude_agent_sdk`'s docstring and in `agent_config()`'s
+  names the model, the tools and the settings: `ClaudeAgentOptions(model="claude-haiku-5-5", tools=[],
+  setting_sources=[])`, and prints only the final answer. The old example passed only `max_turns`,
+  so a run took the machine's own Claude Code setup: its default model, its shell and file tools,
+  and its plugins and hooks. Only the examples changed.
 - `decimalai skills add` tells you how to try the skill in the framework your project uses. It
   always said `pip install "decimalai[openai-agents]"` and set `OPENAI_API_KEY`, so a Claude
   Agent SDK or CrewAI project got the wrong install line and the wrong key. It now reads the
