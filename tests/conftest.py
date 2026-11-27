@@ -584,12 +584,25 @@ def _synchronous_sender(request, monkeypatch):
 
 
 
+# The notebook-freshness workflow's keyless job runs tests/test_notebook_examples.py with only what
+# Colab ships (pytest, requests, pyyaml, google-genai): the SDK and its dependencies are deliberately
+# NOT installed, because Tier 0's claim is that the notebook runs on a cold machine. An autouse
+# fixture that imports the SDK unguarded therefore errors at setup of EVERY test there (httpx is
+# missing), and from 2026-11-06 the job reported "Onboarding notebooks no longer run keyless" daily
+# (decimalai-python#29) though no notebook had run. The fixtures below reset SDK state only when the
+# SDK imports; tests that need the SDK import it themselves and fail on their own.
+
+
 @pytest.fixture(autouse=True)
 def _clear_prompt_cache():
     """`agent_config()` keeps the last good config per process so it can serve it
     during a platform outage. That is process-local state, so it has to be reset
     between tests or one case's fetch answers the next case's assertion."""
-    from decimalai._agent import _reset_prompt_cache
+    try:
+        from decimalai._agent import _reset_prompt_cache
+    except ImportError:  # the keyless notebook job: see the note above _clear_prompt_cache
+        yield
+        return
 
     _reset_prompt_cache()
     yield
@@ -601,7 +614,11 @@ def _clear_route_pauses():
     """A route failure answered by the menu pauses routes for that host and key
     for 30 s, process-wide (`skill_router._ROUTE_PAUSE_S`). Reset it between tests
     or one case's failure turns the next case's route into a menu."""
-    from decimalai.skill_router import _clear_route_pauses as _clear
+    try:
+        from decimalai.skill_router import _clear_route_pauses as _clear
+    except ImportError:  # the keyless notebook job: see the note above _clear_prompt_cache
+        yield
+        return
 
     _clear()
     yield
