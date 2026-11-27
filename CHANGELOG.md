@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.29.3] — 2026-11-27
+
 ### Added
 
 - `decimalai.claude_agent_sdk.agent_config()` warns once per agent when the run's
@@ -30,6 +32,17 @@ and patch releases are fixes.
   model key and its docs page. A project that uses OpenAI Agents, or names no framework, still
   gets the runnable OpenAI Agents example; with no framework found it is labelled as an example
   and followed by the link to the other frameworks' pages. Nothing is imported or installed.
+
+### Fixed
+
+- Help and messages that said the wrong thing. `decimalai init --framework adk` or
+  `--framework pydantic-ai` on Python 3.10 said pip "installs an older decimalai release"; since
+  0.28.4 it installs this one without the framework, and `agent_config()` then raises an
+  ImportError that names Python 3.11, which the note now says. `decimalai compat-check --help` said
+  the command always exits 0; it exits 1 when the check can't run (no API key, an agent it can't
+  find, an API it can't reach). `decimalai skills benchmark --help` gave models that no longer
+  exist as examples (now `gemini-3.6-flash`, `claude-haiku-5-5`) and explained `--runs` with
+  internal terms.
 
 ## [0.29.2] — 2026-11-19
 
