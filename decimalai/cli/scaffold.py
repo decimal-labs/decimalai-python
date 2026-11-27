@@ -1225,9 +1225,11 @@ INSTALL: Dict[str, str] = {
 
 #: Extras whose framework floor needs a newer Python than decimalai itself
 #: (pyproject's `[adk]` and `[pydantic-ai]`: google-adk and pydantic-ai-slim at
-#: their floors require 3.11). pip does not report the mismatch. On an older
-#: Python it installs the newest decimalai release whose requirements still
-#: resolve, older than the one that wrote the file, and prints nothing.
+#: their floors require 3.11). pip does not report the mismatch. Each extra
+#: carries a `python_version >= '3.11'` marker (since 0.28.4), so on an older
+#: Python pip installs this decimalai without the framework and prints nothing;
+#: agent_config() then raises the ImportError in decimalai/_extras.py. Before
+#: the marker, pip fell back to an old release (0.13.9) instead.
 EXTRA_MIN_PYTHON: Dict[str, Tuple[int, int]] = {
     f.key: f.min_python for f in _registry.FRAMEWORKS if f.min_python
 }
@@ -1248,9 +1250,9 @@ def install_python_note(
         return None
     return (
         f"decimalai[{framework}] needs Python {need[0]}.{need[1]} or newer, and this is "
-        f"Python {have[0]}.{have[1]}. Here pip installs an older decimalai release "
-        f"instead, without saying so. Run the install line under Python "
-        f"{need[0]}.{need[1]}+."
+        f"Python {have[0]}.{have[1]}. Here pip installs decimalai without the "
+        f"framework, without saying so, and agent_config() stops with an error. "
+        f"Run the install line under Python {need[0]}.{need[1]}+."
     )
 
 

@@ -1142,8 +1142,9 @@ class TestCliWritesTheFile:
         self, framework, tmp_path, monkeypatch
     ):
         """On Python 3.10 the printed `pip install "decimalai[adk]"` does not
-        fail: pip quietly installs an older decimalai, under a file written for
-        this one. The next steps say so instead of leaving it to be found."""
+        fail: pip quietly installs decimalai without the framework, and the
+        file's agent_config() then stops with an ImportError. The next steps say
+        so instead of leaving it to be found."""
         from decimalai.cli import scaffold
 
         monkeypatch.chdir(tmp_path)
@@ -1153,7 +1154,8 @@ class TestCliWritesTheFile:
         assert f'pip install "decimalai[{framework}]"' in result.output
         assert (f"decimalai[{framework}] needs Python 3.11 or newer, and this is "
                 "Python 3.10") in result.output
-        assert "older decimalai release" in result.output
+        assert "without the framework" in result.output
+        assert "older decimalai release" not in result.output
 
     @pytest.mark.parametrize("framework,version", [
         ("adk", (3, 11, 0)), ("pydantic-ai", (3, 12, 1)),

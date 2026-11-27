@@ -2160,7 +2160,7 @@ def skills_review(skill_name, api_key, base_url):
     metavar="MODEL",
     help=(
         "Benchmark against this model for the model-relative lane "
-        "(e.g. gpt-4o-mini, claude-haiku-4-5). Lift is skill x model, so the "
+        "(e.g. gemini-3.6-flash, claude-haiku-5-5). Lift is skill x model, so the "
         "result is tagged with the model and the registry headline is the best "
         "across the models you've run. Must be in the platform's supported "
         "models. Default: the platform's configured model."
@@ -2205,17 +2205,15 @@ def skills_benchmark(skill_dir, api_key, base_url, model, runs, trials):
     so the platform has the latest test cases. Then the benchmark runs
     each case twice (with skill / without skill) and prints the deltas.
 
-    ``--runs N`` re-runs the whole suite N times, uniformly, and averages
-    the per-case results by MEAN (ADR-0007). The expected value of the
-    headline is independent of N — more runs only narrow the error bars.
-    It is a run-level parameter on the hosted run endpoint and does NOT
-    modify your eval.yaml. (It replaces the removed per-case pass^k
-    ``--trials`` flag.)
+    ``--runs N`` re-runs the whole suite N times and averages the per-case
+    results. More runs don't change what the headline measures; they only
+    narrow its error bars. It is a setting of the hosted run and does NOT
+    modify your eval.yaml. (It replaces the removed ``--trials`` flag.)
 
     \b
     Example:
         $ decimalai skills benchmark ./skills/gdpr-pii-classifier
-        $ decimalai skills benchmark ./skills/gdpr-pii-classifier --model gpt-4o-mini
+        $ decimalai skills benchmark ./skills/gdpr-pii-classifier --model claude-haiku-5-5
         $ decimalai skills benchmark ./skills/gdpr-pii-classifier --runs 3
     """
     import hashlib
@@ -2228,8 +2226,7 @@ def skills_benchmark(skill_dir, api_key, base_url, model, runs, trials):
     if trials is not None:
         click.echo(
             f"  ✗ --trials has been removed. Use --runs {trials} instead: it "
-            "re-runs the whole suite N times and averages by MEAN (the old "
-            "per-case pass^k reliability knob is retired — see ADR-0007).",
+            "re-runs the whole suite N times and averages the results.",
             err=True,
         )
         raise SystemExit(1)
@@ -2970,7 +2967,9 @@ def compat_check(agent_name, fmt, recompute, api_key, base_url):
 
     Compares the latest two manifests for an agent and reports how many
     training-data traces are affected (keep/repair/replay/drop). This
-    command is informational — it always exits 0 so it won't block CI.
+    command is informational: whatever it finds, it exits 0, so it won't
+    block CI. It exits 1 only when it can't run the check (no API key, an
+    agent it can't find, or an API it can't reach).
 
     Use in GitHub Actions to annotate PRs with compatibility impact:
 
