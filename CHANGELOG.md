@@ -6,6 +6,8 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+## [0.29.4] — 2026-11-28
+
 ### Changed
 
 - The README's registry examples, the help for `decimalai skills add` and `skills pull`, and the
