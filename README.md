@@ -436,11 +436,11 @@ router = SkillRouter(api_key="dai_sk_...")
 results = router.search("code review security")
 
 # Link a skill into your workspace (no copy): your agents are offered it, and it tracks the author's updates
-router.use("pdf")
+router.use("playwright-cli")
 
 # Take an editable copy, only if you intend to change it: it replaces the original on the agents
 # that had it, and reaches others when you add it to them (offer_scope="workspace": every agent)
-router.fork("pdf")
+router.fork("playwright-cli")
 ```
 
 ### Skills on Disk
@@ -448,12 +448,12 @@ router.fork("pdf")
 For a runtime that loads SKILL.md folders itself, install registry skills into the project, like packages:
 
 ```bash
-decimalai skills add pdf            # record it in .decimal/skills.toml, write .agents/skills/<name>/, lock its bytes
+decimalai skills add playwright-cli # record it in .decimal/skills.toml, write .agents/skills/<name>/, lock its bytes
 decimalai skills install --frozen   # CI and Docker: exactly what .decimal/skills.lock records, or a refusal
 decimalai skills update             # move `latest` entries to the newest version
 decimalai skills status             # installed folders against the lock, and ./skills against the platform
 decimalai skills verify             # what a native skill loader would reject
-decimalai skills remove pdf
+decimalai skills remove playwright-cli
 ```
 
 Commit `.decimal/skills.toml` and `.decimal/skills.lock`. A folder you edited by hand is never replaced without `--force`, which backs it up first. Without an API key, `add`, `install` and `update` work anonymously for public skills. Each of these commands exits with a code listed in `decimalai skills --help`, and the same engine is `from decimalai import skillpkg` in Python; `router.status()` and `router.update_skills()` run `skills status` and `skills update` for the project.

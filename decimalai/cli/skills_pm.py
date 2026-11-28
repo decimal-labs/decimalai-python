@@ -420,7 +420,7 @@ def skills_add(ref, yes, force, no_install, agent_name, directory, api_key, base
         $ decimalai skills add acme/refund-policy
         $ decimalai skills add acme/refund-policy@3
         $ decimalai skills add refund-policy          # a skill you wrote
-        $ decimalai skills add pdf --yes --to-agent support
+        $ decimalai skills add playwright-cli --yes --to-agent support
     """
     _add(ref, yes=yes, force=force, no_install=no_install, agent_name=agent_name,
          directory=directory, api_key=api_key, base_url=base_url)
@@ -1117,10 +1117,10 @@ def skills_pull(ref, out_dir, base_url, no_evals, to_stdout, force):
         $ decimalai skills pull playwright-cli
     \b
         # Write to a specific path
-        $ decimalai skills pull pdf --out ./agents/skills/
+        $ decimalai skills pull playwright-cli --out ./agents/skills/
     \b
         # Just print the SKILL.md
-        $ decimalai skills pull pdf --stdout
+        $ decimalai skills pull playwright-cli --stdout
     """
     from skillevaluation import skillfmt
 

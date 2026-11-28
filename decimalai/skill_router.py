@@ -4490,7 +4490,7 @@ class SkillRouter:
         Example::
 
             router = SkillRouter(api_key="dai_sk_...")
-            router.fork("pdf")            # now in your workspace; not on disk
+            router.fork("playwright-cli") # now in your workspace; not on disk
         """
         # Step 1: resolve the registry skill id by name. `q=` is a semantic
         # search that always ranks something, so match the name EXACTLY —
@@ -4682,7 +4682,7 @@ class SkillRouter:
         Example::
 
             router = SkillRouter(api_key="dai_sk_...")
-            snap = router.preview("pdf")
+            snap = router.preview("playwright-cli")
             if snap:
                 print(snap["body_markdown"][:200])
         """

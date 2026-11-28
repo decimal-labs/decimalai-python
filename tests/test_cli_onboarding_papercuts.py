@@ -303,9 +303,9 @@ class TestHelpPapercuts:
         result = CliRunner().invoke(cli, ["skills", "pull", "--help"])
         assert result.exit_code == 0
         # Pre-fix, click re-wrapped the 2nd/3rd example paragraphs into
-        # "# Write to a specific path     $ decimalai skills pull pdf --out".
-        assert "$ decimalai skills pull pdf --out ./agents/skills/" in result.output
-        assert "$ decimalai skills pull pdf --stdout" in result.output
+        # "# Write to a specific path     $ decimalai skills pull playwright-cli --out".
+        assert "$ decimalai skills pull playwright-cli --out ./agents/skills/" in result.output
+        assert "$ decimalai skills pull playwright-cli --stdout" in result.output
 
     def test_top_level_one_liners_do_not_truncate(self):
         result = CliRunner().invoke(cli, ["--help"])

@@ -6,6 +6,12 @@ and patch releases are fixes.
 
 ## [Unreleased]
 
+### Changed
+
+- The README's registry examples, the help for `decimalai skills add` and `skills pull`, and the
+  `SkillRouter.fork()` and `preview()` docstrings use `playwright-cli`. They named `pdf`, which the
+  public registry no longer has, so copying one failed. Only the examples changed.
+
 ## [0.29.3] — 2026-11-27
 
 ### Added
